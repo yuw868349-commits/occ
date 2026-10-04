@@ -170,7 +170,42 @@ if(NOT DEFINED OCC_LIBCXX_ROOT)
     endforeach()
 endif()
 
+# Declared here rather than with the other options at the bottom of the file,
+# because it has to be known before the standard library is chosen below.
+option(OCC_ENABLE_FUZZ "Build libFuzzer harnesses" OFF)
+
 set(OCC_USE_LIBCXX ON CACHE BOOL "Build against libc++ instead of libstdc++")
+
+# libFuzzer ships as a prebuilt archive linked into the harness, and it was
+# compiled against libstdc++. Its C++ symbols carry libstdc++'s ABI --
+# std::__cxx11::basic_string, std::thread::hardware_concurrency -- none of
+# which libc++ defines, because libc++ puts the same names in std::__1. A
+# fuzz build against libc++ therefore fails to link, and the errors name
+# symbols from the fuzzer archive rather than anything in this tree, so they
+# read as a broken toolchain rather than a mismatched standard library.
+#
+# Linking libstdc++ alongside libc++ to satisfy those symbols is worse than
+# the link error. The two runtimes implement operator new and operator delete
+# separately, so a std::string allocated inside libFuzzer and destroyed by
+# code in this tree -- or the reverse -- calls free() on memory the other
+# library's allocator owns. That is heap corruption a sanitizer run may not
+# catch, and it would live in the fuzz build only, where it would make the
+# harness itself the thing under suspicion.
+#
+# So a fuzz build uses libstdc++ throughout. Nothing is lost: the harnesses
+# parse untrusted bytes, and the parsers they drive use no standard library
+# behaviour that differs between the two. A fuzz build is not shipped, and a
+# crash found under libstdc++ is a crash in the same code.
+#
+# Written to the cache rather than as a normal variable so that the value a
+# reconfigure reads back is the value this build used. A normal variable would
+# shadow the cache for this run and leave the cache claiming ON, so the next
+# configure would look at a build that never existed.
+if(OCC_ENABLE_FUZZ AND OCC_USE_LIBCXX)
+    set(OCC_USE_LIBCXX OFF CACHE BOOL "Build against libc++ instead of libstdc++" FORCE)
+    message(STATUS
+        "occ: fuzzing needs libstdc++ (libFuzzer's ABI); building against libstdc++")
+endif()
 set(OCC_STATIC_LINK ON CACHE BOOL "Link the main binary statically")
 
 # A libc++ that is present is not a libc++ this compiler can use. The pairing
@@ -422,6 +457,22 @@ if(OCC_USE_LIBCXX AND OCC_STATIC_LINK)
     endif()
 endif()
 
+if(OCC_ENABLE_FUZZ)
+    # A sanitized build cannot be a static build. libFuzzer supplies main(),
+    # and ASan needs the dynamic loader's data to install its shadow memory --
+    # linking -static against it fails with an undefined reference to
+    # _DYNAMIC, which names neither the cause nor the flag.
+    #
+    # This has to happen before the -static below is turned into a link
+    # option. Setting OCC_STATIC_LINK after add_link_options(-static) is too
+    # late: the option is already on every target in the directory, so the
+    # variable would read OFF while the command line still said -static.
+    # A variable that lies about what the build did is worse than one that
+    # is merely set in the wrong place, because the next thing that consults
+    # it is this kind of check.
+    set(OCC_STATIC_LINK OFF)
+endif()
+
 if(OCC_STATIC_LINK)
     add_link_options(-static)
 endif()
@@ -449,7 +500,6 @@ endif()
 # ---------------------------------------------------------------- options
 
 option(OCC_ENABLE_TESTS "Build unit tests" ON)
-option(OCC_ENABLE_FUZZ "Build libFuzzer harnesses" OFF)
 option(OCC_WERROR "Treat warnings as errors" ON)
 
 if(OCC_WERROR)
@@ -457,11 +507,13 @@ if(OCC_WERROR)
 endif()
 
 if(OCC_ENABLE_FUZZ)
+    # Compile options only. The fuzzer and sanitizer *link* options belong to
+    # the harnesses and are set per target in fuzz/CMakeLists.txt, because
+    # -fsanitize=fuzzer links libFuzzer's main() and this directory also
+    # builds the occ binary, which has a main() of its own. A directory-level
+    # add_link_options would put two mains in one link.
     add_compile_options(-fsanitize=fuzzer-no-link,address,undefined
                         -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=fuzzer,address,undefined)
-    # A sanitized build cannot be a static build; libFuzzer supplies main().
-    set(OCC_STATIC_LINK OFF)
 endif()
 
 # ---------------------------------------------------------------- core
@@ -506,6 +558,14 @@ add_executable(occ
 target_link_libraries(occ PRIVATE occ_core)
 if(OCC_CXX_LIBS)
     target_link_libraries(occ PRIVATE ${OCC_CXX_LIBS})
+endif()
+
+# The sanitizer runtimes, but not libFuzzer's. occ_core is instrumented in a
+# sanitized build, so occ needs the runtime to resolve it -- and occ is the
+# one binary a sanitized build still produces that is meant to be run by a
+# person, which makes it the one worth running under ASan by hand.
+if(OCC_ENABLE_FUZZ)
+    target_link_options(occ PRIVATE -fsanitize=address,undefined)
 endif()
 
 # ---------------------------------------------------------------- tests
