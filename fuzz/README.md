@@ -40,6 +40,7 @@ For a longer run, point a harness at the corpus directly:
 | Harness | Input | Claim under test |
 |---|---|---|
 | `occ_fuzz_elf` | any bytes | ELF parse, and format detection over the same bytes |
+| `occ_fuzz_zip` | any bytes | the zip central directory, and the member report drawn from it |
 | `occ_fuzz_pe` | any bytes | PE section extents and RVA-to-offset conversion |
 | `occ_fuzz_loader` | any bytes | what the loader decides about an image, and where it puts it |
 | `occ_fuzz_rsp` | any bytes | GDB RSP framing, checksums, escapes, and the queue between them |
@@ -52,6 +53,17 @@ invariant of its own checked here, and `tests/test_detect.cpp` is where its
 answers are pinned down. Running both readers on the same bytes is the point:
 a corpus entry that reaches one is a starting point for the other, which is
 most of the value of a corpus.
+
+`occ_fuzz_zip` is the one reader whose offsets are relative to the *end* of
+the file rather than the start. The end-of-central-directory record is found
+by scanning backwards, and the directory's position, its size and the member
+count all come from that record -- so a file controlling bytes near its end
+controls every offset the walk uses. That is a different shape from the
+other three inputs, which is why it is a separate binary against a separate
+corpus rather than a case folded into the ELF one. What the report of a
+package costs is downstream of this: `occ check` prints the member list, and
+`occ run` writes one event per member, so a member read from the wrong offset
+is a lie in both places at once.
 
 `occ_fuzz_loader` shares the PE corpus deliberately. A loader harness whose
 inputs never parsed would exercise the refusal paths and none of the
@@ -135,12 +147,70 @@ The two-call shape is load-bearing: `feed()` appends to an internal queue and
 `take()` pops from it, so a harness that only fed would never exercise the
 queue's own bookkeeping, which is where an off-by-one would live.
 
+**Zip.** Two invariants, and both are about where a name came from rather than
+about what the archive says.
+
+A reported member's name has to be bytes the file actually contains. This is
+the one a walk from a wrong offset breaks, and the reader cannot check it: it
+copies a name and hands back a string, and a copy of the wrong bytes is still
+a string. The harness checks it against the input instead. The check is that
+the name appears *somewhere* in the file rather than at a computed offset,
+because the reader does not report where it read from -- reconstructing the
+offset here would mean reimplementing the walk under test, and a second
+implementation agreeing with the first would prove nothing.
+
+`stored` is derived from the compression method rather than read, so it has to
+equal `method == 0` on every member. That is the reader's own promise rather
+than a fact about the archive, which is the distinction the next paragraph is
+about.
+
+And the member report has to be drawn from what was read: no member reported
+that was not read, and none reported more often than it was read. Counted per
+name rather than compared as a subsequence, because a directory may name the
+same member twice -- two records with one name is a malformed archive, but it
+is a well-formed list -- and a subsequence walk loses its place at the
+duplicate and then fails to match a name that is genuinely present. That false
+report was found by running this harness, not by reading it.
+
+Detection and the reader are called separately and compared, but only where
+the two are supposed to agree. Detection reads the central directory *after*
+the first local file header has identified the file as a zip, so a file whose
+first local header has been damaged is not a zip to detection -- it reports no
+members -- while a direct call to the reader, which starts from the end of the
+file, still finds the directory. Both answers are right; they answer different
+questions. Asserting they agree unconditionally was the first version, and the
+fuzzer found the contradiction on its first mutated input.
+
 ## What is deliberately not asserted
 
 An invariant that is wrong is worse than a missing one, because it reports a
 fault that does not exist and trains people to ignore the harness. These have
 been left out on purpose, and the reasons are recorded so they are not
 re-added by someone who thinks they found a gap.
+
+**Not: that a member's uncompressed size fits in the file.** Asserted first,
+and the fuzzer found the contradiction immediately on a seed that was a real
+archive: a deflated member's uncompressed size is *supposed* to be able to
+exceed the whole file, since the file holds the compressed bytes. That is
+what compression is for. A size that exceeds the file is not a broken reader;
+it is a member that would have to be inflated to be read, which is a fact a
+caller needs in order to decide whether to bother.
+
+**Not: that a stored member's two sizes are equal.** Also asserted first, also
+found by the fuzzer, also wrong. They are equal in every archive a writer
+produces, so a difference means the record is inconsistent -- but inconsistent
+is a fact about the file, and this reader's contract is to report what the
+directory said rather than to rule that the directory is lying. A caller who
+sees a stored member whose sizes differ has learned something true and
+important about the archive in front of them, and the harness that refused to
+report it would have been the defect.
+
+Both of those were the same mistake in different clothes: treating a property
+of *well-formed archives* as a promise the *reader* makes. The distinction is
+worth keeping. An invariant is about the code -- about what it promises
+regardless of input. A fact about the input is what the code exists to report,
+and asserting it inside the reader would mean a file could not be reported at
+all.
 
 **Not: that a packet with a good checksum carries a non-empty payload.**
 `"$#00"` is `vMustReplyEmpty` -- a well-formed packet whose payload is empty.
@@ -172,7 +242,7 @@ be testing a mock.
 
 ## Seeds
 
-Seventeen seeds, all generated by `tools/make_pe_seeds.py` and checked
+Twenty-six seeds, all generated by `tools/make_pe_seeds.py` and checked
 against it by `occ_test_seeds`. They are written rather than checked in by
 hand so that what each one is can be read: a seed whose purpose is unclear is
 a seed nobody regenerates when it stops being useful. Python is not part of
@@ -197,6 +267,15 @@ the build; it is needed to change a seed, never to compile or run one.
 | `pe_section_over_headers.bin` | a section placed at RVA zero |
 | `elf_min.bin` | the program header table's extent check |
 | `rsp_g.gdb` | a valid packet followed by a byte outside a packet |
+| `zip_package.zip` | the whole directory walk, and a member under `lib/` |
+| `zip_deflated.zip` | a record whose two sizes differ, and the "on disk" half of the report |
+| `zip_many_members.zip` | more libraries than the report lists, and the line saying so |
+| `zip_commented.zip` | an archive comment, so the end record is searched for |
+| `zip_count_lies.zip` | a count larger than the directory holds |
+| `zip_offset_past_end.zip` | a directory offset past the end of the file |
+| `zip_size_lies.zip` | a directory size larger than what is there, from a valid offset |
+| `zip_comment_overruns.zip` | a record whose comment runs past the directory |
+| `zip_streamed.apk` | a package with no central directory at all |
 
 The last three of the loader group and `elf_min.bin` are permanent guards
 rather than starting points: the loader harness traps on a violated invariant
@@ -207,6 +286,23 @@ to find again.
 every field in it is plausible; the table it points at runs past the end of
 the file, and `ElfImage::parse` refuses it with "the table runs from 0x40 to
 0x318 and the file is 256 bytes".
+
+The zip seeds are one per gate rather than one per format, because the reader
+has four gates in sequence and a seed that stops at the first teaches the
+fuzzer about the first. `zip_package.zip` is the only one that reads to the
+end; the rest each stop at a different refusal, and three of them (the lying
+count, the offset past the end, the lying size) are the shapes that separate a
+reader which bounds its walk by the directory from one which trusts the file.
+
+`zip_archive()` in the generator refuses to build a record that cannot exist
+-- a stored member whose two sizes differ -- with a `ValueError` naming the
+member. That check is there because of what it replaced: the first version of
+`zip_many_members.zip` had such a record, and the harness rejected it as a
+broken invariant rather than as the malformed input it was meant to be. The
+mistake then reached the fuzz corpus as a crash artifact and cost three rounds
+of "is occ wrong or is the harness wrong". Catching it at generation time
+turns a forty-second investigation into a stack trace.
+
 
 ## Not reached
 
@@ -224,7 +320,7 @@ time, which is not something a harness in this directory can observe.
 
 **The seccomp and container tests are skipped in a fuzz build.** They install
 filters and unshare namespaces, and the sanitizer runtimes do not compose
-with that. The four harnesses here do none of it: no fork per input, no filter
+with that. The five harnesses here do none of it: no fork per input, no filter
 installed, no ptrace, which is why they run sanitized without trouble.
 
 **Non-determinism.** Nothing here records what a run depended on. Two runs of

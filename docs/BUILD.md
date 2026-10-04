@@ -173,10 +173,11 @@ isolation code the binary ships, which is the point.
 
 ## Fuzz harnesses
 
-**Built, and only in a build that asks for them.** `fuzz/` holds four
-`LLVMFuzzerTestOneInput` targets -- the ELF reader, the PE reader, the PE
-loader and the GDB RSP codec -- plus a `seeds/` directory of seventeen seeds
-that `tools/make_pe_seeds.py` writes and `occ_test_seeds` checks against it.
+**Built, and only in a build that asks for them.** `fuzz/` holds five
+`LLVMFuzzerTestOneInput` targets -- the ELF reader, the zip reader, the PE
+reader, the PE loader and the GDB RSP codec -- plus a `seeds/` directory of
+twenty-six seeds that `tools/make_pe_seeds.py` writes and `occ_test_seeds`
+checks against it.
 `fuzz/README.md` records what each harness asserts and, at more length, what
 each one deliberately does not.
 

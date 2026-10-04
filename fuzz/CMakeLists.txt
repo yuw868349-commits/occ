@@ -20,6 +20,17 @@ add_executable(occ_fuzz_elf fuzz_elf.cpp)
 target_link_libraries(occ_fuzz_elf PRIVATE occ_core)
 target_link_options(occ_fuzz_elf PRIVATE ${OCC_FUZZ_LINK_FLAGS})
 
+# The zip central directory is the only reader whose offsets are relative to
+# the end of the file rather than the start: the end-of-central-directory
+# record is found by scanning backwards, and the directory's position, its
+# size and the member count all come from it. A file that controls bytes near
+# its end therefore controls every offset the walk uses, which is a different
+# shape from the other three inputs and gets its own binary and its own
+# corpus for the same reason they do.
+add_executable(occ_fuzz_zip fuzz_zip.cpp)
+target_link_libraries(occ_fuzz_zip PRIVATE occ_core)
+target_link_options(occ_fuzz_zip PRIVATE ${OCC_FUZZ_LINK_FLAGS})
+
 add_executable(occ_fuzz_rsp fuzz_rsp.cpp)
 target_link_libraries(occ_fuzz_rsp PRIVATE occ_core)
 target_link_options(occ_fuzz_rsp PRIVATE ${OCC_FUZZ_LINK_FLAGS})
@@ -54,6 +65,22 @@ target_link_options(occ_fuzz_loader PRIVATE ${OCC_FUZZ_LINK_FLAGS})
 # readable to be believable. tools/make_pe_seeds.py writes them, and the
 # comments there say which gate each one is for.
 #
+set(OCC_ZIP_SEEDS
+    zip_package.zip
+    zip_deflated.zip
+    zip_many_members.zip
+    zip_commented.zip
+    zip_count_lies.zip
+    zip_offset_past_end.zip
+    zip_size_lies.zip
+    zip_comment_overruns.zip
+    zip_streamed.apk)
+
+set(OCC_ZIP_SEED_PATHS)
+foreach(_seed IN LISTS OCC_ZIP_SEEDS)
+    list(APPEND OCC_ZIP_SEED_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/seeds/${_seed})
+endforeach()
+
 # The last three are the loader's regressions rather than the parser's
 # gates: files the loader used to accept and must refuse, one per shape the
 # loader fuzz harness found. They are the seed half of those findings; the
@@ -93,6 +120,15 @@ add_custom_command(
 add_custom_target(occ_fuzz_pe_corpus
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe/.stamp)
 
+add_custom_target(occ_fuzz_zip_corpus
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${OCC_ZIP_SEED_PATHS}
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip/
+    COMMENT "staging the zip fuzzing seed corpus"
+    VERBATIM)
+
 add_custom_target(occ_fuzz_corpus
     COMMAND ${CMAKE_COMMAND} -E make_directory
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/elf
@@ -105,7 +141,7 @@ add_custom_target(occ_fuzz_corpus
             ${CMAKE_CURRENT_SOURCE_DIR}/seeds/rsp_g.gdb
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/rsp/
     COMMENT "staging the fuzzing seed corpus")
-add_dependencies(occ_fuzz_corpus occ_fuzz_pe_corpus)
+add_dependencies(occ_fuzz_corpus occ_fuzz_pe_corpus occ_fuzz_zip_corpus)
 
 # One target that runs each harness for a fixed time, for a caller who wants a
 # smoke test rather than a campaign. The times are short enough to finish in
@@ -128,7 +164,12 @@ add_custom_target(occ_fuzz_smoke
             -max_total_time=20
             -max_len=4096
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/occ_fuzz_zip
+            -max_total_time=20
+            -max_len=8192
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip
     DEPENDS occ_fuzz_elf occ_fuzz_rsp occ_fuzz_pe occ_fuzz_loader
+            occ_fuzz_zip
             occ_fuzz_corpus
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     COMMENT "running each harness briefly against its seeds")
@@ -151,8 +192,9 @@ add_custom_target(occ_fuzz_smoke
 # The seccomp and container tests are not built in this configuration, and
 # the reason is in tests/CMakeLists.txt: a sanitizer cannot survive the
 # seccomp filter it installs or the ptrace attach it performs. None of those
-# four harnesses does either. They call the library over a buffer -- the ELF,
-# PE and loader harnesses parse one, the RSP harness frames one -- with no
+# five harnesses does either. They call the library over a buffer -- the ELF,
+# PE and zip harnesses parse one, the loader harness walks one, the RSP
+# harness frames one -- with no
 # fork, no exec, no filter and no tracer. The incompatibility that removes
 # two tests from this build does not apply here, and a reader who has just
 # read that it does somewhere else deserves the sentence saying so.
@@ -181,6 +223,7 @@ occ_add_fuzz_run(occ_fuzz_run_elf    occ_fuzz_elf    4096 elf)
 occ_add_fuzz_run(occ_fuzz_run_rsp    occ_fuzz_rsp    256  rsp)
 occ_add_fuzz_run(occ_fuzz_run_pe     occ_fuzz_pe     4096 pe)
 occ_add_fuzz_run(occ_fuzz_run_loader occ_fuzz_loader 4096 pe)
+occ_add_fuzz_run(occ_fuzz_run_zip    occ_fuzz_zip    8192 zip)
 
 # A test that runs a harness against a corpus directory needs that directory
 # populated, and the population is the same copy_if_different chain the
@@ -194,17 +237,22 @@ occ_add_fuzz_run(occ_fuzz_run_loader occ_fuzz_loader 4096 pe)
 # destination: copy_if_different takes a list of sources and a single
 # destination directory, so a command mixing the two would copy each directory
 # name as if it were a source file and drop the seeds wherever the last
-# argument pointed. The three commands below are what make the claim "the
-# corpus is staged" true for all three corpora rather than for one.
+# argument pointed. The four commands below are what make the claim "the
+# corpus is staged" true for all four corpora rather than for one.
 add_test(NAME occ_fuzz_corpus_dirs
     COMMAND ${CMAKE_COMMAND} -E make_directory
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/elf
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/rsp
-            ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe)
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip)
 add_test(NAME occ_fuzz_corpus_pe
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${OCC_PE_SEED_PATHS}
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe)
+add_test(NAME occ_fuzz_corpus_zip
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${OCC_ZIP_SEED_PATHS}
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip)
 add_test(NAME occ_fuzz_corpus_elf
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_SOURCE_DIR}/seeds/elf_min.bin
@@ -215,12 +263,14 @@ add_test(NAME occ_fuzz_corpus_rsp
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/rsp)
 
 set_tests_properties(occ_fuzz_corpus_dirs PROPERTIES FIXTURES_SETUP fuzz_corpus)
-foreach(_s occ_fuzz_corpus_pe occ_fuzz_corpus_elf occ_fuzz_corpus_rsp)
+foreach(_s occ_fuzz_corpus_pe occ_fuzz_corpus_zip occ_fuzz_corpus_elf
+             occ_fuzz_corpus_rsp)
     set_tests_properties(${_s} PROPERTIES
         FIXTURES_SETUP fuzz_corpus
         DEPENDS occ_fuzz_corpus_dirs)
 endforeach()
 
-foreach(_t occ_fuzz_run_elf occ_fuzz_run_rsp occ_fuzz_run_pe occ_fuzz_run_loader)
+foreach(_t occ_fuzz_run_elf occ_fuzz_run_rsp occ_fuzz_run_pe
+             occ_fuzz_run_loader occ_fuzz_run_zip)
     set_tests_properties(${_t} PROPERTIES FIXTURES_REQUIRED fuzz_corpus)
 endforeach()

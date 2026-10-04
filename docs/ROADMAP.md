@@ -23,14 +23,14 @@ the observation layer is the product, and it is the deepest part.
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 1,829 assertions across sixteen binaries. The counts are what
+The test suite is 1,884 assertions across sixteen binaries. The counts are what
 the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
 
 | Test | Assertions |
 |---|---|
-| `test_engine` | 420 |
+| `test_engine` | 437 |
 | `test_pe` | 278 |
 | `test_observer` | 263 |
 | `test_runtime_loader` | 247 |
@@ -40,12 +40,12 @@ none to a grep:
 | `test_seccomp` | 49 |
 | `test_placer` | 46 |
 | `test_event` | 43 |
-| `test_detect` | 36 |
+| `test_detect` | 65 |
 | `test_probe_wiring` | 36 |
 | `test_gdb_interop` | 29 |
 | `test_container` | 25 |
 | `test_check` | 24 |
-| `test_seeds` | 22 |
+| `test_seeds` | 31 |
 
 `test_gdb_interop` is the one that does not run without a peer. It forks the
 host's gdb and drives a real attach, register read and detach through a
@@ -137,9 +137,9 @@ are written now. A reference to a document that is not there is worse than no
 reference: it tells a reader the question has been answered.
 
 **The fuzz harnesses are built, and only in a build that asks for them.**
-`fuzz/` holds four of them -- the ELF reader, the PE reader, the PE loader and
-the GDB RSP codec -- each a `LLVMFuzzerTestOneInput` over the parser it names,
-plus a `seeds/` directory of seventeen seeds. `docs/BUILD.md` describes
+`fuzz/` holds five of them -- the ELF reader, the zip reader, the PE reader,
+the PE loader and the GDB RSP codec -- each a `LLVMFuzzerTestOneInput` over
+the parser it names, plus a `seeds/` directory of twenty-six seeds. `docs/BUILD.md` describes
 `-DOCC_ENABLE_FUZZ=ON`, which is what `add_subdirectory(fuzz)` is conditioned
 on, and `fuzz/README.md` records what each harness asserts. They are off by
 default because the sanitizer link flags they need are per-consumer, so an
@@ -228,7 +228,7 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 1,829 assertions and needs no network. Two of the sixteen
+The test suite is 1,884 assertions and needs no network. Two of the sixteen
 binaries need a target binary and a host that permits namespaces and seccomp,
 one needs a gdb on `PATH`, and one needs a `python3` to re-run the seed
 generator; those are skipped rather than failed where the host does not have

@@ -98,10 +98,14 @@ surface besides the kernel itself:
 - The ELF reader.
 - The PE reader.
 - The GDB RSP packet decoder, which accepts bytes from a socket.
-- The zip reader in the format detector, which reads a local file header to
-  tell an Android package from any other archive.
+- The zip reader in the format detector. It reads a local file header to
+  tell an Android package from any other archive, and then walks the central
+  directory to name the members -- the only reader here whose offsets are
+  relative to the end of the file rather than the start, since the
+  end-of-central-directory record is found by scanning backwards and every
+  other offset comes from it.
 
-Four libFuzzer harnesses exist under `fuzz/`, one per parser above plus the
+Five libFuzzer harnesses exist under `fuzz/`, one per parser above plus the
 PE loader. They are written to validate before allocating, to bound every
 length against the buffer actually received, and to never trust a field that
 describes the size of another field. `fuzz/README.md` records what each one

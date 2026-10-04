@@ -498,6 +498,275 @@ def rsp_query(payload=b"g"):
     return b"$" + body + b"#" + ("%02x" % cksum).encode("ascii") + b"\n"
 
 
+# ---------------------------------------------------------------- zip
+
+# Offsets inside the three records, named so that the packing below reads as
+# the layout rather than as a row of numbers. A central directory record is
+# the one place where a mistake is invisible in the output: pack the fields in
+# the wrong order and the record still has the right length, so the reader
+# walks straight through it and finds a name of four bytes where there should
+# be nineteen. These were checked against a zip produced by Info-ZIP 3.0,
+# field by field, rather than against the specification alone.
+_ZIP_LOCAL_SIG = 0x04034B50
+_ZIP_CENTRAL_SIG = 0x02014B50
+_ZIP_EOCD_SIG = 0x06054B50
+
+_ZIP_LOCAL_NAME_LEN = 26
+_ZIP_LOCAL_EXTRA_LEN = 28
+
+_ZIP_CENTRAL_METHOD = 10
+_ZIP_CENTRAL_COMP_SIZE = 20
+_ZIP_CENTRAL_UNCOMP_SIZE = 24
+_ZIP_CENTRAL_NAME_LEN = 28
+_ZIP_CENTRAL_EXTRA_LEN = 30
+_ZIP_CENTRAL_COMMENT_LEN = 32
+_ZIP_CENTRAL_HEADER_SIZE = 46
+
+_ZIP_EOCD_ENTRIES = 10
+_ZIP_EOCD_CD_SIZE = 12
+_ZIP_EOCD_CD_OFFSET = 16
+_ZIP_EOCD_SIZE = 22
+
+# A stored member: no compression, so the two sizes are equal and the bytes
+# on disk are the bytes in the member.
+_ZIP_STORED = 0
+# Method 8 is deflate. The member's contents are not deflated here, because
+# nothing ever reads them -- the directory records the sizes and occ does not
+# inflate anything. A seed whose payload was not really compressed is still
+# a valid directory record, and the field under test is the method number.
+_ZIP_DEFLATED = 8
+
+
+def _zip_local(name, method, payload):
+    """A local file header followed by the member's data."""
+    raw = name if isinstance(name, bytes) else name.encode("utf-8")
+    head = bytearray(30)
+    struct.pack_into("<I", head, 0, _ZIP_LOCAL_SIG)
+    struct.pack_into("<H", head, 4, 20)        # version needed to extract
+    struct.pack_into("<H", head, 6, 0)         # flags
+    struct.pack_into("<H", head, 8, method)
+    struct.pack_into("<I", head, 18, len(payload))   # compressed size
+    struct.pack_into("<I", head, 22, len(payload))   # uncompressed size
+    struct.pack_into("<H", head, _ZIP_LOCAL_NAME_LEN, len(raw))
+    struct.pack_into("<H", head, _ZIP_LOCAL_EXTRA_LEN, 0)
+    return bytes(head) + raw + bytes(payload)
+
+
+def _zip_central(name, method, comp_size, uncomp_size, *,
+                 name_len=None, extra_len=0, comment_len=0,
+                 comment=b"", extra=b""):
+    """A central directory record.
+
+    The three lengths are what this reader checks against the directory's
+    extent, and they are settable apart from the bytes actually written --
+    which is how the malformed seeds below are built. `comment_len` says what
+    the header claims; `comment` is what follows. Writing a claim larger than
+    the bytes is the shape a truncated archive has.
+    """
+    raw = name if isinstance(name, bytes) else name.encode("utf-8")
+    rec = bytearray(_ZIP_CENTRAL_HEADER_SIZE)
+    struct.pack_into("<I", rec, 0, _ZIP_CENTRAL_SIG)
+    struct.pack_into("<H", rec, 4, 20)         # version made by
+    struct.pack_into("<H", rec, 6, 20)         # version needed
+    struct.pack_into("<H", rec, 8, 0)          # flags
+    struct.pack_into("<H", rec, _ZIP_CENTRAL_METHOD, method)
+    struct.pack_into("<I", rec, _ZIP_CENTRAL_COMP_SIZE, comp_size)
+    struct.pack_into("<I", rec, _ZIP_CENTRAL_UNCOMP_SIZE, uncomp_size)
+    struct.pack_into("<H", rec, _ZIP_CENTRAL_NAME_LEN,
+                     len(raw) if name_len is None else name_len)
+    struct.pack_into("<H", rec, _ZIP_CENTRAL_EXTRA_LEN, extra_len)
+    struct.pack_into("<H", rec, _ZIP_CENTRAL_COMMENT_LEN, comment_len)
+    return bytes(rec) + raw + bytes(extra) + bytes(comment)
+
+
+def _zip_eocd(entries, cd_size, cd_offset, comment=b""):
+    """The end-of-central-directory record, with an optional archive comment."""
+    rec = bytearray(_ZIP_EOCD_SIZE)
+    struct.pack_into("<I", rec, 0, _ZIP_EOCD_SIG)
+    struct.pack_into("<H", rec, 4, 0)          # this disk
+    struct.pack_into("<H", rec, 6, 0)          # disk with the directory
+    struct.pack_into("<H", rec, 8, entries)    # entries on this disk
+    struct.pack_into("<H", rec, _ZIP_EOCD_ENTRIES, entries)
+    struct.pack_into("<I", rec, _ZIP_EOCD_CD_SIZE, cd_size)
+    struct.pack_into("<I", rec, _ZIP_EOCD_CD_OFFSET, cd_offset)
+    struct.pack_into("<H", rec, 20, len(comment))
+    return bytes(rec) + bytes(comment)
+
+
+def zip_archive(members, *, comment=b"", entries=None, cd_size=None,
+                cd_offset=None):
+    """A whole archive: local headers, a central directory, and an EOCD.
+
+    `members` is a list of (name, method, payload, compressed_size,
+    uncompressed_size). The two sizes are passed rather than derived from the
+    payload because a directory record's sizes are the claim under test: a
+    real deflated member's compressed size is smaller than its bytes, and a
+    seed that recorded the payload's length in both fields would never reach
+    the code that has to tell them apart.
+
+    The three overrides on the EOCD are the fields a malformed file lies
+    about, and each produces a different refusal.
+
+    Raises ValueError on a record that cannot exist. A stored member's two
+    sizes are the same claim stated twice, so a seed giving them different
+    values describes an archive no writer could produce -- and the harness
+    would reject it as a broken invariant rather than as the malformed input
+    it was meant to be. Catching it here means the mistake is a stack trace
+    naming the call rather than a fuzzer artifact found forty seconds later.
+    """
+    for name, method, _payload, comp, uncomp in members:
+        if method == _ZIP_STORED and comp != uncomp:
+            raise ValueError(
+                f"stored member {name!r} declares two sizes ({comp} and "
+                f"{uncomp}); a stored member's sizes are equal by definition")
+
+    body = bytearray()
+    directory = bytearray()
+    for name, method, payload, comp, uncomp in members:
+        body += _zip_local(name, method, payload)
+        directory += _zip_central(name, method, comp, uncomp)
+
+    offset = len(body)
+    body += directory
+    tail = _zip_eocd(
+        len(members) if entries is None else entries,
+        len(directory) if cd_size is None else cd_size,
+        offset if cd_offset is None else cd_offset,
+        comment)
+    return bytes(body) + tail
+
+
+# The manifest is what makes a zip a package, so it is the first member in
+# every archive below that is meant to be detected as one.
+_MANIFEST = b"AndroidManifest.xml"
+# A real manifest is a compiled binary XML blob. The first bytes matter to a
+# real reader and not to this one, so this is the actual AXML magic followed
+# by padding: it makes the seed look like what it is to anything that sniffs
+# the member, which a fuzzer will do by accident.
+_MANIFEST_BYTES = b"\x03\x00\x08\x00" + b"\x00" * 14
+# An ELF header, so the member under lib/ is the shape occ could be pointed
+# at instead of the package. The refusal says to extract exactly this file.
+_SO_BYTES = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 + b"\x02\x00\x3e\x00"
+
+
+def _zip_seeds():
+    """The archives the detection harness starts from.
+
+    Each one gets past a different gate. The reader is the zip central
+    directory, and its gates are: find the end-of-central-directory record,
+    believe the directory's offset and size, then believe each record's
+    name, extra and comment lengths. A seed that stops at the first gate
+    teaches the fuzzer about the first gate only.
+    """
+    seeds = {}
+
+    # The whole reader, reached and passed: two members, one of them a native
+    # library, so the report list has a manifest and a lib/ entry and the
+    # omitted-count path is not taken. This is the seed that makes the rest
+    # reachable -- without an archive that reads, the later gates are only
+    # ever reached by mutation.
+    seeds["zip_package.zip"] = zip_archive([
+        (_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES,
+         len(_MANIFEST_BYTES), len(_MANIFEST_BYTES)),
+        (b"lib/arm64-v8a/libfoo.so", _ZIP_STORED, _SO_BYTES,
+         len(_SO_BYTES), len(_SO_BYTES)),
+    ])
+
+    # The same archive with a deflated library, so the two sizes in a record
+    # are different. The stored/deflated branch and the "print the size on
+    # disk as well" branch are both here and nowhere else.
+    seeds["zip_deflated.zip"] = zip_archive([
+        (_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES,
+         len(_MANIFEST_BYTES), len(_MANIFEST_BYTES)),
+        (b"lib/x86_64/libfoo.so", _ZIP_DEFLATED, _SO_BYTES,
+         30, len(_SO_BYTES)),
+    ])
+
+    # More members than the report lists, so the cap and the line saying what
+    # it left out are both reached. A real package has thousands of entries
+    # and a real one has some libraries; the report's bound is only
+    # meaningful when something hits it.
+    many = [(_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES,
+             len(_MANIFEST_BYTES), len(_MANIFEST_BYTES))]
+    for abi in (b"arm64-v8a", b"armeabi-v7a", b"x86", b"x86_64"):
+        for lib in (b"libfoo.so", b"libbar.so", b"libbaz.so"):
+            many.append((b"lib/" + abi + b"/" + lib, _ZIP_STORED, _SO_BYTES,
+                         len(_SO_BYTES), len(_SO_BYTES)))
+    many.append((b"classes.dex", _ZIP_DEFLATED, b"dex\n035\x00",
+                 12, 40000))
+    # Stored, so the two sizes have to be equal: a record claiming method 0
+    # with two different sizes describes a file that cannot exist, and a
+    # reader that believed it would be believing an archive nobody wrote.
+    # The uncompressed size here is the member's real length.
+    many.append((b"resources.arsc", _ZIP_STORED, b"\x02\x00\x0c\x00",
+                 4, 4))
+    seeds["zip_many_members.zip"] = zip_archive(many)
+
+    # An archive comment, which is the reason the end record is searched for
+    # rather than assumed to be the last 22 bytes. A build stamps its own
+    # name there, so this is not a shape a producer has to go out of its way
+    # to write.
+    seeds["zip_commented.zip"] = zip_archive([
+        (_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES,
+         len(_MANIFEST_BYTES), len(_MANIFEST_BYTES)),
+    ], comment=b"built by occ's seed generator, 2026")
+
+    # A member count larger than the directory holds. The walk stops when the
+    # records run out, so the answer is the members that exist -- and the
+    # count field being wrong is the case that separates a reader which
+    # bounds its walk by the count from one which bounds it by the directory.
+    seeds["zip_count_lies.zip"] = zip_archive([
+        (_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES,
+         len(_MANIFEST_BYTES), len(_MANIFEST_BYTES)),
+        (b"lib/arm64-v8a/libfoo.so", _ZIP_STORED, _SO_BYTES,
+         len(_SO_BYTES), len(_SO_BYTES)),
+    ], entries=30000)
+
+    # A directory offset past the end of the file. The offset is 32 bits and
+    # comes straight from the file, so this is the case the subtraction in the
+    # bounds check exists for.
+    seeds["zip_offset_past_end.zip"] = zip_archive([
+        (_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES,
+         len(_MANIFEST_BYTES), len(_MANIFEST_BYTES)),
+    ], cd_offset=0xFFFFFF00)
+
+    # A directory size larger than what is there, from an offset that is
+    # correct. The magic at the offset matches, so the walk starts; the size
+    # is the only thing saying how far it may go.
+    seeds["zip_size_lies.zip"] = zip_archive([
+        (_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES,
+         len(_MANIFEST_BYTES), len(_MANIFEST_BYTES)),
+    ], cd_size=0x7FFFFFFF)
+
+    # A record whose name fits and whose comment does not. The record claims
+    # 200 bytes of comment inside a directory that has 40, and the record
+    # after it is a real one. A reader that adds the three lengths before
+    # comparing stops here and reports one member; a reader that checks the
+    # name alone accepts the record, starts the next one 200 bytes late,
+    # finds no magic and stops -- with the same answer for the wrong reason.
+    # The seed is here so that the difference is reachable, and the unit
+    # tests in tests/test_detect.cpp are what tell the two apart.
+    body = _zip_local(_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES)
+    directory = _zip_central(_MANIFEST, _ZIP_STORED,
+                             len(_MANIFEST_BYTES), len(_MANIFEST_BYTES))
+    directory += _zip_central(_MANIFEST, _ZIP_STORED, 18, 18,
+                              comment_len=200, comment=b" " * 40)
+    offset = len(body)
+    seeds["zip_comment_overruns.zip"] = body + directory + _zip_eocd(
+        2, len(directory), offset)
+
+    # A streamed archive: local headers and no central directory at all. The
+    # first member is still the manifest, so this is detected as a package
+    # with no member list -- which is a different answer from a package with
+    # an empty one, and both are real.
+    seeds["zip_streamed.apk"] = (
+        _zip_local(_MANIFEST, _ZIP_STORED, _MANIFEST_BYTES)
+        + _zip_local(b"classes.dex", _ZIP_DEFLATED, b"dex\n035\x00", )
+    )
+
+    return seeds
+
+
 # The seeds for the harnesses that are not the PE one. Kept beside the PE
 # seeds rather than in a second generator because the reason they are
 # generated is the same reason, and a reader looking for "what does this
@@ -511,6 +780,8 @@ OTHER_SEEDS = {
     # ignore. See rsp_query.
     "rsp_g.gdb": rsp_query(),
 }
+
+OTHER_SEEDS.update(_zip_seeds())
 
 SEEDS = dict(PE_SEEDS)
 SEEDS.update(OTHER_SEEDS)
