@@ -1304,13 +1304,13 @@ SpawnResult container_spawn(const ContainerConfig& config,
     // would hold the parent until the target exits, which for a long-running
     // target is forever, and the run's observation would never begin.
     //
-    // The window is generous because what it is waiting for is a write that
-    // has already happened by the time the child could be scheduled: the
-    // child writes its report before it exits, and the parent got here by
-    // releasing it. A millisecond of scheduling is ample on any machine, and
-    // a miss is not silent -- the failure detail is empty and the caller
-    // reports a clone-stage error with no reason, which is visibly wrong
-    // rather than quietly so.
+    // The window is a grace period for the common case, not a deadline on
+    // the report. The child was released three lines above, so the report has
+    // almost certainly not been written yet: the child still has to reach its
+    // first setup step. A machine slow to schedule it loses the report, the
+    // poll times out, and the failure that follows has to be recovered from
+    // the exit status instead -- where it is known, but blind to the stage and
+    // the errno the child had already determined.
     {
         struct pollfd pfd {};
         pfd.fd = report[0];
@@ -1336,8 +1336,9 @@ SpawnResult container_spawn(const ContainerConfig& config,
             out.error = ContainerError{Stage::Clone, -pr,
                                        "waiting for the child's report"};
         }
-        // pr == 0 is the success case: the child said nothing, which means
-        // it did not fail.
+        // pr == 0 means only that the child had not reported yet. Whether it
+        // went on to fail is settled by the exit status in container_reap,
+        // so nothing is decided here.
     }
     (void)sys::close(report[0]);
 
@@ -1379,19 +1380,30 @@ ContainerResult container_reap(int pid) noexcept {
     // its own choosing. The stage and errno travel on a separate pipe, read
     // by container_spawn, so this code only has to say "setup failed" and
     // not which step it was.
+    //
+    // The errno still has to be a real one. ContainerError treats zero as "no
+    // error", so a sentinel carrying zero here would report a setup failure
+    // that every caller reads as a success -- the run comes back with no error
+    // and an exit code of zero, for a container that never started. That is
+    // not a cosmetic gap: the stage and errno are already known when the child
+    // writes them, and losing them costs the caller the one thing it needs,
+    // which is why this is reported at all. ECHILD says the setup was
+    // abandoned, which is true of every child that reaches this path, and it
+    // cannot be confused with a real cause reported over the pipe.
     constexpr int kSetupFailed = 125;
     constexpr int kExecFailed = 126;
 
     if (WIFEXITED(status)) {
         const int code = WEXITSTATUS(status);
         if (code == kSetupFailed) {
-            out.error = ContainerError{Stage::RootAssembly, 0,
+            out.error = ContainerError{Stage::RootAssembly, sys::kEchild,
                                        "the container setup failed"};
             return out;
         }
         if (code == kExecFailed) {
             out.error =
-                ContainerError{Stage::Exec, 0, "the target could not be run"};
+                ContainerError{Stage::Exec, sys::kEnoexec,
+                               "the target could not be run"};
             return out;
         }
         out.exit_code = code;
