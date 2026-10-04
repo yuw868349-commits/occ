@@ -49,11 +49,12 @@ correct.
 object per line. Dropped events are reported as their own kind rather than
 lost, which is the property that makes a trace worth reading.
 
-One of the thirteen is never emitted: `file_opened` has a name and an enum
-value and no producer. `src/observer/event.cpp` maps it to a string,
-`tests/test_event.cpp` builds one to exercise the writer, and nothing in
-`src/` creates one. The schema is documented in `docs/EVENTS.md` with that
-stated rather than with the field list it would have if it worked.
+`file_opened` was one of the thirteen with a name and an enum value and no
+producer — `src/observer/event.cpp` mapped it to a string and
+`tests/test_event.cpp` built one to exercise the writer, and nothing in `src/`
+created one. It is implemented now: the path is read at the syscall's entry,
+where the register still points where the target meant it to, and reported at
+its exit, where the result is known. `docs/EVENTS.md` has the fields.
 
 **W^X tracking.** Hardware breakpoints via `perf_event_open`, so the target is
 not modified to watch it. Four debug registers against whole-page candidate

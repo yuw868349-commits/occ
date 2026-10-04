@@ -31,6 +31,27 @@ constexpr std::uint64_t kSysMprotect = 10;
 constexpr std::uint64_t kSysMunmap = 11;
 constexpr std::uint64_t kSysMremap = 25;
 
+// The syscalls that name a path, and so are the ones a file-access event can
+// be built from. open and openat are the two a dynamically linked target
+// actually uses -- the C library's open() is a wrapper around openat on this
+// architecture -- and openat2 is the same operation with a flags struct, so
+// it is recognised by number but reported with the path its arguments carry.
+//
+// openat2 takes a how{} structure rather than a flags word, and reading that
+// structure needs a second memory read whose layout is the kernel's rather
+// than the C library's. It is recognised but reported without flags, because
+// a report that guessed the struct's layout would be worse than one that
+// reported less.
+constexpr std::uint64_t kSysOpen = 2;
+constexpr std::uint64_t kSysOpenat = 257;
+constexpr std::uint64_t kSysOpenat2 = 437;
+
+// The longest path reported. A path longer than this is truncated and the
+// record says so, because the alternative is a record whose size is set by
+// the target: a program that opens a megabyte-long path would make every
+// consumer allocate a megabyte to read one line of a trace.
+constexpr std::size_t kMaxPathLength = 512;
+
 } // namespace
 
 namespace {
@@ -393,6 +414,75 @@ constexpr std::string_view kTargetXml = R"(<?xml version="1.0"?>
   </feature>
 </target>
 )";
+
+// Reads a NUL-terminated string out of a tracee, one bounded chunk at a
+// time.
+//
+// The read is bounded twice over, and both bounds are load-bearing. The
+// total is capped at kMaxPathLength so that a record's size is a property of
+// this program rather than of the target, and the single read is capped at a
+// page because a path that crosses into an unmapped page must fail rather
+// than fault the tracee: process_vm_readv on an unmapped address returns
+// EFAULT rather than killing the caller, but a request that spans the end of
+// a mapping can still be refused wholesale, so a chunked read is what makes a
+// long path across several mappings work.
+//
+// The return value distinguishes three outcomes, because a consumer needs to
+// tell them apart: a path that was read, a path that was longer than the cap
+// (reported as truncated, with the bytes that did fit), and a path that could
+// not be read at all. The third is not a rare case -- a target that unlinks
+// a file and immediately opens a path it has just made inaccessible passes a
+// perfectly good pointer to a page that is no longer there.
+struct PathRead {
+    bool ok = false;
+    bool truncated = false;
+    std::string text;
+};
+
+PathRead read_remote_path(Tracer& tracer, int pid, std::uint64_t addr) {
+    PathRead out;
+    if (addr == 0) {
+        // A null path is a target's own bug rather than something to report,
+        // and the kernel will return EFAULT for it a moment from now.
+        return out;
+    }
+
+    constexpr std::size_t kChunk = 256;
+    char buffer[kChunk];
+
+    for (std::size_t read = 0; read < kMaxPathLength;) {
+        const auto res =
+            tracer.read_memory(pid, addr + read, buffer, kChunk);
+        if (res.failed() || res.value <= 0) {
+            // A read that fails after some bytes have already arrived still
+            // has a path in hand -- it is the path up to the point the
+            // mapping ended. Reporting it is more useful than reporting
+            // nothing, and the truncation flag says it is incomplete.
+            out.ok = !out.text.empty();
+            out.truncated = true;
+            return out;
+        }
+        const auto got = static_cast<std::size_t>(res.value);
+        for (std::size_t i = 0; i < got; ++i) {
+            if (buffer[i] == '\0') {
+                out.ok = true;
+                return out;
+            }
+            out.text.push_back(buffer[i]);
+        }
+        read += got;
+        if (got < kChunk) {
+            // A short read with no terminator means the mapping ends here.
+            out.ok = !out.text.empty();
+            out.truncated = true;
+            return out;
+        }
+    }
+
+    out.ok = true;
+    out.truncated = true;
+    return out;
+}
 
 } // namespace
 
@@ -1268,20 +1358,54 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
     struct SyscallState {
         int pid;
         bool next_is_entry;
+        // The path the current syscall named, captured on entry.
+        //
+        // It has to be read there. On the way out the register that held it
+        // has been reused by the kernel for the return value, and the string
+        // it pointed at may have been freed by the syscall itself -- an
+        // unlink followed by an open of the same name is the common case,
+        // and reading the path afterwards would read whatever now occupies
+        // that memory. A trace that reported the wrong path would be worse
+        // than one that reported none, so an entry that was not a path
+        // syscall leaves this empty and the exit reports nothing.
+        std::string open_path;
+        std::uint64_t open_flags = 0;
+        // Whether the flags word was actually read. Recorded on entry
+        // because orig_rax is not stable at the exit stop -- the kernel is
+        // free to have used the register for the return value -- and a
+        // record whose field depends on which register happened to survive
+        // would report a different thing for the same syscall on different
+        // kernels.
+        bool flags_known = false;
+        bool was_open = false;
     };
     std::vector<SyscallState> syscall_state;
-    auto syscall_entry_for = [&](int pid, bool& at_entry) {
+    auto syscall_entry_for = [&](int pid, bool& at_entry) -> SyscallState& {
         for (auto& s : syscall_state) {
             if (s.pid == pid) {
                 at_entry = s.next_is_entry;
                 s.next_is_entry = !s.next_is_entry;
-                return;
+                if (at_entry) {
+                    // Entering a new syscall. Whatever the previous one
+                    // captured has already been reported, and clearing it
+                    // here rather than at the exit is what keeps the exit's
+                    // own report intact: the exit stop is where the record
+                    // is emitted, so a clear that ran before that point
+                    // would erase the path before it was read.
+                    s.was_open = false;
+                    s.open_path.clear();
+                    s.open_flags = 0;
+                    s.flags_known = false;
+                }
+                return s;
             }
         }
         // The first stop for a process is an entry, because the process was
         // resumed and the kernel stopped it before running the instruction.
-        syscall_state.push_back(SyscallState{pid, false});
+        syscall_state.push_back(
+            SyscallState{pid, false, {}, 0, false, false});
         at_entry = true;
+        return syscall_state.back();
     };
 
     for (;;) {
@@ -1522,12 +1646,44 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             ++out.syscall_stops;
 
             bool at_entry = false;
-            syscall_entry_for(stop.pid, at_entry);
+            SyscallState& state = syscall_entry_for(stop.pid, at_entry);
 
             Registers regs{};
             auto gr = tracer.get_regs(stop.pid, regs);
             if (gr.ok()) {
                 const std::uint64_t nr = regs.orig_rax;
+
+                // On entry, a path syscall's argument is still a pointer the
+                // target chose and the kernel has not yet acted on. This is
+                // the only moment at which the string can be read, and the
+                // reason a file event can name a file at all.
+                if (at_entry &&
+                    (nr == kSysOpen || nr == kSysOpenat ||
+                     nr == kSysOpenat2)) {
+                    // open(path) puts the path in rdi and openat(dirfd,
+                    // path) puts it in rsi; openat2 has it there too. The
+                    // first is unreachable on a dynamically linked target,
+                    // where open() is a wrapper around openat, but a static
+                    // one can issue it directly.
+                    const std::uint64_t path_addr =
+                        (nr == kSysOpen) ? regs.rdi : regs.rsi;
+                    // open's flags are the mode; openat's are the third
+                    // argument too, so one read covers both. openat2's are
+                    // inside a structure this does not read, so they are
+                    // left at zero and the record says they are unknown
+                    // rather than reporting the structure's first word --
+                    // which is how.flags on this kernel, and is not
+                    // something a uapi header guarantees.
+                    state.open_flags =
+                        (nr == kSysOpenat2) ? 0 : regs.rdx;
+                    state.flags_known = (nr != kSysOpenat2);
+                    const PathRead pr =
+                        read_remote_path(tracer, stop.pid, path_addr);
+                    if (pr.ok) {
+                        state.open_path = pr.text;
+                        state.was_open = true;
+                    }
+                }
 
                 // The permission syscalls are the whole of the transition
                 // story. On entry the arguments are the ones the target
@@ -1632,6 +1788,22 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
                     e.add("text", std::string_view{"syscall exit"});
                     e.add("ret", static_cast<std::int64_t>(
                                       static_cast<long>(regs.rax)));
+
+                    // A file event is emitted on the way out, not on the
+                    // way in, because only here is the result known. A path
+                    // that was opened and failed was not opened, and a
+                    // consumer counting the files a program touched would be
+                    // wrong by one per failed attempt.
+                    if (state.was_open && !state.open_path.empty()) {
+                        auto& f = events.begin(EventKind::FileOpened);
+                        f.add("pid", static_cast<std::uint64_t>(stop.pid));
+                        f.add("path", state.open_path);
+                        f.add("ret", static_cast<std::int64_t>(
+                                        static_cast<long>(regs.rax)));
+                        f.add("flags", state.open_flags);
+                        f.add("flags_known", state.flags_known);
+                        events.commit();
+                    }
                 }
                 e.add("pid", static_cast<std::uint64_t>(stop.pid));
                 events.commit();

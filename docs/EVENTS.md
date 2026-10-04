@@ -146,6 +146,32 @@ none of them. Their absence from a real stream is expected and is not evidence
 that they are unreachable — but neither is it evidence that they work. See
 `docs/ROADMAP.md`.
 
+## A real file_opened
+
+`occ run --observe /bin/cat /etc/hostname`, filtered to the three file
+events, verbatim:
+
+```json
+{"kind":"file_opened","session":0,"t":3214523203917680,"pid":238626,"path":"/etc/ld.so.cache","ret":3,"flags":524288,"flags_known":true}
+{"kind":"file_opened","session":0,"t":3214523203964065,"pid":238626,"path":"/lib/x86_64-linux-gnu/libc.so.6","ret":3,"flags":524288,"flags_known":true}
+{"kind":"file_opened","session":0,"t":3214523204350228,"pid":238626,"path":"/etc/hostname","ret":3,"flags":0,"flags_known":true}
+```
+
+Three files, and the first two are the dynamic loader doing its own work
+before `main` exists. `ret` is the file descriptor the kernel returned, so
+`3` for the first two and `3` again for the target's own open — the earlier
+ones were closed after mapping. `flags` is `0x80000`, which is `O_CLOEXEC`,
+on exactly the two the loader opens and absent on the one `cat` opens itself:
+a program that does not want its library descriptors leaking into an exec
+sets it, and a program that intends to pass them on does not.
+
+A run that fails to open the file reports the attempt anyway, with the
+kernel's error as `ret`:
+
+```json
+{"kind":"file_opened","session":0,"t":3214490070298931,"pid":237085,"path":"/nonexistent-xyz","ret":-2,"flags":0,"flags_known":true}
+```
+
 ## Fields by kind
 
 `session_start` — `target`, `argv_count`
@@ -182,14 +208,31 @@ and `zero_fill` is how much of it is zero rather than file-backed. `index` is
 the program header order, which is the order a loader sees. One event per
 `PT_LOAD`, so `index` is sparse: a typical small binary reports 0, 3, 6.
 
-`file_opened` — **never emitted.** The kind exists in `EventKind` and has a
-name in `event_kind_name`, but nothing in `src/` produces one; the only
-occurrence outside those two places is `tests/test_event.cpp`, which builds
-one to exercise the writer. A consumer filtering on it will see no records,
-ever, and a consumer that counts on it as a file-access log is waiting for
-something occ does not do. Opening a file is currently visible only indirectly,
-as a `syscall entry`/`syscall exit` pair for `open`/`openat`, and those carry
-no path.
+`file_opened` — `pid`, `path`, `ret`, `flags`, `flags_known`. Emitted when a
+path syscall returns, not when it is called, because only the return says
+whether the file was opened at all: a path that was tried and failed is
+reported with a negative `ret`, and a consumer counting the files a program
+touched would otherwise be wrong by one per failed attempt.
+
+`path` is read on the way in, while the register that holds it still points
+where the target meant it to. On the way out that register has been reused
+for the return value and the string may have been freed — an unlink followed
+by an open of the same name is the common case — so a path read at the exit
+would name whatever now occupies that memory. A trace reporting the wrong
+file is worse than one reporting none, so an entry whose path could not be
+read produces no event at all rather than an event with a guessed name.
+
+`flags` is the flags word as the caller passed it; `0x80000` is `O_CLOEXEC`,
+which is what a dynamically linked target sets on every library it loads.
+`flags_known` is false only for `openat2`, whose flags live in a `how`
+structure this does not read: the field is reported as zero and marked
+unknown rather than filled with the structure's first word, which happens to
+be `how.flags` on this kernel and is not something a uapi header guarantees.
+`open`, `openat` and `openat2` are all recognised; `open` is unreachable from
+a dynamically linked target, where `open()` is a wrapper around `openat`.
+
+A path longer than 512 bytes is truncated, because the alternative is a
+record whose size is set by the target.
 
 `syscall_blocked` — `pid`, `nr`. Emitted when the seccomp filter denies a
 call, and the process is resumed with the denial standing: occ does not
