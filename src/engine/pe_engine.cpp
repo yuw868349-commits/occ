@@ -666,9 +666,15 @@ LaunchPlan PeEngine::plan(const EngineRequest& request,
     // Wine 9.0 aborts during startup whenever TMPDIR is present in the
     // environment, with any value including /tmp:
     //
-    //     $ env -i PATH=/usr/bin:/bin HOME=/root WINEPREFIX=/tmp/p \
-    //           TMPDIR=/tmp wine64 cmd.exe /c
+    //     $ env -i PATH=/usr/bin:/bin HOME=/root WINEPREFIX=/tmp/p
+    //                TMPDIR=/tmp wine64 cmd.exe /c
     //     free(): invalid pointer
+    //
+    // The example is one env invocation wrapped over two lines. It carries
+    // no shell continuation on purpose: a trailing backslash inside a line
+    // comment is a line splice, and GCC reports that under -Wcomment where
+    // Clang does not. One variable per line keeps this file clean under
+    // both compilers, and the wrap is only for width.
     //
     // The freed pointer is a stack address -- the value half of the
     // "TMPDIR=/tmp" entry in the environment block -- and the abort comes

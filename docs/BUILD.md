@@ -33,6 +33,36 @@ mutually exclusive here, and libc++ asks for GCC 15 or newer regardless. That
 is a property of the two implementations coexisting on one machine, not
 something a flag resolves, and the build says so rather than failing later.
 
+### Warnings the two compilers do not share
+
+The build is warning-clean under both, and getting there is not automatic:
+`-Wall` does not mean the same set of diagnostics on each. A construct that
+Clang accepts silently can be an error under GCC with `-Werror` on, and the
+reverse.
+
+The one that has bitten this tree is a trailing backslash at the end of a
+`//` comment. The preprocessor splices the following line onto it, so the
+comment swallows a line the author meant to be a new one. GCC reports this
+under `-Wcomment`; Clang does not. A shell example wrapped with a `\`
+continuation inside a comment is the usual way to write it by accident:
+
+```c++
+    //     $ env -i PATH=/usr/bin:/bin TMPDIR=/tmp wine64 cmd.exe /c \
+    //           --some-long-flag
+    //                            ^ the backslash above is the bug
+```
+
+Written without the backslash the same example is clean under both:
+
+```c++
+    //     $ env -i PATH=/usr/bin:/bin TMPDIR=/tmp wine64 cmd.exe /c
+    //           --some-long-flag
+```
+
+Since a Clang-only build would never show this, the GCC row in the table above
+is worth running before a release, and the reference build being Clang is not
+a reason to skip it.
+
 ### When a libc++ cannot be used
 
 A libc++ is not usable merely because it is installed. The build compiles a
