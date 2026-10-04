@@ -3,8 +3,10 @@
 #include "occ/parser/elf.h"
 #include "occ/util/fs.h"
 
+#include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 
 namespace occ::obs {
 
@@ -99,6 +101,13 @@ Placement ProbePlacer::resolve(const engine::ProbeRequest& request) noexcept {
     Placement out;
     out.label = request.label;
     out.symbol = request.symbol;
+    // Copied before the resolution is attempted, because the names describe
+    // the request and not the outcome: a placement that failed still has a
+    // report worth reading, and a report that carried the names only on
+    // success would drop them from exactly the case a person is looking at.
+    for (std::size_t i = 0; i < 6; ++i) {
+        out.arg_names[i] = request.arg_names[i];
+    }
 
     const std::string path = find_module(request.module);
     if (path.empty()) {
@@ -178,7 +187,7 @@ std::size_t ProbePlacer::place(
         if (p.outcome == PlacementOutcome::Attached) {
             std::string detail;
             const int err = probes_.add(p.label, p.module, p.offset,
-                                        ProbeKind::Entry, detail);
+                                        ProbeKind::Entry, detail, p.arg_names);
             if (err != 0) {
                 p.outcome = PlacementOutcome::KernelRefused;
                 p.detail = detail;

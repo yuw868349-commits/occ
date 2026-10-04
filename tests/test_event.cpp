@@ -276,6 +276,63 @@ void test_sink_on_closed_descriptor() {
 
 } // namespace
 
+// The shape a probe_hit takes when it carries argument values.
+//
+// The encoder is flat -- there is no nested object or array in the API -- so
+// the six arguments are six fields, arg0 through arg5, and a consumer reads
+// the ABI slot from the position in the key. That convention is only useful
+// if it is stable, so it is pinned here rather than left to the emission
+// site: a change that started writing arg6 or dropped the "name=" prefix
+// would still produce a stream that parses, and every consumer would read
+// the wrong argument.
+void test_probe_hit_argument_fields() {
+    Captured cap;
+    auto& e = cap.writer.begin(EventKind::ProbeHit);
+    e.add("pid", static_cast<std::uint64_t>(7));
+    e.add("tid", static_cast<std::uint64_t>(8));
+    e.add("label", std::string_view{"NtCreateFile"});
+    e.add_hex("ip", 0x401000);
+    // What the emission site writes: the name, an equals sign, and the
+    // value in hexadecimal, for each of the six slots.
+    e.add("arg0", std::string_view{"FileHandle=0x1f"});
+    e.add("arg1", std::string_view{"0x7ffe1234"});
+    cap.writer.commit();
+
+    const auto lines = cap.lines();
+    check(lines.size() == 1, "one commit writes one line");
+    if (lines.empty()) {
+        return;
+    }
+    const std::string& line = lines[0];
+    check(line.find("\"arg0\":\"FileHandle=0x1f\"") != std::string::npos,
+          "a named argument is written as name=value");
+    check(line.find("\"arg1\":\"0x7ffe1234\"") != std::string::npos,
+          "an unnamed argument is written as a bare value");
+    check(line.find("\"args_captured\"") == std::string::npos,
+          "a hit with arguments does not also claim they were uncaptured");
+}
+
+// The other half: a hit whose registers the kernel did not capture says so,
+// rather than carrying six fields of zero that a reader would take for
+// arguments.
+void test_probe_hit_without_captured_arguments() {
+    Captured cap;
+    auto& e = cap.writer.begin(EventKind::ProbeHit);
+    e.add("label", std::string_view{"NtCreateFile"});
+    e.add("args_captured", false);
+    cap.writer.commit();
+
+    const auto lines = cap.lines();
+    check(lines.size() == 1, "one commit writes one line");
+    if (lines.empty()) {
+        return;
+    }
+    check(lines[0].find("\"args_captured\":false") != std::string::npos,
+          "the absence of arguments is stated rather than implied");
+    check(lines[0].find("\"arg0\"") == std::string::npos,
+          "no zero-valued argument field is invented");
+}
+
 int main() {
     test_kind_names();
     test_value_types();
@@ -286,6 +343,8 @@ int main() {
     test_commit_without_begin();
     test_note_shortcut();
     test_sink_on_closed_descriptor();
+    test_probe_hit_argument_fields();
+    test_probe_hit_without_captured_arguments();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

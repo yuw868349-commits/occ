@@ -41,6 +41,73 @@ constexpr const char* kUprobeEvents = "/uprobe_events";
 constexpr std::uint32_t kPerfRecordSample = PERF_RECORD_SAMPLE;
 constexpr std::uint32_t kPerfRecordLost = PERF_RECORD_LOST;
 
+// --------------------------------------------------------- the sampled fields
+//
+// PERF_SAMPLE_REGS_INTR, which asks the kernel to include the register set in
+// the sample. It is restated here rather than taken from <linux/perf_event.h>
+// for the reason ptrace.h restates its request numbers: the header this
+// project includes is the host's, the values are the kernel's, and a host
+// whose header is older than its kernel should not silently drop a field.
+// The value is fixed by the perf ABI and cannot move.
+constexpr std::uint64_t kPerfSampleRegsIntr = 1ULL << 18;
+
+// The x86-64 register numbers as perf names them, from the kernel's
+// perf_event_x86_regs enum. Restated for the same reason and used to build
+// the mask below, so a reader can see which register each bit is instead of
+// checking a hexadecimal constant against a header that may not be present.
+constexpr unsigned int kRegX86Cx = 2;
+constexpr unsigned int kRegX86Dx = 3;
+constexpr unsigned int kRegX86Si = 4;
+constexpr unsigned int kRegX86Di = 5;
+constexpr unsigned int kRegX86R8 = 16;
+constexpr unsigned int kRegX86R9 = 17;
+
+// The six registers the x86-64 System V calling convention passes arguments
+// in, as a mask. They are not contiguous in the kernel's numbering -- r8 and
+// r9 sit far above the first four -- which is why the sample's register array
+// cannot be read as "the first six values".
+constexpr std::uint64_t kArgRegsMask =
+    (1ULL << kRegX86Cx) | (1ULL << kRegX86Dx) | (1ULL << kRegX86Si) |
+    (1ULL << kRegX86Di) | (1ULL << kRegX86R8) | (1ULL << kRegX86R9);
+
+// Which slot of the ABI-ordered argument array a mask bit belongs to, in
+// ascending bit order -- which is the order the kernel writes the values in.
+//
+// The array a consumer reads is in ABI order: rdi, rsi, rdx, rcx, r8, r9. The
+// kernel's order is by register number, and the two differ -- rdi has the
+// highest bit of the first four and takes the lowest index -- so the mapping
+// is a table and not an offset. The table has to be in the kernel's write
+// order, because the reader walks it alongside the values as they arrive; a
+// table in ABI order would pair every value with the wrong register.
+//
+// A bit that is not in the mask has no slot, and no entry here.
+struct ArgRegSlot {
+    unsigned int reg;
+    int index;
+};
+
+constexpr ArgRegSlot kArgRegSlots[] = {
+    {kRegX86Cx, 3},  // rcx
+    {kRegX86Dx, 2},  // rdx
+    {kRegX86Si, 1},  // rsi
+    {kRegX86Di, 0},  // rdi: the first integer argument
+    {kRegX86R8, 4},  // r8
+    {kRegX86R9, 5},  // r9
+};
+
+// How many registers the mask asks for, which is how many u64 the sample
+// carries. Counted from the table rather than written as a 6, so that adding
+// a register to the set cannot leave this disagreeing with the mask it
+// describes.
+constexpr std::size_t kArgRegsWeight =
+    sizeof(kArgRegSlots) / sizeof(kArgRegSlots[0]);
+
+// The kernel's perf_sample_regs_abi values. The one that matters is NONE:
+// it is what the kernel writes when it did not capture a register set, and
+// a reader that treated it as "captured, all zero" would report six zero
+// arguments for a call it knows nothing about.
+constexpr std::uint64_t kSampleRegsAbiNone = 0;
+
 struct RingHeader {
     std::uint32_t type;
     std::uint16_t misc;
@@ -297,7 +364,8 @@ int Uprobes::read_event_id(const std::string& root, const std::string& event,
 int Uprobes::register_only(const std::string& name, const std::string& path,
                            std::uint64_t offset, ProbeKind kind,
                            std::size_t& out_index,
-                           std::string& detail) noexcept {
+                           std::string& detail,
+                           const std::string_view* names) noexcept {
     detail.clear();
     out_index = 0;
 
@@ -361,6 +429,15 @@ int Uprobes::register_only(const std::string& name, const std::string& path,
     p.path = path;
     p.offset = offset;
     p.kind = kind;
+    // The names are kept on the probe, which is where they are still
+    // attached to a symbol. A caller that did not name its arguments passes
+    // null, and every slot stays empty -- an unnamed argument, not an
+    // argument that does not exist.
+    if (names != nullptr) {
+        for (std::size_t i = 0; i < 6; ++i) {
+            p.arg_names[i] = names[i];
+        }
+    }
 
     {
         const int err = read_event_id(root_, event, p.id);
@@ -404,9 +481,11 @@ int Uprobes::register_only(const std::string& name, const std::string& path,
 
 int Uprobes::add(const std::string& name, const std::string& path,
                  std::uint64_t offset, ProbeKind kind,
-                 std::string& detail) noexcept {
+                 std::string& detail,
+                 const std::string_view* names) noexcept {
     std::size_t index = 0;
-    const int reg = register_only(name, path, offset, kind, index, detail);
+    const int reg =
+        register_only(name, path, offset, kind, index, detail, names);
     if (reg != 0) {
         return reg;
     }
@@ -458,12 +537,28 @@ int Uprobes::subscribe(std::size_t index, std::string& detail) noexcept {
     attr.disabled = 1;
     attr.sample_period = 1;
     attr.wakeup_events = 1;
-    // The fields the record carries. The raw sample is the trace entry: it
-    // holds the register set the kernel saved at the probe, which is where
-    // the argument registers come from. ip and pid are asked for
-    // separately because a trace entry's own header does not carry them and
-    // without them a hit cannot be attributed to a thread.
-    attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_RAW;
+    // The fields the record carries.
+    //
+    // ip and tid are asked for because a record's own header carries neither
+    // and without them a hit cannot be attributed to a thread.
+    //
+    // The registers come from PERF_SAMPLE_REGS_INTR and not from the raw
+    // trace entry. The raw entry does contain the saved register set, and
+    // reading it there was the obvious first answer -- but the kernel calls
+    // that field opaque and says in as many words that its contents "are not
+    // an ABI" and "may vary depending on event, hardware, kernel version and
+    // phase of the moon". A struct that changes under the reader is the wrong
+    // place to get a value a report depends on. REGS_INTR is a documented
+    // sample field with a defined layout, so the argument registers are asked
+    // for by name. The raw sample is still requested because the trace
+    // entry's head is useful for telling an entry probe from a return one.
+    attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_RAW |
+                       kPerfSampleRegsIntr;
+    // Which registers to include. The mask is the six argument registers, and
+    // the kernel writes one u64 per set bit in ascending bit order -- which
+    // is why the decoder reorders them rather than reading them straight
+    // across.
+    attr.sample_regs_intr = kArgRegsMask;
     attr.exclude_kernel = 1;
     attr.exclude_hv = 1;
 
@@ -572,6 +667,116 @@ std::vector<int> Uprobes::fds() const noexcept {
     return out;
 }
 
+// Reads a little-endian integer out of the sample body, or refuses.
+//
+// The three readers below exist because every field in the record has to be
+// bounds-checked before it is copied, and doing that inline at each site is
+// three chances to forget one. Each advances `at` only on success, so a
+// failure leaves the cursor where the caller can see that nothing after it
+// was read either.
+bool take_u64(const std::uint8_t* body, std::size_t size, std::size_t& at,
+              std::uint64_t& out) noexcept {
+    if (at + 8 > size) {
+        return false;
+    }
+    std::memcpy(&out, body + at, 8);
+    at += 8;
+    return true;
+}
+
+bool take_u32(const std::uint8_t* body, std::size_t size, std::size_t& at,
+              std::uint32_t& out) noexcept {
+    if (at + 4 > size) {
+        return false;
+    }
+    std::memcpy(&out, body + at, 4);
+    at += 4;
+    return true;
+}
+
+bool skip_bytes(std::size_t size, std::size_t& at,
+                std::size_t count) noexcept {
+    if (at + count > size) {
+        return false;
+    }
+    at += count;
+    return true;
+}
+
+SampleDecode decode_sample(const std::uint8_t* body,
+                           std::size_t size) noexcept {
+    SampleDecode out;
+    if (body == nullptr) {
+        return out;
+    }
+
+    // The fields arrive in the order of their bit in sample_type, which is
+    // ascending, and this is what a reader gets wrong: the register block is
+    // bit 18 and the raw sample is bit 10, so the raw sample comes first and
+    // has to be stepped over before the registers can be reached. Reading
+    // the registers where the raw sample is reads the trace entry's own
+    // bytes as if they were rdi and the rest.
+    std::size_t at = 0;
+
+    if (!take_u64(body, size, at, out.ip)) {
+        return out;
+    }
+    if (!take_u32(body, size, at, out.pid)) {
+        return out;
+    }
+    if (!take_u32(body, size, at, out.tid)) {
+        return out;
+    }
+
+    std::uint32_t raw_size = 0;
+    if (!take_u32(body, size, at, raw_size)) {
+        return out;
+    }
+    if (!skip_bytes(size, at, static_cast<std::size_t>(raw_size))) {
+        return out;
+    }
+
+    std::uint64_t abi = 0;
+    if (!take_u64(body, size, at, abi)) {
+        return out;
+    }
+    // Everything before the registers was intact, so the sample itself is
+    // good even when the registers were not captured.
+    out.ok = true;
+
+    if (abi == kSampleRegsAbiNone) {
+        // The kernel did not capture a register set. The array is not there
+        // to read, and the flag is left false so that a consumer reading
+        // this hit sees "no arguments" rather than six zeroes.
+        return out;
+    }
+
+    // One u64 per set bit of the mask, in ascending bit order. The values
+    // arrive in that order and the array is in ABI order, so each value is
+    // placed at the index its register owns rather than at the position it
+    // arrived in. The two orders differ: rdi has the highest bit of the
+    // first four registers and takes the lowest index, so a value copied
+    // straight across would be reported under the wrong name.
+    std::uint64_t values[6] = {0, 0, 0, 0, 0, 0};
+    for (std::size_t i = 0; i < kArgRegsWeight; ++i) {
+        if (!take_u64(body, size, at, values[i])) {
+            // A truncated register block. The hit's ip and tid are real and
+            // are kept -- reporting them with no arguments is better than
+            // reporting nothing -- and has_args stays false so the absent
+            // values are not read as zeroes.
+            return out;
+        }
+    }
+
+    std::size_t ascending = 0;
+    for (const ArgRegSlot& slot : kArgRegSlots) {
+        out.args[static_cast<std::size_t>(slot.index)] = values[ascending];
+        ++ascending;
+    }
+    out.has_args = true;
+    return out;
+}
+
 std::size_t Uprobes::read_hits(std::vector<UprobeHit>& out) noexcept {
     const std::size_t before = out.size();
 
@@ -629,23 +834,27 @@ std::size_t Uprobes::read_hits(std::vector<UprobeHit>& out) noexcept {
                     lost_hits_ += lost;
                 }
             } else if (hdr.type == kPerfRecordSample) {
-                // The sample layout is the requested fields in bit order:
-                // ip (8), tid (8: pid then tid as two u32), then the raw
-                // trace entry (u32 size, then the bytes).
-                std::size_t at = p.ring_tail + sizeof(RingHeader);
-                const std::size_t end = p.ring_tail + hdr.size;
-
-                if (at + 8 + 8 + 4 <= end) {
+                // The body is everything after the header; decode_sample
+                // owns the layout, including the ordering rule that puts the
+                // registers after the raw sample rather than before it.
+                const std::uint8_t* body = base + p.ring_tail + sizeof(RingHeader);
+                const std::size_t body_size =
+                    hdr.size - sizeof(RingHeader);
+                const SampleDecode d = decode_sample(body, body_size);
+                if (d.ok) {
                     UprobeHit hit;
-                    std::memcpy(&hit.ip, base + at, 8);
-                    at += 8;
-                    std::uint32_t pid32 = 0;
-                    std::uint32_t tid32 = 0;
-                    std::memcpy(&pid32, base + at, 4);
-                    std::memcpy(&tid32, base + at + 4, 4);
-                    at += 8;
-                    hit.pid = static_cast<int>(pid32);
-                    hit.tid = static_cast<int>(tid32);
+                    hit.ip = d.ip;
+                    hit.pid = static_cast<int>(d.pid);
+                    hit.tid = static_cast<int>(d.tid);
+                    hit.has_args = d.has_args;
+                    for (std::size_t i = 0; i < 6; ++i) {
+                        hit.args[i] = d.args[i];
+                        // The names travel with the probe, which is the last
+                        // thing that knows which function was called: the
+                        // record carries values and an address and nothing
+                        // that says whose prototype they are.
+                        hit.arg_names[i] = p.arg_names[i];
+                    }
                     // The hit is attributed to the probe whose ring it came
                     // from, which is the identity the per-probe ring
                     // exists to preserve. The name is not decoded out of

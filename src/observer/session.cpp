@@ -1412,6 +1412,40 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             e.add("tid", static_cast<std::uint64_t>(hit.tid));
             e.add("label", hit.name);
             e.add_hex("ip", hit.ip);
+            // The argument registers, when the sample carried them.
+            //
+            // The event encoder writes flat key and value pairs and has no
+            // way to nest, so the six are six fields: arg0 through arg5, in
+            // ABI order, each "name=0xvalue" when the probe named the
+            // argument and "0xvalue" when it did not. The position in the
+            // key is the ABI slot, so a consumer that wants rdx reads arg2,
+            // and the name is carried alongside rather than looked up
+            // because the name belongs to the prototype and the stream is
+            // the only thing that knows which function was called.
+            //
+            // When the kernel did not capture a register set there is
+            // nothing to report, and `args_captured: false` says that
+            // rather than the six fields being absent: an absent field is
+            // indistinguishable from a consumer reading an older stream
+            // that never had them, and the two call for different
+            // conclusions.
+            if (hit.has_args) {
+                for (std::size_t i = 0; i < 6; ++i) {
+                    std::string key = "arg";
+                    key += static_cast<char>('0' + i);
+                    std::string value;
+                    const std::string_view nm = hit.arg_names[i];
+                    if (!nm.empty()) {
+                        value.assign(nm);
+                        value += '=';
+                    }
+                    value += "0x";
+                    value += to_hex(hit.args[i], 16);
+                    e.add(key, value);
+                }
+            } else {
+                e.add("args_captured", false);
+            }
             events.commit();
         }
         // Reported per drain rather than once at the end: a run whose rings

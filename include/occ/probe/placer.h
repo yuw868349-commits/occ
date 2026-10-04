@@ -72,6 +72,11 @@ struct Placement {
     std::uint64_t offset = 0;
     // The probe layer's own sentence when the kernel refused.
     std::string detail;
+    // What to call the six argument registers on a hit, in ABI order. Carried
+    // through from the request so that the layer that decodes a hit can name
+    // what it read; see ProbeRequest::arg_names for why it travels with the
+    // request rather than being looked up later.
+    std::string_view arg_names[6]{};
 };
 
 // Places probes and keeps the resulting layer alive.

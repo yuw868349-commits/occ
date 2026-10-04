@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "occ/isolation/container.h"
@@ -116,6 +117,21 @@ struct ProbeRequest {
     // Why this probe is worth having, for the event that reports it. Empty
     // is allowed.
     std::string note;
+
+    // What to call the six argument registers, in ABI order: rdi, rsi, rdx,
+    // rcx, r8, r9. Empty entries are permitted and meant the argument is not
+    // named, which is different from an argument the function does not take.
+    //
+    // The names travel with the request rather than being looked up at the
+    // hit, because the only thing that knows them is the table that asked for
+    // the probe: by the time a hit arrives it carries a value and an address
+    // and nothing that says which function's prototype it came from. A probe
+    // layer that joined them itself would need a copy of the table, and two
+    // copies of one table disagree at the first edit.
+    //
+    // string_view and not string: an entry is a static table's own view, so
+    // carrying it costs a pointer and copying it costs nothing to free.
+    std::string_view arg_names[6]{};
 };
 
 // What the runner is going to execute.

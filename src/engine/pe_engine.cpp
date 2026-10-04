@@ -352,6 +352,13 @@ ProbePlan build_probes(const std::string& ntdll_path) noexcept {
         req.symbol = std::string(p.symbol);
         req.label = std::string(p.symbol);
         req.note = std::string(p.note);
+        // Unconditional, because arg() already answers an empty view for a
+        // position the entry does not name. A loop guarded by a count would
+        // be a second place that has to know how many names there are, and
+        // the two would drift the first time an entry names a sixth.
+        for (std::size_t i = 0; i < 6; ++i) {
+            req.arg_names[i] = p.arg(i);
+        }
         out.requests.push_back(std::move(req));
     }
     return out;

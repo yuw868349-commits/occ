@@ -342,11 +342,12 @@ all and the run continues at syscall-level observation; the events are how a
 consumer learns that its own trace is coarser than it wanted, rather than
 concluding from empty output that the target never made those calls.
 
-`probe_hit` — `pid`, `tid`, `label`, `ip`. Emitted when the target enters a
-probed function. `label` is the name the request gave the probe, which is what
-ties a hit back to the `probe_attached` record that placed it; `ip` is the
-address inside the function, which is the probed address because an entry
-probe fires at its first byte.
+`probe_hit` — `pid`, `tid`, `label`, `ip`, and the argument registers.
+Emitted when the target enters a probed function. `label` is the name the
+request gave the probe, which is what ties a hit back to the
+`probe_attached` record that placed it; `ip` is the address inside the
+function, which is the probed address because an entry probe fires at its
+first byte.
 
 Hits are attributed by which probe's ring buffer produced them, not by
 anything in the record: each probe has its own buffer, so a hit cannot be
@@ -358,12 +359,33 @@ between two of its own syscalls. The session polls the probe descriptors
 between stops and drains again after each one, which is why a `probe_hit`
 appears in the stream without any `session_end` stop count having moved.
 
-What is **not** on this event yet: the argument registers. A uprobe can read
-up to six argument registers at the entry point, and the argument names are in
-the probe table, but nothing reads them yet -- so this event carries no
-`args` and a consumer that needs the arguments does not have them. A field
-that is absent is a field a consumer can detect; one filled with zeroes would
-look like a call with six zero arguments.
+**The arguments.** When the target entered the function, the kernel can
+capture the six registers the x86-64 calling convention passes arguments in,
+and this tool asks it to. They arrive as `arg0` through `arg5`, which are
+`rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9` in that order — the position in
+the key is the ABI slot, so a consumer that wants the third argument reads
+`arg2`. Each value is a string, because it may carry the argument's name:
+
+```
+"arg0":"FileHandle=0x1f"     the register was captured and the name is known
+"arg1":"0x7ffe1234"          captured, and the probe named no argument here
+"args_captured":false        the kernel did not capture a register set
+```
+
+The name is the Windows prototype's parameter name from the probe table, and
+it is written inline rather than in a parallel field so that one read of one
+field gives both. An empty name is not an argument that does not exist: it
+is an argument this project has nothing to say about, and the value is still
+reported.
+
+`args_captured: false` replaces the six fields rather than accompanying
+them, and the reason is worth stating. The kernel declines to capture
+registers when the event's context excludes the level the probe is at, and
+says so with an abi of zero. Six zero-valued `argN` fields would then read
+as a call whose arguments were all zero — which is not a rare case, it is a
+perfectly normal call — and a consumer would have no way to tell it from a
+capture that did not happen. A field that is absent is a field a consumer
+can detect; a field filled with zeroes is not.
 
 **A hit count that is short is reported.** The kernel drops records when a
 ring fills faster than the observer drains it, and the count of what it
@@ -415,9 +437,17 @@ settle it. The only thing that can is the absence of a lost-hit notice in
 `degradations`, which is on stderr and not in the stream. Where a hit count is
 load-bearing, correlate the two.
 
-**Argument values on a hit.** As noted under `probe_hit`, nothing reads the
-argument registers yet. This tool would rather say so than report six zeroes
-that read as arguments.
+**Argument values on a hit, beyond the six registers.** Every probe this
+project places is an entry probe, so a hit is at the function's first byte
+and the registers hold what the caller passed. What is not reported is
+anything behind a pointer argument: an out-parameter the callee will fill in
+is empty at that moment, and reading it would report the caller's buffer
+before the callee touched it. The value in `NtCreateFile`'s `FileHandle` is
+an address, and what that address holds when the call returns is a different
+observation this stream does not make. A return probe would see the filled-in
+value and would also see the registers as the callee left them, which is a
+different set from the arguments; the layer supports placing one, and the
+planner places none.
 
 ## Reading the stream
 

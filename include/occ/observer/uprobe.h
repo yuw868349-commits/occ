@@ -54,8 +54,10 @@
 // the file is refused at registration, and the error names the offset rather
 // than the conversion that produced it.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -93,6 +95,12 @@ struct Uprobe {
     // the two steps can be separated.
     int fd = -1;
 
+    // What to call the six argument registers on a hit, in ABI order. Held
+    // here because this is the last place that knows which function the
+    // probe is on: a decoded hit carries values and an address, and the
+    // name of the function is what turns rdi into a parameter name.
+    std::string_view arg_names[6]{};
+
     void* ring = nullptr;
     std::size_t ring_bytes = 0;
     std::size_t ring_data_offset = 0;
@@ -113,12 +121,49 @@ struct UprobeHit {
     // is the address the function returned to.
     std::uint64_t ip = 0;
     // The argument registers, in the order the x86-64 ABI passes them:
-    // rdi, rsi, rdx, rcx, r8, r9. Zero when the sample did not carry them,
-    // which is the case when the probe was opened without the register
-    // fields requested.
+    // rdi, rsi, rdx, rcx, r8, r9. Meaningful only when has_args is true;
+    // otherwise they are zero and are not arguments.
+    std::uint64_t args[6] = {0, 0, 0, 0, 0, 0};
+    // What to call each of those, in the same order, taken from the probe
+    // that fired. An empty entry means the argument is not named, which is
+    // not the same as an argument that does not exist.
+    std::string_view arg_names[6]{};
+    // True when the sample really carried the registers. False has one
+    // cause worth naming: the kernel declined to capture them and said so
+    // with an abi of zero, which happens when the event's context excludes
+    // the level the probe is at. A consumer must not read six zeroes as six
+    // arguments, and this flag is what keeps it from having to guess.
+    bool has_args = false;
+};
+
+// Decodes one perf sample record's body, which is everything after the ring
+// header.
+//
+// A free function rather than a method because it touches nothing: it reads
+// bytes the kernel wrote and knows nothing about file descriptors, rings, or
+// probe state. That is what makes it testable, and it matters here more than
+// usual -- the kernel path needs a mounted tracefs and a permitted
+// perf_event_open, so on a host with neither this function is the only part
+// of the decode that can be checked at all.
+//
+// The layout it reads, which is the requested sample_type's fields in
+// ascending bit order: ip (u64), pid (u32), tid (u32), the raw sample (u32
+// size, then that many bytes), then the register block (u64 abi, then one u64
+// per set bit of the requested mask, ascending). Every read is bounds-checked
+// against `size`; a record that does not fit is reported as not ok rather
+// than guessed at, which is the same policy the ring reader applies to a
+// record it cannot decode.
+struct SampleDecode {
+    bool ok = false;
+    std::uint64_t ip = 0;
+    std::uint32_t pid = 0;
+    std::uint32_t tid = 0;
     std::uint64_t args[6] = {0, 0, 0, 0, 0, 0};
     bool has_args = false;
 };
+
+[[nodiscard]] SampleDecode decode_sample(const std::uint8_t* body,
+                                         std::size_t size) noexcept;
 
 // Why a probe layer is unavailable, and what is still possible without it.
 //
@@ -180,10 +225,13 @@ public:
     // from the outside -- so they are not left separable.
     //
     // Returns 0 on success and a negative errno otherwise, with `detail`
-    // holding a sentence that names what failed.
+    // holding a sentence that names what failed. `names` is what to call the
+    // six argument registers on a hit, in ABI order, and may be null for a
+    // probe whose arguments are not worth naming.
     [[nodiscard]] int add(const std::string& name, const std::string& path,
                           std::uint64_t offset, ProbeKind kind,
-                          std::string& detail) noexcept;
+                          std::string& detail,
+                          const std::string_view* names = nullptr) noexcept;
 
     // Writes the tracefs line and reads back the id the kernel assigned,
     // leaving the probe in the layer without a subscription. Returns the
@@ -204,7 +252,9 @@ public:
                                     const std::string& path,
                                     std::uint64_t offset, ProbeKind kind,
                                     std::size_t& out_index,
-                                    std::string& detail) noexcept;
+                                    std::string& detail,
+                                    const std::string_view* names =
+                                        nullptr) noexcept;
 
     // Opens the subscription for a probe that is registered. Used by add,
     // and exposed so that a caller that wants to register many probes and

@@ -23,22 +23,22 @@ the observation layer is the product, and it is the deepest part.
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 1,562 assertions across thirteen binaries. The counts are what
+The test suite is 1,599 assertions across thirteen binaries. The counts are what
 the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
 
 | Test | Assertions |
 |---|---|
-| `test_engine` | 419 |
+| `test_engine` | 420 |
 | `test_pe` | 278 |
 | `test_observer` | 263 |
 | `test_elf` | 150 |
+| `test_uprobe` | 108 |
 | `test_ntdll_probes` | 102 |
-| `test_uprobe` | 84 |
 | `test_seccomp` | 63 |
-| `test_placer` | 41 |
-| `test_event` | 36 |
+| `test_placer` | 46 |
+| `test_event` | 43 |
 | `test_detect` | 36 |
 | `test_probe_wiring` | 36 |
 | `test_gdb_interop` | 29 |
@@ -215,7 +215,7 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 1,562 assertions and needs no network. Two of the thirteen
+The test suite is 1,599 assertions and needs no network. Two of the thirteen
 binaries need a target binary and a host that permits namespaces and seccomp,
 and one needs a gdb on `PATH`; those are skipped rather than failed where the
 host does not have them, and the skip says so in a note. A claim in this file

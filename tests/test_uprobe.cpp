@@ -15,8 +15,16 @@
 // probe that registered, which needs tracefs, and a test that silently
 // skipped itself on a host without tracefs would be a test that reports
 // success for having run nothing. The registration path is covered by the
-// failure cases below and the decode path by the observer's own watch tests,
-// which share the ring reader's framing.
+// failure cases below.
+//
+// The record decoder is the exception, and it is tested here directly. It
+// takes bytes and returns a value and touches no kernel object, so it can be
+// exercised on every host -- which makes it the part of this file that would
+// otherwise be the least covered and the most likely to be wrong. The
+// register ordering it has to get right is not visible from the outside: a
+// sample whose six registers are shuffled among themselves still carries
+// plausible addresses, so the fixtures below use values that differ from each
+// other and the assertions name the slot each one belongs in.
 
 #include "occ/observer/uprobe.h"
 
@@ -277,6 +285,179 @@ void test_hit_defaults_are_zeroed() {
     for (std::uint64_t a : h.args) {
         check(a == 0, "a default hit's argument registers are zero");
     }
+}
+
+// ------------------------------------------------------- the sample decoder
+//
+// This is the part of the uprobe layer that can be tested on every host.
+// The rest of the path needs tracefs and a permitted perf_event_open, so on
+// a machine without either the decoder is the only thing that runs -- which
+// makes it the one place a mistake would ship unnoticed. The records below
+// are built by hand, byte by byte, from the layout the kernel documents.
+
+void put_u64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xff));
+    }
+}
+
+void put_u32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+        b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xff));
+    }
+}
+
+// The registers in the order the kernel writes them into the sample, which is
+// ascending by mask bit: cx, dx, si, di, r8, r9. The decoder is what turns
+// this into the ABI order a consumer reads.
+struct RegValues {
+    std::uint64_t cx = 0;
+    std::uint64_t dx = 0;
+    std::uint64_t si = 0;
+    std::uint64_t di = 0;
+    std::uint64_t r8 = 0;
+    std::uint64_t r9 = 0;
+};
+
+std::vector<std::uint8_t> make_sample(std::uint64_t ip, std::uint32_t pid,
+                                      std::uint32_t tid,
+                                      const std::string& raw,
+                                      std::uint64_t abi,
+                                      const RegValues& r) {
+    std::vector<std::uint8_t> b;
+    put_u64(b, ip);
+    put_u32(b, pid);
+    put_u32(b, tid);
+    // The raw sample sits between the thread ids and the register block,
+    // because its sample_type bit (10) is below the register block's (18).
+    // A decoder that read the registers here would be reading this.
+    put_u32(b, static_cast<std::uint32_t>(raw.size()));
+    for (char c : raw) {
+        b.push_back(static_cast<std::uint8_t>(c));
+    }
+    put_u64(b, abi);
+    // The register array is present whenever abi is not NONE. Writing it for
+    // abi 0 as well is what lets a test prove the decoder ignores it.
+    put_u64(b, r.cx);
+    put_u64(b, r.dx);
+    put_u64(b, r.si);
+    put_u64(b, r.di);
+    put_u64(b, r.r8);
+    put_u64(b, r.r9);
+    return b;
+}
+
+void test_sample_decodes_the_argument_registers_in_abi_order() {
+    // The six values are distinct and chosen so that no two of them can be
+    // confused for each other under a wrong ordering: a decoder that read
+    // them straight across, or that used the kernel's register numbers as
+    // indices, would place at least one of them in the wrong slot and every
+    // assertion below would name the slot it should have been in.
+    RegValues r;
+    r.cx = 0xC0;
+    r.dx = 0xD0;
+    r.si = 0x51;
+    r.di = 0xD1;
+    r.r8 = 0x88;
+    r.r9 = 0x99;
+
+    const std::string raw = "trace entry bytes";
+    const auto sample = make_sample(0x4000, 4242, 4243, raw, 2, r);
+    const SampleDecode d = decode_sample(sample.data(), sample.size());
+
+    check(d.ok, "a well-formed sample decodes");
+    check(d.ip == 0x4000, "the instruction pointer is read from the front");
+    check(d.pid == 4242, "the pid is read");
+    check(d.tid == 4243, "the tid is read");
+    check(d.has_args, "the registers are reported as captured");
+
+    // The ABI order is rdi, rsi, rdx, rcx, r8, r9. The values arrived in the
+    // kernel's order, so each of these is a real reordering and not a copy.
+    check(d.args[0] == 0xD1, "arg0 is rdi");
+    check(d.args[1] == 0x51, "arg1 is rsi");
+    check(d.args[2] == 0xD0, "arg2 is rdx");
+    check(d.args[3] == 0xC0, "arg3 is rcx");
+    check(d.args[4] == 0x88, "arg4 is r8");
+    check(d.args[5] == 0x99, "arg5 is r9");
+}
+
+void test_sample_without_captured_registers_reports_none() {
+    // abi 0 is the kernel saying it did not capture a register set. The
+    // array is still present in this fixture, so a decoder that ignored the
+    // abi would report six arguments that were never observed.
+    RegValues r;
+    r.cx = 0xC0;
+    r.di = 0xD1;
+    const auto sample = make_sample(0x5000, 1, 2, "x", 0, r);
+    const SampleDecode d = decode_sample(sample.data(), sample.size());
+
+    check(d.ok, "the sample itself is still well-formed");
+    check(!d.has_args, "no registers were captured, so none are reported");
+    // The ip and the thread ids are real and are kept: a hit with no
+    // arguments is still a hit, and discarding it would lose the call.
+    check(d.ip == 0x5000, "the instruction pointer survives");
+    check(d.pid == 1 && d.tid == 2, "the thread ids survive");
+}
+
+void test_the_raw_sample_is_stepped_over_before_the_registers() {
+    // The case the field order gets wrong. A long raw sample pushes the
+    // register block far from the front of the record, so a decoder that
+    // read the register array at a fixed offset near the start would take
+    // these bytes for registers.
+    RegValues r;
+    r.di = 0xABCDEF;
+    std::string raw(4096, 'Z');
+    const auto sample = make_sample(0x6000, 7, 8, raw, 2, r);
+    const SampleDecode d = decode_sample(sample.data(), sample.size());
+
+    check(d.ok, "a sample with a large raw block decodes");
+    check(d.args[0] == 0xABCDEF,
+          "the registers are read past the raw block, not inside it");
+    check(d.has_args, "and they are reported as captured");
+}
+
+void test_a_truncated_sample_is_refused_rather_than_guessed() {
+    RegValues r;
+    r.di = 0xD1;
+    const auto full = make_sample(0x7000, 9, 10, "abc", 2, r);
+
+    // Every prefix that is short of the whole record has to be refused.
+    // Stopping before the register block is the interesting boundary: the
+    // ip and the ids are already readable there, and a decoder that returned
+    // them as ok with has_args unset would be right -- but one that returned
+    // has_args set with a partial array would not be.
+    for (std::size_t n = 0; n < full.size(); ++n) {
+        const SampleDecode d = decode_sample(full.data(), n);
+        if (d.has_args) {
+            check(false, "a truncated sample claimed to carry registers");
+        }
+    }
+    // The whole record still decodes, so the loop above is not passing
+    // because nothing ever decodes.
+    const SampleDecode whole = decode_sample(full.data(), full.size());
+    check(whole.ok && whole.has_args, "the untruncated record still decodes");
+}
+
+void test_a_truncated_register_block_keeps_the_hit_without_arguments() {
+    // The ip and the ids are intact and only the register array is cut. The
+    // hit is real and must survive, with has_args false so the missing
+    // values are not read as zeroes -- a call with an address argument of
+    // zero is a real thing and must not be produced by a short read.
+    RegValues r;
+    r.di = 0xD1;
+    const auto full = make_sample(0x8000, 11, 12, "", 2, r);
+    const std::size_t cut = full.size() - 8; // one register short
+    const SampleDecode d = decode_sample(full.data(), cut);
+
+    check(d.ok, "the hit survives a truncated register block");
+    check(d.ip == 0x8000, "with its instruction pointer");
+    check(!d.has_args, "and without claiming arguments it did not read");
+}
+
+void test_a_null_body_is_refused() {
+    const SampleDecode d = decode_sample(nullptr, 0);
+    check(!d.ok, "a null body decodes to nothing");
+    check(!d.has_args, "and claims no arguments");
 }
 
 void test_explicit_root_is_used_and_not_searched_past() {
@@ -641,6 +822,12 @@ int main() {
     test_subscribe_of_an_unknown_index_is_refused();
     test_probe_kind_values_are_distinct();
     test_hit_defaults_are_zeroed();
+    test_sample_decodes_the_argument_registers_in_abi_order();
+    test_sample_without_captured_registers_reports_none();
+    test_the_raw_sample_is_stepped_over_before_the_registers();
+    test_a_truncated_sample_is_refused_rather_than_guessed();
+    test_a_truncated_register_block_keeps_the_hit_without_arguments();
+    test_a_null_body_is_refused();
     test_explicit_root_is_used_and_not_searched_past();
     test_explicit_root_missing_events_directory();
     test_explicit_root_without_uprobe_events_is_reported();

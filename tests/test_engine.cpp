@@ -1183,6 +1183,7 @@ void test_pe_plan_requests_the_ntdll_probes() {
         return;
     }
 
+    bool saw_a_named_argument = false;
     for (const engine::ProbeRequest& p : plan.probes) {
         check(!p.module.empty(), "every probe names a module");
         check(!p.symbol.empty(), "every probe names a symbol");
@@ -1190,7 +1191,19 @@ void test_pe_plan_requests_the_ntdll_probes() {
         check(p.symbol.starts_with("Nt") || p.symbol.starts_with("Zw") ||
                   p.symbol.starts_with("Rtl") || p.symbol.starts_with("Ldr"),
               "every probe is on an ntdll entry point");
+
+        // The argument names travel with the request, because the engine's
+        // table is the only thing that knows them and the probe layer is
+        // where they are read back off a hit. A request that dropped them
+        // would produce hits with values and no names, which is a report
+        // nobody can read -- and the loss would be silent, because a probe
+        // with no names is a perfectly valid probe.
+        if (!p.arg_names[0].empty()) {
+            saw_a_named_argument = true;
+        }
     }
+    check(saw_a_named_argument,
+          "the table's argument names reach the plan's probe requests");
 
     // The module is Wine's Unix-side ntdll, which is the ELF with the
     // bodies -- not the PE ntdll.dll, where the same names are thunks.

@@ -388,6 +388,43 @@ void test_the_offset_is_not_the_address() {
 
 // ------------------------------------------------------- the layer lifetime
 
+void test_argument_names_survive_resolution() {
+    // The names have to reach the placement, because the placement is what
+    // the report and the hit both read them from. They are copied in
+    // resolve() rather than in place(), and resolve() runs whichever way the
+    // placement turns out -- so a refusal still has its names, which is what
+    // makes this assertable on a host that cannot place a probe.
+    const DeltaLibrary lib = build_delta_library();
+    if (!lib.ok) {
+        std::fprintf(stderr,
+                     "note: no toolchain that can build a gap-offset library; "
+                     "the argument-name check was skipped\n");
+        return;
+    }
+
+    ProbeRequest req{lib.path, "occ_delta_target", "occ_delta_target", ""};
+    req.arg_names[0] = "FileHandle";
+    req.arg_names[2] = "DesiredAccess";
+    // Position 1 is deliberately left empty: an argument that is not named
+    // is not the same as an argument that does not exist, and the empty slot
+    // has to survive the copy rather than being filled in with something.
+
+    ProbePlacer placer;
+    std::vector<ProbeRequest> requests{req};
+    std::vector<Placement> out;
+    placer.place(requests, out, nullptr);
+
+    check(out.size() == 1, "one placement is reported");
+    check(out[0].arg_names[0] == "FileHandle",
+          "the first argument's name survives into the placement");
+    check(out[0].arg_names[2] == "DesiredAccess",
+          "and so does the third");
+    check(out[0].arg_names[1].empty(),
+          "an unnamed argument stays unnamed rather than being filled in");
+    check(out[0].arg_names[5].empty(),
+          "and the ones past the named entries are unnamed too");
+}
+
 void test_placing_nothing_leaves_an_empty_layer() {
     ProbePlacer placer;
     std::vector<ProbeRequest> requests;
@@ -444,6 +481,7 @@ int main() {
     test_a_real_function_resolves_to_a_file_offset();
     test_the_definition_is_preferred_over_the_import();
     test_the_offset_is_not_the_address();
+    test_argument_names_survive_resolution();
     test_placing_nothing_leaves_an_empty_layer();
     test_a_layer_that_placed_nothing_says_why();
     test_a_placer_is_not_copyable();
