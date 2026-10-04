@@ -223,7 +223,14 @@ namespace occ_test {
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--sigsegv-helper") == 0) {
         // A raw null write produces SIGSEGV without any library support.
-        volatile int* p = nullptr;
+        //
+        // The address is taken from argc rather than written as a literal
+        // null, so the compiler cannot prove the store is unreachable and
+        // fold it away. The write is still unconditional: this path must
+        // fault, and a check in front of it would be a check that could be
+        // optimized away, leaving a test that passes without ever raising a
+        // signal.
+        auto* p = reinterpret_cast<volatile int*>(argc);
         *p = 1;
         _exit(0);
     }
