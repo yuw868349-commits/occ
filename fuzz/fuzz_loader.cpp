@@ -27,10 +27,22 @@
 //     has, or to the headers. A loader that invented a region would be
 //     describing an image the file does not contain.
 //
-//   * The module's entry point, when the load succeeded, is inside a region
-//     the load recorded. A program whose entry point is not mapped is a
-//     program that faults on its first instruction, and the loader is the
-//     only layer that can see that coming.
+//   * The module's entry point, when the load succeeded, is at the base plus
+//     the image's entry RVA, and that address is inside a region the load
+//     recorded and is executable. A program whose entry point is not mapped
+//     is a program that faults on its first instruction, and the loader is
+//     the only layer that can see that coming. The arithmetic is checked and
+//     not only the mapping, because an entry computed from the wrong base is
+//     still a mapped address.
+//
+//   * The module reports the base the caller asked for, or the image's own
+//     when the caller asked for none. The harness loads each input twice,
+//     once each way, so a loader that relocated the image but reported the
+//     preferred base is caught.
+//
+//   * A resolved import's IAT slot is inside a region the load recorded. The
+//     slot is where the address is written; a slot outside the map is a
+//     store into unmapped memory before the program's first instruction.
 //
 // The corpus is the PE corpus. A loader harness whose inputs never parse
 // would spend its whole budget in the parser's first three gates, so it reuses
@@ -127,7 +139,8 @@ bool regions_are_disjoint(const AddressSpace& space) noexcept {
 
 // What the loader claims about a successful load.
 bool module_is_sane(const PeImage& image, const AddressSpace& space,
-                    const occ::runtime::LoadedModule& m) noexcept {
+                    const occ::runtime::LoadedModule& m,
+                    std::uint64_t requested_base) noexcept {
     // The entry point is mapped and executable -- but only when the image
     // declares one.
     //
@@ -151,14 +164,39 @@ bool module_is_sane(const PeImage& image, const AddressSpace& space,
         if (!at_entry->executable) {
             return false;
         }
+        // The entry address is the base plus the image's own RVA, and the
+        // check above would not catch a loader that paired the right entry
+        // RVA with the wrong base -- the wrong base is still a mapped
+        // address, just not the one the entry point is at. Loading an image
+        // at a base it did not compute the entry for runs the wrong code
+        // silently, so the arithmetic is asserted rather than the fact that
+        // some region contains the answer.
+        if (m.entry_va != m.base + image.entry_rva()) {
+            return false;
+        }
     }
 
-    // The base and size are the ones the caller would have passed, and the
-    // size is the image's.
-    if (m.size != image.image_size()) {
+    // The base is the one asked for, or the image's own when the caller
+    // named none. The loader documents both halves: `preferred_base` of zero
+    // means "use the image's base", and a non-zero one is a request the
+    // caller is entitled to.
+    //
+    // The harness calls this twice per input, once with zero and once with a
+    // chosen base, so a loader that ignored the caller's base -- or that
+    // relocated the image but reported the preferred base -- is caught on
+    // the second call. Checking only that the base is non-zero, which is
+    // what this used to do, is satisfied by every wrong answer.
+    const std::uint64_t expected_base =
+        requested_base != 0 ? requested_base : image.image_base();
+    if (m.base != expected_base) {
         return false;
     }
     if (m.base == 0) {
+        return false;
+    }
+
+    // The size is the image's.
+    if (m.size != image.image_size()) {
         return false;
     }
 
@@ -174,6 +212,18 @@ bool module_is_sane(const PeImage& image, const AddressSpace& space,
             return false;
         }
         if (imp.resolved != (imp.target_va != 0)) {
+            return false;
+        }
+        // A resolved import's IAT slot is where the address is written, and
+        // it is a virtual address in the loaded image. A slot outside every
+        // recorded region is a write into memory the load never mapped --
+        // the program would fault storing its own imports, before it ran a
+        // single instruction of its own.
+        //
+        // Only checked when the image actually has an IAT slot for the
+        // entry. A loader that could not place one records zero, and zero is
+        // not an address this can test.
+        if (imp.iat_va != 0 && space.find(imp.iat_va) == nullptr) {
             return false;
         }
     }
@@ -209,6 +259,13 @@ bool module_is_sane(const PeImage& image, const AddressSpace& space,
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, std::size_t size) {
     // A PE smaller than a DOS header and a signature cannot get anywhere, and
     // running the loader on it would only exercise the parser's first gate.
+    //
+    // Both returns below happen before the address space is constructed, so
+    // there is no "the failed load left the space untouched" claim to make on
+    // these paths -- there is no space yet. The invariant that matters is
+    // asserted further down, against a space this function made and
+    // pre-populated, and a reader should not have to trace the ordering to
+    // find out which paths it covers.
     if (size < 64) {
         return 0;
     }
@@ -279,7 +336,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, std::size_t size) {
             continue;
         }
 
-        if (!module_is_sane(image, space, result.module)) {
+        if (!module_is_sane(image, space, result.module, base)) {
             __builtin_trap();
         }
     }
