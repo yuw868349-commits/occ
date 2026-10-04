@@ -528,6 +528,7 @@ add_library(occ_core STATIC
     src/probe/doctor.cpp
     src/parser/detect.cpp
     src/parser/elf.cpp
+    src/parser/pe.cpp
     src/isolation/seccomp.cpp
     src/isolation/container.cpp
     src/observer/event.cpp

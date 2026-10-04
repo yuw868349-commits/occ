@@ -47,7 +47,7 @@ endfunction()
 # their assertions are about seccomp and namespaces rather than about a
 # sanitizer's shadow memory.
 #
-# The other four are instrumented in a sanitized build and should stay that
+# The other five are instrumented in a sanitized build and should stay that
 # way: they parse untrusted bytes and build events, which is the work a
 # sanitizer is for.
 if(NOT OCC_ENABLE_FUZZ)
@@ -58,3 +58,4 @@ occ_add_test(occ_test_detect test_detect.cpp)
 occ_add_test(occ_test_elf test_elf.cpp)
 occ_add_test(occ_test_event test_event.cpp)
 occ_add_test(occ_test_observer test_observer.cpp)
+occ_add_test(occ_test_pe test_pe.cpp)
