@@ -534,6 +534,7 @@ add_library(occ_core STATIC
     src/observer/event.cpp
     src/observer/ptrace.cpp
     src/observer/watchpoint.cpp
+    src/observer/uprobe.cpp
     src/observer/wx.cpp
     src/observer/rsp.cpp
     src/observer/session.cpp
