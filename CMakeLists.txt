@@ -539,6 +539,10 @@ add_library(occ_core STATIC
     src/observer/session.cpp
     src/observer/transport.cpp
     src/observer/registry.cpp
+    src/engine/engine.cpp
+    src/engine/exe_engine.cpp
+    src/engine/pe_engine.cpp
+    src/engine/apk_engine.cpp
     src/runner/run.cpp
 )
 

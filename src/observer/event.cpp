@@ -28,6 +28,10 @@ const char* event_kind_name(EventKind k) noexcept {
         return "image_loaded";
     case EventKind::Mapping:
         return "mapping";
+    case EventKind::Section:
+        return "section";
+    case EventKind::Import:
+        return "import";
     case EventKind::FileOpened:
         return "file_opened";
     case EventKind::SyscallBlocked:

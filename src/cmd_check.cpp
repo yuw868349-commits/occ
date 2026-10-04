@@ -1,5 +1,6 @@
 #include "occ/commands.h"
 
+#include "occ/engine/engine.h"
 #include "occ/parser/detect.h"
 #include "occ/util/log.h"
 #include "occ/util/string.h"
@@ -17,7 +18,6 @@ namespace {
 using parser::Detection;
 using parser::ElfClass;
 using parser::ElfEndian;
-using parser::ElfMachine;
 using parser::Format;
 
 struct Cli {
@@ -66,60 +66,73 @@ bool parse(const int argc, char** argv, Cli& out) {
 // the ones it does not handle: an engine that receives a target it cannot
 // run produces a named refusal, and routing such a target nowhere would
 // turn a specific error into a generic one.
+//
+// This asks the engine layer rather than keeping a table here. Two tables
+// of which format goes where is one more than the tree should have, and the
+// one that is not the engine's is the one that goes stale.
 const char* engine_for(const Detection& d) noexcept {
-    switch (d.format) {
-    case Format::Elf:
-        return "exe";
-    case Format::Apk:
-        return "apk";
-    case Format::Zip:
-    case Format::MachO:
-    case Format::Pe:
-    case Format::Unknown:
-        return nullptr;
-    }
-    return nullptr;
+    const engine::Engine* e = engine::engine_for(d);
+    return e != nullptr ? e->name() : nullptr;
 }
 
 // The reason a format is not runnable, in one line. Kept separate from the
 // engine decision because a caller reading the exit status needs to know
 // which of "no engine exists" and "the engine refuses this file" applies.
+//
+// The refusal comes from the engine, not from here, for the same reason the
+// engine choice does. A refusal written in this file would be a second
+// statement of what each engine accepts, and the two would disagree the
+// first time an engine changed.
 std::string refusal(const Detection& d) {
-    switch (d.format) {
-    case Format::Unknown:
-        return "no signature matched";
-    case Format::Zip:
-        return "a zip archive of code has no engine; point occ at a package "
-               "or extract the dex";
-    case Format::MachO:
-        return "Mach-O images are not handled; occ runs Linux targets";
-    case Format::Pe:
-        return "PE images are not handled; occ runs Linux targets";
-    case Format::Apk:
+    const engine::Engine* e = engine::engine_for(d);
+    if (e == nullptr) {
+        switch (d.format) {
+        case Format::Unknown:
+            return "no signature matched";
+        case Format::Zip:
+            return "a zip archive of code has no engine; point occ at a "
+                   "package or extract the native library from it";
+        case Format::MachO:
+            return "Mach-O images are not handled; occ runs Linux and Windows "
+                   "targets";
+        case Format::Elf:
+        case Format::Apk:
+        case Format::Pe:
+            break;
+        }
+        return "this build has no engine for this format";
+    }
+    return e->preflight(d);
+}
+
+// The reason a target is not runnable, in one line, or an empty string.
+//
+// Two different questions are answered here and they are kept apart because
+// they have different exit statuses. The first is whether an engine takes
+// this format at all, which preflight answers. The second is whether the
+// engine that takes it can actually run this file, which is a property of
+// the host and of the file's contents rather than of the format -- a PE
+// needs a Wine loader, an APK needs an Android runtime, and neither is a
+// fact `occ check` can read from a detection.
+//
+// So the second question is reported as a caveat rather than folded into
+// the refusal. A caller that sees a caveat knows the engine will read the
+// file and may still decline to run it, and a caller that sees neither
+// knows the engine has no host-level objection.
+std::string caveat(const Detection& d) {
+    const engine::Engine* e = engine::engine_for(d);
+    if (e == nullptr) {
         return {};
-    case Format::Elf:
-        if (d.bare_program_header) {
-            return "the file is an Android OAT image, which the apk engine "
-                   "reads rather than the exe engine";
-        }
-        if (d.elf_class == ElfClass::Elf32) {
-            return "32-bit ELF is not handled by the exe engine";
-        }
-        if (d.elf_endian == ElfEndian::Big) {
-            return "big-endian ELF is not handled by the exe engine";
-        }
-        if (d.elf_machine != ElfMachine::X86_64) {
-            return std::string("e_machine is ") +
-                   parser::elf_machine_name(d.elf_machine) +
-                   "; the exe engine handles x86-64 only";
-        }
-        if (d.elf_type == parser::ElfType::Rel) {
-            return "a relocatable object is not a program; link it first";
-        }
-        if (d.elf_type == parser::ElfType::Core) {
-            return "a core file is not a program";
-        }
-        return {};
+    }
+    if (e->kind() == engine::EngineKind::Apk) {
+        return "the apk engine reads a package and reports it, but occ has no "
+               "Android runtime and will not run one; extract the native "
+               "library under lib/ and point occ at that";
+    }
+    if (e->kind() == engine::EngineKind::Pe) {
+        return "the pe engine needs a Wine loader on this host, and needs one "
+               "matching the image's bitness; occ checks that when it runs, "
+               "not here";
     }
     return {};
 }
@@ -176,6 +189,13 @@ void print_text(const std::string& path, const Detection& d) {
         out += "\n";
     }
 
+    const std::string note = caveat(d);
+    if (!note.empty()) {
+        out += "  note         ";
+        out += note;
+        out += "\n";
+    }
+
     if (!d.evidence.empty()) {
         out += "  evidence\n";
         for (const auto& e : d.evidence) {
@@ -221,6 +241,10 @@ void print_ndjson(const std::string& path, const Detection& d) {
 
     out += ",\"reason\":\"";
     append_json_escaped(out, refusal(d));
+    out += "\"";
+
+    out += ",\"note\":\"";
+    append_json_escaped(out, caveat(d));
     out += "\"";
 
     out += ",\"evidence\":[";

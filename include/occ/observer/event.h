@@ -34,6 +34,14 @@ enum class EventKind : std::uint8_t {
     ProcessExit,
     ImageLoaded,
     Mapping,
+    // One section of a PE image. Separate from Mapping because a section is
+    // not a mapping: it is a range of the file and a range of the address
+    // space, and the loader is what turns one into the other. Reporting a
+    // section as a mapping would claim a correspondence the file does not
+    // make.
+    Section,
+    // One DLL a PE imports, in the order the import directory lists them.
+    Import,
     FileOpened,
     SyscallBlocked,
     BreakpointHit,

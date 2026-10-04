@@ -1,5 +1,6 @@
 #include "occ/runner/run.h"
 
+#include "occ/engine/engine.h"
 #include "occ/observer/session.h"
 #include "occ/parser/detect.h"
 #include "occ/syscall/errno.h"
@@ -7,6 +8,14 @@
 #include "occ/util/fs.h"
 #include "occ/util/log.h"
 #include "occ/util/string.h"
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <unistd.h>
 
 namespace occ::runner {
 
@@ -30,65 +39,128 @@ std::vector<std::string> default_environment(const RunOptions& options) {
     return env;
 }
 
-// Reports one loadable segment. Called once per PT_LOAD header, in address
-// order, which is the order the kernel itself would map them.
-void report_mapping(obs::Writer& events, const parser::DesiredMapping& m,
-                    std::size_t index) {
-    auto& e = events.begin(obs::EventKind::Mapping);
-    e.add("index", static_cast<std::uint64_t>(index));
-    e.add_hex("file_offset", m.file_offset);
-    e.add_hex("vaddr", m.vaddr);
-    e.add_hex("filesz", m.filesz);
-    e.add_hex("memsz", m.memsz);
-    e.add("readable", (m.flags & parser::kPfRead) != 0);
-    e.add("writable", (m.flags & parser::kPfWrite) != 0);
-    e.add("executable", (m.flags & parser::kPfExec) != 0);
-    // The part of the segment that is not backed by the file has to be
-    // zeroed rather than read. Reporting it separately means a consumer does
-    // not have to subtract two fields to find the size of the zero region.
-    e.add_hex("zero_fill", m.memsz > m.filesz ? m.memsz - m.filesz : 0);
+// Appends the entries an engine asked for, without displacing one the
+// caller set.
+//
+// The caller's entry wins, and that is the rule rather than an accident of
+// iteration order: a caller who set WINEPREFIX has said where the prefix
+// goes, and an engine that overrode it would be discarding an explicit
+// instruction. A later engine entry still displaces an earlier one, so two
+// entries from the same engine resolve the same way regardless of order.
+std::vector<std::string> merge_environment(
+    const std::vector<std::string>& base,
+    const std::vector<std::string>& additions) {
+    std::vector<std::string> out = base;
+    for (const std::string& entry : additions) {
+        const std::size_t eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            // An entry with no '=' is not an environment variable, and
+            // passing it to execve would put a nameless entry in the
+            // target's environment where it can be read by anything that
+            // iterates it. Dropped rather than refused: the engine that
+            // produced it has already been asked, and refusing the whole
+            // run over a string it will never read is a worse outcome.
+            continue;
+        }
+        const std::string_view key(entry.data(), eq);
+        bool replaced = false;
+        for (std::string& existing : out) {
+            const std::size_t existing_eq = existing.find('=');
+            if (existing_eq == std::string::npos) {
+                continue;
+            }
+            if (std::string_view(existing.data(), existing_eq) == key) {
+                existing = entry;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            out.push_back(entry);
+        }
+    }
+    return out;
+}
+
+// Reports the end of a session that never started, and the reason. Every
+// path that stops before a process exists comes through here, so a stream
+// that shows a refusal still ends with a session_end and a reader does not
+// have to treat a short stream as a broken one.
+RunResult refuse(RunResult out, obs::Writer& events,
+                 const std::string& reason) {
+    out.failed = true;
+    out.failure_detail = reason;
+    events.note(reason);
+    auto& end = events.begin(obs::EventKind::SessionEnd);
+    end.add("started", false);
     events.commit();
+    out.events = events.events_written();
+    return out;
 }
 
 } // namespace
 
-parser::ElfImage inspect(const std::string& path, obs::Writer* events,
-                         std::string& read_error) {
+engine::LoadedImage inspect(const std::string& path, obs::Writer* events,
+                           std::string& read_error) {
     read_error.clear();
 
-    auto bytes = fs::read_file_bytes(path);
-    if (!bytes) {
-        read_error = "the file could not be read";
-        return parser::ElfImage{};
+    // The detection reads the file to find out what it is, and the engine
+    // reads it again to parse it. Two reads rather than one because they
+    // answer different questions and the readers are separate: the
+    // detection must be cheap and total -- it has to work on a file no
+    // parser can read at all -- and the parser must be exact about a file
+    // it has already been told is its own format. A reader that detected
+    // and parsed in one pass would have to trust its own signature check
+    // before committing to a layout, which is the mistake every
+    // format-confused parser makes.
+    const parser::Detection detection = parser::detect_file(path);
+    if (detection.format == parser::Format::Unknown) {
+        read_error = detection.evidence.empty()
+                         ? "no signature matched"
+                         : detection.evidence.front();
     }
 
-    const parser::ElfImage image =
-        parser::ElfImage::parse(ByteSpan{bytes->data(), bytes->size()});
-
-    if (events != nullptr) {
-        auto& e = events->begin(obs::EventKind::ImageLoaded);
-        e.add("path", path);
-        e.add("size", static_cast<std::uint64_t>(bytes->size()));
-        e.add("ok", image.ok());
-        if (image.ok()) {
-            e.add("type", static_cast<std::uint64_t>(image.type()));
-            e.add("machine", static_cast<std::uint64_t>(image.machine()));
-            e.add_hex("entry", image.entry());
-            e.add("phnum", static_cast<std::uint64_t>(image.phnum()));
-            e.add("phentsize", static_cast<std::uint64_t>(image.phentsize()));
-            e.add_hex("lowest_vaddr", image.lowest_vaddr());
-            e.add_hex("highest_vaddr", image.highest_vaddr());
-            e.add("interpreter", image.interpreter());
-            e.add("executable_stack", image.wants_executable_stack());
-            e.add("gnu_relro", image.has_gnu_relro());
-        } else {
-            e.add("error", parser::load_error_name(image.error()));
-            e.add("detail", image.error_detail());
+    const engine::Engine* chosen = engine::engine_for(detection);
+    if (chosen == nullptr) {
+        engine::LoadedImage out;
+        out.format = detection.format;
+        out.error = "no engine handles this format";
+        out.detail = parser::format_name(detection.format);
+        if (events != nullptr) {
+            auto& e = events->begin(obs::EventKind::ImageLoaded);
+            e.add("path", path);
+            e.add("engine", "none");
+            e.add("size", detection.file_size);
+            e.add("ok", false);
+            e.add("error", out.error);
+            e.add("detail", out.detail);
+            events->commit();
         }
-        events->commit();
+        return out;
     }
 
-    return image;
+    // The engine's own judgement on the detection comes before the read, so
+    // a refusal that does not need the file does not pay for it. A
+    // detection-level refusal says the engine will not take this file, and
+    // that is a different fact from the file being unreadable.
+    const std::string preflight = chosen->preflight(detection);
+    if (!preflight.empty()) {
+        engine::LoadedImage out;
+        out.format = detection.format;
+        out.error = preflight;
+        if (events != nullptr) {
+            auto& e = events->begin(obs::EventKind::ImageLoaded);
+            e.add("path", path);
+            e.add("engine", chosen->name());
+            e.add("size", detection.file_size);
+            e.add("ok", false);
+            e.add("error", preflight);
+            events->commit();
+        }
+        return out;
+    }
+
+    return chosen->load(path, events);
 }
 
 RunResult run(const std::string& path, const std::vector<std::string>& argv,
@@ -100,38 +172,82 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     start.add("argv_count", static_cast<std::uint64_t>(argv.size()));
     events.commit();
 
-    const parser::ElfImage image = inspect(path, &events, out.load_detail);
-    out.load_error = image.error();
+    const parser::Detection detection = parser::detect_file(path);
+    out.format = detection.format;
 
-    if (!image.ok()) {
-        // A target this build cannot run is refused by name. The detail
-        // string is the same one the reader produced, so the reason a run
-        // was refused and the reason a parse failed cannot disagree.
-        out.failed = true;
-        out.failure_detail =
-            "the image is not one this build can run: " +
-            std::string(parser::load_error_name(image.error()));
-        events.note(out.failure_detail);
-        auto& end = events.begin(obs::EventKind::SessionEnd);
-        end.add("started", false);
-        events.commit();
-        out.events = events.events_written();
-        return out;
+    const engine::Engine* chosen = engine::engine_for(detection);
+    if (chosen == nullptr) {
+        // A format this build recognises but has no engine for is refused by
+        // name. The alternative -- exec'ing the file and letting the kernel
+        // decide -- produces a run whose isolation nobody designed, which
+        // for a tool whose entire claim is what it does to a target is not
+        // a thing worth doing.
+        std::string why =
+            "this build has no engine for a ";
+        why += parser::format_name(detection.format);
+        why += " image; occ runs Linux executables";
+        if (detection.format == parser::Format::Pe) {
+            why +=
+                ", and a Windows image needs the pe engine, which needs a "
+                "Wine loader on this host";
+        }
+        return refuse(std::move(out), events, why);
+    }
+    out.engine = chosen->name();
+
+    const std::string preflight = chosen->preflight(detection);
+    if (!preflight.empty()) {
+        return refuse(std::move(out), events, preflight);
     }
 
-    out.image_loaded = true;
-    out.entry = image.entry();
-    out.mapping_count = image.mappings().size();
+    engine::LoadedImage image = chosen->load(path, &events);
+    out.image_loaded = image.ok;
+    out.load_error = image.error;
+    out.load_detail = image.detail;
+    out.entry = image.entry;
+    out.mapping_count = image.region_count;
 
-    for (std::size_t i = 0; i < image.mappings().size(); ++i) {
-        report_mapping(events, image.mappings()[i], i);
+    if (!image.ok) {
+        // A refusal names the reason directly. The detail string is the one
+        // the reader produced, so the reason a run was refused and the
+        // reason a parse failed cannot disagree.
+        return refuse(std::move(out), events,
+                      "the image is not one this build can run: " +
+                          image.error);
     }
 
-    // The container configuration comes from the options and the image. The
-    // image contributes the one fact the isolation layer cannot derive on
-    // its own: a target that asks for an executable stack is a target whose
-    // stack request the caller has to decide about, and the decision is
-    // recorded here rather than made silently in the loader.
+    // The scratch directory. An engine that keeps state on disk needs
+    // somewhere that belongs to this run and to nothing else, and the
+    // runner is what knows when the run ends. It is created before the
+    // plan so that an engine which refuses for want of one says so before
+    // anything has been built.
+    std::string scratch;
+    if (options.scratch_dir.empty()) {
+        scratch = "/run/occ-scratch-" + std::to_string(::getpid());
+    } else {
+        scratch = options.scratch_dir;
+    }
+    if (!fs::mkdir_p(scratch, 0700)) {
+        return refuse(std::move(out), events,
+                      "the run's scratch directory " + scratch +
+                          " could not be created");
+    }
+
+    engine::EngineRequest request;
+    request.path = path;
+    request.argv = argv;
+    request.scratch_dir = scratch;
+
+    engine::LaunchPlan plan = chosen->plan(request, image);
+    if (!plan.refusal.empty()) {
+        (void)fs::remove_tree(scratch);
+        return refuse(std::move(out), events, plan.refusal);
+    }
+    out.degradations = plan.degradations;
+
+    // The container configuration comes from the options and the engine.
+    // The options contribute what the caller asked for; the engine
+    // contributes what the format needs to run at all.
     isolation::ContainerConfig config;
     config.root_dir = options.root_dir;
     config.upper_dir = options.upper_dir;
@@ -142,42 +258,47 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     config.limits.pids = options.pids;
     config.limits.cpu_percent = options.cpu_percent;
     config.extra_mounts = options.extra_mounts;
+
+    // The engine's binds go after the caller's. Order matters: a later bind
+    // of the same target is the one that is in effect, so an engine that
+    // needs a directory the caller also bound gets to decide what is at
+    // that path -- the alternative is the caller's mount being silently
+    // masked by a loader's, which produces a target that fails in a way
+    // that names neither.
+    for (const isolation::ContainerConfig::BindMount& m : plan.binds) {
+        config.extra_mounts.push_back(m);
+    }
+
+    // A run with no root named still needs a root, unless the engine named
+    // one. The host's own / is bound read-only, which is the smallest setup
+    // that gives the target a coherent filesystem: it can read the
+    // libraries and data files it expects, and it cannot write anything,
+    // because the bind is sealed before the pivot. Binding an empty path
+    // instead would be refused by the kernel with EINVAL, and a caller who
+    // did not name a root has not asked for an empty one -- they have asked
+    // for the default.
+    if (config.root_dir.empty() && plan.root_dir.empty() &&
+        config.root_kind == isolation::RootKind::ReadOnlyBind) {
+        config.root_dir = "/";
+    }
+    // The engine's root is the last word: an engine that needs a writable
+    // root has said so, and a caller who did not name one has not asked to
+    // override it.
+    if (!plan.root_dir.empty()) {
+        config.root_dir = plan.root_dir;
+    }
+
+    const std::vector<std::string> env =
+        merge_environment(default_environment(options), plan.env);
+
     // An observed run has to have its target stop at the exec boundary, or
     // the target can complete before the observer reaches it.
     config.stop_at_exec = options.observe;
 
-    // A run with no root named still needs a root. The host's own / is bound
-    // read-only, which is the smallest setup that gives the target a
-    // coherent filesystem: it can read the libraries and data files it
-    // expects, and it cannot write anything, because the bind is sealed
-    // before the pivot. Binding an empty path instead would be refused by
-    // the kernel with EINVAL, and a caller who did not name a root has not
-    // asked for an empty one -- they have asked for the default.
-    if (config.root_dir.empty() &&
-        config.root_kind == isolation::RootKind::ReadOnlyBind) {
-        config.root_dir = "/";
-    }
-
-    const std::vector<std::string> env = default_environment(options);
-
-    // The target's path is made absolute before the container is built.
-    //
-    // The container pivots its root, and everything after the pivot is
-    // resolved against the new root rather than against the directory occ
-    // happened to be started in. A relative path is therefore a different
-    // file inside the container than it was outside, and the failure is
-    // ENOENT from an execve that looks correct at the call site.
-    //
-    // Resolving here rather than in the child is deliberate: the child has
-    // already pivoted by the time it could do it, and the host's view of
-    // where the file is no longer exists from inside. The path recorded in
-    // the event stream is the resolved one too, so a reader of the stream
-    // can tell what actually ran.
-    const std::string resolved = fs::absolute_path(path);
-
     isolation::SpawnResult spawned =
-        isolation::container_spawn(config, resolved, argv, env);
+        isolation::container_spawn(config, plan.program, plan.argv, env);
     if (!spawned.error.ok()) {
+        (void)fs::remove_tree(scratch);
         out.failed = true;
         out.error = spawned.error;
         auto& e = events.begin(obs::EventKind::Note);
@@ -197,7 +318,7 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
 
     auto& spawn = events.begin(obs::EventKind::ProcessSpawn);
     spawn.add("pid", static_cast<std::uint64_t>(spawned.pid));
-    spawn.add("entry", static_cast<std::uint64_t>(image.entry()));
+    spawn.add("entry", out.entry);
     events.commit();
 
     // The container releases the target as soon as it has been set up, so
@@ -252,6 +373,7 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         out.signaled = sr.signaled;
 
         (void)isolation::container_cleanup(config);
+        (void)fs::remove_tree(scratch);
 
         auto& end = events.begin(obs::EventKind::SessionEnd);
         end.add("started", true);
@@ -291,6 +413,7 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     events.commit();
 
     (void)isolation::container_cleanup(config);
+    (void)fs::remove_tree(scratch);
 
     auto& end = events.begin(obs::EventKind::SessionEnd);
     end.add("started", true);
