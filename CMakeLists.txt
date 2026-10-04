@@ -184,13 +184,30 @@ set(OCC_STATIC_LINK ON CACHE BOOL "Link the main binary statically")
 # would really use. The question is answered by a compile rather than by
 # parsing a version, because the version in the directory name is the
 # distribution's and not necessarily the one whose floor applies.
+#
+# The probe includes what this project includes, not a token sample. A probe
+# that reaches only for <string> and <vector> passes on a combination that
+# cannot build: GCC with libc++ takes <string> cleanly and only fails on
+# <cstdlib>, where libstdc++'s stdlib.h and libc++'s cstdlib each expect the
+# other to have gone first. A probe narrower than the real sources is worse
+# than no probe, because it turns a build that cannot start into one that
+# fails three thousand lines later. So the headers below are the ones the
+# sources actually open, and adding to them costs one line.
 if(OCC_USE_LIBCXX AND OCC_LIBCXX_ROOT)
     set(_occ_probe_dir "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/occ_libcxx_probe")
     file(MAKE_DIRECTORY "${_occ_probe_dir}")
     file(WRITE "${_occ_probe_dir}/probe.cpp"
-         "#include <string>\n#include <vector>\nint main() {\n"
+         "#include <cstdlib>\n#include <cstring>\n#include <string>\n"
+         "#include <vector>\n#include <map>\n#include <span>\n"
+         "#include <optional>\n#include <algorithm>\n"
+         "int main() {\n"
          "  std::vector<std::string> v;\n  v.push_back(\"probe\");\n"
-         "  return static_cast<int>(v[0].size());\n}\n")
+         "  std::map<int, std::string> m;\n  m.emplace(1, v[0]);\n"
+         "  std::span<const int> s;\n  (void)s;\n"
+         "  std::optional<int> o = 1;\n"
+         "  (void)std::strncmp(v[0].c_str(), \"p\", 1);\n"
+         "  (void)std::max(0, o.value_or(0));\n"
+         "  return static_cast<int>(m.size() + v[0].size());\n}\n")
 
     set(_occ_probe_ok TRUE)
     set(_occ_probe_include "")
@@ -210,24 +227,57 @@ if(OCC_USE_LIBCXX AND OCC_LIBCXX_ROOT)
         endif()
     endforeach()
 
+    set(_occ_probe_link_flags "")
+    foreach(suffix /lib/x86_64-unknown-linux-gnu /lib)
+        if(EXISTS "${OCC_LIBCXX_ROOT}${suffix}/libc++.a" OR
+           EXISTS "${OCC_LIBCXX_ROOT}${suffix}/libc++.so")
+            set(_occ_probe_link_flags "-L${OCC_LIBCXX_ROOT}${suffix}")
+            break()
+        endif()
+    endforeach()
+    if(_occ_probe_link_flags)
+        list(APPEND _occ_probe_link_flags -lc++ -lc++abi)
+    endif()
+
     if(NOT _occ_probe_include)
         set(_occ_probe_ok FALSE)
         set(_occ_probe_reason "no libc++ include directory under ${OCC_LIBCXX_ROOT}")
     else()
+        # The probe links as well as compiles. Headers that compile against a
+        # libc++ whose library is missing or built for another ABI are a
+        # combination that gets all the way to the end of the build before it
+        # is found, and finding it here costs one command instead of a full
+        # build. The library directory is the one this file would use, so a
+        # root whose libraries are somewhere else is reported as incomplete
+        # rather than being linked against whatever happens to be installed.
         execute_process(
             COMMAND "${CMAKE_CXX_COMPILER}" ${_occ_probe_flags}
-                    -std=c++23 -isystem "${_occ_probe_include}" -c
-                    "${_occ_probe_dir}/probe.cpp" -o "${_occ_probe_dir}/probe.o"
+                    -std=c++23 -isystem "${_occ_probe_include}"
+                    "${_occ_probe_dir}/probe.cpp"
+                    -o "${_occ_probe_dir}/probe"
+                    ${_occ_probe_link_flags}
             RESULT_VARIABLE _occ_probe_result
             OUTPUT_VARIABLE _occ_probe_output
             ERROR_VARIABLE _occ_probe_output)
         if(NOT _occ_probe_result EQUAL 0)
             set(_occ_probe_ok FALSE)
+            # The reason is taken from what the compiler actually said, so
+            # that the warning names the incompatibility rather than just
+            # asserting one exists. Two forms are recognised: a libc++ that
+            # states its own floor outright, and any other hard error, which
+            # is reported as the first line the compiler marked. Anything
+            # more specific than that would be a guess about a message this
+            # file does not control.
             string(REGEX MATCH "Libc\\+\\+ only supports[^\"]*"
                    _occ_probe_reason "${_occ_probe_output}")
             if(NOT _occ_probe_reason)
+                string(REGEX MATCH "error:[^\n]*" _occ_probe_reason
+                       "${_occ_probe_output}")
+            endif()
+            if(NOT _occ_probe_reason)
                 set(_occ_probe_reason "the compiler rejected it")
             endif()
+            string(STRIP "${_occ_probe_reason}" _occ_probe_reason)
         endif()
     endif()
 
