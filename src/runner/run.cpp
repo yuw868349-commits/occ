@@ -26,10 +26,14 @@ namespace {
 // the whole host environment through would hand the target every variable
 // the operator happens to have set, and a variable like LD_PRELOAD changes
 // what the binary does. These three are what a static binary needs.
-std::vector<std::string> default_environment(const RunOptions& options) {
-    if (!options.env.empty()) {
-        return options.env;
-    }
+//
+// The three are always present, and --env adds to them rather than replacing
+// them. Replacing is the tempting implementation and it is wrong: a caller
+// who adds one variable is naming one variable, not asking to run without a
+// PATH. A target that cannot find its own libraries fails in the dynamic
+// linker before any of occ's machinery sees it, and the report names a
+// missing file rather than the one-variable addition that caused it.
+std::vector<std::string> default_environment() {
     std::vector<std::string> env;
     env.emplace_back("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:"
                      "/usr/bin:/sbin:/bin");
@@ -364,8 +368,11 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         config.root_dir = plan.root_dir;
     }
 
-    const std::vector<std::string> env =
-        merge_environment(default_environment(options), plan.env);
+    // The caller's --env entries are merged over the defaults, and over the
+    // engine's, so that a flag which sets one variable leaves the rest of
+    // the environment as the run would have had it without the flag.
+    const std::vector<std::string> env = merge_environment(
+        merge_environment(default_environment(), plan.env), options.env);
 
     // An observed run has to have its target stop at the exec boundary, or
     // the target can complete before the observer reaches it.

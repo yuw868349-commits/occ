@@ -609,15 +609,116 @@ LaunchPlan PeEngine::plan(const EngineRequest& request,
     libs.writable = false;
     out.binds.push_back(libs);
 
-    // Wine reads its loader configuration from /usr/lib/wine and its
-    // registry from the prefix, and it writes nothing outside those two
-    // except a socket under /tmp. The socket is the one that matters: a
-    // wineserver that outlives the run holds the prefix open, and the next
+    // The prefix, writable.
+    //
+    // The path in WINEPREFIX is the host path, and the container's root is
+    // a read-only bind of the host's, so without this line Wine finds its
+    // own prefix directory read-only and dies creating the lock file inside
+    // it: "creat($WINEPREFIX/wineserver)" returns EROFS before the loader
+    // has looked at the target. The failure names a path the caller never
+    // wrote and a lock file they never asked for, which is the least
+    // useful shape a failure can have.
+    //
+    // It is bound at the same path it already has rather than moved
+    // somewhere writable, because WINEPREFIX is an absolute path Wine
+    // echoes back in its own messages and in the registry it writes; a
+    // prefix that is at one path in the environment and another in the
+    // filesystem makes every one of those messages wrong.
+    isolation::ContainerConfig::BindMount prefix_bind;
+    prefix_bind.source = prefix;
+    prefix_bind.target = prefix;
+    prefix_bind.writable = true;
+    out.binds.push_back(prefix_bind);
+
+    // A writable /tmp, because Wine's ntdll creates its server directory
+    // there.
+    //
+    // The container's root is a read-only bind of the host's, so the /tmp
+    // inside it is the host's /tmp with the write bit taken away. Wine
+    // builds "$TMPDIR/wine-<uid>" before it starts its server, and being
+    // unable to is not a degradation it recovers from: the loader prints
+    // "unable to create wineserver tmpdir" and the process exits before the
+    // target's entry point is reached. That is a run which fails for a
+    // reason that has nothing to do with the target, which is exactly the
+    // report this engine exists not to produce.
+    //
+    // The directory is under the run's scratch, so it is per-run and the
+    // runner removes it with everything else. Naming it /tmp rather than
+    // passing it in TMPDIR alone is deliberate: Wine is not the only thing
+    // in the run that wants a temp directory, and a target that calls
+    // GetTempPath must not be handed a path that does not exist.
+    const std::string tmp = request.scratch_dir + "/tmp";
+    if (!fs::mkdir_p(tmp, 01777)) {
+        out.refusal = "the Wine run's temporary directory " + tmp +
+                      " could not be created";
+        return out;
+    }
+    isolation::ContainerConfig::BindMount tmps;
+    tmps.source = tmp;
+    tmps.target = "/tmp";
+    tmps.writable = true;
+    out.binds.push_back(tmps);
+
+    // TMPDIR, TEMP and TMP are deliberately NOT set, and the reason is worth
+    // writing down because the naive thing to do here is exactly what they
+    // look like.
+    //
+    // Wine 9.0 aborts during startup whenever TMPDIR is present in the
+    // environment, with any value including /tmp:
+    //
+    //     $ env -i PATH=/usr/bin:/bin HOME=/root WINEPREFIX=/tmp/p \
+    //           TMPDIR=/tmp wine64 cmd.exe /c
+    //     free(): invalid pointer
+    //
+    // The freed pointer is a stack address -- the value half of the
+    // "TMPDIR=/tmp" entry in the environment block -- and the abort comes
+    // from ntdll's server-connect path, which walks the environment, keeps
+    // pointers into it, and frees some of them as though they were heap
+    // allocations from asprintf. Removing the variable is the only fix
+    // available from outside: the bug is in the loader and it is not ours
+    // to patch.
+    //
+    // What makes this safe is the bind above. With TMPDIR unset Wine falls
+    // back to /tmp, and /tmp inside the container is now the run's own
+    // writable directory, which is the directory TMPDIR would have named
+    // anyway. The variable only said out loud what the bind already
+    // guarantees, so dropping it costs nothing and the run stops dying
+    // before the target's entry point.
+    //
+    // TEMP and TMP are left alone for the same reason even though neither
+    // one is touched by that loader path: they are read from the Windows
+    // environment side, where Wine derives them from the fallback, and a
+    // value occ set here would be a second copy of the same path that could
+    // disagree with the first.
+
+    // A wineserver that outlives the run holds the prefix open, and the next
     // run against the same prefix would find a server it did not start.
-    // WINESERVER= disables the sharing outright, which costs some speed on
-    // a run that starts several processes and buys a run that leaves
-    // nothing running.
-    out.env.emplace_back("WINESERVER=");
+    //
+    // WINESERVER is not set, and that is a deliberate negative. Wine's
+    // loader.c tries bin_dir/wineserver first and consults WINESERVER only
+    // if that path does not exec, so a value here would be inert in the
+    // normal layout -- and it is not inert when it is the empty string,
+    // which aborts Wine 9.0 in the same startup path TMPDIR does. A variable
+    // that does nothing when it is right and breaks the run when it is
+    // wrong is not worth setting.
+    //
+    // The sharing is instead prevented by construction: every run gets its
+    // own WINEPREFIX under its own scratch directory, so a server bound to
+    // that prefix has nothing to hand to a later run. Retiring a server that
+    // is still alive after the run is the runner's job and it can do it by
+    // prefix, which is a fact about this run; asking the loader to skip a
+    // step is a fact about the host.
+    //
+    // What replaces this is not another environment variable. The
+    // distribution's launcher, /usr/lib/wine/wineserver, ends in
+    // "exec $wineserver -p0": -p0 is a zero-second master socket timeout,
+    // so the server connects once and exits. That is the model Wine 9.0's
+    // client expects -- server.c's server_connect forks the server, waits
+    // for it with waitpid, and then connects to the socket it left behind --
+    // and it is measured working, three runs out of three, both on the host
+    // and inside a container shaped like the one this engine builds.
+    // Anything that keeps the server alive longer makes that waitpid block,
+    // so -p0 stays and none of it is this file's business.
 
     // The probes.
     //

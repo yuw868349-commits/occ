@@ -8,8 +8,11 @@
 
 #include <array>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include <sched.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/wait.h>
 
@@ -603,11 +606,55 @@ int assemble_root(const ContainerConfig& config, const std::string& target,
 // directory pivot_root needs has been created. A bind mount's flags can only
 // be changed by a second mount call naming the same mount, which is why this
 // is a separate call rather than a flag on the first one.
+//
+// The remount is recursive because a read-only root that leaves a writable
+// subtree behind is not read-only: a target can name the subtree, write
+// there, and the filesystem the root was bound from takes the writes. The
+// recursion is what makes the seal a seal.
+//
+// A writable mount the engine asked for is un-mounted before the seal and
+// mounted again after it, rather than remounted read-write afterwards.
+// Remounting looks like the smaller change and is not the one that works:
+// the source of these mounts is itself on the host's overlay, and a
+// remount of a bind whose upper filesystem is shared can return success
+// without clearing the read-only flag, which turns a two-line difference
+// into a run that fails for a reason no message explains. Unmounting and
+// mounting again produces a fresh mount that never had the flag, which was
+// measured to work where the remount did not.
+//
+// The mounts are handled in the order apply_extra_mounts used them, so a
+// target named twice resolves the same way in both passes.
 int seal_root(const ContainerConfig& config, const std::string& target,
               std::string& detail) noexcept {
     if (config.root_kind != RootKind::ReadOnlyBind) {
         return 0;
     }
+
+    // The mounts to keep writable, unmounted first.
+    //
+    // A mount that was never made -- because its source did not exist --
+    // is skipped: unmounting what is not mounted fails with EINVAL and
+    // that failure says nothing about the run.
+    struct Kept {
+        const ContainerConfig::BindMount* mount;
+        std::string at;
+    };
+    std::vector<Kept> kept;
+    for (const auto& m : config.extra_mounts) {
+        if (!m.writable) {
+            continue;
+        }
+        const std::string at = target + m.target;
+        if (!fs::exists(at)) {
+            continue;
+        }
+        if (sys::umount2(at.c_str(), sys::kMntDetach).failed()) {
+            detail = "unmount " + m.target + " before sealing the root";
+            return sys::kEacces;
+        }
+        kept.push_back(Kept{&m, at});
+    }
+
     auto ro = sys::mount(nullptr, target.c_str(), nullptr,
                          sys::kMsRemount | sys::kMsBind | sys::kMsRecursive |
                              sys::kMsRdonly,
@@ -615,6 +662,22 @@ int seal_root(const ContainerConfig& config, const std::string& target,
     if (ro.failed()) {
         detail = "remount " + target + " read-only";
         return ro.error;
+    }
+
+    // Mounting them again, now that the root underneath is read-only.
+    //
+    // A mount that cannot be remade is an error rather than a degradation:
+    // the engine asked for it by name, and continuing without it runs the
+    // target in a configuration nobody chose and then reports whatever the
+    // target did about it.
+    for (const Kept& k : kept) {
+        auto rw = sys::mount(k.mount->source.c_str(), k.at.c_str(), nullptr,
+                             sys::kMsBind | sys::kMsRecursive, nullptr);
+        if (rw.failed()) {
+            detail = "remount " + k.mount->target +
+                     " writable after sealing the root";
+            return rw.error;
+        }
     }
     return 0;
 }
@@ -718,12 +781,49 @@ RootSupport populate_root(const ContainerConfig& config,
     // exposes the host's /dev/null, and a bind of that file gives the
     // target the one node almost every program uses. A file bind is
     // cheaper than a device bind and does not need CAP_MKNOD.
-    if (!any && fs::exists("/dev/null")) {
-        const std::string target = root + "/dev/null";
-        if (sys::mount("/dev/null", target.c_str(), nullptr,
-                       sys::kMsBind, nullptr)
-                .ok()) {
-            any = true;
+    //
+    // The bind target has to exist first. The tmpfs above is fresh, so
+    // there is nothing at root/dev/null to bind onto, and a bind onto a
+    // path that does not exist fails with ENOENT rather than creating it
+    // -- the earlier version of this code relied on that and produced a
+    // container where every mknod was denied and the fallback was too, so
+    // the target ran with no /dev/null at all. An empty regular file is
+    // enough to bind over: the bind replaces it with the host's character
+    // device, and the mode of the temporary file is never seen by anyone.
+    //
+    // Only the few names worth having are bound, and only when the host
+    // has them. A target that wanted a different device finds out when it
+    // opens it, which is where that failure belongs.
+    if (!any) {
+        // A name and a mode, and nothing about a device number: these are
+        // host files being bound over, so the number is the host's and is
+        // not this code's to state.
+        struct FallbackNode {
+            const char* name;
+            unsigned int mode;
+        };
+        const FallbackNode fallback[] = {
+            {"null", 0666},
+            {"zero", 0666},
+            {"urandom", 0444},
+            {"random", 0444},
+        };
+        for (const FallbackNode& n : fallback) {
+            const std::string host = std::string("/dev/") + n.name;
+            if (!fs::exists(host)) {
+                continue;
+            }
+            const std::string target = root + "/dev/" + n.name;
+            const int fd = ::open(target.c_str(), O_CREAT | O_WRONLY, n.mode);
+            if (fd < 0) {
+                continue;
+            }
+            ::close(fd);
+            if (sys::mount(host.c_str(), target.c_str(), nullptr,
+                           sys::kMsBind, nullptr)
+                    .ok()) {
+                any = true;
+            }
         }
     }
     support.devices = any;
@@ -999,6 +1099,59 @@ int child_setup(const ContainerConfig& config, const std::string& scratch,
 // which the arrangement is possible. Repeating it here would fail for the
 // reason the earlier comment describes, so the parameter that used to carry
 // the instruction is gone rather than left in place to be ignored.
+// Writes a snapshot of the container's view to stderr, when the caller asked
+// for one.
+//
+// This exists because the interesting container failures are the ones that
+// happen between the last thing occ can check from outside and the exec: a
+// mount the target cannot traverse, a device node that was skipped, a
+// writable directory that ended up read-only. From outside, all of them look
+// alike -- the target exits before its entry point and the only evidence is
+// what the target printed, which is nothing.
+//
+// The dump is opt-in through OCC_DEBUG_CONTAINER=1 rather than a flag,
+// because the process that needs to read it is the target's parent, and a
+// flag would have to be threaded through the container setup to reach this
+// point. An environment variable is already in the environment.
+//
+// Nothing here is needed for the run to be correct. A run without the
+// variable does no more work than a check of the environment block it was
+// handed.
+void debug_dump_container(const std::vector<std::string>& envp) {
+    bool wanted = false;
+    for (const std::string& e : envp) {
+        if (e == "OCC_DEBUG_CONTAINER=1") {
+            wanted = true;
+            break;
+        }
+    }
+    if (!wanted) {
+        return;
+    }
+
+    auto write_all = [](int fd, const std::string& s) {
+        std::size_t done = 0;
+        while (done < s.size()) {
+            auto w = sys::write(fd, s.data() + done, s.size() - done);
+            if (w.failed() || w.value == 0) {
+                return;
+            }
+            done += static_cast<std::size_t>(w.value);
+        }
+    };
+
+    write_all(2, "occ: container view\n");
+    if (auto mounts = fs::read_file("/proc/self/mounts")) {
+        write_all(2, "--- /proc/self/mounts ---\n");
+        write_all(2, *mounts);
+    }
+    write_all(2, "--- environment ---\n");
+    for (const std::string& e : envp) {
+        write_all(2, e + "\n");
+    }
+    write_all(2, "--- end occ container view ---\n");
+}
+
 int child_exec(const std::string& path, const std::vector<std::string>& argv,
                const std::vector<std::string>& envp) {
     std::vector<char*> argv_ptrs;
@@ -1019,6 +1172,8 @@ int child_exec(const std::string& path, const std::vector<std::string>& argv,
         envp_ptrs.push_back(e.data());
     }
     envp_ptrs.push_back(nullptr);
+
+    debug_dump_container(envp);
 
     auto r = sys::execve(path.c_str(), argv_ptrs.data(), envp_ptrs.data());
     return r.failed() ? r.error : 0;

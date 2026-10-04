@@ -128,6 +128,52 @@ Unprivileged operation is possible in principle — user namespaces provide most
 of it, and the `user namespaces` check exists to confirm they are available —
 but it has not been verified and is not claimed. `docs/ROADMAP.md` lists it.
 
+## Nested container runtimes, and MS_BIND
+
+occ already runs inside a container in at least one deployment, and that is a
+case worth writing down because it fails in a way that looks like anything
+but the cause.
+
+A runtime that virtualises the mount namespace — Sysbox is the one this was
+found on — intercepts `mount(2)` and serves it from its own overlay rather
+than from the kernel's mount tree. A bind mount issued by occ is accepted,
+returns success, and does not produce a bind mount. The check is
+`/proc/self/mounts` from inside the target, and it is unambiguous: every
+mount point occ created, writable or read-only, reports as the same `overlay`
+entry as `/`, with the host's `lowerdir` and `upperdir`. The evidence that
+the runtime is the cause rather than occ is `sysboxfs` appearing in the same
+table.
+
+What breaks is any target that passes a path to another process. Wine is the
+first one, and it is a good illustration of how far the failure is from the
+fault: the `wineserver` and the loader that talks to it both `chdir` into
+`$TMPDIR/wine-<random>/server-<dev>-<ino>` and then talk over a socket named
+by a *relative* path. That works only if the two see the same directory. They
+do not — one sees its bind of the run's scratch, the other sees the overflow
+layer — so the client's six `connect` attempts get `ECONNREFUSED` and the run
+ends with
+
+```
+wine: for some mysterious reason, the wine server failed to run.
+```
+
+which names neither the mount that did not happen nor the runtime that
+skipped it.
+
+Nothing about this is specific to Wine. Any engine whose target and its
+helper process have to agree on a path will fail the same way, and the
+failure will be as far from the cause. Two things follow:
+
+- When a run inside a nested runtime fails at a point that involves two
+  processes and a path, read `/proc/self/mounts` from inside the container
+  before reading anything else. `OCC_DEBUG_CONTAINER=1` makes the container
+  print it, along with the environment it was handed, immediately before the
+  exec.
+- A host that must run Wine under occ needs a runtime that does not
+  virtualise mounts — a plain namespace-based one, or no container at all.
+  There is no configuration of occ that works around it, because the missing
+  piece is kernel semantics rather than a setting.
+
 ## Why no version matrix for kernels
 
 occ depends on kernel behaviour, not kernel API stability: `PTRACE_*` and
