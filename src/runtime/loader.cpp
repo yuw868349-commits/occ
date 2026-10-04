@@ -773,6 +773,51 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                 ResolvedImport imp;
                 imp.dll = dll;
                 imp.iat_va = base + iat_cursor + 8 * i;
+
+                // The IAT slot has to be inside something this load mapped,
+                // and this is the check the loader did not have.
+                //
+                // The address above is computed from the file's RVA, and the
+                // only thing bounded so far is that the *name* array could be
+                // read. A malformed directory -- and the corpus has one --
+                // therefore produces an IAT at an address nothing covers, and
+                // the load reports success while handing the layer above a
+                // module that will store its imports into unmapped memory. The
+                // program faults on the store, before its first instruction,
+                // which is the same shape of failure as an unmapped entry
+                // point and is decided here for the same reason: this is the
+                // only layer holding both the address and the map.
+                //
+                // What counts as covered is the batch that was just recorded,
+                // not the section list alone. The headers are a mapped
+                // region and an import table is allowed to live in them --
+                // the parser resolves an RVA below SizeOfHeaders as a file
+                // offset precisely because the format puts things there. A
+                // check that walked the sections alone would refuse images
+                // whose imports are real, and the unit tests hold exactly
+                // such an image.
+                //
+                // An entry that fails this is skipped rather than refused.
+                // The failure is local to one import: the other descriptors
+                // in the array are real, and a load that refused the whole
+                // image because one thunk pointed outside it would refuse
+                // images that run. What the caller needs is the ones that
+                // are real, with the ones that are not left out.
+                bool slot_mapped = imp.iat_va >= base &&
+                                   imp.iat_va - base < headers_size;
+                for (const Placement& p : placements) {
+                    if (slot_mapped) {
+                        break;
+                    }
+                    if (imp.iat_va >= p.va &&
+                        imp.iat_va - p.va < p.mem_size) {
+                        slot_mapped = true;
+                    }
+                }
+                if (!slot_mapped) {
+                    continue;
+                }
+
                 constexpr std::uint64_t kOrdinalFlag = 0x8000000000000000ULL;
                 if ((value & kOrdinalFlag) != 0) {
                     imp.by_ordinal = true;

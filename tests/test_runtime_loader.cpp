@@ -967,6 +967,13 @@ void test_loader_rounds_section_sizes_to_the_page() {
 // and leaves the addresses zero -- which is what lets `occ check` describe
 // an image without an implementation of the API existing.
 void test_loader_walks_imports() {
+    // This image keeps its whole import table in the headers, below
+    // SizeOfHeaders, where the parser resolves an RVA as a file offset. It is
+    // the shape a linker produces and the one a slot-coverage check has to
+    // agree with: a loader that demanded every slot be inside a section
+    // would refuse this image, and refusing it would be wrong. The companion
+    // is test_loader_drops_an_import_whose_slot_is_unmapped, which is the
+    // other direction.
     // One import descriptor and two hint/name entries, placed in the tail
     // the builder appends after the section data. The loader resolves RVAs
     // through the parser, and a tail is in no section -- so the fixture
@@ -1708,7 +1715,98 @@ void test_loads_the_handwritten_pe() {
     }
 }
 
+// An import whose IAT slot falls outside everything the load mapped is left
+// out of the module rather than reported at an address that cannot be
+// written.
+//
+// The loader computes the slot from the file's RVA and used to record it
+// without asking whether anything covered it. A directory pointing past every
+// section therefore produced a module that reported success and would have
+// stored its own imports into unmapped memory -- a fault before the program's
+// first instruction, from a load that said it worked.
+//
+// The shape is the one the fuzz corpus produced: a real, readable import
+// table whose IAT array is addressed past the end of everything the load
+// placed. The names stay where the parser can read them, because a table that
+// could not be read produces no imports at all and would exercise nothing --
+// the point is a slot that reads and then cannot be written.
+void test_loader_drops_an_import_whose_slot_is_unmapped() {
+    std::vector<std::uint8_t> tail(0x200, 0);
+    const std::uint32_t name0 = 0x10;  // hint + "CreateFileW"
+    const std::uint32_t dll_at = 0x40;  // "kernel32.dll"
+    const std::uint32_t thunk_at = 0x60;
+    const std::uint32_t iat_at = 0x80;
+    const std::uint32_t desc_at = 0xA0;
+    const std::size_t tail_at = 0x400;
+
+    put16(tail, name0, 0);
+    std::memcpy(&tail[name0 + 2], "CreateFileW", 12);
+    std::memcpy(&tail[dll_at], "kernel32.dll", 13);
+
+    const std::uint32_t thunk_base =
+        static_cast<std::uint32_t>(tail_at + thunk_at);
+    // The IAT array is the thing moved out of the map. It goes to 0x8000:
+    // inside the image's declared size, so nothing else refuses the load
+    // first, and past the end of the only section, so nothing covers it.
+    const std::uint32_t iat_base = 0x8000;
+
+    // One entry, and then the terminator. A second entry would be walked the
+    // same way and dropped the same way; one is enough to make the claim and
+    // keeps the failure attributable to the slot rather than to a count.
+    put64(tail, thunk_at + 0, static_cast<std::uint64_t>(tail_at + name0));
+    put64(tail, thunk_at + 8, 0);
+    put64(tail, iat_at + 0, static_cast<std::uint64_t>(tail_at + name0));
+    put64(tail, iat_at + 8, 0);
+
+    put32(tail, desc_at + 0, thunk_base);
+    put32(tail, desc_at + 12, static_cast<std::uint32_t>(tail_at + dll_at));
+    put32(tail, desc_at + 16, iat_base);
+
+    Spec s;
+    s.sections.push_back({".text", 0x1000, 0x200, 0x200,
+                          kScnExecute | kScnRead});
+    // SizeOfHeaders covers the whole tail, so the descriptor, the names and
+    // the thunk array are all at RVAs the parser resolves as file offsets --
+    // inside the header region the load maps. Only the IAT is outside it.
+    s.headers_size_override =
+        static_cast<std::uint32_t>(tail_at + tail.size());
+    s.image_size_override = 0x10000;
+    s.tail = tail;
+
+    Built b = build(s);
+    const std::size_t coff = kDosSize + 4;
+    const std::size_t opt = coff + 4 + kCoffSize;
+    const std::size_t dirs = opt + 112;
+    put32(b.bytes, dirs + 1 * 8, static_cast<std::uint32_t>(tail_at + desc_at));
+    put32(b.bytes, dirs + 1 * 8 + 4, 40);
+
+    const PeImage p = parse_image(b.bytes);
+    check(p.ok(), "unmapped slot: the fixture parses");
+
+    AddressSpace sp;
+    const auto r = load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()}, 0, sp,
+                              LoadContext{});
+    // The load is not refused. The sections are well formed and the image is
+    // real; refusing it would refuse images that run. What changes is what
+    // the module reports.
+    check(r.ok, "unmapped slot: the load still succeeds");
+
+    check(r.module.imports.empty(),
+          "unmapped slot: no import is reported at an address that is not mapped");
+
+    // The claim is about the address space and not only about the count. An
+    // import recorded at an address the space does not contain is the defect
+    // this test exists for, and a count alone would also be satisfied by a
+    // loader that reported one at a stray address.
+    for (const auto& imp : r.module.imports) {
+        check(sp.find(imp.iat_va) != nullptr,
+              "unmapped slot: every reported slot is inside the map");
+    }
+}
+
+
 } // namespace
+
 
 int main() {
     test_record_window_check_does_not_wrap();
@@ -1728,6 +1826,7 @@ int main() {
     test_loader_rounds_section_sizes_to_the_page();
     test_loader_walks_imports();
     test_loader_reads_an_ordinal_import();
+    test_loader_drops_an_import_whose_slot_is_unmapped();
     test_loader_refuses_a_second_load_at_the_same_base();
     test_a_refused_load_leaves_the_space_alone();
     test_loader_refuses_an_unrunnable_entry_point();
