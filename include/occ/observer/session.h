@@ -256,10 +256,15 @@ public:
         : tracer_(&tracer), breakpoints_(&breakpoints), pid_(pid),
           events_(&events) {}
 
-    // Handles one decoded packet and produces the response payload. An
-    // empty response means the packet is not supported, which the protocol
-    // defines as an answer rather than a failure.
-    [[nodiscard]] std::string handle(std::string_view packet) noexcept;
+    // Handles one decoded packet and produces the response.
+    //
+    // The return is a Reply rather than a string because the two ways of
+    // having nothing to say are not the same: "unsupported" is a packet
+    // with an empty body, and "not yet" is silence, and only the handler
+    // knows which one this request calls for. A continue is the case that
+    // separates them -- it is not a question, so there is nothing to send
+    // until the target stops again.
+    [[nodiscard]] Reply handle(std::string_view packet) noexcept;
 
     // True when the client asked to detach. The loop uses it to stop.
     [[nodiscard]] bool detached() const noexcept { return detached_; }

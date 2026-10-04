@@ -23,7 +23,7 @@ the observation layer is the product, and it is the deepest part.
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 1,532 assertions across twelve binaries. The counts are what
+The test suite is 1,562 assertions across thirteen binaries. The counts are what
 the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
@@ -32,7 +32,7 @@ none to a grep:
 |---|---|
 | `test_engine` | 419 |
 | `test_pe` | 278 |
-| `test_observer` | 262 |
+| `test_observer` | 263 |
 | `test_elf` | 150 |
 | `test_ntdll_probes` | 102 |
 | `test_uprobe` | 84 |
@@ -41,7 +41,15 @@ none to a grep:
 | `test_event` | 36 |
 | `test_detect` | 36 |
 | `test_probe_wiring` | 36 |
+| `test_gdb_interop` | 29 |
 | `test_container` | 25 |
+
+`test_gdb_interop` is the one that does not run without a peer. It forks the
+host's gdb and drives a real attach, register read and detach through a
+listener this process serves, so the assertions are about what gdb does with
+the answers rather than about what this project thinks it sent. When gdb is
+absent it reports a skip and exits zero, and the count above is from a host
+that has one.
 
 ## What works
 
@@ -50,6 +58,24 @@ none to a grep:
 in-tree. Verified against GDB 15.1 with no warnings: registers, the target
 description, and disassembly of the target's first instructions all come back
 correct.
+
+The verification is a test rather than a claim. `tests/test_gdb_interop.cpp`
+forks the host's gdb, serves it a connection, and asserts that it attaches,
+reads a register and detaches with exit status zero — so the assertions are
+about the peer's behaviour and not this project's own codec agreeing with
+itself.
+
+That test exists because of a defect it now covers. `vMustReplyEmpty` is a
+protocol packet whose entire purpose is to confirm a stub answers an unknown
+request with an empty packet; this stub answered it with silence, and GDB
+refused the connection with `Remote replied unexpectedly to
+'vMustReplyEmpty'`. Every self-test passed throughout, because the two ways
+of having nothing to say — "not implemented" and "not yet" — were both
+spelled as an empty `std::string`, and the encoder resolved the ambiguity by
+refusing to frame an empty payload at all. They are now different types
+(`Reply::unsupported()` against `Reply::nothing()`), the encoder frames
+`$#00` as the packet it is, and the decoder accepts one instead of reporting
+a checksum failure that the sender can never correct.
 
 **The event stream.** Thirteen event kinds on a Unix domain socket, one JSON
 object per line. Dropped events are reported as their own kind rather than
@@ -189,8 +215,8 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 1,532 assertions and needs no network. Two of the twelve
-binaries need a target binary and a host that permits namespaces and seccomp;
-those are skipped rather than failed where it does not, and the skip says so in
-a note. A claim in this file that can be checked should be checked that way
-before it is believed.
+The test suite is 1,562 assertions and needs no network. Two of the thirteen
+binaries need a target binary and a host that permits namespaces and seccomp,
+and one needs a gdb on `PATH`; those are skipped rather than failed where the
+host does not have them, and the skip says so in a note. A claim in this file
+that can be checked should be checked that way before it is believed.

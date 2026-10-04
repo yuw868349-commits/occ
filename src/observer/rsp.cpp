@@ -70,16 +70,17 @@ std::string escape(std::string_view in) noexcept {
 }
 
 std::string encode_packet(std::string_view payload) noexcept {
-    // An empty payload has no frame. "$#00" would checksum correctly -- the
-    // sum of no bytes is zero -- and the decoder now refuses it as the
-    // framing error it is, so emitting one would produce a packet this
-    // project sends and then rejects on receipt. An empty return says
-    // "nothing to send" to a caller that already checks for it, which is
-    // what an encoder should say rather than a frame that cannot arrive.
-    if (payload.empty()) {
-        return std::string{};
-    }
-
+    // An empty payload becomes "$#00", and that is the protocol's "not
+    // implemented" answer rather than an error. It is a real packet: the
+    // framing is there, the checksum of nothing is zero, and a peer reads
+    // it as a reply. vMustReplyEmpty is the packet that exists to check
+    // exactly this, and a stub that could only answer it with silence is
+    // one a debugger reports as having hung.
+    //
+    // "Send nothing" is a different decision and is made by the caller.
+    // This function cannot tell the two apart -- both arrive as an empty
+    // string_view -- so it does not try: it frames what it is given, and
+    // silence is expressed by not calling it.
     const std::string escaped = escape(payload);
 
     unsigned int sum = 0;
@@ -179,28 +180,18 @@ std::size_t PacketDecoder::feed(const char* data, std::size_t length) noexcept {
                 static_cast<unsigned int>((checksum_hi_ << 4) | d);
 
             Packet p;
-            // A packet with no payload is not a packet. Its checksum is the
-            // sum of nothing, which is zero, so a peer that sent "$#00" --
-            // or a byte stream that happened to contain a start and an end
-            // with nothing between them -- would otherwise be answered with
-            // an acknowledgment and handed to the dispatcher as a packet
-            // whose command name is the empty string.
+            // The checksum is the one thing this layer judges. An empty
+            // payload is not an exception to that: "$#00" carries the
+            // checksum of no bytes, which is zero, and a peer that sent it
+            // sent a well-formed packet. Accepting it costs nothing and
+            // refusing it costs the peer a retransmission it can never
+            // satisfy -- it would resend "$#00" forever and be told each
+            // time that the checksum was wrong.
             //
-            // Nothing can act on that. The dispatcher matches on the first
-            // byte, an empty payload has none, and the packet is dropped
-            // silently: no reply to the peer, no event, no error. A stream
-            // that produces nothing but valid-looking empty packets looks
-            // exactly like a debugger that has stopped responding, which is
-            // the hardest kind of failure to diagnose and the easiest to
-            // avoid here.
-            //
-            // It is reported as a bad checksum rather than silently dropped,
-            // because it is a framing error and the peer should be told to
-            // resend rather than told the packet arrived.
-            if (payload_.empty()) {
-                p.checksum_ok = false;
-                want_retransmit_ = true;
-            } else if (sum == expected) {
+            // What an empty payload means is a question for the layer above,
+            // which answers "unsupported" and moves on. This layer only
+            // says whether the bytes arrived intact.
+            if (sum == expected) {
                 p.data = unescape(payload_);
                 p.checksum_ok = true;
                 last_ = raw_;

@@ -486,9 +486,14 @@ PathRead read_remote_path(Tracer& tracer, int pid, std::uint64_t addr) {
 
 } // namespace
 
-std::string DebugServer::handle(std::string_view packet) noexcept {
+Reply DebugServer::handle(std::string_view packet) noexcept {
     if (packet.empty()) {
-        return {};
+        // A packet with no command byte. The peer sent "$#00", which is a
+        // well-formed packet that asks for nothing in particular; the
+        // protocol's answer to a request it does not implement is an empty
+        // packet, so it gets one back. Going silent here would be the one
+        // answer vMustReplyEmpty exists to catch.
+        return Reply::unsupported();
     }
 
     const char cmd = packet[0];
@@ -508,26 +513,30 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
         if (tracer_->get_regs(pid_, now).ok()) {
             pc = gdb_register(now, kPcRegnum);
         }
-        return encode_stop_reply(gdb_signal_for_trap(), pc);
+        return Reply::packet(encode_stop_reply(gdb_signal_for_trap(), pc));
     }
 
     case 'v':
         // Only vCont is implemented. A 'v' packet for anything else answers
-        // empty, which is what the protocol defines as unsupported, and the
-        // debugger falls back to the single-threaded packets it knows.
+        // with an empty packet, which is what the protocol defines as
+        // unsupported, and the debugger falls back to the single-threaded
+        // packets it knows. vMustReplyEmpty is the case that makes this
+        // observable: it is named for the answer, and a stub that stays
+        // silent fails it.
         if (starts_with(args, "Cont")) {
-            return handle_vcont(args.substr(std::string_view{"Cont"}.size()));
+            return Reply::packet(
+                handle_vcont(args.substr(std::string_view{"Cont"}.size())));
         }
-        return {};
+        return Reply::unsupported();
 
     case 'q':
-        return handle_query(args);
+        return Reply::packet(handle_query(args));
 
     case 'g':
-        return handle_read_registers();
+        return Reply::packet(handle_read_registers());
 
     case 'G':
-        return handle_write_registers(args);
+        return Reply::packet(handle_write_registers(args));
 
     case 'p': {
         // Read one register by number. The number is the one GDB assigned in
@@ -545,35 +554,46 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
         // latter wants eight digits and would refuse both.
         std::uint64_t which = 0;
         if (!parse_hex_number(args, which)) {
-            return {};
+            return Reply::unsupported();
         }
         if (which > kOrigRaxRegnum) {
-            return {};
+            // Out of range is not "unsupported": the packet is understood
+            // and the register does not exist. An empty packet says the
+            // former, which would send the debugger looking for a
+            // different way to ask.
+            return Reply::packet(std::string{});
         }
         Registers r{};
         if (tracer_->get_regs(pid_, r).failed()) {
-            return "E01";
+            return Reply::packet("E01");
         }
-        return hex_u64_le(gdb_register(r, static_cast<std::size_t>(which)));
+        return Reply::packet(
+            hex_u64_le(gdb_register(r, static_cast<std::size_t>(which))));
     }
 
     case 'm':
-        return handle_read_memory(args);
+        return Reply::packet(handle_read_memory(args));
 
     case 'M':
-        return handle_write_memory(args);
+        return Reply::packet(handle_write_memory(args));
 
     case 'Z':
     case 'z':
-        return handle_breakpoint(packet);
+        return Reply::packet(handle_breakpoint(packet));
 
     case 'H':
-        return handle_thread();
+        return Reply::packet(handle_thread());
 
     case 'c':
         // Continue, optionally with a signal to deliver. The session does
         // not resume inside the handler: the loop owns the tracee and has
         // to be the one that decides when it runs.
+        //
+        // Nothing is sent now, and that is the correct answer rather than
+        // an omission. A continue is not a question: the answer is the
+        // stop reply, which the loop sends when the target stops again. An
+        // empty packet here would say "unsupported" and the debugger would
+        // take it for a target that cannot be resumed.
         resume_requested_ = true;
         step_ = false;
         resume_signal_ = 0;
@@ -585,32 +605,37 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
                 resume_signal_ = static_cast<int>(sig);
             }
         }
-        return {};
+        return Reply::nothing();
 
     case 's':
         resume_requested_ = true;
         step_ = true;
         resume_signal_ = 0;
-        return {};
+        return Reply::nothing();
 
     case 'D':
         detached_ = true;
-        return "OK";
+        return Reply::packet("OK");
 
     case 'k':
         // A kill request. The session reports it as a detach and lets the
         // caller decide; killing a process the user did not ask to kill is
-        // not something a debugger stub does on its own.
+        // not something a debugger stub does on its own. The detach is the
+        // answer and it is carried by the session ending, so nothing is
+        // sent on the wire.
         detached_ = true;
-        return {};
+        return Reply::nothing();
 
     case '#':
-        return {};
+        // The checksum the decoder has already consumed never reaches a
+        // command byte. Reaching here means a payload that began with '#',
+        // which no request does.
+        return Reply::unsupported();
 
     default:
-        // Anything else is unsupported, and the empty response is the
+        // Anything else is unsupported, and an empty packet is the
         // protocol's way of saying so.
-        return {};
+        return Reply::unsupported();
     }
 }
 
@@ -1526,8 +1551,16 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
                         // debugger that asked a question and got silence
                         // waits for the answer forever, which is a stub that
                         // looks hung rather than one that looks limited.
-                        const std::string reply = server.handle(request);
-                        (void)connection.send_packet(reply);
+                        //
+                        // The handler decides which of the two applies, and
+                        // Reply carries that decision rather than leaving it
+                        // to be re-derived from an empty string -- where the
+                        // two cases are indistinguishable and the wrong one
+                        // is easy to pick.
+                        const Reply reply = server.handle(request);
+                        if (reply.send) {
+                            (void)connection.send_packet(reply.payload);
+                        }
                         if (server.detached()) {
                             (void)tracer.detach(config.pid, 0);
                             connection.close();

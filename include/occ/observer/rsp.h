@@ -21,11 +21,20 @@
 // Packets outside that set are answered with an empty response, which the
 // protocol defines as "not supported" -- an answer a debugger understands,
 // rather than a disconnect it would have to guess at.
+//
+// "An empty response" is a framed packet with nothing between the framing
+// bytes, and it is not the same thing as sending nothing. The two look
+// alike in a std::string -- both are an empty string -- and they mean
+// opposite things on the wire: "$#00" is a reply the peer can act on, and
+// silence is what a peer waits on until it times out. Reply is that
+// distinction given a type, so a handler cannot express one while meaning
+// the other.
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace occ::obs {
@@ -35,10 +44,66 @@ struct Packet {
     // The packet's payload, with the framing and checksum removed and the
     // escapes undone. A command packet begins with a letter; a response
     // packet is whatever was queued.
+    //
+    // An empty payload is possible and is not a decode failure: "$#00" is
+    // a well-formed packet, and the protocol's own vMustReplyEmpty exists
+    // to send one. A consumer has to decide what it means, which for this
+    // stub is "unsupported".
     std::string data;
     // False when the checksum did not match, in which case the payload is
     // empty and the caller has to ask for a retransmission.
     bool checksum_ok = true;
+};
+
+// What a handler has to say back to a request.
+//
+// The protocol has exactly two ways to be unhelpful and they are not
+// interchangeable:
+//
+//   - "nothing to send" -- the request was acted on and the answer, if any,
+//     comes from somewhere else. A continue is the case that matters: the
+//     resume is the answer, and the stop reply follows when the target
+//     stops again. A stub that framed an empty packet here would tell the
+//     debugger "unsupported", and the debugger would conclude the target
+//     cannot be resumed.
+//
+//   - "an empty packet" -- the request was understood and is not
+//     implemented. This is "$#00" on the wire, and it is a real packet: it
+//     has framing and a checksum, and the peer reads it as an answer.
+//     vMustReplyEmpty exists precisely to test this, because a stub that
+//     cannot produce it is one that goes silent on every packet it does
+//     not know, which reads as a hung connection.
+//
+// Encoding either as the other is the bug this type exists to prevent.
+struct Reply {
+    // When false, nothing is written and the packet is answered by the
+    // session loop rather than here.
+    bool send = true;
+    // The payload to frame. Ignored when `send` is false. An empty payload
+    // with `send` true is the "unsupported" answer and frames as "$#00".
+    std::string payload;
+
+    // An answer the peer can read.
+    static Reply packet(std::string body) noexcept {
+        Reply r;
+        r.send = true;
+        r.payload = std::move(body);
+        return r;
+    }
+
+    // The protocol's "not implemented" answer.
+    [[nodiscard]] static Reply unsupported() noexcept {
+        Reply r;
+        r.send = true;
+        return r;
+    }
+
+    // No answer now; the loop answers later or not at all.
+    [[nodiscard]] static Reply nothing() noexcept {
+        Reply r;
+        r.send = false;
+        return r;
+    }
 };
 
 // Incrementally decodes a byte stream into packets. Bytes are fed in as they
@@ -108,6 +173,12 @@ private:
 
 // Encodes a payload into a framed packet. The payload is escaped and the
 // checksum computed.
+//
+// An empty payload frames as "$#00" and that is a valid result, not a
+// failure: the protocol's "not implemented" answer is a packet with no
+// payload, and the checksum of nothing is zero. A caller that means
+// "send nothing" must say so before calling this -- by not calling it --
+// because this function cannot tell the two apart and must not guess.
 [[nodiscard]] std::string encode_packet(std::string_view payload) noexcept;
 
 // Undoes the protocol's escape sequences. '}' is the escape byte and the

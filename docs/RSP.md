@@ -207,8 +207,29 @@ lets the caller decide.
 
 ### `#` — deprecated
 
-Answers empty. Extended-remote mode is not implemented, and this packet is
-what a stub that does not want extended mode uses to say so.
+Answers empty, which is the protocol's "unsupported". Extended-remote mode is
+not implemented, and this packet is what a stub that does not want extended
+mode uses to say so.
+
+### `vMustReplyEmpty`
+
+Answers empty, and the name is the requirement. The packet exists so a
+debugger can confirm that a stub answers an *unknown* request with an empty
+packet rather than with nothing at all, and it is the only way to tell those
+two apart over the wire.
+
+This stub answered it with silence until the answer was made a distinct type.
+The reason is worth keeping because the mistake is easy to repeat: "not
+implemented" is `$#00`, a framed packet with no payload, and "not now" is no
+bytes at all — a continue is the request that means this, and its answer is
+the stop reply that arrives later. Both were spelled as an empty
+`std::string`, so the encoder could not tell them apart and settled on
+sending nothing for both. GDB reported the consequence as `Remote replied
+unexpectedly to 'vMustReplyEmpty'` at `target remote`, before anything else
+could be tried.
+
+`Reply::unsupported()` and `Reply::nothing()` are now different values and
+`tests/test_gdb_interop.cpp` asserts on both, in both directions.
 
 ## What is not implemented
 
@@ -218,8 +239,9 @@ monitor command channel. `P` — one-register write; use `G`. `vAttach`,
 `vRun` — occ starts the process itself and attaches to what it started.
 Multiprocess and multi-thread `vCont`. Non-stop mode. Reverse execution.
 
-None of these are silent. Each answers empty, which is the protocol's own
-"unsupported", and each is a thing GDB has a working fallback for.
+None of these are silent. Each answers with `$#00` — the protocol's own
+"unsupported", framed and checksummed like any other reply — and each is a
+thing GDB has a working fallback for.
 
 ## Interoperability
 
@@ -263,3 +285,11 @@ Every feature announced in `qSupported` is exercised by the test suite;
 `include/occ/observer/session.h` notes this as an invariant, because a
 feature announced and not implemented is the failure mode this protocol hides
 best.
+
+The transcript above is a manual run, and a manual run is a claim that decays:
+the same paragraph was here while `target remote` was failing, and it looked
+exactly like this. What keeps it honest is `tests/test_gdb_interop.cpp`,
+which forks the host's gdb, serves it over a listener, and fails if gdb does
+not attach and detach with exit status zero. It runs under `ctest` with the
+rest, and it skips — reporting which binary was missing — rather than passing
+on a host that has no gdb.

@@ -59,41 +59,49 @@ void test_checksum() {
           "the checksum is the low byte of the payload sum");
 }
 
-// Found by the fuzz harness. A packet with no payload has a checksum of
-// zero -- the sum of no bytes -- so "$#00" passes the checksum test and
-// produces a packet that claims to be valid and carries nothing. The
-// dispatcher matches on the first byte, an empty payload has none, and the
-// packet is dropped with no reply, no event and no error: a stream of them
-// looks exactly like a debugger that has stopped responding.
-void test_empty_payload_is_not_a_packet() {
+// A packet with no payload is a packet.
+//
+// This test previously asserted the opposite, and the assertion was wrong.
+// The checksum of no bytes is zero, so "$#00" is well-formed by the
+// protocol's own rule; refusing it as a checksum failure makes a peer that
+// sent one retransmit forever, because its retransmission is the same
+// bytes and they will fail the same way. The protocol uses exactly this
+// packet for "not implemented" -- the request vMustReplyEmpty is named
+// after -- so a stub that cannot accept it cannot hold a conversation with
+// a debugger that follows up an unknown packet with it.
+//
+// What an empty payload *means* is decided one layer up, where it answers
+// "unsupported". This layer only judges the bytes.
+void test_empty_payload_is_a_packet() {
     PacketDecoder d;
     check(d.feed("$#00") == 1, "an empty frame is still framed");
     const Packet p = d.take();
-    check(!p.checksum_ok, "an empty payload fails the checksum test");
+    check(p.checksum_ok, "an empty payload passes the checksum test");
     check(p.data.empty(), "an empty payload carries no data");
 
-    // The same thing arriving in the middle of a stream, which is where a
-    // fuzzer found it: a real packet, then a start byte, then an end.
+    // The same thing arriving in the middle of a stream: a real packet,
+    // then an empty one, then another real one. All three are packets.
     PacketDecoder d2;
     const std::string wire = encode_packet("g") + "$#00" + encode_packet("m1,1");
     check(d2.feed(wire) == 3, "the good packets around it still decode");
     const Packet first = d2.take();
     check(first.checksum_ok && first.data == "g", "the first packet is intact");
     const Packet middle = d2.take();
-    check(!middle.checksum_ok, "the empty frame in the middle is refused");
+    check(middle.checksum_ok, "the empty frame is a packet");
+    check(middle.data.empty(), "and it carries no payload");
     const Packet last = d2.take();
     check(last.checksum_ok && last.data == "m1,1",
           "the packet after it is intact");
 }
 
-// The two halves of the codec have to agree. An encoder that produced "$#00"
-// for an empty payload would be sending something its own decoder refuses,
-// which is how a codec ends up retransmitting a packet forever.
-void test_encode_refuses_empty_payload() {
-    check(encode_packet("").empty(),
-          "an empty payload is not framed at all");
-    // One byte is the smallest thing that can be framed, so this is the
-    // boundary: the refusal above is about emptiness, not about size.
+// The two halves of the codec have to agree, in this direction: an encoder
+// that framed an empty payload into bytes its own decoder refused would
+// send a packet it could never receive. They now agree -- the encoder
+// frames "$#00" and the decoder accepts it -- and the boundary is that
+// one byte is still framed the same way it always was.
+void test_encode_frames_empty_payload() {
+    check(encode_packet("") == "$#00",
+          "an empty payload frames as the protocol's empty packet");
     check(encode_packet("g") == "$g#67", "a one-byte payload is framed");
 }
 
@@ -1279,8 +1287,8 @@ void test_parse_vcont() {
 
 int main() {
     test_checksum();
-    test_empty_payload_is_not_a_packet();
-    test_encode_refuses_empty_payload();
+    test_empty_payload_is_a_packet();
+    test_encode_frames_empty_payload();
     test_single_packet();
     test_split_across_reads();
     test_two_packets_in_one_read();
