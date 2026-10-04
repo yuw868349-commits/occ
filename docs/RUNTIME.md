@@ -193,6 +193,97 @@ plan, the relocation walk and the entry-point check all happen before
 the first region is recorded, and the recording itself goes through
 `record_batch`, which is all-or-nothing.
 
+**What the loader does not do yet, stated plainly.** It reports an
+image's shape; it does not run it. Nothing is mapped from the file,
+no relocation is written, and no IAT slot is filled -- the loader
+computes every one of those values and stops before the first store. So
+the milestone is not "M1 is done" but "M1's decisions are made and
+checked, and the stores that follow them are not". The layer that will
+perform the stores is below.
+
+### The mapping layer — `include/occ/runtime/mapper.h`
+
+`AddressSpace` is a ledger. It was deliberately built as one: every rule
+in `record()` and `record_batch()` is reachable without a syscall, which is
+what makes the overlap and window rules testable against spaces that were
+never mapped. It also means the ledger cannot create memory.
+
+`Mapper` is the hand that moves the kernel and the ledger in one step, and
+it exists because the two cannot be allowed to disagree. Between "the kernel
+mapped it" and "the ledger recorded it" there is a window in which a region
+exists in memory and no operation can find it, or exists in the map and
+nothing will ever free it. So the operations that create and destroy memory
+come in pairs — `map`/`unmap`, `map_batch`/`remove`, `protect`/
+`set_protection` — and there is deliberately no public way to map memory
+into an address space that does not know about it.
+
+Three decisions in it are the ones that matter, and each is a place where
+the obvious implementation is wrong:
+
+  * **`MAP_FIXED_NOREPLACE`, conditionally.** Without it, a mapping at an
+    address that is already mapped does not fail — it silently replaces what
+    was there, and the ledger still describes the old region, and the
+    process's map is now a lie about its own memory. With a check-then-map
+    instead, the check and the act are two syscalls and two threads both
+    find the address free. The flag makes the kernel do the check as part of
+    the mapping, which is the only place the answer cannot change in
+    between.
+
+    The flag is passed only when the caller named an address, and that
+    condition is a kernel behaviour rather than a preference: asked with a
+    null address the kernel does not search for a hole, it fails with EPERM,
+    because the search starts at zero and zero is below `mmap_min_addr`.
+    A null address is the one case where the flag has nothing to say, since
+    the kernel's own search already finds a hole and a hole is not something
+    that can be silently replaced.
+
+  * **`PAGE_WRITECOPY` translates to `PROT_READ`.** Linux's private mapping
+    is already copy-on-write, so the copy is the mapping's own semantics
+    and the page must not be writable. Translating it to `PROT_READ|PROT_WRITE`
+    would let a program write to a page whose entire purpose is that it must
+    not, and the ledger would say `PAGE_WRITECOPY` while the kernel said
+    otherwise. The two write-copy protections and the four executable ones
+    are translated by enumeration rather than by bit test, because the
+    Windows constants are powers of two that do not compose into the
+    protection they name — `PAGE_EXECUTE` is 0x10 and `PAGE_EXECUTE_READ` is
+    0x20, so neither shares a bit with the other, and `PAGE_READWRITE` is
+    0x04, so a mask that included 0x04 would mark every writable region
+    executable.
+
+  * **A modifier is refused, not stripped.** `protect` returns
+    `NotImplemented` for `PAGE_GUARD`, `PAGE_NOCACHE` and
+    `PAGE_WRITECOMBINE` rather than applying the base protection. A guard
+    page that arrives as ordinary read-write memory is a buffer overflow that
+    does not fault, and the reason the modifier bits are separate from the
+    protections in the type at all is that a reader who treats them as
+    protections would accept `PAGE_GUARD` alone and map something with no
+    access. Linux's closest equivalent is `PROT_NONE` plus a signal handler,
+    which is a mechanism this runtime does not have a place for yet.
+
+`unmap` and `protect` address a whole region and refuse an address in the
+middle of one. This is stricter than `NtUnmapViewOfSection` and
+`NtProtectVirtualMemory`, which both take a range and split, and it is
+strict on purpose: a split makes "the region covering this address" a
+different answer before and after a call a reader would call the same call.
+It is also the limit that lets `Region::protection_changes` mean what its
+comment says — a per-region count is only a per-region count.
+
+`tests/test_mapper.cpp` holds every mapping case to one rule: a case that
+claims a mapping works must prove it by writing to the bytes and reading
+them back, and a case that claims a protection was applied must prove it by
+failing to touch them. The accesses that must fault are attempted in a
+forked child, because a `SIGSEGV` in the test process is a process that
+died having proved nothing. The read-only region of a batch is checked
+three ways — the child faults on write, the ledger says `ReadOnly`, and
+`/proc/self/maps` says `r--p` — because a mapper that translated every
+protection to `PROT_READ|PROT_WRITE` would return success for all of them
+and only the kernel's own map distinguishes them.
+
+84 checks. Three mutations were tried against it and each is caught by the
+case written for it: removing `MAP_FIXED_NOREPLACE` (11 failures), removing
+the batch's rollback (1 failure, the case that exists for exactly that), and
+stripping modifiers instead of refusing them (6 failures).
+
 ### M2 — ntdll, memory and handles
 
 `NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtFreeVirtualMemory`,

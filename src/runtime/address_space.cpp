@@ -316,6 +316,73 @@ Result<std::uint64_t> AddressSpace::record_batch(
     return out;
 }
 
+Result<std::uint64_t> AddressSpace::remove(std::uint64_t base) noexcept {
+    Result<std::uint64_t> out;
+
+    // The search is the same one record() and find() use, so the region this
+    // finds is a region those two would have found. A lower_bound on the base
+    // rather than an upper_bound on an address, because the question here is
+    // "which region starts exactly here" and an address search would find the
+    // region containing a base that is in the middle of one.
+    const auto at = std::lower_bound(
+        regions_.begin(), regions_.end(), base,
+        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
+
+    if (at == regions_.end() || at->base != base) {
+        out.status = Status::InvalidAddress;
+        return out;
+    }
+
+    // The size is read before the erase because the region is gone afterwards
+    // and the result carries it. A caller that wants to know what it just
+    // released cannot ask the map afterwards.
+    out.value = at->size;
+    regions_.erase(at);
+
+    // The allocation count does not move. It counts allocations, and it is
+    // the sequence number a replay hands out; a region being forgotten is not
+    // an allocation, and a replay that skipped a number would hand two
+    // different allocations the same address.
+    out.status = Status::Success;
+    return out;
+}
+
+Result<std::uint32_t> AddressSpace::set_protection(
+    std::uint64_t base, PageProtection protection) noexcept {
+    Result<std::uint32_t> out;
+
+    const auto at = std::lower_bound(
+        regions_.begin(), regions_.end(), base,
+        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
+
+    if (at == regions_.end() || at->base != base) {
+        out.status = Status::InvalidAddress;
+        return out;
+    }
+
+    at->protection = protection;
+    // The executable flag is recomputed rather than set from the new
+    // protection's bits at the call site, because it is an enumeration
+    // question and make_region() is where the enumeration lives. Recomputing
+    // it here by calling nothing would be a second copy of a switch that
+    // already exists; so the region keeps the answer it was given and this
+    // updates it through the same helper the constructor uses.
+    //
+    // Which means the helper has to be reachable from here, and it is
+    // declared above in this file, so the call is a name rather than a
+    // duplicate switch. This is the second reader of make_region's rule and
+    // the reason it is a function.
+    Region updated = make_region(at->base, at->size, protection, at->kind,
+                                 at->section, at->section_index);
+    updated.initial_protection = at->initial_protection;
+    updated.protection_changes = at->protection_changes + 1;
+    *at = std::move(updated);
+
+    out.value = at->protection_changes;
+    out.status = Status::Success;
+    return out;
+}
+
 const Region* AddressSpace::find(std::uint64_t addr) const noexcept {
     // The same comparison as the insert's search, so a region that the
     // insert would have rejected as overlapping is a region this finds.

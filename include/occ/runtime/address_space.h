@@ -16,6 +16,15 @@
 // lookup is the only difference: everything below it is the same code, so
 // there is no pair of behaviours to keep in step.
 //
+// The operations that create and destroy memory are on Mapper, in
+// mapper.h, and this class holds the map they move. The split is the one the
+// second paragraph below is about: this is a ledger, and a ledger that
+// created memory would be untestable against a space that was never mapped.
+// What the two must not do is disagree, which is why the pairs are paired --
+// there is no public way to map memory into a space that does not know about
+// it, and no way to forget a region whose memory is still there except
+// remove(), which says in its comment what that costs.
+//
 // The second thing this type exists for is that Wine's mappings live in the
 // server and these live here. That is what makes "which region covers this
 // address, when was it made, and with what protection" answerable at all,
@@ -315,6 +324,46 @@ public:
         std::uint32_t section_index = 0;
     };
     Result<std::uint64_t> record_batch(const std::vector<Candidate>& batch) noexcept;
+
+    // Forgets a region. Does not unmap it.
+    //
+    // This exists for the mapper in mapper.h, and it exists as a separate
+    // operation from record()'s absence for the reason the whole of that file
+    // is about: the ledger and the kernel have to move together, and the
+    // only way to let a caller with a kernel mapping in hand update the
+    // ledger is to give it the one operation that updates the ledger alone.
+    //
+    // A caller that has not unmapped the memory and calls this has created a
+    // mapping no operation can reach again. The header comment on the class
+    // says the bookkeeping is not a cache of the kernel's state, and this is
+    // where that stops being a defence and becomes a hazard: a ledger that
+    // disagrees with the kernel is not a slow ledger, it is a wrong one. The
+    // mapper orders the two operations so that the disagreement is visible
+    // rather than silent.
+    //
+    // Returns the region's size, or InvalidAddress when no region starts at
+    // `base`. Requiring the start rather than any address inside is the same
+    // rule unmap() follows and for the same reason: a removal of a range
+    // inside a region would have to decide what happens to the two halves,
+    // and this type does not split.
+    Result<std::uint64_t> remove(std::uint64_t base) noexcept;
+
+    // Changes a region's recorded protection and counts the change.
+    //
+    // Does not call mprotect; the mapper in mapper.h does that and calls this
+    // after the kernel has agreed, for the same reason unmap() calls remove()
+    // after the kernel has agreed. A ledger that recorded a protection the
+    // kernel never granted would answer "was this region ever writable" with
+    // a yes that never happened, and that question is the one the whole
+    // observer layer exists to answer.
+    //
+    // `initial_protection` is not touched. It is the answer to "what was this
+    // made as", and a protection change does not rewrite it.
+    //
+    // Returns the new protection change count, or InvalidAddress when no
+    // region starts at `base`.
+    Result<std::uint32_t> set_protection(std::uint64_t base,
+                                          PageProtection protection) noexcept;
 
     // Finds the region containing an address, or nothing.
     [[nodiscard]] const Region* find(std::uint64_t addr) const noexcept;
