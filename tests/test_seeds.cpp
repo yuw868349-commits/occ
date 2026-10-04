@@ -60,6 +60,14 @@ int failures = 0;
 int checks = 0;
 int skipped = 0;
 
+// Set when the generator could not be run at all, so that a second test
+// asking the same question does not report it a second time -- as a failure,
+// which is what happened before this existed: the corpus comparison skipped
+// cleanly and the reproducibility check then failed for the same missing
+// interpreter, so a host without python3 got one skip and one failure and the
+// pair said two contradictory things about the same condition.
+bool generator_unavailable = false;
+
 void check(bool ok, const char* what) {
     ++checks;
     if (!ok) {
@@ -264,6 +272,7 @@ void test_seeds_match_the_generator() {
         // to hide behind the same message.
         remove_tree(tmp);
         if (g.why == "python3 is not on PATH") {
+            generator_unavailable = true;
             note("seeds: python3 is not installed, so the corpus was not "
                  "checked against the generator; a seed can drift without "
                  "this test noticing");
@@ -406,13 +415,17 @@ void test_the_generator_is_reproducible() {
     const Generated a = run_generator(dirs[0]);
     const Generated b = run_generator(dirs[1]);
     if (!a.ran || !b.ran) {
-        // The first test already reported a missing interpreter. Reaching
-        // here means the interpreter was there and the generator still did
-        // not run, which is a fault rather than an absent tool.
-        check(false, "seeds: the generator ran twice");
+        // The corpus comparison already reported a missing interpreter and
+        // set this flag; asking again would report the same condition as a
+        // failure. Reaching here with the flag unset means the interpreter was
+        // there and the generator still did not run, which is a fault.
         for (const std::string& d : dirs) {
             remove_tree(d);
         }
+        if (generator_unavailable) {
+            return;
+        }
+        check(false, "seeds: the generator ran twice");
         return;
     }
     check(true, "seeds: the generator ran twice");
