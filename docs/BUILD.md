@@ -138,8 +138,13 @@ isolation code the binary ships, which is the point.
 
 ## Fuzz harnesses
 
+**Not built.** `fuzz/` is an empty directory, so `-DOCC_ENABLE_FUZZ=ON` fails
+configuration at `add_subdirectory(fuzz)` rather than producing harnesses. The
+commands below are what the build is intended to support once they exist; they
+do not work today.
+
 Sanitizers and libFuzzer cannot be combined with a fully static link, so
-the fuzz build is separate and dynamic:
+the fuzz build would be separate and dynamic:
 
 ```
 cmake -S . -B build-fuzz -G Ninja \
@@ -149,8 +154,9 @@ cmake -S . -B build-fuzz -G Ninja \
 cmake --build build-fuzz
 ```
 
-Nineteen hours of a corpus is not the same as correctness, but it is more
-than zero, and zero is what a parser without a harness has.
+The isolation layer is the part that most needs a harness: seccomp BPF is 338
+lines of arithmetic over a structure the kernel rejects without explaining
+why, and it currently has 11 assertions against it.
 
 ## Sanitizer build of the test suite
 
@@ -177,7 +183,7 @@ recorded because it happened.
 
 ## Reproducing a reported environment
 
-`COMPAT.md` lists hosts this has been built and run on, with the kernel
+`docs/COMPAT.md` lists hosts this has been built and run on, with the kernel
 release string, the toolchain paths, and the `occ doctor` output for each.
 A build that differs from every entry there is not wrong, it is just not
 one of the verified cases.

@@ -1,0 +1,295 @@
+# Events
+
+The event schema, field by field.
+
+The sample stream below is verbatim from a real `occ run /bin/true`. The field
+lists are not: they were read off the emitters in `src/observer/` and
+`src/runner/`, because a sample only shows the fields one particular run
+happened to produce, and a consumer needs to know which fields are always there
+and which are conditional. Where the two disagree, the emitters are right.
+
+One emitter is not in the sample and is documented here anyway, because
+knowing a kind exists but never arrives is a fact a consumer needs. See
+`file_opened` below.
+
+## Shape
+
+One JSON object per line, no array wrapper, no commas between records. The
+stream is line-delimited so that a reader can process it without buffering the
+whole session, and so that a truncated stream is still readable up to the
+truncation.
+
+Every record carries three fields, present on every event without exception:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | string | One of the thirteen names below, or `"unknown"` |
+| `session` | integer | Session id. Distinguishes concurrent sessions on one socket |
+| `t` | integer | `CLOCK_MONOTONIC` in nanoseconds |
+
+`t` is monotonic rather than wall-clock on purpose. A trace whose timestamps
+can go backwards cannot be sorted, and a target that changes the system clock
+would otherwise reorder its own history. To correlate with wall-clock, record
+both ends and offset.
+
+Addresses, sizes and offsets are **hex strings** (`"0x7f3e46875540"`). They are
+addresses, and addresses are read as hex; a decimal address in a trace is read
+wrong. Counts, indices, pids, errno and exit codes are **integers**, because
+they are quantities rather than locations.
+
+Booleans are `true`/`false`, unquoted.
+
+## The kinds
+
+`session_start`, `session_end`, `process_spawn`, `process_exit`,
+`image_loaded`, `mapping`, `file_opened`, `syscall_blocked`,
+`breakpoint_hit`, `signal`, `memory_write`, `exec`, `note`.
+
+`note` carries diagnostics from occ itself — a target that could not be
+exec'd, a capability that could not be acquired. Its `text` field is a
+sentence, not a code. Anything occ wants to say about its own behaviour goes
+here rather than to stderr, so that it lands in the same stream and in order.
+
+Its other fields depend on the `text`; there is no fixed set. A consumer should
+read `text` and treat the rest as context for that particular sentence. The
+field names that do appear, and where they come from:
+
+| `text` | Additional fields |
+|---|---|
+| the container could not be started | `stage`, `errno`, `detail` |
+| no first stop | `pid`, `errno`, `status` |
+| a breakpoint could not be installed | `address` (the detail string, not a number) |
+| write tracking is off | — |
+| write tracking armed | `regions`, `watches`, `bytes_covered`, `bytes_total`, `unwatched_regions` |
+| a region could not be watched | `base` (hex), `length` |
+| a debugger attached | `port` |
+| the debugger resumed the target | `pc` (hex), `sp` (hex), if the registers could be read |
+| chased a new mapping | `base` (hex), `length`, `watches`, `bytes_covered` |
+| syscall entry | `pid`, `nr`, `arg0`, `arg1`, `arg2` (hex) |
+| syscall exit | `pid`, `ret` |
+
+`syscall entry` and `syscall exit` are not the same kind as the rest. They are
+emitted per syscall stop whenever the observer is tracing, which `occ run
+--observe` always does, and they are the only kind that arrives in volume. A
+consumer that reads a run with observation on gets a syscall-level log as well
+as the session structure; the two are interleaved in one stream, ordered by
+`t`. There is no flag that turns them off.
+
+## A real run
+
+`occ run /bin/true`, verbatim and unedited:
+
+```json
+{"kind":"session_start","session":0,"t":3211955085839025,"target":"/bin/true","argv_count":1}
+{"kind":"image_loaded","session":0,"t":3211955085888751,"path":"/bin/true","size":26936,"ok":true,"type":3,"machine":62,"entry":"0x19f0","phnum":13,"phentsize":56,"lowest_vaddr":"0x0","highest_vaddr":"0x7000","interpreter":"/lib64/ld-linux-x86-64.so.2","executable_stack":false,"gnu_relro":true}
+{"kind":"mapping","session":0,"t":3211955085892410,"index":0,"file_offset":"0x0","vaddr":"0x0","filesz":"0xfa8","memsz":"0xfa8","readable":true,"writable":false,"executable":false,"zero_fill":"0x0"}
+{"kind":"mapping","session":0,"t":3211955085898520,"index":3,"file_offset":"0x5c90","vaddr":"0x5c90","filesz":"0x384","memsz":"0x398","readable":true,"writable":true,"executable":false,"zero_fill":"0x14"}
+{"kind":"process_spawn","session":0,"t":3211955099073266,"pid":148906,"entry":6640}
+{"kind":"process_exit","session":0,"t":3211955099582717,"pid":148906,"exit_code":0,"signaled":false,"term_signal":0}
+{"kind":"session_end","session":0,"t":3211955099585347,"started":true,"exit_code":0,"signaled":false,"term_signal":0}
+```
+
+Without `--observe` that is the whole stream: seven records, and nothing about
+the target's execution beyond its exit.
+
+## A real observed run
+
+`occ run --observe /bin/true`, abridged — the first four records, the first
+syscall pair, and the last three, with the middle of the syscall log cut:
+
+```json
+{"kind":"session_start","session":0,"t":3212420579797798,"target":"/bin/true","argv_count":1}
+{"kind":"image_loaded","session":0,"t":3212420579845383,"path":"/bin/true","size":26936,"ok":true,"type":3,"machine":62,"entry":"0x19f0","phnum":13,"phentsize":56,"lowest_vaddr":"0x0","highest_vaddr":"0x7000","interpreter":"/lib64/ld-linux-x86-64.so.2","executable_stack":false,"gnu_relro":true}
+{"kind":"mapping","session":0,"t":3212420579848643,"index":0,"file_offset":"0x0","vaddr":"0x0","filesz":"0xfa8","memsz":"0xfa8","readable":true,"writable":false,"executable":false,"zero_fill":"0x0"}
+{"kind":"mapping","session":0,"t":3212420579850413,"index":1,"file_offset":"0x1000","vaddr":"0x1000","filesz":"0x2eb1","memsz":"0x2eb1","readable":true,"writable":false,"executable":true,"zero_fill":"0x0"}
+{"kind":"process_spawn","session":0,"t":3212420591480366,"pid":164138,"entry":6640}
+{"kind":"note","session":0,"t":3212420591606944,"text":"syscall entry","nr":12,"arg0":"0x0","arg1":"0x7fa24ed30a18","arg2":"0x0","pid":164138}
+{"kind":"note","session":0,"t":3212420591617343,"text":"syscall exit","ret":93833319542784,"pid":164138}
+...
+{"kind":"note","session":0,"t":3212425858596813,"text":"syscall entry","nr":231,"arg0":"0x0","arg1":"0xffffffffffffff88","arg2":"0xe7","pid":164312}
+{"kind":"process_exit","session":0,"t":3212425858754088,"pid":164312,"exit_code":0,"signaled":false,"term_signal":0}
+{"kind":"session_end","session":0,"t":3212425858759188,"started":true,"observed":true,"stops":58,"exit_code":0,"signaled":false,"term_signal":0}
+```
+
+66 records in total, and the composition is the thing to notice:
+
+| Kind | Count |
+|---|---|
+| `note` — `syscall entry` | 29 |
+| `note` — `syscall exit` | 28 |
+| `mapping` | 4 |
+| `session_start`, `image_loaded`, `process_spawn`, `process_exit`, `session_end` | 1 each |
+
+**Observation is mostly syscalls.** Five kinds carry the session's structure
+and the rest is a syscall log, so a consumer that wants the structure filters
+the other eleven kinds out.
+
+Two details are visible in the sample and are not obvious from the schema.
+**Entry and exit do not pair up**: 29 entries against 28 exits, because the
+last one is `exit_group` (nr 231) and never returns. A consumer that pairs
+them up and waits for a partner will hang on exactly the syscall that ended the
+program. And **`stops: 58` in `session_end` is not a record count** — it
+increments once per `waitpid`, so it counts waits, including any that reported
+a `PTRACE_EVENT_STOP` and produced no record at all. 58 waits produced these
+66 records; the two numbers are not comparable and neither is a subset of the
+other.
+
+The 29 syscalls a trivial static binary makes, by number: `read`, `close` ×2,
+`fstat` ×2, `mmap` ×8, `mprotect` ×3, `munmap`, `brk`, `pread64` ×2, `access`,
+`arch_prctl`, `set_tid_address`, `exit_group`, `openat` ×2, `set_robust_list`,
+`prlimit64`, `rseq`.
+
+`--observe` produced no `signal`, no `breakpoint_hit`, no `memory_write` and
+no `syscall_blocked` here. Those need a target that faults, a debugger
+attached, `--track-wx`, and a seccomp denial respectively; `/bin/true` does
+none of them. Their absence from a real stream is expected and is not evidence
+that they are unreachable — but neither is it evidence that they work. See
+`docs/ROADMAP.md`.
+
+## Fields by kind
+
+`session_start` — `target`, `argv_count`
+
+`session_end` — `started`, and then `exit_code`, `signaled`, `term_signal`.
+`started: false` means the target never ran; the stream still ends, so a reader
+does not have to treat a short stream as a broken one. An observed run adds
+`observed` and `stops`. **The field set is not the same on every path**: a
+container that could not start emits only `started`, with no exit fields at
+all, because there was no process to have an exit.
+
+`process_spawn` — `pid`, and then either `entry` or `parent`. The first
+process of a session is spawned by occ itself and carries the target's entry
+point as a decimal number, not a hex string, because it is an offset into the
+image and is compared against `image_loaded`'s `entry` as a number. A process
+that appears because the target forked or cloned carries `parent` instead, and
+has no entry point: it is running whatever the image already contained.
+
+`process_exit` — `pid`, `exit_code`, `signaled`, `term_signal`. When
+`signaled` is true, `exit_code` is meaningless and `term_signal` is the signal
+that killed it.
+
+`image_loaded` — `path`, `size`, `ok`, then either the ELF header fields
+(`type`, `machine`, `entry` (hex here, unlike `process_spawn`), `phnum`,
+`phentsize`, `lowest_vaddr`, `highest_vaddr`, `interpreter`,
+`executable_stack`, `gnu_relro`) or, when `ok` is false, `error` and `detail`.
+The two branches are exclusive. `ok: false` means the file was not a readable
+ELF, and the header fields are absent rather than zero — absent and zero mean
+different things.
+
+`mapping` — `index`, `file_offset`, `vaddr`, `filesz`, `memsz`, `readable`,
+`writable`, `executable`, `zero_fill`. `memsz` exceeding `filesz` is the BSS,
+and `zero_fill` is how much of it is zero rather than file-backed. `index` is
+the program header order, which is the order a loader sees. One event per
+`PT_LOAD`, so `index` is sparse: a typical small binary reports 0, 3, 6.
+
+`file_opened` — **never emitted.** The kind exists in `EventKind` and has a
+name in `event_kind_name`, but nothing in `src/` produces one; the only
+occurrence outside those two places is `tests/test_event.cpp`, which builds
+one to exercise the writer. A consumer filtering on it will see no records,
+ever, and a consumer that counts on it as a file-access log is waiting for
+something occ does not do. Opening a file is currently visible only indirectly,
+as a `syscall entry`/`syscall exit` pair for `open`/`openat`, and those carry
+no path.
+
+`syscall_blocked` — `pid`, `nr`. Emitted when the seccomp filter denies a
+call, and the process is resumed with the denial standing: occ does not
+substitute a result. `nr` is a hex string. There is no `name` and no `errno`;
+a consumer that wants a name maps `nr` itself, against the kernel's table for
+the architecture, because a name occ guessed from a number it may not
+recognise is a name that can be wrong.
+
+`breakpoint_hit` — `pid`, `address` (hex). **There is no register block on the
+event.** The address is `rip - 1`, because the breakpoint byte is still in
+place when the trap is reported and the trap lands after the instruction that
+fetched it. When a debugger is attached it has already read the registers over
+the RSP connection and has them; the event exists to say that a trap was
+classified as a breakpoint rather than a stray signal, which is a fact the
+consumer cannot get any other way.
+
+`signal` — `pid`, `signal`. There is no `core_dumped` and no `term_signal`
+here: a `signal` event is a signal *delivered to* the target, not the signal
+that killed it. The killing signal is on `process_exit`, as `term_signal` with
+`signaled` true. A target that installs a SIGSEGV handler and recovers
+produces a `signal` event and then exits normally, which is the case that
+distinguishes the two.
+
+`memory_write` — **two different field sets, from two different emitters.**
+This is the one place in the schema where the kind alone does not tell a
+consumer what is in the record.
+
+| Emitter | Fields | Meaning |
+|---|---|---|
+| a hardware watch firing | `pid`, `address` (hex), `rip` (hex), `bytes`, `kind` | One store instruction, at the moment it happened |
+| the W^X tracker | `pid`, `address` (hex), `bytes_written`, `write_count`, `was_writable`, `was_executable`, `became_executable` | A region that was written while not executable and is executable now |
+
+`kind` is `"watch"` on the first and absent on the second, so the field's
+presence distinguishes them. The first is a raw event and carries `rip`,
+because knowing *which instruction* wrote is what makes the address mean
+something. The second is a conclusion, and `became_executable` is always true
+on it: a region that was already executable when written is not a transition
+and is not reported as one. `bytes` on the first is decoded from the
+instruction at `rip`, not from the watch record, because the kernel reports
+which address matched and not how much was touched.
+
+`exec` — `pid`. The target's own `execve`, reported because after it every
+cached address, breakpoint and watch is stale and has been dropped. There is
+no `path` and no `ret`: occ reports that an exec happened, and the new image
+if it is an ELF is reported separately by `image_loaded`. An exec that failed
+does not produce this event; it appears as a `syscall exit` whose `ret` is
+negative.
+
+## What is not in the stream
+
+**The target's output.** stdout and stderr belong to the target. Interleaving
+them into the event stream would corrupt both: a prompt with no newline would
+merge with the next record. Use a separate file descriptor, or run the target
+under a pty.
+
+**The register block, on any event.** No event in the schema carries GDB's
+forty registers, and `breakpoint_hit` does not either. Dumping all of them on
+every stop makes a stream that is expensive to read and expensive to store, and
+the registers that did not change are the ones nobody looks at. When a
+debugger is attached, the RSP server serves the full block on request, and that
+is where the full block belongs. A consumer that wants registers without a
+debugger attached gets none from this stream; that is the trade, and it is a
+deliberate one.
+
+**Anything from a run that failed before the session opened.** If occ cannot
+isolate, it reports on stderr and emits no events. A stream that existed would
+imply an observation happened.
+
+## Reading the stream
+
+```
+occ run ./target > events.ndjson
+```
+
+stdout carries the stream when it is not a terminal, and a session summary when
+it is. When it is a TTY, the stream is on the socket and the summary is for a
+human; the two are never mixed, so a reader never has to strip anything.
+
+The stream is never multiplexed onto the target's output, and a dropped event
+is reported rather than skipped — see the `note` kind, and
+`docs/ROADMAP.md` for why that matters more than it sounds.
+
+To follow a session live, read the socket. The path is printed as a single
+NDJSON line when stdout is not a terminal:
+
+```
+socat - UNIX-CONNECT:/run/occ/<session>.sock
+```
+
+`jq` handles the format as-is:
+
+```
+occ run --observe ./target | jq -r 'select(.kind=="mapping" and .executable) | .vaddr'
+```
+
+## Adding a kind
+
+`EventKind` in `include/occ/observer/event.h`, the name in
+`event_kind_name`, the fields in whichever observer emits it, and a test in
+`tests/test_event.cpp`. The enum and the name function are the two places
+that have to agree; a kind added to one and not the other arrives as
+`"unknown"`, which is the intended behaviour for a name occ does not know and
+the reason that case is reachable at all.

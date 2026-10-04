@@ -11,8 +11,13 @@ executes under isolation and emits facts.
 
 ## Status
 
-Only the PE engine (`exe` targets) is implemented. The APK and SYS engine
-directories exist in the tree and are not built. See `docs/ROADMAP.md`.
+`occ run` executes a target and observes it. It does not dispatch on the
+target's format: it will exec an ELF, and it will also exec a PE or an APK,
+but the kernel's binfmt handler decides what that means, not this project.
+There is no PE engine and no APK engine — `src/engine/` is empty. Against an
+ELF target on Linux the full observation surface is available. See
+`docs/ROADMAP.md` for the state of each part, including what is known to be
+missing.
 
 ## What this is not
 
@@ -88,7 +93,14 @@ set listed in `docs/RSP.md`: `qSupported`, `g`, `G`, `m`, `M`, `c`, `s`,
 served from observer data. Writes go through `process_vm_writev` and
 `PTRACE_SETREGSET` at a stop point.
 
-## PE engine
+## PE engine (not implemented)
+
+The design for PE support is below. It is written down because the boundary it
+has to respect is worth deciding in advance, and because a reader who finds
+this section should know it describes intent. **None of it is in the tree.**
+`occ run` does not load PE through Wine; exec'ing a `.exe` on Linux hands it
+to the kernel's binfmt handler, and whatever that does is not this project's
+work. `docs/ROADMAP.md` has the current state.
 
 Runs a user-supplied Wine installation inside the isolation layer as the PE
 loader and API translation layer. Occ does not modify Wine. It hooks Wine's
@@ -170,7 +182,7 @@ tools/           development helpers, not shipped
 - `docs/EVENTS.md` — the event schema, field by field
 - `docs/BUILD.md` — toolchain details, static linking, reproducible flags
 - `docs/ROADMAP.md` — what is implemented, what is not, in plain terms
-- `COMPAT.md` — hosts this has actually been built and run on
+- `docs/COMPAT.md` — hosts this has actually been built and run on
 
 ## License
 

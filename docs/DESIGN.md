@@ -25,7 +25,7 @@ in this document.
 
 Version numbers create an implication that this tree has releases with
 defined compatibility ranges. It does not. What matters is which host it
-was verified on, and that is recorded as fact in `COMPAT.md` rather than
+was verified on, and that is recorded as fact in `docs/COMPAT.md` rather than
 encoded as a number that has to be interpreted.
 
 ## Timestamps in output, not in source
