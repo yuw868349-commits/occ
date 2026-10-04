@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
-"""Generates the fuzzing seed corpus for the PE harness.
+"""Generates the fuzzing seed corpus.
 
 The seeds are written rather than checked in as binaries so that what they
 are is readable: a fuzzer starts by broadening what its corpus already
-reaches, and each of these gets past one of the PE reader's gates that an
+reaches, and each of these gets past one of the reader's gates that an
 input of zeros would not.
+
+Three harnesses have seeds. They are generated here for the same reason
+rather than two of them by hand: a binary checked in without the program
+that makes it says only what it is, and the ELF and RSP seeds were both
+written that way before. A reader who opens this file can see that one of
+them declares thirteen program headers in a file that cannot hold them,
+which is the entire point of it.
 
 Run from the repository root:
 
     python3 tools/make_pe_seeds.py fuzz/seeds
+
+The output is byte-for-byte reproducible and tests/test_seeds.cpp checks it
+against what is checked in, so a seed cannot drift away from the generator
+without a test failing. Python is not part of the build: it is only needed
+to change a seed, never to compile or to run one.
 """
 
 import struct
@@ -228,7 +240,7 @@ def _loader_regressions(pe):
 # The corpus. Each entry exists to get past a specific gate, and the comment
 # says which one -- a seed whose purpose is unclear is a seed nobody
 # regenerates when it stops being useful.
-SEEDS = {
+PE_SEEDS = {
     # The smallest file that parses at all. Everything past the optional
     # header's magic is reachable from here.
     "pe32_min.bin": minimal_pe(),
@@ -285,7 +297,160 @@ SEEDS = {
 # built on the i386 base would be rejected by the machine check and would
 # reach none of the checks it exists to exercise -- which is exactly what
 # happened the first time this was written.
-SEEDS.update(_loader_regressions(minimal_pe(plus=True, machine=0x8664)))
+PE_SEEDS.update(_loader_regressions(minimal_pe(plus=True, machine=0x8664)))
+
+
+# ---------------------------------------------------------------- ELF
+
+# Field offsets in the 64-bit header, named as in include/occ/parser/elf.h
+# and matching the constants in src/parser/elf.cpp. Stated here rather than
+# shared with the reader because the reader is C++ and this is Python, and
+# because a generator that imported the reader's offsets would be a second
+# thing to keep in step rather than a description of the format.
+_ELF_OFF_TYPE = 16
+_ELF_OFF_MACHINE = 18
+_ELF_OFF_ENTRY = 24
+_ELF_OFF_PHOFF = 32
+_ELF_OFF_SHOFF = 40
+_ELF_OFF_EHSIZE = 52
+_ELF_OFF_PHENTSIZE = 54
+_ELF_OFF_PHNUM = 56
+_ELF_OFF_SHENTSIZE = 58
+_ELF_OFF_SHNUM = 60
+_ELF_OFF_SHSTRNDX = 62
+
+# The 64-bit header is 64 bytes and the 64-bit program header is 56. The
+# reader checks e_phentsize against the second number rather than assuming
+# it, so a seed that wants to reach the segment table has to state it.
+_ELF64_HEADER_SIZE = 64
+_ELF64_PHDR_SIZE = 56
+
+
+def truncated_elf(*, machine=0x3E, elf_type=3, phoff=0x40, phnum=13, shoff=0x9218):
+    """A 64-bit ELF header whose program header table does not fit.
+
+    The name this seed carries says "minimal", and it is worth saying why
+    that is misleading rather than renaming the file: what the file is, is
+    the shape where the header parses completely, every field in it is
+    plausible, and the table it points at runs past the end of the file.
+    Reading it with ElfImage::parse gives, verbatim:
+
+        error 6, "the table runs from 0x40 to 0x318 and the file is 256 bytes"
+
+    That is the point. Everything up to and including the phdr-count check
+    is reachable from this file, so the fuzzer starts next to the boundary
+    rather than having to find its way there through 256 bytes of nothing.
+    An input of zeros stops at the magic; this one stops four fields later.
+
+    The numbers are chosen so that nothing else refuses the file first. The
+    type is ET_DYN and the machine is x86-64, which are the two the reader
+    accepts, and e_phentsize is the size it steps by, so the check that
+    fires is the one about the table's extent and not one of the two easier
+    ones above it. phnum is 13 because 13 * 56 is a table that clearly
+    overruns a 256-byte file rather than one that lands just past the end,
+    where the two mistakes are easy to confuse.
+    """
+    buf = bytearray(_ELF64_HEADER_SIZE)
+
+    # e_ident. The class, the encoding and the version are the three the
+    # reader checks; the rest is the padding the format specifies.
+    buf[0:4] = b"\x7fELF"
+    buf[4] = 2                                          # EI_CLASS: ELFCLASS64
+    buf[5] = 1                                          # EI_DATA: ELFDATA2LSB
+    buf[6] = 1                                          # EI_VERSION: EV_CURRENT
+
+    struct.pack_into("<H", buf, _ELF_OFF_TYPE, elf_type)
+    struct.pack_into("<H", buf, _ELF_OFF_MACHINE, machine)
+    # e_version, the 32-bit field after the three 16-bit ones above. The
+    # reader does not take it from here -- it uses e_ident[EI_VERSION] -- so
+    # this one is set to the current value rather than left at zero, which is
+    # what makes it a field a reader could get wrong.
+    struct.pack_into("<I", buf, 20, 1)
+    struct.pack_into("<Q", buf, _ELF_OFF_ENTRY, 0x3AC0)
+    struct.pack_into("<Q", buf, _ELF_OFF_PHOFF, phoff)
+    # e_shoff points into the middle of nowhere: 0x9218 is well past the end
+    # of a 256-byte file, and it is not a value the program header count
+    # produces, so a reader that checked the segment table's extent and then
+    # went on to the section table's would find a second overrun rather than
+    # the one it had already refused.
+    struct.pack_into("<Q", buf, _ELF_OFF_SHOFF, shoff)
+    struct.pack_into("<H", buf, _ELF_OFF_EHSIZE, _ELF64_HEADER_SIZE)
+    struct.pack_into("<H", buf, _ELF_OFF_PHENTSIZE, _ELF64_PHDR_SIZE)
+    struct.pack_into("<H", buf, _ELF_OFF_PHNUM, phnum)
+    struct.pack_into("<H", buf, _ELF_OFF_SHENTSIZE, 64)  # Elf64_Shdr size
+    struct.pack_into("<H", buf, _ELF_OFF_SHNUM, 31)
+    struct.pack_into("<H", buf, _ELF_OFF_SHSTRNDX, 30)
+
+    # Four program headers, the last one cut off after its first four fields.
+    #
+    # The point of writing them at all is that a fuzzer mutating this file
+    # starts from a table with plausible contents rather than from 200 bytes
+    # of zero, and the headers give it segment types, flags, offsets and
+    # virtual addresses to move. They are never read -- the count above
+    # refuses the file first -- so what they say does not matter, and the
+    # fourth is truncated because a file that ended on a header boundary
+    # would not be the shape where the table runs off the end. Its four
+    # surviving fields are the ones a reader would take first, which makes
+    # it the shape where a reader that checked the count but not the file
+    # length would read a header and believe it.
+    phdrs = bytearray()
+    # PT_PHDR, then PT_INTERP, then a PT_LOAD at zero and one at 0x2000 --
+    # the four types a real dynamic executable has, in the order it has them.
+    phdrs += struct.pack("<IIQQQQQQ", 6, 4, 0x40, 0x40, 0x40, 0x2D8, 0x2D8, 8)
+    phdrs += struct.pack("<IIQQQQQQ", 3, 4, 0x318, 0x318, 0x318, 0x1C, 0x1C, 1)
+    phdrs += struct.pack("<IIQQQQQQ", 1, 4, 0, 0, 0, 0x1640, 0x1640, 0x1000)
+    phdrs += struct.pack("<IIQQ", 1, 5, 0x2000, 0x2000)
+    buf += phdrs
+
+    return bytes(buf)
+
+
+# ---------------------------------------------------------------- RSP
+
+def rsp_query(payload=b"g"):
+    """One framed GDB remote-serial-protocol packet, plus trailing noise.
+
+    The packet is the "read registers" request a debugger sends first, and
+    the framing is what the decoder has to see before it will look at any of
+    it: a dollar, the payload, a hash, and two hex digits whose value is the
+    payload's bytes summed mod 256. For "g" that sum is 0x67, which is what
+    the two characters after the hash are.
+
+    The newline at the end is not part of the packet and is not an accident
+    of how the file was written. It is there because a byte outside a packet
+    is a case the decoder has to get right: the protocol says to ignore it,
+    and a decoder that treated an unexpected byte as the start of a checksum
+    would leave this file waiting for two more digits that never come. The
+    packet and the noise are one input because they are one thing a real peer
+    does -- a line-oriented terminal, or a debugger whose output is captured
+    with its echo.
+
+    Feeding this to the decoder yields one packet with data "g" and
+    checksum_ok set, and asks for a '+' back. Feeding it without the
+    newline yields the same packet, which is the check that the newline
+    changed nothing.
+    """
+    body = bytes(payload)
+    cksum = sum(body) & 0xFF
+    return b"$" + body + b"#" + ("%02x" % cksum).encode("ascii") + b"\n"
+
+
+# The seeds for the harnesses that are not the PE one. Kept beside the PE
+# seeds rather than in a second generator because the reason they are
+# generated is the same reason, and a reader looking for "what does this
+# harness start from" should find the answer in one place.
+OTHER_SEEDS = {
+    # Reaches the program header table's extent check and is refused there.
+    # See truncated_elf for why it is shaped this way and what it reports.
+    "elf_min.bin": truncated_elf(),
+
+    # A well-formed packet the decoder accepts, followed by a byte it has to
+    # ignore. See rsp_query.
+    "rsp_g.gdb": rsp_query(),
+}
+
+SEEDS = dict(PE_SEEDS)
+SEEDS.update(OTHER_SEEDS)
 
 
 def main():
