@@ -367,16 +367,46 @@ endif()
 # not once per translation unit -- so a compile-only option leaves every
 # executable in the build printing it. Both are set here for that reason.
 if(OCC_COMPILER_IS_CLANG AND OCC_USE_LIBCXX)
-    foreach(ver 15 14)
-        if(EXISTS "/usr/lib/gcc/x86_64-linux-gnu/${ver}")
-            set(OCC_GCC_INSTALL_DIR
-                "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/${ver}")
-            add_compile_options("${OCC_GCC_INSTALL_DIR}")
-            add_link_options("${OCC_GCC_INSTALL_DIR}")
-            set(OCC_GCC_LIB_DIR "/usr/lib/gcc/x86_64-linux-gnu/${ver}")
-            break()
-        endif()
-    endforeach()
+    # The version has to be the one the compiler actually is, not merely the
+    # newest one on disk. A hardcoded list goes stale: on a machine whose
+    # default GCC is 16, a list ending at 15 names a different compiler than
+    # the one running, and the warning it silences comes back -- pointing at
+    # a directory this build did not choose. So the version is read from the
+    # compiler, and the directory is used only if it is the one that reported.
+    #
+    # -DOCC_GCC_LIB_DIR overrides that, for a machine where the compiler
+    # reports a directory that is not the one to use -- a sysroot, or a
+    # cross-compilation setup where the answer is right and the path is not.
+    if(NOT DEFINED OCC_GCC_LIB_DIR)
+        execute_process(
+            COMMAND "${CMAKE_CXX_COMPILER}" -print-search-dirs
+            OUTPUT_VARIABLE _occ_gcc_search
+            ERROR_QUIET)
+        # The line is "libraries: =<dir>:<dir>:...", a search path rather
+        # than a single directory. The GCC installation is the one under a
+        # gcc directory in that list -- the clang resource directory and the
+        # system library directories are also on it, and naming any of those
+        # as a GCC installation would be wrong.
+        string(REGEX MATCH "libraries: *=([^ \n]*)" _occ_gcc_libs
+               "${_occ_gcc_search}")
+        string(REPLACE ":" ";" _occ_gcc_libs "${_occ_gcc_libs}")
+        foreach(_occ_libdir IN LISTS _occ_gcc_libs)
+            if(_occ_libdir MATCHES "/gcc/")
+                set(OCC_GCC_LIB_DIR "${_occ_libdir}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(OCC_GCC_LIB_DIR AND IS_DIRECTORY "${OCC_GCC_LIB_DIR}")
+        set(OCC_GCC_INSTALL_DIR "--gcc-install-dir=${OCC_GCC_LIB_DIR}")
+        add_compile_options("${OCC_GCC_INSTALL_DIR}")
+        add_link_options("${OCC_GCC_INSTALL_DIR}")
+    else()
+        # A Clang with no GCC installation behind it has nothing to name, and
+        # the warning does not fire in that case either.
+        message(STATUS "occ: no GCC installation found for --gcc-install-dir")
+    endif()
 endif()
 
 # libc++abi needs _Unwind_*. Both LLVM's libunwind and GCC's libgcc_eh

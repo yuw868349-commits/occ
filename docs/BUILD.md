@@ -4,16 +4,63 @@
 
 Occ requires C++23.
 
-| Compiler | Minimum |
-|---|---|
-| Clang | 18 |
-| GCC | 14 |
+The compiler and the standard library are chosen separately, and the pair has
+to be one that works. A compiler that is new enough for the language is not
+automatically able to use a libc++ that happens to be installed, and the two
+failures look nothing alike.
 
-The reference build uses Clang with libc++ from the LLVM release tree. The
-reason is the static link: libc++'s static archives are self-contained and
-are what the shipped binary is built against. libstdc++ works dynamically
-and is usable for development. See "Static linking" below for the exact
-flags.
+### Verified combinations
+
+Every row below was built from a clean configure with warnings as errors on,
+and the test suite run. "Clean" means zero errors and zero warnings.
+
+| Compiler | Standard library | Result |
+|---|---|---|
+| Clang 23.1.2 | libc++ 23 | clean, 6/6 |
+| Clang 20.1.2 | libc++ 20 | clean, 6/6 |
+| GCC 16.0.1 | libstdc++ | clean, 6/6 |
+| GCC 16.0.1 | libc++ 23 | falls back to libstdc++ |
+| GCC 14.2 | libc++ 20 | falls back to libstdc++ |
+| GCC 13.3 | libc++ 23 | falls back to libstdc++ |
+
+The reference build is Clang with libc++ from the LLVM release tree. The
+reason is the static link: libc++'s static archives are self-contained and are
+what the shipped binary is built against.
+
+GCC is supported and reaches the same clean result, on libstdc++. It is not
+able to use libc++ 23 at all — the two standard libraries' headers are
+mutually exclusive here, and libc++ asks for GCC 15 or newer regardless. That
+is a property of the two implementations coexisting on one machine, not
+something a flag resolves, and the build says so rather than failing later.
+
+### When a libc++ cannot be used
+
+A libc++ is not usable merely because it is installed. The build compiles a
+small probe with the include path it would really use, covering the headers
+this project actually opens, and links it against the library directory it
+would really use. If that fails, the build falls back to libstdc++ and reports
+why, naming the compiler, its version, and the diagnostic it produced:
+
+```
+occ: GNU 16.0.1 cannot use the libc++ at /usr/lib/llvm-23
+(error: 'abort' has not been declared in 'std'); falling back to libstdc++.
+```
+
+To use a libc++ the compiler cannot find for itself, name it:
+
+```
+cmake -S . -B build -DOCC_LIBCXX_ROOT=/opt/LLVM-23.1.2-Linux-X64
+```
+
+The GCC installation Clang is told to use is read from the compiler itself, so
+that the version named is the version running. Override it when that answer is
+right but the path is not — a sysroot, or a cross setup:
+
+```
+cmake -S . -B build -DOCC_GCC_LIB_DIR=/usr/lib/gcc/x86_64-linux-gnu/15
+```
+
+`-DOCC_USE_LIBCXX=OFF` forces libstdc++ and skips the probe.
 
 CMake 3.20 or newer. Ninja is recommended but not required.
 
@@ -35,7 +82,7 @@ for instance — pass the root:
 ```
 cmake -S . -B build -G Ninja \
   -DOCC_LIBCXX_ROOT=/opt/LLVM-23.1.2-Linux-X64 \
-  -DOCC_GCC_LIB_DIR=/usr/lib/gcc/x86_64-linux-gnu/14
+  -DOCC_GCC_LIB_DIR=/usr/lib/gcc/x86_64-linux-gnu/16
 ```
 
 `occ doctor` prints both paths so a build can be reproduced from a working

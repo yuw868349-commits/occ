@@ -108,11 +108,19 @@ not a failure, and is reported as such.
 
 Requirements:
 
-- Clang 18 or newer, or GCC 14 or newer.
+- Clang 20 or newer, or GCC 16 or newer. Those are the versions verified
+  against the test suite with warnings treated as errors;
+  `docs/BUILD.md` has the full matrix, including which pairings of compiler
+  and standard library work and what an unusable libc++ looks like.
 - CMake 3.20 or newer.
 - A C++23 standard library. libc++ is recommended; see `docs/BUILD.md` for
   the exact flags used to produce a fully static binary against the LLVM
   tree, which is what this project ships.
+
+A libc++ that is installed but that the compiler cannot use is detected at
+configure time and reported, and the build falls back to libstdc++ rather
+than failing partway through. GCC currently builds against libstdc++; Clang
+builds against libc++.
 
 ```
 cmake -S . -B build -G Ninja
