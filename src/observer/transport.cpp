@@ -215,6 +215,21 @@ bool Connection::pump() noexcept {
     return false;
 }
 
+bool Connection::flush_ack() noexcept {
+    if (fd_ < 0 || !decoder_.needs_ack()) {
+        return true;
+    }
+    const char ack = decoder_.pending_ack();
+    decoder_.clear_ack();
+    // A single byte, written directly: going through send_packet would frame
+    // an acknowledgement, and an acknowledgement is not a packet.
+    const auto wrote = sys::write(fd_, &ack, 1);
+    if (wrote.failed()) {
+        return wrote.value == -sys::kEintr;
+    }
+    return true;
+}
+
 bool Connection::has_packet() const noexcept {
     return decoder_.has_packet() && !decoder_.retransmit_requested();
 }

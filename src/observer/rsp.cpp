@@ -180,6 +180,13 @@ std::size_t PacketDecoder::feed(const char* data, std::size_t length) noexcept {
                 p.checksum_ok = false;
                 want_retransmit_ = true;
             }
+            // Every framed packet is acknowledged, including a damaged one.
+            // The two cases differ in the byte: '+' says the packet arrived
+            // and '-' says send it again, and both say that something was
+            // received at all. Silence is the one answer a sender cannot act
+            // on, so it resends until it gives up.
+            needs_ack_ = true;
+            pending_ack_ = p.checksum_ok ? '+' : '-';
             ready_.push_back(std::move(p));
             payload_.clear();
             raw_.clear();

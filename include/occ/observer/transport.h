@@ -73,11 +73,23 @@ public:
     void clear_retransmit() noexcept;
     [[nodiscard]] const std::string& last_packet() const noexcept;
 
-    // Sends a payload as one packet and waits for its acknowledgement. The
-    // acknowledgement is what makes a reply reliable on a stream that does
-    // not promise delivery, and a debugger that never saw it will send the
-    // packet again.
+    // Sends a payload as one packet. The framing includes the checksum; the
+    // acknowledgement of the reply is the far end's business and this side
+    // answers it when it arrives.
     [[nodiscard]] bool send_packet(std::string_view payload) noexcept;
+
+    // Sends the '+' or '-' that the last decoded packet is owed, if it has
+    // not been sent yet.
+    //
+    // This is not optional politeness. A sender that gets no answer resends,
+    // and gdb -- which is the sender here -- resends a handful of times and
+    // then abandons the connection. A stub that never acknowledges therefore
+    // fails to attach, after a delay, with no indication of why.
+    //
+    // Called after every pump(), before the packets are handled, so the
+    // acknowledgement goes out even for a packet that turns out to be
+    // malformed.
+    [[nodiscard]] bool flush_ack() noexcept;
 
     // Waits up to the timeout for the peer to close or for data to arrive.
     // Used to notice a debugger that has gone away without waiting for the

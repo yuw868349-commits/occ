@@ -1,6 +1,9 @@
 #include "occ/observer/session.h"
 
+#include "occ/observer/transport.h"
+
 #include "occ/syscall/errno.h"
+#include "occ/syscall/syscall.h"
 #include "occ/util/string.h"
 
 #include <cerrno>
@@ -32,24 +35,101 @@ constexpr std::uint64_t kSysMremap = 25;
 
 namespace {
 
-// The number of registers the 'g' reply carries. It has to agree with the
-// target description below, and a static_assert in fill_gdb_registers is
-// what keeps the two from drifting apart. Declared here so both the fill and
-// the parse paths can size themselves from one number.
-constexpr std::size_t kGdbRegisterCount = 27;
+// The digits the register block is written in. The 'g' reply is hex, and
+// writing the nibbles directly is cheaper than converting each byte through a
+// format call on a path that runs on every stop.
+constexpr std::string_view kHexDigits = "0123456789abcdef";
+
+// How many registers the target description below declares: the forty GDB
+// requires of "org.gnu.gdb.i386.core", plus %fs_base, %gs_base and %orig_rax.
+// The count itself is derived from kGdbFields below, so this comment is about
+// why that table has the shape it does.
+//
+// The forty are not ours to choose. GDB validates a target description against
+// the layout its own x86-64 tdep declares, in i386_validate_tdesc_p: it walks
+// the first num_core_regs entries of the core feature and requires each one to
+// be present, in order, under the name that tdep lists for it. num_core_regs is
+// forty on x86-64, because the core feature ends at %fop and not at %gs. A
+// description that stops at the general registers is rejected outright with
+// "Architecture rejected target-supplied description", and the rejection is
+// only a warning: GDB then falls back to its built-in 32-bit defaults and reads
+// the rest of the 'g' reply at the wrong offsets, so every register past the
+// gap shows a plausible value under the wrong name.
+//
+// Note this is a count of registers, not a count of bytes. The block itself is
+// kGdbRegisterBytes, and the two are not related by a factor of eight -- see
+// fill_gdb_registers.
 
 // The register GDB treats as the program counter, per the description below.
 constexpr std::size_t kPcRegnum = 16;
 
+// The register numbers GDB assigns to the three this stub adds past the core
+// feature. These are not free choices: they come from GDB's own i386 register
+// enum, and reading the wrong one answers a question about %gs_base with the
+// syscall number. The core forty occupy 0 through 39 in that enum and GDB
+// reserves 40 through 51 for the SSE and AVX banks, so %fs_base and %gs_base
+// land well past this stub's block -- at 152 and 153 -- and %orig_rax, which
+// has no number in the enum at all, is reported at the one past the end.
+constexpr std::size_t kFsBaseRegnum = 152;
+constexpr std::size_t kGsBaseRegnum = 153;
+constexpr std::size_t kOrigRaxRegnum = 154;
+
+// One register's place in the 'g' block: where it starts and how wide it is.
+// The order is the order fill_gdb_registers writes and the order
+// handle_write_registers parses, and all three read this one table, so a
+// register cannot be described in the document at one width and supplied at
+// another. That mistake is invisible from either side alone -- each path is
+// self-consistent -- and it does not corrupt one register, it shifts every
+// register after the gap, so %st0 ends up holding %fop and a backtrace names
+// the wrong frame.
+struct GdbField {
+    std::size_t offset;
+    unsigned bits;
+};
+
+// The x86-64 block, in bytes: seventeen general registers and %rip at eight
+// bytes each, then %eflags and the six segment selectors at four, then the
+// eight x87 stack registers at ten, then the eight x87 control registers at
+// four, then %fs_base, %gs_base and %orig_rax at eight. GDB packs a target
+// description end to end with no padding, so these add up to exactly the size
+// below -- 300 bytes, and not one more.
+constexpr GdbField kGdbFields[] = {
+    {0, 64},   {8, 64},   {16, 64},  {24, 64},  {32, 64},  {40, 64},
+    {48, 64},  {56, 64},  {64, 64},  {72, 64},  {80, 64},  {88, 64},
+    {96, 64},  {104, 64}, {112, 64}, {120, 64}, {128, 64},
+    {136, 32}, {140, 32}, {144, 32}, {148, 32}, {152, 32}, {156, 32},
+    {160, 32},
+    {164, 80}, {174, 80}, {184, 80}, {194, 80}, {204, 80}, {214, 80},
+    {224, 80}, {234, 80},
+    {244, 32}, {248, 32}, {252, 32}, {256, 32}, {260, 32}, {264, 32},
+    {268, 32}, {272, 32},
+    {276, 64}, {284, 64}, {292, 64},
+};
+
+constexpr std::size_t kGdbRegisterCount =
+    sizeof(kGdbFields) / sizeof(kGdbFields[0]);
+
+// The size of the block, summed from the table at compile time so it cannot
+// disagree with the widths the description declares.
+constexpr std::size_t kGdbRegisterBytes = []{
+    std::size_t total = 0;
+    for (const GdbField& f : kGdbFields) {
+        total += (f.bits + 7u) / 8u;
+    }
+    return total;
+}();
+
 // One register out of the block, by the index the target description gives.
 //
-// The indexing is shared by the 'g', 'p' and 'G' paths so a register cannot
-// be written at one index and read at another. That is not a theoretical
-// concern: this file did exactly that once, describing twenty-seven
-// registers and supplying twenty-four, and every register after the gap
-// displayed under the wrong name with a plausible-looking value.
-std::uint64_t gdb_register(const Registers& r, std::size_t index) noexcept {
-    switch (index) {
+// The indexing is by the register number GDB uses, not by position in the 'g'
+// block. Those are the same for the forty core registers -- GDB numbers them
+// 0 through 39 in document order -- but they part company past that, because
+// GDB reserves 40 through 51 for the SSE and AVX banks this description does
+// not declare. So %fs_base is position 40 in the block and register 152 to
+// GDB. The 'p' handler asks by register number and the 'g' handler walks the
+// block in order, and both land here.
+std::uint64_t gdb_register(const Registers& r, std::size_t regnum) noexcept {
+    switch (regnum) {
     case 0: return r.rax;
     case 1: return r.rbx;
     case 2: return r.rcx;
@@ -74,18 +154,29 @@ std::uint64_t gdb_register(const Registers& r, std::size_t index) noexcept {
     case 21: return r.es;
     case 22: return r.fs;
     case 23: return r.gs;
-    case 24: return r.orig_rax;
-    case 25: return r.fs_base;
-    case 26: return r.gs_base;
+    // Registers 24 through 39 are the x87 stack (%st0-%st7) and the x87
+    // control block (%fctrl-%fop). The kernel's user_regs_struct does not
+    // carry them and a stop in a syscall is not an x87 context, so there is
+    // nothing truthful to report and zero is the honest answer. They are still
+    // named here so that asking for one gets an answer rather than a refusal.
+    case kFsBaseRegnum: return r.fs_base;
+    case kGsBaseRegnum: return r.gs_base;
+    case kOrigRaxRegnum: return r.orig_rax;
     default: return 0;
     }
 }
 
-// Writes the writable registers of the block back. The three the kernel does
-// not accept from SETREGS on this architecture are ignored: the description
-// names them because GDB needs a coherent register list, not because the
-// debugger can change them, and silently writing zeros into a thread
-// selector would be far worse than ignoring the request.
+// Writes back the registers the kernel accepts from SETREGS on this
+// architecture: the sixteen general registers and %rip.
+//
+// Everything else the block names is deliberately not written. The caller
+// leaves those entries zeroed, so assigning them here would push a zero into
+// the tracee's context for a register the debugger never mentioned -- clearing
+// the thread and group selectors, or worse, the flags, on the strength of a
+// packet this stub only understood in part. %eflags and the segment selectors
+// are the sharpest case: they are present in the block and readable, and the
+// kernel's setregs rejects them on x86-64, so honouring them would either
+// error out or be silently dropped depending on the kernel.
 void set_gdb_register(Registers& r, const std::uint64_t* values) noexcept {
     r.rax = values[0];
     r.rbx = values[1];
@@ -104,47 +195,88 @@ void set_gdb_register(Registers& r, const std::uint64_t* values) noexcept {
     r.r14 = values[14];
     r.r15 = values[15];
     r.rip = values[16];
-    r.eflags = values[17];
-    r.cs = values[18];
-    r.ss = values[19];
-    r.ds = values[20];
-    r.es = values[21];
-    r.fs = values[22];
-    r.gs = values[23];
-    // values[24..26] are orig_rax, fs_base and gs_base. Not writable here.
+    // values[17..23] are %eflags and the segment selectors, values[24..39] the
+    // x87 block, and values[40..42] %fs_base, %gs_base and %orig_rax. All of
+    // them stay as the kernel last reported them.
 }
 
-// The register block GDB expects for x86-64, in the order the target
-// description below declares. The two lists have to agree: the document
-// tells GDB how wide each register is, and this function supplies the bytes
-// in that same order. A register described but not supplied leaves the block
-// short, and every register after the gap reads as the wrong value -- which
-// looks like a target that corrupted its own state rather than a stub that
-// filled in too few.
+// The register block GDB expects for x86-64, packed in the order and at the
+// widths the target description below declares.
 //
-// The four segment selectors are 32 bits wide in the description and are
-// sent as eight bytes here, because the register block is a fixed-width
-// array in the protocol: GDB masks the surplus rather than misreading
-// everything after it, and sending four bytes for them would shift the rest.
+// The block is not an array of eight-byte cells and this used to assume it was.
+// The description gives each register its own width and GDB packs them
+// end to end with no padding, so the block for x86-64 is 300 bytes and not one
+// byte more: seventeen general registers and %rip at eight bytes each, then the
+// seven 32-bit registers %eflags and the segment selectors, then the eight x87
+// stack registers at ten bytes each, then the eight 32-bit x87 control
+// registers, then %fs_base, %gs_base and %orig_rax at eight bytes each.
+//
+// Getting this wrong is quiet in the worst way. Sending eight bytes for a
+// four-byte register does not make GDB read that one wrongly -- it shifts every
+// register after it, so %st0 shows up holding %fop and a backtrace names the
+// wrong frame. And because the sizes are only described in the document, nothing
+// in this file would catch it: the same register list, packed two different
+// ways, produces two self-consistent builds. The table below is therefore the
+// single place the layout is written down, and the byte count is checked
+// against it rather than recomputed.
+// Appends one register of the given width in bits, little endian, which is the
+// order every register in this block is stored in.
+void append_gdb_register(std::string& out, std::uint64_t value,
+                         unsigned bits) noexcept {
+    const unsigned bytes = (bits + 7u) / 8u;
+    // Mask off anything above the declared width first. A 32-bit register fed a
+    // 64-bit value has to come back as the low half, exactly as the kernel
+    // would report it, and sending the surplus would push the rest of the block
+    // out of alignment.
+    if (bits < 64) {
+        value &= (std::uint64_t{1} << bits) - 1u;
+    }
+    for (unsigned i = 0; i < bytes; ++i) {
+        const auto byte = static_cast<unsigned>((value >> (8u * i)) & 0xFFu);
+        out += kHexDigits[byte >> 4];
+        out += kHexDigits[byte & 0xFu];
+    }
+}
+
 void fill_gdb_registers(const Registers& r, std::string& out) noexcept {
     out.clear();
-    out.reserve(kGdbRegisterCount * 16);
-    const std::uint64_t order[] = {
-        r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp, r.rsp,
-        r.r8,  r.r9,  r.r10, r.r11, r.r12, r.r13, r.r14, r.r15,
-        r.rip, r.eflags, r.cs, r.ss, r.ds, r.es, r.fs, r.gs,
-        // The three the description adds past the classic block. orig_rax
-        // is the syscall the thread is stopped in, which is the most
-        // valuable thing this stub can show a debugger that asked, and the
-        // two base registers are the thread and the group selector.
-        r.orig_rax, r.fs_base, r.gs_base,
-    };
-    static_assert(sizeof(order) / sizeof(order[0]) == kGdbRegisterCount,
-                  "the register block and the target description disagree on "
-                  "how many registers x86-64 has");
-    (void)order;
+    out.reserve(kGdbRegisterBytes * 2);
+
     for (std::size_t i = 0; i < kGdbRegisterCount; ++i) {
-        out += hex_u64_le(gdb_register(r, i));
+        // gdb_register answers by GDB's register number, which is the same as
+        // the position in this table for the forty core registers. It is not
+        // the same past those: GDB reserves 40 through 51 for the SSE and AVX
+        // banks this description does not declare, so %fs_base sits at 152
+        // there and at 40 here. Reading the table below by GDB's numbering
+        // would answer a question about %orig_rax with %fs_base.
+        const unsigned bits = kGdbFields[i].bits;
+        if (i < 17) {
+            append_gdb_register(out, gdb_register(r, i), bits);
+        } else if (i < 24) {
+            // %eflags and the six segment selectors. The kernel reports these
+            // as 32 bits and the description declares them that way, so they
+            // are sent as four bytes. Sending eight would shift the whole x87
+            // block that follows.
+            append_gdb_register(out, gdb_register(r, i), bits);
+        } else if (i < 40) {
+            // The x87 stack and its control block. The kernel's
+            // user_regs_struct does not carry them and a thread stopped at a
+            // syscall entry is not an x87 context, so there is nothing
+            // truthful to report and zero is the honest answer. They still
+            // occupy their ten and four bytes: the description has to declare
+            // them for GDB to accept the layout at all, and leaving them out
+            // here would shorten the block by eighty-eight bytes.
+            append_gdb_register(out, 0, bits);
+        } else if (i == 40) {
+            // %fs_base is the thread pointer and %gs_base the group selector.
+            // %orig_rax is the syscall the thread is stopped in, which is the
+            // most valuable thing this stub can show a debugger that asked.
+            append_gdb_register(out, r.fs_base, bits);
+        } else if (i == 41) {
+            append_gdb_register(out, r.gs_base, bits);
+        } else {
+            append_gdb_register(out, r.orig_rax, bits);
+        }
     }
 }
 
@@ -158,10 +290,34 @@ void fill_gdb_registers(const Registers& r, std::string& out) noexcept {
 // fill_gdb_registers writes, and the two are cross-checked by the register
 // count below.
 //
-// The names are the ones GDB uses for x86-64. Two are not register names at
-// all -- orig_rax and fs_base are the syscall the thread is in and the
-// thread pointer -- and they are included because a debugger reading them
-// gets a coherent view rather than a shifted one.
+// The core feature is the part GDB checks hardest. i386_validate_tdesc_p walks
+// the first num_core_regs registers of "org.gnu.gdb.i386.core" and requires
+// each to be present, in order, under the name its x86-64 tdep lists for it --
+// the list runs rax..gs, then st0..st7, then fctrl..fop, and ends at %fop. A
+// description that stops after %gs is rejected whole, and the rejection is only
+// a warning: GDB then falls back to its built-in defaults and reads the rest of
+// the 'g' reply at the wrong offsets, so every register after the gap shows a
+// plausible value under the wrong name. The x87 registers are declared here to
+// satisfy that walk and read as zero, because a thread stopped at a syscall
+// entry has no x87 state this stub can see.
+//
+// %orig_rax is the syscall number the thread is stopped in. GDB has no
+// register number for it, so it goes in a feature of its own rather than at
+// the end of the core feature, where it would take the slot belonging to %st0
+// and shift the whole x87 block up by one.
+//
+// %fs_base and %gs_base are the thread pointer and the group selector. They
+// live in "org.gnu.gdb.i386.segments", which is the feature GDB looks for them
+// in by name; declaring them in the core feature instead would leave GDB
+// believing %fs has no base, and every backtrace would show a wrong thread
+// pointer.
+//
+// No regnum attribute appears anywhere below, and that is deliberate. GDB
+// numbers the registers itself, in document order, from its own tdep enum --
+// the numbers in this file would be a second, parallel numbering that GDB
+// never consults when it validates the description, and one that would drift
+// the moment a register were added. Writing them buys nothing and risks
+// GDB believing a layout this file does not actually implement.
 //
 // The vector size is in bytes and is the x86-64 requirement.
 constexpr std::string_view kTargetXml = R"(<?xml version="1.0"?>
@@ -169,33 +325,71 @@ constexpr std::string_view kTargetXml = R"(<?xml version="1.0"?>
 <target version="1.0">
   <architecture>i386:x86-64</architecture>
   <feature name="org.gnu.gdb.i386.core">
-    <reg name="rax" bitsize="64" type="int64" regnum="0"/>
-    <reg name="rbx" bitsize="64" type="int64" regnum="1"/>
-    <reg name="rcx" bitsize="64" type="int64" regnum="2"/>
-    <reg name="rdx" bitsize="64" type="int64" regnum="3"/>
-    <reg name="rsi" bitsize="64" type="int64" regnum="4"/>
-    <reg name="rdi" bitsize="64" type="int64" regnum="5"/>
-    <reg name="rbp" bitsize="64" type="data_ptr" regnum="6"/>
-    <reg name="rsp" bitsize="64" type="data_ptr" regnum="7"/>
-    <reg name="r8" bitsize="64" type="int64" regnum="8"/>
-    <reg name="r9" bitsize="64" type="int64" regnum="9"/>
-    <reg name="r10" bitsize="64" type="int64" regnum="10"/>
-    <reg name="r11" bitsize="64" type="int64" regnum="11"/>
-    <reg name="r12" bitsize="64" type="int64" regnum="12"/>
-    <reg name="r13" bitsize="64" type="int64" regnum="13"/>
-    <reg name="r14" bitsize="64" type="int64" regnum="14"/>
-    <reg name="r15" bitsize="64" type="int64" regnum="15"/>
-    <reg name="rip" bitsize="64" type="code_ptr" regnum="16"/>
-    <reg name="eflags" bitsize="32" regnum="17"/>
-    <reg name="cs" bitsize="32" regnum="18"/>
-    <reg name="ss" bitsize="32" regnum="19"/>
-    <reg name="ds" bitsize="32" regnum="20"/>
-    <reg name="es" bitsize="32" regnum="21"/>
-    <reg name="fs" bitsize="32" regnum="22"/>
-    <reg name="gs" bitsize="32" regnum="23"/>
-    <reg name="orig_rax" bitsize="64" type="int64" regnum="24"/>
-    <reg name="fs_base" bitsize="64" type="int64" regnum="25"/>
-    <reg name="gs_base" bitsize="64" type="int64" regnum="26"/>
+    <flags id="i386_eflags" size="4">
+      <field name="CF" start="0" end="0"/>
+      <field name="PF" start="2" end="2"/>
+      <field name="AF" start="4" end="4"/>
+      <field name="ZF" start="6" end="6"/>
+      <field name="SF" start="7" end="7"/>
+      <field name="TF" start="8" end="8"/>
+      <field name="IF" start="9" end="9"/>
+      <field name="DF" start="10" end="10"/>
+      <field name="OF" start="11" end="11"/>
+      <field name="NT" start="14" end="14"/>
+      <field name="RF" start="16" end="16"/>
+      <field name="VM" start="17" end="17"/>
+      <field name="AC" start="18" end="18"/>
+      <field name="VIF" start="19" end="19"/>
+      <field name="VIP" start="20" end="20"/>
+      <field name="ID" start="21" end="21"/>
+    </flags>
+    <reg name="rax" bitsize="64" type="int64"/>
+    <reg name="rbx" bitsize="64" type="int64"/>
+    <reg name="rcx" bitsize="64" type="int64"/>
+    <reg name="rdx" bitsize="64" type="int64"/>
+    <reg name="rsi" bitsize="64" type="int64"/>
+    <reg name="rdi" bitsize="64" type="int64"/>
+    <reg name="rbp" bitsize="64" type="data_ptr"/>
+    <reg name="rsp" bitsize="64" type="data_ptr"/>
+    <reg name="r8" bitsize="64" type="int64"/>
+    <reg name="r9" bitsize="64" type="int64"/>
+    <reg name="r10" bitsize="64" type="int64"/>
+    <reg name="r11" bitsize="64" type="int64"/>
+    <reg name="r12" bitsize="64" type="int64"/>
+    <reg name="r13" bitsize="64" type="int64"/>
+    <reg name="r14" bitsize="64" type="int64"/>
+    <reg name="r15" bitsize="64" type="int64"/>
+    <reg name="rip" bitsize="64" type="code_ptr"/>
+    <reg name="eflags" bitsize="32" type="i386_eflags"/>
+    <reg name="cs" bitsize="32" type="int32"/>
+    <reg name="ss" bitsize="32" type="int32"/>
+    <reg name="ds" bitsize="32" type="int32"/>
+    <reg name="es" bitsize="32" type="int32"/>
+    <reg name="fs" bitsize="32" type="int32"/>
+    <reg name="gs" bitsize="32" type="int32"/>
+    <reg name="st0" bitsize="80" type="i387_ext"/>
+    <reg name="st1" bitsize="80" type="i387_ext"/>
+    <reg name="st2" bitsize="80" type="i387_ext"/>
+    <reg name="st3" bitsize="80" type="i387_ext"/>
+    <reg name="st4" bitsize="80" type="i387_ext"/>
+    <reg name="st5" bitsize="80" type="i387_ext"/>
+    <reg name="st6" bitsize="80" type="i387_ext"/>
+    <reg name="st7" bitsize="80" type="i387_ext"/>
+    <reg name="fctrl" bitsize="32" type="int" group="float"/>
+    <reg name="fstat" bitsize="32" type="int" group="float"/>
+    <reg name="ftag" bitsize="32" type="int" group="float"/>
+    <reg name="fiseg" bitsize="32" type="int" group="float"/>
+    <reg name="fioff" bitsize="32" type="int" group="float"/>
+    <reg name="foseg" bitsize="32" type="int" group="float"/>
+    <reg name="fooff" bitsize="32" type="int" group="float"/>
+    <reg name="fop" bitsize="32" type="int" group="float"/>
+  </feature>
+  <feature name="org.gnu.gdb.i386.segments">
+    <reg name="fs_base" bitsize="64" type="int64"/>
+    <reg name="gs_base" bitsize="64" type="int64"/>
+  </feature>
+  <feature name="org.gnu.gdb.i386.syscall">
+    <reg name="orig_rax" bitsize="64" type="int64"/>
   </feature>
 </target>
 )";
@@ -246,11 +440,14 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
         return handle_write_registers(args);
 
     case 'p': {
-        // Read one register by number. The numbering is the one the target
-        // description gives, which is the same one the 'g' reply is built
-        // from -- reading a register by a different index than it was
-        // written by is how a debugger ends up displaying one register's
-        // value under another's name.
+        // Read one register by number. The number is the one GDB assigned in
+        // its own register enum, not the position in the 'g' block -- the two
+        // agree only across the forty core registers, because GDB reserves
+        // 40 through 51 for the SSE and AVX banks this description does not
+        // declare. Reading by a different index than the description gives is
+        // how a debugger ends up displaying one register's value under
+        // another's name, so the bound below is the highest number this stub
+        // answers for rather than the count of registers in the block.
         //
         // The number arrives as a variable-width hexadecimal value, so "p0"
         // asks for the first register and "p1a" for the twenty-sixth. It is
@@ -260,7 +457,7 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
         if (!parse_hex_number(args, which)) {
             return {};
         }
-        if (which >= kGdbRegisterCount) {
+        if (which > kOrigRaxRegnum) {
             return {};
         }
         Registers r{};
@@ -341,7 +538,16 @@ std::string DebugServer::handle_query(std::string_view kind) noexcept {
         // vContSupported+ is here because handle_vcont() implements the
         // actions, and qXfer:features:read+ because
         // handle_qxfer_features() serves the target description.
-        return "qXfer:features:read+;swbreak+;hwbreak+;vContSupported+";
+        //
+        // xmlRegisters=i386 is what makes the debugger fetch the target
+        // description at all. Without it gdb keeps its built-in default,
+        // which describes a 32-bit i386 target with 17 registers, and every
+        // register read is then the wrong width at the wrong offset -- the
+        // 'g' reply is rejected as truncated and no register is shown. The
+        // name is i386 even for an x86-64 target: it names the register
+        // description format, not the processor.
+        return "qXfer:features:read+;swbreak+;hwbreak+;vContSupported+;"
+               "xmlRegisters=i386";
     }
     if (starts_with(kind, "Xfer:features:read:")) {
         return handle_qxfer_features(
@@ -373,6 +579,29 @@ std::string DebugServer::handle_query(std::string_view kind) noexcept {
 
 std::string_view target_description() noexcept {
     return kTargetXml;
+}
+
+std::size_t gdb_register_block_size() noexcept {
+    return kGdbRegisterBytes;
+}
+
+unsigned gdb_register_bits(std::size_t index) noexcept {
+    if (index >= kGdbRegisterCount) {
+        return 0;
+    }
+    return kGdbFields[index].bits;
+}
+
+std::size_t gdb_regnum_fs_base() noexcept {
+    return kFsBaseRegnum;
+}
+
+std::size_t gdb_regnum_gs_base() noexcept {
+    return kGsBaseRegnum;
+}
+
+std::size_t gdb_regnum_orig_rax() noexcept {
+    return kOrigRaxRegnum;
 }
 
 std::string serve_target_description(std::string_view args) noexcept {
@@ -550,18 +779,31 @@ std::string DebugServer::handle_read_registers() noexcept {
 }
 
 std::string DebugServer::handle_write_registers(std::string_view args) noexcept {
-    // A 'G' packet carries every register, so the length is fixed by the
-    // target description rather than by what the debugger happened to send.
-    // The sixteen segment selectors and flags are declared 32 bits wide and
-    // arrive in sixteen-byte slots, which is why the multiply is by two
-    // characters rather than one.
-    if (args.size() < kGdbRegisterCount * 16) {
+    // A 'G' packet carries every register, so its length is fixed by the target
+    // description rather than by what the debugger happened to send. The block
+    // is not sixteen hex characters per register: the description gives each
+    // register its own width and GDB packs them end to end, so the whole block
+    // is kGdbRegisterBytes and a field is eight or twenty hex characters wide
+    // depending on which register it is. Parsing it as a fixed-stride array
+    // would read %st0 out of the middle of %fop.
+    if (args.size() < kGdbRegisterBytes * 2) {
         return "E01";
     }
 
-    std::uint64_t values[kGdbRegisterCount];
-    for (std::size_t i = 0; i < kGdbRegisterCount; ++i) {
-        if (!parse_hex_u64_le(args.substr(i * 16, 16), values[i])) {
+    // Only the first seventeen are writable through SETREGS on this
+    // architecture: the sixteen general registers and %rip. %eflags and the
+    // segment selectors are named because the description has to name them, and
+    // the kernel's setregs rejects them here; the x87 block is not accepted at
+    // all, and %fs_base, %gs_base and %orig_rax belong to the syscall entry
+    // path. Writing any of them would be either refused or silently undone,
+    // which is worse than ignoring the request, so they are left as zero here
+    // and never reach the tracee.
+    std::uint64_t values[kGdbRegisterCount] = {};
+    for (std::size_t i = 0; i < 17 && i < kGdbRegisterCount; ++i) {
+        const GdbField& f = kGdbFields[i];
+        const std::string_view field =
+            args.substr(f.offset * 2, (f.bits / 8u) * 2u);
+        if (!parse_hex_u64_le(field, values[i])) {
             return "E01";
         }
     }
@@ -843,7 +1085,17 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
 
     DebugServer server(tracer, breakpoints, config.pid, events);
 
-    PacketDecoder decoder;
+    // A run that asked for a debugger port hands over the listening socket
+    // rather than a connection, because the person running it has to be told
+    // where to connect before they can connect. The first pass through the
+    // loop accepts whoever arrives; every pass after that serves them.
+    Connection connection;
+
+    // Set once the debugger has said to continue. Until then the target stays
+    // stopped, which is the point of holding at all: the alternative is a
+    // target that has already run past main by the time anybody could have
+    // attached.
+    bool released_for_debugger = false;
 
     // The process has been seized and is stopped. The first resume is what
     // lets it run at all.
@@ -854,7 +1106,16 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
         return r.failed() ? r.error : 0;
     };
 
-    if (resume(config.pid, 0) != 0) {
+    // A session that was asked to wait for a debugger does not resume here.
+    // The process is stopped at its first instruction of the new image and
+    // stays there while the loop below serves the protocol, so a debugger
+    // that connects gets a target it can set breakpoints in rather than one
+    // that has already run.
+    //
+    // The resume itself happens inside the loop, once a continue arrives,
+    // because the loop is what has to be running to deliver that continue.
+    const bool hold_for_debugger = config.wait_for_debugger && config.serve_gdb;
+    if (!hold_for_debugger && resume(config.pid, 0) != 0) {
         out.failed = true;
         out.detail = "the process could not be resumed after being seized";
         (void)tracer.detach(config.pid, 0);
@@ -1028,39 +1289,82 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             break;
         }
 
-        // Serves the debugger between stops. poll with a zero timeout is
-        // used rather than a blocking read so that the tracee's stops are
-        // never delayed by a debugger that has nothing to say.
-        if (config.serve_gdb && config.gdb_read_fd >= 0) {
-            struct pollfd pfd {};
-            pfd.fd = config.gdb_read_fd;
-            pfd.events = POLLIN;
-            const int pr = ::poll(&pfd, 1, 0);
-            if (pr > 0 && (pfd.revents & POLLIN) != 0) {
-                char buffer[4096];
-                const ssize_t n = ::read(config.gdb_read_fd, buffer,
-                                         sizeof(buffer));
-                if (n > 0) {
-                    decoder.feed(buffer, static_cast<std::size_t>(n));
-                    while (decoder.has_packet()) {
-                        const Packet p = decoder.take();
-                        if (!p.checksum_ok) {
-                            continue;
-                        }
-                        const std::string reply = server.handle(p.data);
-                        const std::string encoded = encode_packet(reply);
-                        if (config.gdb_write_fd >= 0) {
-                            const ssize_t w = ::write(config.gdb_write_fd,
-                                                      encoded.data(),
-                                                      encoded.size());
-                            (void)w;
+        // Serves the debugger between stops. Two things happen here and the
+        // order matters: a listening socket is accepted on first, and only
+        // then is there a connection to read from.
+        //
+        // The accept is non-blocking. A run started with a debugger port and
+        // no debugger attached still has to run its target, or asking for a
+        // port would be a way to run nothing. It is the tracee's stops that
+        // drive this loop, so a debugger that has not arrived yet is simply
+        // not there yet.
+        if (config.serve_gdb && !connection.valid()) {
+            const int listen_fd = config.gdb_listen_fd >= 0
+                                      ? config.gdb_listen_fd
+                                      : config.gdb_read_fd;
+            if (listen_fd >= 0) {
+                sys::PollFd pfd{};
+                pfd.fd = listen_fd;
+                pfd.events = 0x0001; // POLLIN
+                pfd.revents = 0;
+                const auto ready = sys::poll(&pfd, 1, 0);
+                if (ready.ok() && ready.value > 0) {
+                    const auto accepted =
+                        sys::accept4(listen_fd, nullptr, nullptr,
+                                     0x80000 /* SOCK_CLOEXEC */);
+                    if (accepted.ok()) {
+                        connection.adopt(static_cast<int>(accepted.value));
+                        auto& note = events.begin(EventKind::Note);
+                        note.add("text", std::string_view{"a debugger attached"});
+                        note.add("port",
+                                 static_cast<std::uint64_t>(config.gdb_port));
+                        events.commit();
+                    }
+                }
+            }
+        } else if (config.serve_gdb && connection.valid()) {
+            // Reading with a zero timeout keeps the tracee's stops from being
+            // delayed by a debugger that has nothing to say. The target is
+            // the thing making progress here; the debugger is a passenger.
+            if (connection.wait_readable(0)) {
+                if (connection.pump()) {
+                    // Acknowledge before handling. A debugger that has sent
+                    // a packet is waiting for the '+' before it will send the
+                    // next one, so answering after the reply would make every
+                    // exchange take a round of timeouts.
+                    (void)connection.flush_ack();
+                    if (connection.retransmit_requested()) {
+                        // The far end saw a checksum fail. The same bytes go
+                        // back, because its copy is the only one known to be
+                        // what it meant to send.
+                        connection.clear_retransmit();
+                        const std::string& again = connection.last_packet();
+                        (void)sys::write(connection.fd(), again.data(),
+                                          again.size());
+                    }
+                    std::string request;
+                    while (connection.take_packet(request)) {
+                        // Every request gets an answer, including the ones
+                        // that are not supported. An empty payload in a
+                        // framed packet is the protocol's way of saying "not
+                        // supported", and sending nothing at all is not: a
+                        // debugger that asked a question and got silence
+                        // waits for the answer forever, which is a stub that
+                        // looks hung rather than one that looks limited.
+                        const std::string reply = server.handle(request);
+                        (void)connection.send_packet(reply);
+                        if (server.detached()) {
+                            (void)tracer.detach(config.pid, 0);
+                            connection.close();
+                            break;
                         }
                     }
-                } else if (n == 0) {
+                } else {
                     // The debugger disconnected. The process is left to run
                     // rather than killed, because a debugger that goes away
                     // is not a request to end the target.
                     server.clear_resume();
+                    connection.close();
                 }
             }
         }
@@ -1068,6 +1372,46 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
         if (server.detached()) {
             (void)tracer.detach(config.pid, 0);
             break;
+        }
+
+        // Holding at the first stop: the target is stopped and stays stopped
+        // until the debugger asks it to run. The wait is a sleep rather than
+        // a blocking read because the loop has to keep draining the event
+        // stream and servicing the protocol while it waits, and because a
+        // debugger that connects and then goes quiet must not wedge the run.
+        if (hold_for_debugger && !released_for_debugger) {
+            // Nothing is resumed until a continue arrives, so this branch
+            // runs on every pass and is the run's whole behaviour while it
+            // waits. The poll with no descriptors is a sleep that cannot
+            // fail: the loop has to come back to accept a connection and
+            // drain the event stream, and a debugger that connects and then
+            // says nothing must not wedge the run.
+            if (server.resume_requested()) {
+                const int signal = server.resume_signal();
+                server.clear_resume();
+                released_for_debugger = true;
+                auto& note = events.begin(EventKind::Note);
+                note.add("text", std::string_view{
+                                    "the debugger resumed the target"});
+                Registers held{};
+                if (tracer.get_regs(config.pid, held).ok()) {
+                    note.add_hex("pc", held.rip);
+                    note.add_hex("sp", held.rsp);
+                }
+                events.commit();
+                if (resume(config.pid, signal) != 0) {
+                    out.failed = true;
+                    out.detail = "the target could not be resumed by the debugger";
+                    break;
+                }
+            } else {
+                sys::PollFd idle{};
+                idle.fd = -1;
+                idle.events = 0;
+                idle.revents = 0;
+                (void)sys::poll(&idle, 0, 20);
+            }
+            continue;
         }
 
         Stop stop = tracer.wait(0);

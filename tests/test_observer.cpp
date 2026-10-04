@@ -621,6 +621,52 @@ void test_listener_binds_loopback() {
     check(!listener.valid(), "a closed listener is not valid");
 }
 
+void test_listener_stays_listening() {
+    // The listener has to keep listening for as long as the run lasts, not
+    // only until the first accept. A run that binds a port, prints it, and
+    // then closes the socket looks correct right up to the moment somebody
+    // tries to connect to the number it printed.
+    Listener listener;
+    std::string error;
+    if (!listener.open(0, error)) {
+        std::fprintf(stderr, "  note: skipping: %s\n", error.c_str());
+        return;
+    }
+    const std::uint16_t port = listener.port();
+
+    // Nothing has accepted yet, so the socket must still be connectable.
+    // This is checked by connecting, not by inspecting the descriptor: an
+    // open socket that was never told to listen refuses a connection, and so
+    // does one that was closed after being told to.
+    const auto client = occ::sys::socket(2, 1, 0);
+    if (client.failed()) {
+        std::fprintf(stderr, "  note: cannot create a client socket\n");
+        return;
+    }
+    struct SockAddrIn {
+        std::uint16_t family;
+        std::uint16_t port;
+        std::uint32_t addr;
+        std::uint8_t zero[8];
+    } addr{};
+    addr.family = 2;
+    addr.port = static_cast<std::uint16_t>((port >> 8) | (port << 8));
+    addr.addr = 0x0100007f;
+    const auto connected =
+        occ::sys::connect(static_cast<int>(client.value), &addr, sizeof(addr));
+    check(connected.ok(), "the port accepts a connection before any accept");
+
+    // And the accept still succeeds afterwards, which is the property that
+    // a closed socket would fail.
+    Connection conn;
+    check(listener.accept(conn, 1000),
+          "the listener is still listening when accept is called");
+    check(conn.valid(), "the accepted connection is valid");
+
+    (void)occ::sys::close(static_cast<int>(client.value));
+    conn.close();
+}
+
 void test_listener_accept_times_out() {
     Listener listener;
     std::string error;
@@ -778,55 +824,232 @@ void test_connection_drops_corrupt_packet() {
           "an intact packet is the one to resend");
 }
 
+// Returns the name of the index'th <reg> element, or an empty view when the
+// description is shorter than that. The order is the one GDB numbers by.
+//
+// The scan matches a whole "<reg " tag and nothing else. A looser search --
+// find the next "<reg " and read to the next "/>" -- walks into the <flags>
+// element that declares the eflags bit layout, because its <field> children
+// end in "/>" too, and from there the offsets are wrong. Skipping non-register
+// elements instead is worse: deciding where a <feature> ends means matching
+// nesting, and getting that wrong skips a whole feature and reports the
+// registers after it as missing. A register tag carries no children, so its
+// own "/>" is the end of it, and matching that is enough.
+std::string_view reg_name_at(std::string_view xml, std::size_t index_wanted) {
+    std::size_t pos = 0;
+    std::size_t index = 0;
+    while (pos < xml.size()) {
+        const std::size_t reg = xml.find("<reg ", pos);
+        if (reg == std::string_view::npos) {
+            return {};
+        }
+        // Reject a partial match: "<reg" has to be followed by a space, and
+        // the name attribute has to open before the tag closes.
+        const std::size_t end = xml.find("/>", reg);
+        if (end == std::string_view::npos) {
+            return {};
+        }
+        const std::size_t name = xml.find("name=\"", reg);
+        if (name == std::string_view::npos || name >= end) {
+            // Not a register element after all, or a malformed one. Step past
+            // this tag and keep looking rather than giving up.
+            pos = reg + 5;
+            continue;
+        }
+        if (index == index_wanted) {
+            const std::size_t first = name + 6;
+            const std::size_t close = xml.find('"', first);
+            if (close == std::string_view::npos || close > end) {
+                return {};
+            }
+            return xml.substr(first, close - first);
+        }
+        ++index;
+        pos = end;
+    }
+    return {};
+}
+
 // ------------------------------------------------------- target description
 
-// Counts the regnum attributes in the description. The count is what has to
+// Counts the register elements in the description. The count is what has to
 // agree with the 'g' reply, and it is checked against the wire format rather
 // than against a constant so that a register added to one place and not the
 // other is caught here instead of by a debugger showing shifted values.
 std::size_t count_registers(std::string_view xml) {
     std::size_t seen = 0;
-    std::size_t pos = 0;
-    while ((pos = xml.find("regnum=\"", pos)) != std::string_view::npos) {
-        pos += 8;
+    for (std::size_t i = 0; !reg_name_at(xml, i).empty(); ++i) {
         ++seen;
     }
     return seen;
 }
+
 
 void test_target_description() {
     const std::string_view xml = target_description();
     check(!xml.empty(), "the target description is not empty");
     check(xml.find("i386:x86-64") != std::string_view::npos,
           "the description names the x86-64 architecture");
-    check(count_registers(xml) == 27,
-          "the description carries all twenty-seven registers");
+
+    // The core feature has to carry all forty registers GDB's x86-64 tdep
+    // walks, in the order it walks them. i386_validate_tdesc_p compares each
+    // of the first num_core_regs entries against the name its own list holds,
+    // and rejects the whole description if one is missing or out of place. The
+    // rejection is only a warning from the user's side, and the consequence is
+    // that GDB falls back to its own 32-bit defaults and reads the rest of the
+    // 'g' reply at the wrong offsets. So this is the single assertion that
+    // keeps the description usable at all, and it is written out in full
+    // because the list is GDB's, not ours.
+    static const char *const kCoreNames[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
+        "rip", "eflags", "cs", "ss", "ds", "es", "fs", "gs",
+        "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7",
+        "fctrl", "fstat", "ftag", "fiseg", "fioff", "foseg", "fooff", "fop",
+    };
+    bool core_ok = true;
+    for (std::size_t i = 0; i < sizeof(kCoreNames) / sizeof(kCoreNames[0]);
+         ++i) {
+        if (reg_name_at(xml, i) != kCoreNames[i]) {
+            core_ok = false;
+            break;
+        }
+    }
+    check(core_ok,
+          "the core feature carries all forty registers in GDB's order, "
+          "ending at %fop rather than %gs");
+
+    // The three this stub adds are the 41st through 43rd, and %orig_rax is
+    // last because GDB has no register number for it at all: putting it in the
+    // middle would displace %st0 and shift the whole x87 block up by one.
+    check(reg_name_at(xml, 40) == "fs_base", "fs_base follows the core block");
+    check(reg_name_at(xml, 41) == "gs_base", "gs_base follows fs_base");
+    check(reg_name_at(xml, 42) == "orig_rax", "orig_rax is the last register");
+    check(count_registers(xml) == 43,
+          "the description carries the core forty and the three it adds");
 
     // The program counter is the register a debugger reads first, and its
-    // number is load-bearing: it is the index the 'g' reply and the 'p'
-    // packet both use. A description that renumbered it would make every
-    // register after it wrong too.
-    check(xml.find("name=\"rip\" bitsize=\"64\" type=\"code_ptr\" regnum=\"16\"") !=
-              std::string_view::npos,
-          "rip is register sixteen at sixty-four bits");
+    // width is load-bearing: it is the field the 'g' reply and the 'p' packet
+    // both size from. A description that made it narrower would shift every
+    // register after it.
+    check(reg_name_at(xml, 16) == "rip", "rip is the seventeenth register");
+    check(xml.find("name=\"rip\" bitsize=\"64\"") != std::string_view::npos,
+          "rip is sixty-four bits wide");
 
-    // eflags and the segment selectors are thirty-two bit. Describing them
-    // as sixty-four makes the 'g' reply longer than the debugger expects and
-    // every field after them shifts.
-    check(xml.find("name=\"eflags\" bitsize=\"32\" regnum=\"17\"") !=
-              std::string_view::npos,
+    // eflags and the segment selectors are thirty-two bit, and the x87 stack
+    // registers are eighty. Describing either as a full word makes the 'g'
+    // reply longer than the debugger expects and shifts every field after it,
+    // so %st0 ends up holding %fop and a backtrace names the wrong frame.
+    check(xml.find("name=\"eflags\" bitsize=\"32\"") != std::string_view::npos,
           "eflags is thirty-two bits");
+    check(xml.find("name=\"cs\" bitsize=\"32\"") != std::string_view::npos,
+          "cs is thirty-two bits");
+    check(xml.find("name=\"st0\" bitsize=\"80\"") != std::string_view::npos,
+          "st0 is the eighty-bit x87 extended format");
 
-    // orig_rax and the two base registers are not architectural state a
-    // debugger can set, but a debugger that reads them gets a coherent view
-    // of where the thread is. Their presence is why the count is 27 rather
-    // than the 24 a plain x86-64 layout would give.
-    check(xml.find("name=\"orig_rax\"") != std::string_view::npos,
-          "orig_rax is described");
-    check(xml.find("name=\"fs_base\"") != std::string_view::npos,
-          "fs_base is described");
-    check(xml.find("name=\"gs_base\"") != std::string_view::npos,
-          "gs_base is described");
+    // No regnum attribute anywhere. GDB numbers the registers itself, in
+    // document order, from its own tdep enum; a regnum written here would be a
+    // second parallel numbering that GDB never consults when it validates the
+    // description, and one that would silently drift out of step with it.
+    check(xml.find("regnum=") == std::string_view::npos,
+          "the description leaves register numbering to GDB");
+
+    // eflags is described through a flags element, which has to be declared
+    // before the register that refers to it or GDB reports an unknown type and
+    // drops the whole description.
+    const std::size_t flags = xml.find("<flags id=\"i386_eflags\"");
+    const std::size_t eflags = xml.find("name=\"eflags\"");
+    check(flags != std::string_view::npos && flags < eflags,
+          "the eflags bit layout is declared before the register using it");
+
+    // %fs_base and %gs_base have to live in the segments feature. GDB looks
+    // for them there by name, and a description that put them in the core
+    // feature leaves it believing %fs has no base, so every backtrace shows a
+    // wrong thread pointer.
+    const std::size_t segments = xml.find("org.gnu.gdb.i386.segments");
+    const std::size_t fs_base = xml.find("name=\"fs_base\"");
+    const std::size_t gs_base = xml.find("name=\"gs_base\"");
+    check(segments != std::string_view::npos && segments < fs_base &&
+              fs_base < gs_base,
+          "the segment bases are declared in the segments feature, in order");
+}
+
+// The bitsize the description gives a register, found by the same scan a
+// debugger's parser would do.
+std::size_t reg_bitsize(std::string_view xml, std::string_view name) {
+    const std::string needle = "name=\"" + std::string(name) + "\" bitsize=\"";
+    const std::size_t at = xml.find(needle);
+    if (at == std::string_view::npos) {
+        return 0;
+    }
+    const std::size_t first = at + needle.size();
+    std::size_t value = 0;
+    for (std::size_t i = first; i < xml.size() && xml[i] != '"'; ++i) {
+        const char c = xml[i];
+        if (c < '0' || c > '9') {
+            return 0;
+        }
+        value = value * 10 + static_cast<std::size_t>(c - '0');
+    }
+    return value;
+}
+
+void test_register_block_matches_description() {
+    // The block the 'g' handler writes and the document GDB reads are written
+    // in different places, and nothing in either one checks the other. A
+    // register that disagrees between them is invisible from both sides: the
+    // block is self-consistent, the description is self-consistent, GDB accepts
+    // the description and reads the block at the widths the description gives.
+    // Every register past the mismatch then shows a plausible value under the
+    // wrong name -- %st0 holding %fop, a backtrace naming the wrong frame --
+    // and nothing reports an error. So the two are held against each other
+    // here, name by name, rather than trusted to stay in step.
+    const std::string_view xml = target_description();
+    const std::size_t count = count_registers(xml);
+
+    bool widths_agree = true;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string_view name = reg_name_at(xml, i);
+        if (name.empty()) {
+            widths_agree = false;
+            break;
+        }
+        if (reg_bitsize(xml, name) != gdb_register_bits(i)) {
+            widths_agree = false;
+            break;
+        }
+    }
+    check(widths_agree,
+          "every register is packed at the width the description declares");
+
+    // The block is not eight bytes per register, and treating it as one is the
+    // mistake that makes the check above pass while the wire format is wrong.
+    // GDB packs the description end to end with no padding, so x86-64 comes to
+    // 300 bytes -- and a stub that sent 43 eight-byte cells would be 44 bytes
+    // long and refused outright.
+    check(gdb_register_block_size() == 300,
+          "the block is 300 bytes, not eight per register");
+    check(gdb_register_bits(0) == 64, "rax is 64 bits");
+    check(gdb_register_bits(16) == 64, "rip is 64 bits");
+    check(gdb_register_bits(17) == 32, "eflags is 32 bits");
+    check(gdb_register_bits(23) == 32, "gs is 32 bits");
+    check(gdb_register_bits(24) == 80, "st0 is 80 bits");
+    check(gdb_register_bits(31) == 80, "st7 is 80 bits");
+    check(gdb_register_bits(32) == 32, "fctrl is 32 bits");
+    check(gdb_register_bits(39) == 32, "fop is 32 bits");
+    check(gdb_register_bits(40) == 64, "fs_base is 64 bits");
+    check(gdb_register_bits(42) == 64, "orig_rax is 64 bits");
+    check(gdb_register_bits(43) == 0, "there is no forty-fourth register");
+
+    // The 'p' handler is asked by the register number GDB assigned, and that is
+    // not the position in the block: GDB reserves 40 through 51 for the SSE and
+    // AVX banks this description does not declare, so the segment bases land at
+    // 152 and 153. Reading them by position would answer a question about
+    // %gs_base with %st4.
+    check(gdb_regnum_fs_base() == 152, "fs_base is register 152 to GDB");
+    check(gdb_regnum_gs_base() == 153, "gs_base is register 153 to GDB");
+    check(gdb_regnum_orig_rax() == 154,
+          "orig_rax is answered just past the bases");
 }
 
 void test_serve_target_description() {
@@ -1046,10 +1269,12 @@ int main() {
     test_wx_chase_prefers_new_mapping();
     test_wx_permission_transition();
     test_listener_binds_loopback();
+    test_listener_stays_listening();
     test_listener_accept_times_out();
     test_connection_round_trip();
     test_connection_drops_corrupt_packet();
     test_target_description();
+    test_register_block_matches_description();
     test_serve_target_description();
     test_parse_vcont();
 

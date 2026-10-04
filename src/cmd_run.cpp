@@ -1,6 +1,7 @@
 #include "occ/commands.h"
 
 #include "occ/observer/event.h"
+#include "occ/observer/transport.h"
 #include "occ/runner/run.h"
 #include "occ/util/log.h"
 
@@ -40,6 +41,8 @@ void print_run_usage() {
         "                     anonymous ones\n"
         "  --wx-region <b>:<n>  watch a specific region instead of scanning\n"
         "  --wx-max <bytes>   ignore candidate regions larger than this\n"
+        "  --gdb-port <n>     serve the remote protocol on loopback port <n>\n"
+        "  --gdb-wait         wait for a debugger before running the target\n"
         "  --no-events        do not write the event stream\n"
         "  --help             print this text\n"
         "\n"
@@ -50,7 +53,13 @@ void print_run_usage() {
         "--track-wx needs hardware watch events. There are four debug\n"
         "registers and a candidate region is a whole page, so the stream\n"
         "reports how many bytes were actually covered rather than implying\n"
-        "the region was watched in full\n");
+        "the region was watched in full\n"
+        "\n"
+        "--gdb-port prints the port before the target starts, so a debugger\n"
+        "can be attached at any point during the run. Port 0 asks the kernel\n"
+        "for any free port. --gdb-wait holds the target at its first stop\n"
+        "until a debugger connects, which is what makes 'break main' work\n"
+        "instead of racing the program's first instructions\n");
 }
 
 // Parses an unsigned decimal, or a hexadecimal number written with a 0x
@@ -143,6 +152,13 @@ int cmd_run(int argc, char** argv) {
     std::vector<std::string> target_argv;
 
     bool no_events = false;
+
+    // The port to serve the remote protocol on, and whether to hold the
+    // target until a debugger arrives. Zero with no --gdb-port means no
+    // debugger is served at all.
+    std::uint16_t gdb_port = 0;
+    bool gdb_serve = false;
+    bool gdb_wait = false;
 
     for (int i = 0; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -302,6 +318,28 @@ int cmd_run(int argc, char** argv) {
             options.wx_regions.push_back(t);
             options.track_wx = true;
             options.observe = true;
+        } else if (arg == "--gdb-port" || arg == "--gdb") {
+            const char* v = value("--gdb-port");
+            if (v == nullptr) {
+                return 2;
+            }
+            std::uint64_t port = 0;
+            if (!parse_u64(v, port) || port > 0xffff) {
+                std::fprintf(stderr,
+                             "occ run: --gdb-port wants a port number 0..65535\n");
+                return 2;
+            }
+            gdb_port = static_cast<std::uint16_t>(port);
+            gdb_serve = true;
+            // A run that serves a debugger is a run that observes: the
+            // session loop is what reads the protocol, and it is the same
+            // loop that reports the target's stops. Serving a debugger
+            // without observing would mean a target nobody can stop.
+            options.observe = true;
+        } else if (arg == "--gdb-wait") {
+            gdb_wait = true;
+            gdb_serve = true;
+            options.observe = true;
         } else if (arg == "--no-events") {
             no_events = true;
         } else {
@@ -330,6 +368,33 @@ int cmd_run(int argc, char** argv) {
     if (!no_events) {
         const char* want = ::getenv("OCC_EVENT_STREAM");
         emit_events = want != nullptr && want[0] == '1';
+    }
+
+    // Bound before the target starts. The port has to be printed before
+    // anyone can connect to it, and a person reading a port number off a
+    // terminal is exactly the person who is about to type it into gdb.
+    obs::Listener listener;
+    if (gdb_serve) {
+        std::string error;
+        if (!listener.open(gdb_port, error)) {
+            log::error(error);
+            return 1;
+        }
+        options.gdb_listen_fd = listener.fd();
+        options.gdb_port = listener.port();
+        options.gdb_wait = gdb_wait;
+
+        // The notice goes to stderr even when the event stream is on stdout,
+        // because it is addressed to a person and not to a consumer of the
+        // stream. A parser reading the stream should not have to skip a line
+        // that is not an event.
+        std::fprintf(stderr,
+                     "occ: gdb target remote 127.0.0.1:%u\n",
+                     static_cast<unsigned>(listener.port()));
+        if (gdb_wait) {
+            std::fprintf(stderr,
+                         "occ: holding the target until a debugger connects\n");
+        }
     }
 
     obs::Writer events;

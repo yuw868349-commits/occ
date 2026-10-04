@@ -84,6 +84,36 @@ struct SessionConfig {
     // a stop reply.
     int gdb_read_fd = -1;
     int gdb_write_fd = -1;
+
+    // A listening socket to accept the debugger on, rather than a
+    // connection that already exists.
+    //
+    // The distinction is the whole reason a run can print its port before
+    // it has a debugger: the caller binds and reports, the target starts, and
+    // the debugger connects whenever it is ready. Handing over a live
+    // connection instead would mean the run had to wait for a debugger that
+    // had not been told where to connect yet, which is a deadlock rather
+    // than a feature. The loop accepts at most one debugger; a second
+    // connection is refused, because two debuggers cannot both drive one
+    // tracee.
+    int gdb_listen_fd = -1;
+
+    // The port that socket is bound to, reported in the event stream when a
+    // debugger attaches. Zero when the session was handed a connection rather
+    // than a listener.
+    std::uint16_t gdb_port = 0;
+
+    // Whether to hold the target at its first stop until a debugger
+    // arrives.
+    //
+    // Without this the window for setting a breakpoint is a race: the
+    // session serves the debugger between the target's stops, so a debugger
+    // that connects while the target is running joins it at whatever
+    // instruction it happens to be at. For a target that runs to completion
+    // in a few milliseconds -- which is most of them -- that window is
+    // already closed by the time a person has typed the port number. Holding
+    // at the first stop makes "break main" mean what it says.
+    bool wait_for_debugger = false;
 };
 
 // What a session did.
@@ -149,6 +179,37 @@ struct SessionResult {
 // Returns an empty string for a malformed packet, "l" for an annex that does
 // not exist, and otherwise the chunk prefixed by 'm' or 'l'.
 [[nodiscard]] std::string serve_target_description(std::string_view args) noexcept;
+
+// The size in bytes of the 'g' reply for x86-64, and the width in bits of the
+// register at the given position in it.
+//
+// These are exposed so a test can hold the register block against the
+// description. The two are written in different places -- one is the table the
+// packer walks, the other is the document GDB reads -- and a register that
+// disagrees between them is invisible from either side: the block comes out
+// self-consistent and the right length, GDB accepts the description, and every
+// register past the mismatch shows a plausible value under the wrong name. The
+// only symptom is a debugger whose %st0 holds %fop.
+//
+// The block is not eight bytes per register. GDB packs a target description
+// end to end with no padding, so x86-64 is 300 bytes: seventeen general
+// registers and %rip at eight each, %eflags and the six segment selectors at
+// four, the eight x87 stack registers at ten, the eight x87 control registers
+// at four, and %fs_base, %gs_base and %orig_rax at eight.
+[[nodiscard]] std::size_t gdb_register_block_size() noexcept;
+
+// The width of the register at the given position in the 'g' block, in bits, or
+// zero if the position is past the end of the block.
+[[nodiscard]] unsigned gdb_register_bits(std::size_t index) noexcept;
+
+// The register numbers GDB assigns to the three this stub adds past the core
+// feature, which are not positions in the block: GDB reserves 40 through 51
+// for the SSE and AVX banks this description does not declare, so the segment
+// bases land far past the forty. Exposed so a test can hold the 'p' handler's
+// numbering against them.
+[[nodiscard]] std::size_t gdb_regnum_fs_base() noexcept;
+[[nodiscard]] std::size_t gdb_regnum_gs_base() noexcept;
+[[nodiscard]] std::size_t gdb_regnum_orig_rax() noexcept;
 
 // Answers the packet body after "vCont". Consumes and step_requested() are
 // set when the packet asked for a resume, which the session loop performs

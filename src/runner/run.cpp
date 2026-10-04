@@ -216,9 +216,12 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         sc.pid = spawned.pid;
         sc.trace_syscalls = true;
         sc.follow_forks = true;
-        sc.serve_gdb = options.gdb_read_fd >= 0;
+        sc.serve_gdb = options.gdb_read_fd >= 0 || options.gdb_listen_fd >= 0;
         sc.gdb_read_fd = options.gdb_read_fd;
         sc.gdb_write_fd = options.gdb_write_fd;
+        sc.gdb_listen_fd = options.gdb_listen_fd;
+        sc.gdb_port = options.gdb_port;
+        sc.wait_for_debugger = options.gdb_wait;
         // The tracker is wired through rather than inferred from observe:
         // a run that asked for it gets it, and a run that did not is not
         // charged for the four debug registers it would consume.

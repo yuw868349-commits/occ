@@ -86,6 +86,22 @@ struct RunOptions {
     int gdb_read_fd = -1;
     int gdb_write_fd = -1;
 
+    // A listening socket for a debugger to connect to, and the port it is
+    // bound to.
+    //
+    // This is how a run reports where to attach before anyone has: the
+    // socket is bound before the target starts, so the port is known and can
+    // be printed, and the debugger connects whenever it is ready. Passing a
+    // connected descriptor instead would require a debugger to be waiting
+    // first, which is a deadlock rather than a handshake.
+    int gdb_listen_fd = -1;
+    std::uint16_t gdb_port = 0;
+
+    // Whether to hold the target at its first stop until a debugger
+    // connects. See SessionConfig::wait_for_debugger for why the default is
+    // the other way round.
+    bool gdb_wait = false;
+
     // Environment for the target. Empty means a minimal environment is
     // built from the host's PATH and TERM, which is enough for a static
     // binary and avoids passing through a variable that changes behaviour.

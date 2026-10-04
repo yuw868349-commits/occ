@@ -62,6 +62,22 @@ public:
     }
     void clear_retransmit() noexcept { want_retransmit_ = false; }
 
+    // True when at least one packet has been decoded and not yet
+    // acknowledged.
+    //
+    // The protocol requires the receiver to answer every packet with '+',
+    // including one whose checksum failed -- a packet that arrived damaged
+    // still has to be acknowledged, and the resend is arranged by answering
+    // '-' instead. A receiver that stays silent is one the sender will
+    // resend to forever: gdb gives up after a few attempts and abandons the
+    // connection, which looks like a target that hung rather than one that
+    // never confirmed anything.
+    [[nodiscard]] bool needs_ack() const noexcept { return needs_ack_; }
+    // The byte to send: '+' for a packet that arrived intact, '-' for one
+    // that did not.
+    [[nodiscard]] char pending_ack() const noexcept { return pending_ack_; }
+    void clear_ack() noexcept { needs_ack_ = false; }
+
     // The last packet that was fully decoded, for a retransmission. Stored
     // because the protocol expects the same bytes back, checksum included.
     [[nodiscard]] const std::string& last_packet() const noexcept {
@@ -84,6 +100,8 @@ private:
     std::string raw_;
     int checksum_hi_ = 0;
     bool want_retransmit_ = false;
+    bool needs_ack_ = false;
+    char pending_ack_ = '+';
     std::string last_;
     std::vector<Packet> ready_;
 };
