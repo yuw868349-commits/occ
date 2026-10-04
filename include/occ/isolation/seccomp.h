@@ -59,6 +59,16 @@ enum class SeccompAction : std::uint8_t {
 };
 
 // Comparison applied to one syscall argument.
+//
+// The classic BPF instruction set a seccomp filter runs on has four
+// comparisons: equal, greater, greater-or-equal, and "these bits are set".
+// The three others here are expressed in those four by exchanging a
+// comparison's jump targets, so that the continue-on-match branch is the one
+// the underlying comparison fails.
+// An earlier version of this header reached for BPF_JNE, BPF_JLT and BPF_JLE
+// instead, which are eBPF opcodes: the kernel rejects the entire filter at
+// install time, so a policy using one protected nothing. Every value below is
+// exercised against a live filter in tests/test_seccomp.cpp.
 enum class SeccompCmp : std::uint8_t {
     Equal,
     NotEqual,

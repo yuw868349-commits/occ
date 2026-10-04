@@ -21,13 +21,30 @@ using Insn = struct sock_filter;
 // conditional jump, and `k` carries the offset for an unconditional one.
 //
 // <linux/filter.h> names the classic BPF tests from the original paper:
-// BPF_JEQ, BPF_JGT, BPF_JGE, BPF_JSET. The seccomp language also accepts JNE,
-// JLT and JLE, whose encodings are part of the operation field in
-// <linux/bpf_common.h>. They are written out because the uapi header does not
-// export the names.
-constexpr std::uint16_t kJne = 0x50;
-constexpr std::uint16_t kJlt = 0xa0;
-constexpr std::uint16_t kJle = 0xb0;
+// BPF_JEQ, BPF_JGT, BPF_JGE, BPF_JSET.
+//
+// Those four are the whole of what a seccomp filter can compare with. The
+// uapi header also exports BPF_JNE, BPF_JLT and BPF_JLE, and it is tempting
+// to reach for them -- they are exactly the three comparisons the classic
+// instruction set lacks. They are eBPF opcodes, and the kernel's seccomp
+// verifier rejects a program containing one. The rejection is total: the
+// whole filter fails to install with EINVAL rather than the single
+// instruction being ignored, so a policy using one of them protects nothing
+// and reports nothing until the install is checked.
+//
+// An unused constant is a trap, so none is defined. SeccompCmp::NotEqual,
+// ::Less and ::LessOrEqual are expressed in the four instructions that exist
+// below, and the test suite exercises all six of the enum's values by
+// installing a real filter and making a real syscall.
+
+// The seccomp jump opcodes this emitter uses, in the form the builder wants
+// them: the instruction class ORed with the operation. <linux/bpf_common.h>
+// exports the operations and the class separately, and every instruction here
+// is BPF_JMP, so the two are combined at each use rather than precomputed
+// into a constant that would be wrong the moment the class changed.
+constexpr std::uint16_t jump(std::uint16_t op) noexcept {
+    return static_cast<std::uint16_t>(BPF_JMP | op);
+}
 
 [[nodiscard]] constexpr Insn stmt(std::uint16_t code, std::uint32_t k) noexcept {
     return Insn{code, 0, 0, k};
@@ -249,17 +266,36 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
             const bool last = (t + 1 == args);
 
             insns.push_back(ld_arg_hi(test.index));
-            insns.push_back(branch(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
+            insns.push_back(branch(jump(BPF_JEQ), 0, 1, 0));
             insns.push_back(branch(BPF_JMP | BPF_JA, last ? 3u : 2u, 0, 0));
             insns.push_back(ld_arg_lo(test.index));
 
+            // The comparison, and what a miss has to do.
+            //
+            // The classic instruction set has no "jump if not" and no "jump
+            // if less", so the three comparisons that need one are built by
+            // inverting the operator the hardware does have. The inversion is
+            // a matter of swapping the two jump targets rather than of
+            // emitting a different opcode: a JEQ whose true and false
+            // branches are exchanged *is* a JNE, and a JGE with its branches
+            // exchanged *is* a JLT.
+            //
+            // `inverted` therefore selects which of jt and jf is the match.
+            // A non-negated operator puts the match on the true branch; a
+            // negated one puts it on the false branch, and the operand is
+            // rewritten to match -- `a > v` negated is `a <= v`, so Less is
+            // emitted as a JGE against value+1.
+            bool inverted = false;
+            std::uint32_t value = test.value;
             std::uint16_t op = BPF_JEQ;
+
             switch (test.cmp) {
             case SeccompCmp::Equal:
                 op = BPF_JEQ;
                 break;
             case SeccompCmp::NotEqual:
-                op = kJne;
+                op = BPF_JEQ;
+                inverted = true;
                 break;
             case SeccompCmp::Greater:
                 op = BPF_JGT;
@@ -268,21 +304,49 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
                 op = BPF_JGE;
                 break;
             case SeccompCmp::Less:
-                op = kJlt;
+                // a < v  <=>  !(a >= v). The instruction set has no "less
+                // than", and the two ways to fake one both come to this: the
+                // match has to be the *negation* of a greater-or-equal,
+                // which means exchanging the jump targets so that the
+                // continue-on-match branch is the one the comparison fails.
+                //
+                // Incrementing the operand instead -- a < v as a >= v+1 --
+                // would express the same thing without inverting, but it
+                // wraps at v = 0xffffffff, where every argument is in fact
+                // below the bound and a wrapped test would deny all of them.
+                // The inversion has no such edge.
+                op = BPF_JGE;
+                inverted = true;
                 break;
             case SeccompCmp::LessOrEqual:
-                op = kJle;
+                // a <= v  <=>  !(a > v).
+                op = BPF_JGT;
+                inverted = true;
                 break;
             case SeccompCmp::Masked:
+                // A bit test is a match when the bits are *present*, so it
+                // is never inverted: a Masked rule means "deny when these
+                // bits are set", and inverting it would deny exactly the
+                // flag sets the caller meant to permit.
                 op = BPF_JSET;
                 break;
             }
+
             // A match continues to the next instruction; a miss abandons the
             // rule. When the test is last, the next instruction is the
             // action, so abandoning means stepping past it. When it is not,
             // the next instruction is the following test, which is where a
             // miss belongs.
-            insns.push_back(branch(BPF_JMP | op | BPF_K, test.value, 0, 1));
+            //
+            // Which of jt and jf carries the match depends on the operator:
+            // `branch` puts the true outcome in jt, so a non-negated test
+            // continues on a match and a negated one continues on a miss --
+            // the two are the same instruction with the offsets exchanged.
+            const std::uint8_t on_match = 0;
+            const std::uint8_t on_miss = 1;
+            insns.push_back(branch(jump(op), value,
+                                   inverted ? on_miss : on_match,
+                                   inverted ? on_match : on_miss));
         }
 
         insns.push_back(stmt(BPF_RET | BPF_K, ret_for(rule.action, rule.error)));
