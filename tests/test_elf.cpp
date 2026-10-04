@@ -579,6 +579,452 @@ void test_truncated_buffer_is_not_elF() {
                                           "header");
 }
 
+// ------------------------------------------------------------- symbols
+//
+// The fixtures below build an image with a section header table, a dynamic
+// symbol table, a string table for the symbols and a string table for the
+// section names. Every one of these is a separate way for the reader to be
+// wrong, and a single fixture with a real binary would exercise all four at
+// once -- so they are assembled here, in memory, with every offset chosen
+// by this file.
+//
+// The addresses are chosen so that p_offset and p_vaddr are not equal. A
+// fixture where they are equal cannot tell a reader that converts an
+// address to a file offset from one that returns the address unchanged, and
+// returning the address unchanged is exactly what a probe request must not
+// do: the kernel's uprobe request is stated in file offsets.
+
+constexpr std::size_t kShdrSize = 64;
+constexpr std::size_t kSymSize = 24;
+
+// The layout of the symbol fixture, in one place so the offsets that point
+// into each other cannot drift apart. Everything starts after the three
+// pages base_image allocates, so a fixture that grows the header cannot
+// silently overlap the first segment's payload.
+struct SymbolFixture {
+    std::size_t shoff = 0;
+    std::size_t symoff = 0;
+    std::size_t symcount = 0;
+    std::size_t stroff = 0;
+    std::size_t shstroff = 0;
+    std::size_t shnum = 0;
+};
+
+// Builds an image whose single PT_LOAD segment maps file offset 0x1000 to
+// address 0x500000. The two differ, which is what makes the address-to-
+// offset conversion testable.
+Image symbol_image(SymbolFixture& fix) {
+    Image img = base_image();
+    // One segment: file offset 0x1000, vaddr 0x500000. Congruent modulo
+    // 4096 (both 0), so the rule the reader enforces is satisfied.
+    put_phdr(img.bytes, 0, 1, 5, 0x1000, 0x500000, 0x1000, 0x1000, 4096);
+
+    // The string tables are built one name at a time, and the offsets are
+    // taken as names are appended.
+    //
+    // Both halves matter. Writing the tables as string literals is wrong in
+    // a way that produces a table with no interior NULs at all: the
+    // expression std::string("\0", 1) + ".dynsym\0.dynstr\0" appends a
+    // const char*, which is appended up to its first NUL -- so the second
+    // and later names are simply absent, and every name offset past the
+    // first points into the middle of the first name. The table is then
+    // well-formed enough to parse and produces names that are slices of
+    // other names, which is exactly the kind of wrong a fixture must not
+    // have. Appending and recording offsets avoids the question.
+    std::string strtab("\0", 1);
+    const std::size_t main_off = strtab.size();
+    strtab += "main";
+    strtab.push_back('\0');
+    const std::size_t helper_off = strtab.size();
+    strtab += "helper";
+    strtab.push_back('\0');
+    const std::size_t undef_off = strtab.size();
+    strtab += "undefined_sym";
+    strtab.push_back('\0');
+    const std::size_t object_off = strtab.size();
+    strtab += "data_object";
+    strtab.push_back('\0');
+
+    fix.symoff = 0x2000;
+    fix.symcount = 4;
+    fix.stroff = fix.symoff + fix.symcount * kSymSize;
+    const std::size_t strentries = fix.symcount * kSymSize;
+
+    std::string shstr("\0", 1);
+    const std::size_t n_dynsym = shstr.size();
+    shstr += ".dynsym";
+    shstr.push_back('\0');
+    const std::size_t n_dynstr = shstr.size();
+    shstr += ".dynstr";
+    shstr.push_back('\0');
+    const std::size_t n_shstrtab = shstr.size();
+    shstr += ".shstrtab";
+    shstr.push_back('\0');
+
+    fix.shstroff = fix.stroff + strtab.size();
+    // The section headers are aligned to eight bytes. Nothing in the reader
+    // requires it -- every field is read by offset rather than by a
+    // structure load -- but a fixture laid out the way a linker lays one out
+    // is a fixture that would still be valid if the reader ever did.
+    fix.shoff = (fix.shstroff + shstr.size() + 7) & ~std::size_t{7};
+    fix.shnum = 4;
+
+    img.bytes.resize(fix.shoff + fix.shnum * kShdrSize, 0);
+
+    // The symbols. Symbol zero is the all-zero entry every table starts
+    // with, and it must not appear in the result.
+    //
+    //   main          FUNC   GLOBAL  defined, vaddr 0x500100
+    //   helper        FUNC   LOCAL   defined, vaddr 0x500200
+    //   undefined_sym FUNC   GLOBAL  undefined (shndx 0)
+    //   data_object   OBJECT GLOBAL  defined, vaddr 0x500300
+    auto put_sym = [&](std::size_t idx, std::size_t name_off, std::uint8_t bind,
+                       std::uint8_t type, std::uint16_t shndx,
+                       std::uint64_t value, std::uint64_t size) {
+        const std::size_t base = fix.symoff + idx * kSymSize;
+        put32(img.bytes, base + 0, static_cast<std::uint32_t>(name_off));
+        // st_info packs the binding in the high nibble and the type in the
+        // low one. Both are passed in already split so the packing is
+        // visible here rather than buried in a caller.
+        img.bytes[base + 4] = static_cast<std::uint8_t>((bind << 4) | type);
+        put16(img.bytes, base + 6, shndx);
+        put64(img.bytes, base + 8, value);
+        put64(img.bytes, base + 16, size);
+    };
+    put_sym(0, main_off, 1, 2, 1, 0x500100, 64);   // main
+    put_sym(1, helper_off, 0, 2, 1, 0x500200, 32); // helper
+    put_sym(2, undef_off, 1, 2, 0, 0, 0);          // undefined_sym
+    put_sym(3, object_off, 1, 1, 1, 0x500300, 16); // data_object
+
+    // The strings.
+    std::memcpy(img.bytes.data() + fix.stroff, strtab.data(), strtab.size());
+
+    // The section headers. Index 0 is SHT_NULL by definition; 1 is the
+    // dynamic symbol table and points at index 2 as its string table; 2 is
+    // .dynstr; 3 is .shstrtab, which e_shstrndx names.
+    auto shdr = [&](std::size_t idx, std::size_t name_off, std::uint32_t type,
+                    std::uint64_t off, std::uint64_t size, std::uint32_t link,
+                    std::uint64_t entsize) {
+        const std::size_t base = fix.shoff + idx * kShdrSize;
+        put32(img.bytes, base + 0, static_cast<std::uint32_t>(name_off));
+        put32(img.bytes, base + 4, type);
+        put64(img.bytes, base + 24, off);
+        put64(img.bytes, base + 32, size);
+        put32(img.bytes, base + 40, link);
+        put64(img.bytes, base + 56, entsize);
+    };
+    shdr(0, 0, 0, 0, 0, 0, 0);
+    // .dynsym: SHT_DYNSYM(11), link 2 (.dynstr), stride 24
+    shdr(1, n_dynsym, 11, fix.symoff, strentries, 2, kSymSize);
+    // .dynstr: SHT_STRTAB(3)
+    shdr(2, n_dynstr, 3, fix.stroff, strtab.size(), 0, 0);
+    // .shstrtab: SHT_STRTAB(3)
+    shdr(3, n_shstrtab, 3, fix.shstroff, shstr.size(), 0, 0);
+
+    std::memcpy(img.bytes.data() + fix.shstroff, shstr.data(), shstr.size());
+
+    // The header's section fields.
+    put64(img.bytes, 40, fix.shoff);
+    put16(img.bytes, 58, static_cast<std::uint16_t>(kShdrSize));
+    put16(img.bytes, 60, static_cast<std::uint16_t>(fix.shnum));
+    // e_shstrndx names index 3, and is written 3.
+    put16(img.bytes, 62, 3);
+
+    return img;
+}
+
+void test_sections_are_read() {
+    SymbolFixture fix{};
+    const Image img = symbol_image(fix);
+    const ElfImage e = parse(img);
+    check(e.ok(), "an image with a section table still parses");
+    check(e.sections().size() == 4, "four section headers are read");
+    check(e.has_symbols(), "the dynamic symbols are found");
+    check(e.symbol_status() == SymbolStatus::Found, "the status is found");
+
+    // The names resolve through e_shstrndx and not through sh_link. This is
+    // the assertion that fails when the two are confused: sh_link of
+    // .dynsym is 2, which is .dynstr, and reading the section's own name
+    // out of .dynstr produces a symbol name rather than a section name.
+    const std::string n0 = e.section_name(e.sections()[1], ByteSpan{img.bytes.data(), img.bytes.size()});
+    const std::string n1 = e.section_name(e.sections()[2], ByteSpan{img.bytes.data(), img.bytes.size()});
+    const std::string n2 = e.section_name(e.sections()[3], ByteSpan{img.bytes.data(), img.bytes.size()});
+    check(n0 == ".dynsym", "the symbol table's section is named .dynsym");
+    check(n1 == ".dynstr", "the string table's section is named .dynstr");
+    check(n2 == ".shstrtab", "the name table's section is named .shstrtab");
+}
+
+void test_symbol_names_and_types() {
+    SymbolFixture fix{};
+    const Image img = symbol_image(fix);
+    const ElfImage e = parse(img);
+
+    check(e.dynamic_symbols().size() == 4,
+          "the all-zero first symbol is not stored");
+
+    const Symbol* main_sym = e.find_symbol("main");
+    check(main_sym != nullptr, "main is found by name");
+    if (main_sym != nullptr) {
+        check(main_sym->value == 0x500100, "main's address");
+        check(main_sym->size == 64, "main's size");
+        check(main_sym->type == SymbolType::Func, "main is a function");
+        check(main_sym->bind == SymbolBind::Global, "main is global");
+        check(main_sym->defined(), "main is defined");
+        check(main_sym->probeable(), "main is a place a probe can go");
+    }
+
+    const Symbol* helper = e.find_symbol("helper");
+    check(helper != nullptr, "helper is found by name");
+    if (helper != nullptr) {
+        check(helper->bind == SymbolBind::Local, "helper is local");
+        check(helper->probeable(), "a local function is still probeable");
+    }
+
+    const Symbol* data = e.find_symbol("data_object");
+    check(data != nullptr, "the object symbol is found");
+    if (data != nullptr) {
+        check(data->type == SymbolType::Object, "it is typed as an object");
+        check(!data->probeable(),
+              "an object is not a function and is not probeable");
+    }
+
+    check(e.find_symbol("no_such_symbol") == nullptr,
+          "a name that is not in the table is absent");
+}
+
+void test_undefined_symbol_is_not_probeable() {
+    SymbolFixture fix{};
+    const Image img = symbol_image(fix);
+    const ElfImage e = parse(img);
+
+    // The undefined symbol is stored -- its address is a real entry in a
+    // real table -- but it is not something to attach a probe to. A caller
+    // that treated an undefined symbol as a probe target would ask the
+    // kernel for a probe at address zero, or at whatever the loader has not
+    // yet written there.
+    const Symbol* s = e.find_symbol("undefined_sym");
+    check(s != nullptr, "an undefined symbol is still in the table");
+    if (s != nullptr) {
+        check(!s->defined(), "it is marked undefined");
+        check(!s->probeable(), "an undefined symbol is not probeable");
+    }
+}
+
+void test_defined_symbol_wins_over_undefined() {
+    SymbolFixture fix{};
+    Image img = symbol_image(fix);
+    // Two symbols named "main": one defined at index 0, one undefined added
+    // at index 2 in place of the fixture's own undefined_sym. A lookup that
+    // returned the first match by table order would depend on which of the
+    // two the linker happened to write first, which is a property of the
+    // file rather than of the question being asked.
+    //
+    // Rather than growing the table -- which would move the string table and
+    // the section headers and make the fixture's own offsets a second thing
+    // under test -- the existing entry is renamed. The table's size is
+    // unchanged and every other offset still means what it meant.
+    const std::size_t undef_index = 2;
+    const std::size_t base = fix.symoff + undef_index * kSymSize;
+    const std::uint32_t main_off = 1; // "main" in the string table
+    put32(img.bytes, base + 0, main_off);
+    // Still undefined: GLOBAL|FUNC with shndx 0 and value 0.
+    img.bytes[base + 4] = static_cast<std::uint8_t>((1u << 4) | 2u);
+    put16(img.bytes, base + 6, 0);
+    put64(img.bytes, base + 8, 0);
+
+    const ElfImage e = parse(img);
+    check(e.has_symbols(), "the fixture still has symbols");
+
+    const Symbol* s = e.find_symbol("main");
+    check(s != nullptr, "main is still found");
+    if (s != nullptr) {
+        check(s->defined(),
+              "the defined main wins over the undefined one of the same name");
+        check(s->value == 0x500100, "and it is the one with an address");
+        check(s->shndx != 0, "and it is defined in a section");
+    }
+}
+
+void test_undefined_symbol_is_found_when_it_is_the_only_one() {
+    SymbolFixture fix{};
+    Image img = symbol_image(fix);
+    // Make the undefined entry the only one by that name. The symbol at
+    // index 2 is already undefined and already carries the name; the
+    // defined symbol at index 0 is renamed away from it, and its own
+    // definition is cleared so that nothing with that name is probeable.
+    //
+    // A lookup that dropped undefined symbols entirely would answer "no
+    // such symbol", which is a different claim from "there is a symbol by
+    // that name and it has no code behind it" -- and it is the difference
+    // between a caller looking in the wrong place and being told the right
+    // one.
+    const std::size_t undef_index = 2;
+    const std::size_t base = fix.symoff + undef_index * kSymSize;
+    put32(img.bytes, base + 0, 1); // "main", which index 0 also uses
+    // Clear index 0's definition so it is not the probeable match.
+    put16(img.bytes, fix.symoff + 0 * kSymSize + 6, 0);
+    put64(img.bytes, fix.symoff + 0 * kSymSize + 8, 0);
+
+    const ElfImage e = parse(img);
+    const Symbol* s = e.find_symbol("main");
+    check(s != nullptr, "an undefined symbol is found by name");
+    if (s != nullptr) {
+        check(!s->defined(), "and it is reported as undefined");
+        check(!s->probeable(), "and it is not a place to put a probe");
+    }
+}
+
+void test_vaddr_to_file_offset_converts() {
+    SymbolFixture fix{};
+    const Image img = symbol_image(fix);
+    const ElfImage e = parse(img);
+
+    // The segment maps file offset 0x1000 to address 0x500000, so a symbol
+    // at 0x500100 is at file offset 0x1100. A reader that returned the
+    // address unchanged would give 0x500100, which is not in the file at
+    // all -- and a probe request at that offset is refused by the kernel
+    // with an error that names the offset rather than the conversion.
+    std::uint64_t off = 0;
+    check(e.vaddr_to_file_offset(0x500100, off), "an address in the segment "
+                                                 "converts");
+    check(off == 0x1100, "the converted offset is 0x1000 + (0x500100 - "
+                         "0x500000)");
+    if (off == 0x1100) {
+        // The value at that file offset is the fixture's own byte, which
+        // proves the conversion names a real position rather than a number
+        // that happens to be right.
+        check(img.bytes[off] == 0, "the offset lands in the segment's payload");
+    }
+
+    check(e.vaddr_to_file_offset(0x500000, off), "the segment's first byte "
+                                                 "converts");
+    check(off == 0x1000, "and it maps to p_offset");
+
+    // An address below the segment is in no segment.
+    check(!e.vaddr_to_file_offset(0x4fffff, off),
+          "an address below the segment does not convert");
+    // An address past the segment's memory size is in no segment.
+    check(!e.vaddr_to_file_offset(0x501000, off),
+          "an address at the segment's end does not convert");
+    // An address in the segment's memory but past its file size is in the
+    // zero tail, which has no file offset to name.
+    check(!e.vaddr_to_file_offset(0x501000, off),
+          "an address in the zero tail does not convert");
+}
+
+void test_zero_tail_has_no_file_offset() {
+    Image img = base_image();
+    // A segment whose memory size is larger than its file size: the bytes
+    // from filesz to memsz are zeroed by the loader, not read from the file.
+    put_phdr(img.bytes, 0, 1, 5, 0x1000, 0x500000, 0x400, 0x1000, 4096);
+    img.bytes.resize(0x2000, 0);
+    const ElfImage e = parse(img);
+
+    std::uint64_t off = 0;
+    check(e.vaddr_to_file_offset(0x500300, off),
+          "an address inside the file-backed part converts");
+    check(off == 0x1300, "and it is p_offset plus the delta");
+    // 0x500400 is the first byte of the zero tail. There is no byte there in
+    // the file, so there is no offset to give.
+    check(!e.vaddr_to_file_offset(0x500400, off),
+          "the first byte of the zero tail does not convert");
+    check(!e.vaddr_to_file_offset(0x500800, off),
+          "an address in the middle of the zero tail does not convert");
+}
+
+void test_no_section_table_is_a_status_not_an_error() {
+    // The image parses and has no symbols. That is a fact about the file,
+    // not a failure: the kernel will run it, and a probe layer reports the
+    // absence of function-level observation rather than the absence of a
+    // program.
+    Image img = base_image();
+    put_phdr(img.bytes, 0, 1, 5, 0x1000, 0x500000, 0x400, 0x400, 4096);
+    const ElfImage e = parse(img);
+
+    check(e.ok(), "an image with no section table still loads");
+    check(!e.has_symbols(), "and it reports no symbols");
+    check(e.symbol_status() == SymbolStatus::NoSectionTable,
+          "with the reason being that there is no section table");
+    check(std::strlen(symbol_status_detail(e.symbol_status())) > 0,
+          "and the reason is a sentence");
+    check(e.find_symbol("main") == nullptr,
+          "no name resolves, which is the honest answer");
+}
+
+void test_section_table_that_runs_off_the_file() {
+    SymbolFixture fix{};
+    Image img = symbol_image(fix);
+    const ElfImage ok_image = parse(img);
+    check(ok_image.ok(), "the fixture parses before it is damaged");
+
+    // e_shoff points past the end. The image still loads, and the symbol
+    // status says the table is not there rather than that the program is
+    // broken.
+    put64(img.bytes, 40, img.bytes.size() + 4096);
+    const ElfImage e = parse(img);
+    check(e.ok(),
+          "a section table that is not in the file does not fail the load");
+    check(!e.has_symbols(), "and no symbols are found");
+    check(e.symbol_status() == SymbolStatus::NoSectionTable,
+          "the section table is reported as absent");
+}
+
+void test_dynsym_without_a_string_table() {
+    SymbolFixture fix{};
+    Image img = symbol_image(fix);
+    // sh_link of .dynsym points at index 0, which is SHT_NULL and not a
+    // string table. The symbols still have addresses; they have no names,
+    // and a caller probing by name cannot proceed. That is NoStringTable
+    // and not a silently empty symbol list, which a caller would read as
+    // "this file exports nothing" -- a different claim from "the names are
+    // not here to be read".
+    //
+    // Index 0 rather than index 3 is what makes this a test of the type
+    // check: .shstrtab is itself a SHT_STRTAB, so pointing at it would
+    // satisfy a reader that only asked whether the section is a string
+    // table. The answer would then be names -- the wrong ones, which is
+    // worse than none.
+    put32(img.bytes, fix.shoff + 1 * kShdrSize + 40, 0); // link -> SHT_NULL
+    const ElfImage e = parse(img);
+    check(e.ok(), "the image still loads");
+    check(e.symbol_status() == SymbolStatus::NoStringTable,
+          "a symbol table whose link is not a string table is reported");
+    check(e.dynamic_symbols().empty(),
+          "and no symbols are produced from it");
+}
+
+void test_section_name_table_zero() {
+    SymbolFixture fix{};
+    Image img = symbol_image(fix);
+    // e_shstrndx zero means there is no section name table. Section names
+    // are then empty, and nothing else changes.
+    put16(img.bytes, 62, 0);
+    const ElfImage e = parse(img);
+    check(e.ok(), "an image with no name table still loads");
+    check(e.sections().size() == 4, "the sections are still read");
+    check(e.section_name(e.sections()[1],
+                         ByteSpan{img.bytes.data(), img.bytes.size()})
+              .empty(),
+          "and every name is empty rather than guessed");
+    check(e.has_symbols(), "the symbols are unaffected");
+}
+
+void test_section_name_resolves_through_shstrndx() {
+    SymbolFixture fix{};
+    Image img = symbol_image(fix);
+    // Point e_shstrndx at .dynstr instead of .shstrtab. The names are then
+    // resolved through the wrong table, which is what a reader that used
+    // sh_link would do -- and the assertion that it produces the wrong name
+    // is what pins the two apart.
+    put16(img.bytes, 62, 2); // .dynstr
+    const ElfImage e = parse(img);
+    const std::string wrong =
+        e.section_name(e.sections()[1], ByteSpan{img.bytes.data(), img.bytes.size()});
+    check(wrong != ".dynsym",
+          "naming a section through the symbol string table does not produce "
+          "its section name");
+}
+
 } // namespace
 
 int main() {
@@ -606,6 +1052,18 @@ int main() {
     test_page_helpers();
     test_error_names();
     test_truncated_buffer_is_not_elF();
+    test_sections_are_read();
+    test_symbol_names_and_types();
+    test_undefined_symbol_is_not_probeable();
+    test_defined_symbol_wins_over_undefined();
+    test_undefined_symbol_is_found_when_it_is_the_only_one();
+    test_vaddr_to_file_offset_converts();
+    test_zero_tail_has_no_file_offset();
+    test_no_section_table_is_a_status_not_an_error();
+    test_section_table_that_runs_off_the_file();
+    test_dynsym_without_a_string_table();
+    test_section_name_table_zero();
+    test_section_name_resolves_through_shstrndx();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

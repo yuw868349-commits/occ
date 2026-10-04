@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace occ::parser {
@@ -19,6 +21,12 @@ namespace {
 constexpr std::size_t kIdentSize = 16;
 constexpr std::size_t kElf64HeaderSize = 64;
 constexpr std::size_t kElf64PhdrSize = 56;
+// The 64-bit section header. Sixty-four bytes, of which this reader uses
+// nine fields; the two it does not use are still stepped over, which is why
+// the record size is a constant here rather than a sum of the fields taken.
+constexpr std::size_t kElf64ShdrSize = 64;
+// One Elf64_Sym. st_name, st_info, st_other, st_shndx, st_value, st_size.
+constexpr std::size_t kElf64SymSize = 24;
 
 // Field offsets in the 64-bit header. The 32-bit layout puts e_phoff and
 // e_phnum elsewhere, so these are named after the word size rather than
@@ -27,8 +35,31 @@ constexpr std::size_t kOffType = 16;
 constexpr std::size_t kOffMachine = 18;
 constexpr std::size_t kOffEntry = 24;
 constexpr std::size_t kOffPhoff = 32;
+constexpr std::size_t kOffShoff = 40;
 constexpr std::size_t kOffPhentsize = 54;
 constexpr std::size_t kOffPhnum = 56;
+constexpr std::size_t kOffShentsize = 58;
+constexpr std::size_t kOffShnum = 60;
+constexpr std::size_t kOffShstrndx = 62;
+
+// Field offsets in the 64-bit section header.
+constexpr std::size_t kOffShName = 0;
+constexpr std::size_t kOffShType = 4;
+constexpr std::size_t kOffShFlags = 8;
+constexpr std::size_t kOffShAddr = 16;
+constexpr std::size_t kOffShOffset = 24;
+constexpr std::size_t kOffShSize = 32;
+constexpr std::size_t kOffShLink = 40;
+constexpr std::size_t kOffShInfo = 44;
+constexpr std::size_t kOffShEntsize = 56;
+
+// Field offsets in the 64-bit symbol.
+constexpr std::size_t kOffStName = 0;
+constexpr std::size_t kOffStInfo = 4;
+constexpr std::size_t kOffStOther = 5;
+constexpr std::size_t kOffStShndx = 6;
+constexpr std::size_t kOffStValue = 8;
+constexpr std::size_t kOffStSize = 16;
 
 constexpr std::uint16_t kEmX86_64 = 62;
 constexpr std::uint16_t kEtRel = 1;
@@ -157,8 +188,112 @@ const char* load_error_name(LoadError e) noexcept {
         return "a segment has an alignment that is not a power of two";
     case LoadError::SegmentOutOfFile:
         return "a segment extends past the end of the file";
+    case LoadError::TruncatedSectionHeaders:
+        return "the section header table is truncated";
     }
     return "unknown";
+}
+
+const char* section_type_name(std::uint32_t type) noexcept {
+    switch (static_cast<SectionType>(type)) {
+    case SectionType::Null:
+        return "SHT_NULL";
+    case SectionType::ProgBits:
+        return "SHT_PROGBITS";
+    case SectionType::Symtab:
+        return "SHT_SYMTAB";
+    case SectionType::Strtab:
+        return "SHT_STRTAB";
+    case SectionType::Rela:
+        return "SHT_RELA";
+    case SectionType::Hash:
+        return "SHT_HASH";
+    case SectionType::Dynamic:
+        return "SHT_DYNAMIC";
+    case SectionType::Note:
+        return "SHT_NOTE";
+    case SectionType::Nobits:
+        return "SHT_NOBITS";
+    case SectionType::Rel:
+        return "SHT_REL";
+    case SectionType::Shlib:
+        return "SHT_SHLIB";
+    case SectionType::Dynsym:
+        return "SHT_DYNSYM";
+    case SectionType::InitArray:
+        return "SHT_INIT_ARRAY";
+    case SectionType::FiniArray:
+        return "SHT_FINI_ARRAY";
+    case SectionType::PreinitArray:
+        return "SHT_PREINIT_ARRAY";
+    case SectionType::Group:
+        return "SHT_GROUP";
+    case SectionType::SymtabShndx:
+        return "SHT_SYMTAB_SHNDX";
+    }
+    // A type this reader does not name is still a type, and printing the
+    // number is more use to a reader than printing "unknown" for every
+    // vendor section a toolchain adds.
+    return "a section type this reader does not name";
+}
+
+const char* symbol_visibility_name(std::uint8_t v) noexcept {
+    // STV_*. The values are the ELF specification's, and 3 is STV_DEFAULT
+    // rather than a reserved value: a symbol whose st_other says nothing
+    // else is the ordinary exported one.
+    switch (v) {
+    case 0:
+        return "STV_DEFAULT";
+    case 1:
+        return "STV_INTERNAL";
+    case 2:
+        return "STV_HIDDEN";
+    case 3:
+        return "STV_PROTECTED";
+    }
+    return "STV_DEFAULT";
+}
+
+const char* symbol_status_name(SymbolStatus s) noexcept {    switch (s) {
+    case SymbolStatus::Found:
+        return "found";
+    case SymbolStatus::NoSectionTable:
+        return "no section table";
+    case SymbolStatus::NoDynamicSymbols:
+        return "no dynamic symbols";
+    case SymbolStatus::TruncatedTable:
+        return "the symbol table is truncated";
+    case SymbolStatus::NoStringTable:
+        return "no string table for the symbols";
+    }
+    return "unknown";
+}
+
+const char* symbol_status_detail(SymbolStatus s) noexcept {
+    switch (s) {
+    case SymbolStatus::Found:
+        return "";
+    case SymbolStatus::NoSectionTable:
+        return "the file has no section header table, so there is no "
+               "dynamic symbol table to read and a function cannot be "
+               "located by name; function-level observation is not "
+               "available and syscall-level observation continues";
+    case SymbolStatus::NoDynamicSymbols:
+        return "the section header table holds no SHT_DYNSYM entry, so the "
+               "file exports no dynamic symbols; function-level "
+               "observation is not available and syscall-level "
+               "observation continues";
+    case SymbolStatus::TruncatedTable:
+        return "the section header names a dynamic symbol table that is not "
+               "inside the file; function-level observation is not "
+               "available and syscall-level observation continues";
+    case SymbolStatus::NoStringTable:
+        return "the dynamic symbol table is present but its string table is "
+               "not, so a symbol has an address and no name; "
+               "function-level observation is not available and "
+               "syscall-level observation continues";
+    }
+    return "";
 }
 
 ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
@@ -204,6 +339,10 @@ ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
     out.phoff_ = rd64(bytes, kOffPhoff);
     out.phentsize_ = rd16(bytes, kOffPhentsize);
     out.phnum_ = rd16(bytes, kOffPhnum);
+    out.shoff_ = rd64(bytes, kOffShoff);
+    out.shentsize_ = rd16(bytes, kOffShentsize);
+    out.shnum_ = rd16(bytes, kOffShnum);
+    out.shstrndx_ = rd16(bytes, kOffShstrndx);
 
     if (out.machine_ != kEmX86_64) {
         out.error_ = LoadError::UnsupportedMachine;
@@ -484,8 +623,463 @@ ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
         out.mappings_.push_back(m);
     }
 
+    // The section table is read after the program headers and cannot change
+    // whether the image loaded. That ordering is the whole point: a kernel
+    // loader never reads these, so a file whose sections are corrupt is a
+    // file the kernel will map, and refusing to describe it would be
+    // refusing a running program over metadata.
+    //
+    // The two tables are separate for a reason that shows up here. A
+    // section header says where a file's own bookkeeping lives; a program
+    // header says what to map. A file can be missing either one and still
+    // be the other kind of thing, and an image that is both has told us
+    // two independent facts.
+    out.read_sections(bytes, out.sections_, out.shoff_, out.shentsize_,
+                      out.shnum_);
+
+    if (out.sections_.empty()) {
+        out.symbol_status_ = SymbolStatus::NoSectionTable;
+        out.symbol_detail_ = symbol_status_detail(SymbolStatus::NoSectionTable);
+    } else {
+        out.read_dynamic_symbols(bytes);
+    }
+
     out.error_ = LoadError::None;
     return out;
+}
+
+std::string ElfImage::section_name(const SectionHeader& s,
+                                   ByteSpan bytes) const {
+    // sh_name indexes the section name string table, which e_shstrndx
+    // names. It is not sh_link: for a symbol table sh_link points at the
+    // table that names the *symbols*, and reading a section's own name out
+    // of that one produces a name made of unrelated bytes -- which is a
+    // plausible-looking string rather than an obvious failure, and is the
+    // hardest kind of wrong to notice by reading the output.
+    //
+    // e_shstrndx is a section header table index and is used as the header
+    // states it. It is a zero-based index, so the 30th entry is 30.
+    // e_shstrndx names the section name table, and it is used here as the
+    // index into this vector that it is. The section header table is
+    // zero-based, and the value in the file is the index of the name table
+    // within it: a file whose table holds 31 entries writes 30 for the last
+    // one, and that 30 is the 30th element of this vector, not the 29th.
+    //
+    // Subtracting one selects the section before the name table -- a real
+    // section, with a real sh_offset, whose bytes are whatever that
+    // section holds. The failure mode is a plausible string rather than an
+    // empty one, which is the kind of wrong that a test with only one
+    // fixture cannot see, and is why the fixtures below cover the table's
+    // own position explicitly.
+    if (shstrndx_ == 0 || shstrndx_ >= sections_.size()) {
+        return {};
+    }
+    const SectionHeader& names = sections_[shstrndx_];
+    if (names.type != static_cast<std::uint32_t>(SectionType::Strtab) ||
+        names.size == 0) {
+        return {};
+    }
+    if (names.offset > bytes.size() ||
+        bytes.size() - names.offset < s.name_offset) {
+        return {};
+    }
+    const std::size_t base = static_cast<std::size_t>(names.offset);
+    const std::size_t limit = base + static_cast<std::size_t>(names.size);
+    if (limit > bytes.size()) {
+        return {};
+    }
+    const char* p =
+        reinterpret_cast<const char*>(bytes.data()) + base + s.name_offset;
+    // A name runs to the NUL or to the end of the table, whichever comes
+    // first. The bound matters: the last section in a file has a name
+    // table that ends where the file's own data ends, and reading past the
+    // limit would run into whatever follows.
+    std::size_t n = 0;
+    while (base + s.name_offset + n < limit && p[n] != '\0') {
+        ++n;
+    }
+    if (n == 0) {
+        return {};
+    }
+    return std::string(p, n);
+}
+
+void ElfImage::read_sections(ByteSpan bytes, std::vector<SectionHeader>& out,
+                             std::uint64_t shoff, std::uint16_t shentsize,
+                             std::uint16_t shnum) noexcept {
+    out.clear();
+
+    // A file with no section table says so with e_shoff zero and e_shnum
+    // zero. Both, or either: a table at offset zero cannot be a real table
+    // because the ELF header occupies the first bytes, so either being zero
+    // is enough to conclude there is none and there is nothing to
+    // second-guess.
+    if (shoff == 0 || shnum == 0) {
+        return;
+    }
+
+    // The stride has to be the record size. A file that declares another one
+    // is either corrupt or for an ABI this reader does not implement, and
+    // walking the table with the wrong stride produces entries that are
+    // each individually well-formed and collectively nonsense.
+    if (shentsize != kElf64ShdrSize) {
+        return;
+    }
+
+    // The table's end, asked by subtraction for the reason given in parse():
+    // shoff is a 64-bit field from the file and shnum is up to 65535 records
+    // of 64 bytes, and their sum is an addition a crafted file can push
+    // past the end of the address space. Subtracting from the size asks
+    // whether the file is long enough to hold the table, and shoff is only
+    // ever subtracted from a size it was already compared against.
+    const std::size_t width =
+        static_cast<std::size_t>(shnum) * kElf64ShdrSize;
+    if (shoff > bytes.size() ||
+        bytes.size() - static_cast<std::size_t>(shoff) < width) {
+        return;
+    }
+
+    out.reserve(shnum);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        const std::size_t base = static_cast<std::size_t>(shoff) +
+                                 static_cast<std::size_t>(i) * kElf64ShdrSize;
+        SectionHeader s;
+        s.name_offset = rd32(bytes, base + kOffShName);
+        s.type = rd32(bytes, base + kOffShType);
+        s.flags = rd64(bytes, base + kOffShFlags);
+        s.addr = rd64(bytes, base + kOffShAddr);
+        s.offset = rd64(bytes, base + kOffShOffset);
+        s.size = rd64(bytes, base + kOffShSize);
+        s.link = rd32(bytes, base + kOffShLink);
+        s.info = rd32(bytes, base + kOffShInfo);
+        s.entsize = rd64(bytes, base + kOffShEntsize);
+        out.push_back(s);
+    }
+}
+
+void ElfImage::read_dynamic_symbols(ByteSpan bytes) noexcept {
+    // Two places name the dynamic symbol table, and they are read in this
+    // order for a reason.
+    //
+    // SHT_DYNSYM is the section header, and it is the direct one: it says
+    // the size, the stride and where the strings are in a single record.
+    //
+    // PT_DYNAMIC's DT_SYMTAB and DT_STRTAB are the program headers, and
+    // they are the fallback because they survive something the section
+    // headers do not. A file processed by a tool that rewrites the section
+    // table can end up with a .dynsym section header that names nothing,
+    // while the dynamic segment -- which the dynamic linker itself reads,
+    // and cannot do without -- still points at the table. Reading the
+    // section header first and the dynamic segment second means a file that
+    // still works gets its symbols, and a file that does not is reported
+    // rather than guessed at.
+    //
+    // The one thing neither can supply is the count, because neither
+    // DT_SYMTAB nor the section header says how many symbols there are. It
+    // comes from the section header's size when there is one, and from
+    // DT_SYMENT when the count has to be derived, and the derivation is
+    // bounded below by the string table's own offset: a symbol table cannot
+    // run past the strings that name it, because the linker put them
+    // together.
+    struct TableLocation {
+        std::uint64_t offset = 0;
+        std::uint64_t count = 0;
+        std::uint64_t str_offset = 0;
+        std::uint64_t str_size = 0;
+        bool have_offset = false;
+        bool have_str = false;
+    } loc;
+
+    for (const SectionHeader& s : sections_) {
+        if (s.type != static_cast<std::uint32_t>(SectionType::Dynsym)) {
+            continue;
+        }
+        loc.offset = s.offset;
+        // sh_entsize is the stride. A zero means the record size, which is
+        // what the specification says and what a linker that does not need
+        // a non-default stride leaves behind. A stride that is neither zero
+        // nor the record size is a table this reader would misread, so it
+        // contributes no count rather than a wrong one.
+        const std::uint64_t stride = s.entsize == 0 ? kElf64SymSize : s.entsize;
+        if (stride == kElf64SymSize) {
+            loc.count = s.size / stride;
+        }
+        loc.have_offset = true;
+        if (s.link < sections_.size()) {
+            const SectionHeader& strtab = sections_[s.link];
+            if (strtab.type == static_cast<std::uint32_t>(SectionType::Strtab)) {
+                loc.str_offset = strtab.offset;
+                loc.str_size = strtab.size;
+                loc.have_str = true;
+            }
+        }
+        break;
+    }
+
+    if (!loc.have_offset || !loc.have_str) {
+        // Try the dynamic segment. This is not a fallback for a file with no
+        // sections at all -- read_sections returns early in that case and
+        // the caller never gets here -- it is a fallback for a file whose
+        // sections do not name the table.
+        for (const ProgramHeader& h : headers_) {
+            if (h.type != SegmentType::Dynamic) {
+                continue;
+            }
+            if (h.offset > bytes.size() ||
+                bytes.size() - static_cast<std::size_t>(h.offset) <
+                    static_cast<std::size_t>(h.filesz)) {
+                break;
+            }
+            // Elf64_Dyn is a 16-byte pair of a tag and a value. The tags
+            // below are the ones that matter here.
+            constexpr std::uint64_t kDtNull = 0;
+            constexpr std::uint64_t kDtStrtab = 5;
+            constexpr std::uint64_t kDtSyment = 11;
+            constexpr std::uint64_t kDtSymtab = 6;
+            constexpr std::uint64_t kDtStrsz = 10;
+
+            std::uint64_t symtab = 0;
+            std::uint64_t strtab_v = 0;
+            std::uint64_t strsz = 0;
+            std::uint64_t syment = kElf64SymSize;
+            bool have_symtab = false;
+            bool have_strtab = false;
+
+            const std::size_t entries =
+                static_cast<std::size_t>(h.filesz) / 16;
+            for (std::size_t i = 0; i < entries; ++i) {
+                const std::size_t base =
+                    static_cast<std::size_t>(h.offset) + i * 16;
+                const std::uint64_t tag = rd64(bytes, base);
+                const std::uint64_t val = rd64(bytes, base + 8);
+                if (tag == kDtNull) {
+                    break;
+                }
+                if (tag == kDtSymtab) {
+                    symtab = val;
+                    have_symtab = true;
+                } else if (tag == kDtStrtab) {
+                    strtab_v = val;
+                    have_strtab = true;
+                } else if (tag == kDtStrsz) {
+                    strsz = val;
+                } else if (tag == kDtSyment && val != 0) {
+                    syment = val;
+                }
+            }
+
+            if (!have_symtab || !have_strtab) {
+                break;
+            }
+            // DT_SYMTAB and DT_STRTAB are virtual addresses, not file
+            // offsets, even though they sit in a program header. The
+            // conversion is the same one a probe needs and the same one that
+            // can fail, and it is done with the segment list rather than by
+            // assuming a load bias, because the load bias is a property of
+            // the process and the file does not know it.
+            std::uint64_t sym_off = 0;
+            std::uint64_t str_off = 0;
+            if (!vaddr_to_file_offset(symtab, sym_off) ||
+                !vaddr_to_file_offset(strtab_v, str_off)) {
+                break;
+            }
+            loc.offset = sym_off;
+            loc.str_offset = str_off;
+            loc.str_size = strsz;
+            loc.have_offset = true;
+            loc.have_str = true;
+            // The count. With no section header to say it, the table runs
+            // from DT_SYMTAB to the start of the string table, which is the
+            // next thing in the file that could follow it. Where the
+            // dynamic segment's own view and the file's layout disagree,
+            // the smaller count is the one that cannot be wrong: a symbol
+            // read past a real end is a fabricated function, and a symbol
+            // not read because the count was short is a missing name.
+            if (syment == 0) {
+                syment = kElf64SymSize;
+            }
+            const std::uint64_t span =
+                str_off > sym_off ? str_off - sym_off : 0;
+            loc.count = span / syment;
+            break;
+        }
+    }
+
+    if (!loc.have_offset) {
+        symbol_status_ = SymbolStatus::NoDynamicSymbols;
+        symbol_detail_ = symbol_status_detail(SymbolStatus::NoDynamicSymbols);
+        return;
+    }
+    if (!loc.have_str) {
+        symbol_status_ = SymbolStatus::NoStringTable;
+        symbol_detail_ = symbol_status_detail(SymbolStatus::NoStringTable);
+        return;
+    }
+
+    // The table's own extent, as a subtraction. loc.offset is a file offset
+    // that came either from a section header or from a converted address,
+    // and in both cases the file is the thing that decides whether it is
+    // inside.
+    if (loc.offset > bytes.size() ||
+        loc.str_offset > bytes.size() ||
+        loc.count > (UINT64_MAX / kElf64SymSize) ||
+        bytes.size() - static_cast<std::size_t>(loc.offset) <
+            static_cast<std::size_t>(loc.count * kElf64SymSize)) {
+        symbol_status_ = SymbolStatus::TruncatedTable;
+        symbol_detail_ = symbol_status_detail(SymbolStatus::TruncatedTable);
+        return;
+    }
+    if (loc.str_size == 0) {
+        // A string table of zero length is a table with no names in it,
+        // which is the same uselessness as having no table: every name
+        // lookup would return empty and a caller would conclude the file
+        // exports nothing, which is a different claim from "this file's
+        // names are not here to be read".
+        symbol_status_ = SymbolStatus::NoStringTable;
+        symbol_detail_ = symbol_status_detail(SymbolStatus::NoStringTable);
+        return;
+    }
+    if (loc.str_offset > bytes.size() ||
+        bytes.size() - static_cast<std::size_t>(loc.str_offset) <
+            static_cast<std::size_t>(loc.str_size)) {
+        symbol_status_ = SymbolStatus::NoStringTable;
+        symbol_detail_ = symbol_status_detail(SymbolStatus::NoStringTable);
+        return;
+    }
+
+    symbols_.clear();
+    symbols_.reserve(static_cast<std::size_t>(loc.count));
+
+    const char* str_base = reinterpret_cast<const char*>(bytes.data()) +
+                           static_cast<std::size_t>(loc.str_offset);
+    const std::size_t str_limit = static_cast<std::size_t>(loc.str_size);
+
+    for (std::uint64_t i = 0; i < loc.count; ++i) {
+        const std::size_t base =
+            static_cast<std::size_t>(loc.offset) +
+            static_cast<std::size_t>(i) * kElf64SymSize;
+
+        Symbol sym;
+        const std::uint32_t name_off = rd32(bytes, base + kOffStName);
+        const std::uint8_t info =
+            static_cast<std::uint8_t>(rd32(bytes, base + kOffStInfo) & 0xff);
+        const std::uint8_t other =
+            static_cast<std::uint8_t>(rd32(bytes, base + kOffStOther) & 0xff);
+        sym.shndx = static_cast<std::uint16_t>(
+            rd32(bytes, base + kOffStShndx) & 0xffff);
+        sym.visibility = static_cast<std::uint8_t>(other & 0x03);
+        sym.value = rd64(bytes, base + kOffStValue);
+        sym.size = rd64(bytes, base + kOffStSize);
+        // st_info is two nibbles: the binding in the high four bits and
+        // the type in the low four. Both are read here rather than by the
+        // caller so that a caller asking "is this a function" does not have
+        // to know the packing, and so that a Symbol's answer cannot
+        // disagree with its type.
+        sym.bind = static_cast<SymbolBind>(info >> 4);
+        sym.type = static_cast<SymbolType>(info & 0x0f);
+
+        // A name offset past the string table is a table that has been
+        // truncated in the middle of a name. The symbol is kept with an
+        // empty name rather than dropped: its address is real and a caller
+        // probing by address rather than by name would otherwise lose a
+        // probe point that was there.
+        if (name_off < str_limit) {
+            const char* p = str_base + name_off;
+            std::size_t n = 0;
+            while (name_off + n < str_limit && p[n] != '\0') {
+                ++n;
+            }
+            sym.name.assign(p, n);
+        }
+
+        // The first symbol of a table is all zeroes by definition and names
+        // nothing. It is not an error and it is not a symbol, so it is not
+        // stored; storing it would put an unnamed entry with a zero address
+        // into a list a caller iterates looking for probe points.
+        if (i == 0 && name_off == 0 && sym.value == 0) {
+            continue;
+        }
+
+        symbols_.push_back(std::move(sym));
+    }
+
+    symbol_status_ = SymbolStatus::Found;
+    symbol_detail_.clear();
+}
+
+const Symbol* ElfImage::find_symbol(std::string_view name) const {
+    // The best match wins, and the ranking is by what a caller can do with
+    // the answer.
+    //
+    // A probeable symbol is what a caller asking for a name almost always
+    // wants: it is a defined function at a real address, which is the one
+    // thing a probe can be attached to. A defined symbol that is not
+    // probeable is second -- it exists in code or data and the caller can
+    // be told what it is. An undefined symbol is last, and it is returned
+    // rather than hidden: a name in the table with no code behind it is a
+    // different answer from a name that is not in the table at all, and a
+    // caller that received "not found" for the first would look for the
+    // symbol where it is not.
+    const Symbol* best = nullptr;
+    int best_rank = -1;
+    for (const Symbol& s : symbols_) {
+        if (s.name != name) {
+            continue;
+        }
+        const int rank = s.probeable() ? 2 : (s.defined() ? 1 : 0);
+        if (rank > best_rank) {
+            best = &s;
+            best_rank = rank;
+            if (rank == 2) {
+                // Nothing can beat a probeable symbol, so the search can
+                // stop at the first one.
+                return best;
+            }
+        }
+    }
+    return best;
+}
+
+bool ElfImage::vaddr_to_file_offset(std::uint64_t vaddr,
+                                    std::uint64_t& out) const {
+    for (const auto& h : headers_) {
+        if (h.type != SegmentType::Load) {
+            continue;
+        }
+        // The segment is [vaddr, vaddr + memsz). Both ends come from the
+        // file and the second is an addition that can wrap, so the
+        // containment is asked as a subtraction from the start. A memsz of
+        // zero makes the segment empty and it contains nothing, which is
+        // what the check below says without a special case.
+        if (vaddr < h.vaddr || vaddr - h.vaddr >= h.memsz) {
+            continue;
+        }
+        // Past filesz the segment is memory that was never in the file: the
+        // .bss tail, zeroed by the loader. There is no byte there and so no
+        // byte to probe. Returning false rather than clamping to the end of
+        // the file is the honest answer -- clamping would produce an offset
+        // that is inside the file and belongs to a different byte, and a
+        // probe there would fire on the wrong instruction with nothing to
+        // say so.
+        if (vaddr - h.vaddr >= h.filesz) {
+            return false;
+        }
+        // The offset is p_offset + (vaddr - p_vaddr). p_offset is a file
+        // offset that the parser has already checked lies inside the file,
+        // and the delta is bounded by filesz, so the sum is bounded by the
+        // end of the segment -- but the sum is still formed, and a segment
+        // at the very top of the address space with a large p_offset could
+        // in principle exceed the file. A load segment's file extent was
+        // validated, so this cannot happen for a file that parsed; the
+        // subtraction is kept so the reasoning holds if that ever changes.
+        const std::uint64_t delta = vaddr - h.vaddr;
+        if (delta > h.filesz || h.offset > UINT64_MAX - delta) {
+            return false;
+        }
+        out = h.offset + delta;
+        return true;
+    }
+    return false;
 }
 
 } // namespace occ::parser

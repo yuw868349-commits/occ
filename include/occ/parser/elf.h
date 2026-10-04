@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "occ/util/span.h"
@@ -111,9 +112,140 @@ enum class LoadError : std::uint8_t {
     NoLoadSegments,
     BadAlignment,
     SegmentOutOfFile,
+    // The section header table is not where the header says it is. This is
+    // a distinct error from TruncatedProgramHeaders because it costs
+    // nothing the loader needs: a binary with no readable section table
+    // still runs, and refusing to load it would be refusing a working
+    // program over a table the kernel does not read either.
+    TruncatedSectionHeaders,
 };
 
 [[nodiscard]] const char* load_error_name(LoadError e) noexcept;
+
+// One entry of the section header table. The fields kept are the ones a
+// caller acts on; sh_flags and sh_addralign are read and skipped because
+// walking a 64-byte record needs their positions even when nothing wants
+// their values.
+struct SectionHeader {
+    // The offset of the name in the section's string table, not the name.
+    // Resolving it needs sh_link, so a caller that wants names goes through
+    // ElfImage::section_name rather than reading this and stringifying it.
+    std::uint32_t name_offset = 0;
+    std::uint32_t type = 0;
+    std::uint64_t flags = 0;
+    std::uint64_t addr = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+    std::uint32_t link = 0;
+    std::uint32_t info = 0;
+    std::uint64_t entsize = 0;
+};
+
+// The section types this reader acts on. SHT_DYNSYM is the one that matters:
+// a function-level probe needs an address, an address comes from a symbol,
+// and the symbols an executable exports are the dynamic ones.
+enum class SectionType : std::uint32_t {
+    Null = 0,
+    ProgBits = 1,
+    Symtab = 2,
+    Strtab = 3,
+    Rela = 4,
+    Hash = 5,
+    Dynamic = 6,
+    Note = 7,
+    Nobits = 8,
+    Rel = 9,
+    Shlib = 10,
+    Dynsym = 11,
+    InitArray = 14,
+    FiniArray = 15,
+    PreinitArray = 16,
+    Group = 17,
+    SymtabShndx = 18,
+};
+
+[[nodiscard]] const char* section_type_name(std::uint32_t type) noexcept;
+
+// How a symbol is bound and typed. The two nibbles share one byte in
+// st_info, and separating them here means a caller does not shift.
+enum class SymbolBind : std::uint8_t { Local = 0, Global = 1, Weak = 2 };
+enum class SymbolType : std::uint8_t {
+    NoType = 0,
+    Object = 1,
+    Func = 2,
+    Section = 3,
+    File = 4,
+};
+
+struct Symbol {
+    std::string name;
+    // The address the symbol is at, as a virtual address in the image. For
+    // a probe this is what has to be converted to a file offset, because
+    // the kernel's uprobe request is stated in file offsets and not in
+    // addresses.
+    std::uint64_t value = 0;
+    std::uint64_t size = 0;
+    // The index of the section the symbol is defined in. Zero is
+    // SHN_UNDEF, which is the one value here that is an answer rather than
+    // an index: an undefined symbol has an address in a table and no code
+    // behind it, and a probe on one fires on nothing.
+    std::uint16_t shndx = 0;
+    // st_other's low two bits, which are the symbol's visibility. It is
+    // kept because a hidden or internal symbol is still in .dynsym and is
+    // still a place a trap can be placed, and because a caller filtering
+    // probes by visibility needs it to be told the difference rather than
+    // having every local symbol look exported.
+    std::uint8_t visibility = 0;
+    SymbolBind bind = SymbolBind::Local;
+    SymbolType type = SymbolType::NoType;
+
+    [[nodiscard]] bool defined() const noexcept { return shndx != 0; }
+    [[nodiscard]] bool is_function() const noexcept {
+        return type == SymbolType::Func;
+    }
+    // STV_HIDDEN and STV_INTERNAL name symbols that are not in the
+    // dynamic symbol table's normal sense -- a linker has already resolved
+    // every reference to them. They are reported rather than filtered: the
+    // table has them, and a caller that wants only exported ones asks.
+    [[nodiscard]] bool hidden() const noexcept {
+        return visibility == 2 || visibility == 1;
+    }
+    [[nodiscard]] bool visible() const noexcept { return !hidden(); }
+    // A probe target has to be a defined function. An object, an
+    // undefined name and a zero-size function are all things a symbol
+    // table can contain and none of them is something to attach a probe to.
+    [[nodiscard]] bool probeable() const noexcept {
+        return defined() && is_function() && value != 0;
+    }
+};
+
+[[nodiscard]] const char* symbol_visibility_name(std::uint8_t v) noexcept;
+
+// What a symbol lookup found. A distinct answer for "the table is not
+// there" rather than an empty vector, because the two mean different things
+// to a caller: a name that is absent from a readable table is a question
+// answered, and a table that could not be read is an observation that could
+// not be made.
+enum class SymbolStatus : std::uint8_t {
+    // The dynamic symbol table was read.
+    Found,
+    // The file has no section header table at all, so there is nothing to
+    // find a symbol table through. A stripped-to-nothing file.
+    NoSectionTable,
+    // The section headers are readable and none of them is SHT_DYNSYM. This
+    // is what a file whose exports were made local looks like.
+    NoDynamicSymbols,
+    // The table is named by a section header that is not inside the file.
+    TruncatedTable,
+    // The table is inside the file but its string table is not, so a name
+    // could be read as an offset into nothing.
+    NoStringTable,
+};
+
+[[nodiscard]] const char* symbol_status_name(SymbolStatus s) noexcept;
+
+// Why a symbol table could not be read, in a sentence. Empty when it could.
+[[nodiscard]] const char* symbol_status_detail(SymbolStatus s) noexcept;
 
 // The parsed image. Reading is done entirely from a byte range, so the
 // caller decides where the bytes came from.
@@ -170,7 +302,99 @@ public:
         return stack_.present && stack_.executable;
     }
 
+    // -------------------------------------------------------------- symbols
+    //
+    // Everything below here is optional in a way the program headers are
+    // not. A missing or unreadable section table costs a caller the ability
+    // to resolve a symbol by name; it costs nothing about what the image
+    // asks the kernel to map, so it does not make ok() false. A reader that
+    // failed the whole image over it would refuse to describe a program the
+    // kernel will happily run, and the refusal would name a table that has
+    // no bearing on the question.
+
+    [[nodiscard]] const std::vector<SectionHeader>& sections() const noexcept {
+        return sections_;
+    }
+
+    // What the symbol lookup can and cannot do. Found is the only value
+    // that means names resolve; the rest are the ways it can fail, and each
+    // is a fact about the file rather than a single "no symbols" that a
+    // caller cannot act on.
+    [[nodiscard]] SymbolStatus symbol_status() const noexcept {
+        return symbol_status_;
+    }
+    [[nodiscard]] const std::string& symbol_detail() const noexcept {
+        return symbol_detail_;
+    }
+    [[nodiscard]] bool has_symbols() const noexcept {
+        return symbol_status_ == SymbolStatus::Found;
+    }
+
+    // Every dynamic symbol, in table order. Empty unless has_symbols().
+    [[nodiscard]] const std::vector<Symbol>& dynamic_symbols() const noexcept {
+        return symbols_;
+    }
+
+    // The name of a section. sh_name is an offset into the *section name*
+    // table -- the one e_shstrndx names -- and not into whatever table
+    // sh_link happens to point at. sh_link means different things for
+    // different section types: for a symbol table it is the strings that
+    // name the symbols, and using it here would read a symbol's name out of
+    // the wrong table and produce a section called whatever bytes sit at
+    // that offset. e_shstrndx is stored rather than taken from the caller
+    // because it is a property of the file and every section in the file
+    // resolves its name through the same one.
+    [[nodiscard]] std::string section_name(const SectionHeader& s,
+                                           ByteSpan bytes) const;
+
+    // The named dynamic symbol, or nullptr. Prefers a defined function over
+    // an undefined one of the same name, because a caller asking for
+    // "memcpy" wants the one with code behind it -- an undefined memcpy is
+    // an import the loader has not satisfied yet, and probing its recorded
+    // address would place a trap on nothing.
+    [[nodiscard]] const Symbol* find_symbol(std::string_view name) const;
+
+    // Converts a virtual address to the file offset a probe request needs.
+    //
+    // This exists because the two are not the same number and confusing
+    // them is silent. The kernel's uprobe request names a byte in the file;
+    // a symbol table names an address in the process. The conversion is
+    // only defined inside a PT_LOAD segment's file-backed part, and a
+    // virtual address in a segment's zero tail has no file offset at all --
+    // it is memory that was never in the file, and there is no byte to
+    // probe.
+    //
+    // Returns false for an address in no segment, in a segment's zero tail,
+    // or in a segment with no file backing. On false, `out` is untouched.
+    [[nodiscard]] bool vaddr_to_file_offset(std::uint64_t vaddr,
+                                            std::uint64_t& out) const;
+
 private:
+    // Reads the section header table. Fills `out` with what is inside the
+    // file and leaves it empty when the table is not there or is not
+    // readable; a caller distinguishes those through symbol_status, because
+    // "no table" and "a table that could not be read" are different facts
+    // and a probe layer needs to say which.
+    void read_sections(ByteSpan bytes, std::vector<SectionHeader>& out,
+                       std::uint64_t shoff, std::uint16_t shentsize,
+                       std::uint16_t shnum) noexcept;
+    // Reads .dynsym and the string table it points at. Sets
+    // symbol_status_ and symbol_detail_ to describe what happened, which is
+    // why this is separate from read_sections: the sections can be fine and
+    // the symbols still unavailable.
+    void read_dynamic_symbols(ByteSpan bytes) noexcept;
+
+    // The section header count and the file offset, kept from the header so
+    // the section walk does not re-read them and so a caller can report
+    // where the table claimed to be.
+    std::uint64_t shoff_ = 0;
+    std::uint16_t shentsize_ = 0;
+    std::uint16_t shnum_ = 0;
+    // e_shstrndx, which names the table every section's own name lives in.
+    // It is an index into the section header table and is used as such:
+    // zero is the specification's SHN_UNDEF and means there is no such
+    // table, which is a file with section headers and no names for them.
+    std::uint16_t shstrndx_ = 0;
     LoadError error_ = LoadError::NotElf;
     std::string detail_;
 
@@ -184,6 +408,16 @@ private:
     std::vector<ProgramHeader> headers_;
     std::vector<DesiredMapping> mappings_;
     StackRequest stack_;
+
+    // The section table and what was read out of it. The sections are kept
+    // whole because a caller resolving a section by type needs to see the
+    // table rather than the answer, and the symbols are kept alongside them
+    // because resolving one needs the string table, which is itself a
+    // section.
+    std::vector<SectionHeader> sections_;
+    std::vector<Symbol> symbols_;
+    SymbolStatus symbol_status_ = SymbolStatus::NoSectionTable;
+    std::string symbol_detail_;
 
     std::uint64_t lowest_vaddr_ = 0;
     std::uint64_t highest_vaddr_ = 0;
