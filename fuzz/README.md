@@ -44,6 +44,7 @@ For a longer run, point a harness at the corpus directly:
 | `occ_fuzz_pe` | any bytes | PE section extents and RVA-to-offset conversion |
 | `occ_fuzz_loader` | any bytes | what the loader decides about an image, and where it puts it |
 | `occ_fuzz_rsp` | any bytes | GDB RSP framing, checksums, escapes, and the queue between them |
+| `occ_fuzz_seccomp` | fixed-width record | that the bytecode is the program the policy described |
 
 `occ_fuzz_elf` also drives detection, because detection is what decides
 which parser runs at all: a file's first eight bytes choose the reader, and
@@ -68,6 +69,54 @@ is a lie in both places at once.
 `occ_fuzz_loader` shares the PE corpus deliberately. A loader harness whose
 inputs never parsed would exercise the refusal paths and none of the
 placement ones.
+
+`occ_fuzz_seccomp` is the odd one out twice over, and both are worth stating
+because the input column already says the first. It has no untrusted bytes to
+parse: `src/isolation/seccomp.cpp` builds a filter from a typed
+`SeccompPolicy`, so the harness has to invent its own surface before there is
+anything to fuzz. The surface is a fixed-width record -- a fuzzer's bytes read
+as a stream of fields that become a policy's fallback, ceiling, rules, actions,
+errnos, argument indices and comparisons. Every field is therefore reachable
+and none is out of reach, which is the property a generated surface needs and
+the reason the encoding is written down in the harness header rather than left
+implicit. The obvious alternative was worse: a fuzzer handed the enum values
+alone would never build a policy with two rules and a fall-through between them,
+and that fall-through is the only place the emitter's geometry gets interesting.
+
+The second difference is that this harness does not install anything, and the
+reason is a measurement rather than a preference. The first version did: it
+installed the program in a child process and treated the install's return value
+as the oracle, which is the right oracle -- only the kernel can say whether it
+will execute a filter. It also deadlocked, intermittently, under libFuzzer.
+Six campaigns over the same corpus and the same binary:
+
+| runs | 106 | 130 | 150 | 170 | 185 | 195 |
+|---|---|---|---|---|---|---|
+| exit | 0 | 0 | 0 | **124** | 0 | 0 |
+
+124 is the timeout's own code. The hang is not a function of the input -- all
+54 corpus files fed one run each produced zero hangs -- and not a function of
+the run count. What it is a function of is how fast libFuzzer calls the
+harness. The cost was measured rather than guessed: fork, install and collect
+runs at 6839 a second unsanitized and 1048 a second under AddressSanitizer, six
+and a half times slower, because forking a sanitized process runs the runtime's
+atfork handlers and re-accounts shadow memory. A twenty-second budget was
+still going after three and a half minutes, which is what 1048 a second buys
+you. Deduplicating the shapes the harness had already installed did not fix it
+either, and neither did driving the same logic outside libFuzzer: 51 installs
+over the same corpus, 51 successes, three clean ASan child runs. The mechanism
+is sound. The interaction with a driver that manages its own children is not,
+and neither side owns what they contend for.
+
+So the kernel oracle is a test. `tests/test_seccomp.cpp` really installs
+forty-nine filters, covering all seven comparisons and all five actions, in a
+build without a sanitizer -- bounded, reproducible, and it names the failure
+when it happens. What it cannot do is walk the emitter's geometry, because
+there are only so many policies a person writes. That is what stayed here, and
+the division loses nothing: the test answers "does the kernel take this filter",
+once per shape someone thought of, and this file answers "is the program the
+emitter built the program it meant to build", for every policy a fuzzer can
+describe, at full speed.
 
 Every harness touches every accessor even when the parse failed. An accessor
 that reads uninitialised state is a finding in itself, and a fuzzer that only
@@ -181,6 +230,115 @@ file, still finds the directory. Both answers are right; they answer different
 questions. Asserting they agree unconditionally was the first version, and the
 fuzzer found the contradiction on its first mutated input.
 
+**Seccomp.** The emitter lays a filter out as a preamble -- load the
+architecture, reject anything that is not x86-64, load the syscall number,
+range-test it against a ceiling -- then one block per rule, then a trailing
+fallback return. The blocks are where the arithmetic lives, so that is where
+the assertions are.
+
+Every branch lands inside the program. A jump offset is relative to the
+instruction *after* the branch, and classic BPF has no implicit end: a branch
+whose target is the program length or beyond runs off the end, and the kernel
+rejects the whole filter. This is the property a changed constant breaks first
+and the one reading the source does not catch, because the offsets are computed
+in three places and have to agree in all of them.
+
+The program ends in a return, and every instruction a program can arrive at
+without branching is accounted for. Both halves matter and the honest form of
+the check is the pair: the last instruction returns *and* no branch targets past
+it, and the second is what makes the first sufficient.
+
+The reported count is the emitted count. `insn_count()` is what
+`seccomp_install` hands the kernel as `sock_fprog::len`, and the kernel refuses
+a program longer than 65535 instructions, so a count that disagreed with the
+vector would make the install's own check and the kernel's wrong in opposite
+directions with nothing in between to report it.
+
+And the one that ties the bytecode back to the input: **every rule's number is
+in the dispatch table.** The program is scanned for the comparisons it makes,
+and each policy rule's syscall number has to be among them, with the
+architecture guard subtracted by value rather than by position. This is the
+invariant a fuzzer can actually break, and what breaking it looks like is not a
+crash -- it is a filter that installs cleanly, answers every question it is
+asked, and silently protects less than the policy said. A rule dropped from the
+table is a rule that does not run.
+
+Three properties are about the builder rather than about one program, and are
+checked on every input because a fuzzer that only reached them on its first few
+inputs would not notice a change that broke them later. An argument index the
+header calls out of range is refused *and* the last legal one is accepted, both
+halves, because a check written as "index > 5" passes both of a pair of tests
+that only test the refusal and is wrong at the boundary -- and the boundary is
+5, because `seccomp_data` has six slots. A zero errno is refused on both the
+rule path and the fallback path, because `SECCOMP_RET_ERRNO` with a zero
+payload makes the syscall return zero: a caller of `read` sees end of file and a
+caller flushing a stdio buffer loops forever. And the ceiling keeps the x32 bit
+out of the rule table, read back out of the emitted `JGT` rather than
+recomputed, because the kernel presents a number carrying bit 30 to the filter
+as carrying it -- verified on 6.6.117 by a filter matching `0x27`, which
+matches a native `getpid` and does not match the same call issued as
+`0x40000027`.
+
+Two of those were written once, wrongly, and the way they were wrong is why
+they read the way they do now. The argument bound refused index 6 and never
+confirmed that 5 still worked, and the x32 ceiling was asserted against
+`highest_known_syscall()` directly rather than against the number the builder
+actually compares -- so a change to the emitter's range test would have
+satisfied the assertion while defeating the defence. A check that reads the
+constant under test rather than the implementation of it is the difference
+between a test and a restatement, and both of these were restatements until
+they were not.
+
+A third was found by this harness, which is the argument for having it, and it
+is recorded here because the shape recurs. Telling the architecture guard from
+a rule's entry comparison was done by value -- collect every `JEQ`, erase
+`AUDIT_ARCH_X86_64` -- and the fuzzer produced a policy naming `0xc000003e` as
+a syscall number, which nothing forbids. Its rule was then reported missing,
+because the only entry carrying that number was the guard and the guard had
+just been erased. The harness trapped on a correct program. The comment called
+that "the conservative direction", which is exactly backwards: an invariant
+that reports a fault that does not exist is worse than a missing one, because
+it trains people to ignore the harness, and one that fires on a legal input
+also means the next real finding gets read as noise.
+
+The fix was to stop guessing and start knowing. The preamble's five
+instructions are now checked against the header's documented layout -- the
+architecture guard's position, its two outcomes, the unconditional kill beside
+it, and the range test's operand read back as the ceiling the policy asked for
+-- and the rule scan starts after the preamble instead of subtracting from a
+set. Which is also the stronger check: subtracting by value could not tell a
+rule that happened to share the guard's number from one that did not, and it
+reported both as missing.
+
+The general form is worth keeping: *a check that has to guess which of two
+things it is looking at is a check that will eventually be wrong about both*.
+Position, once established, is information; a value comparison is a guess with
+the numbers in it. And a new invariant is not evidence until something has
+tried to get past it -- so the three assertions in the preamble were each
+checked by breaking them on purpose (moving the guard's taken offset, pointing
+the number load at the architecture's field, and neutering the ceiling
+comparison, which the `-Wtautological-compare` in the warning set refused to
+compile). Two trapped and the third did not build, which is the outcome the
+warning suite is for.
+
+Reading the file for the first time since writing it turned up a third one,
+and it is the mirror image: an assertion that could not fail. There was a
+function called `both_outcomes_are_offsets` whose body was a loop containing
+two `continue`s, a comment and a closing brace. It was going to check that a
+conditional branch's taken and not-taken offsets differ, which is not a
+property any correct program here has -- a rule with no argument tests has a
+one-instruction block, so both offsets are 1 and both branches land on the
+same instruction, which is the entire reason the layout has a pad. Written as
+"the outcomes must differ" it would have trapped on every such policy, so it
+was going to be deleted rather than fixed; the property that does hold, that
+both outcomes land inside the program, is already checked.
+
+An assertion that cannot fail is the same defect as one that fails wrongly,
+and quieter: it costs a reader who trusts it, and it makes the count of
+invariants in a file a number that means nothing. The two of them together are
+why the harness asserts six things about a program rather than nine, and why
+the number is six rather than a larger one that would read as more thorough.
+
 ## What is deliberately not asserted
 
 An invariant that is wrong is worse than a missing one, because it reports a
@@ -240,9 +398,30 @@ part of the loader's contract -- `occ check` loads with a null resolver and a
 null writer for exactly this reason -- and a harness that asserted on it would
 be testing a mock.
 
+**Not: that the kernel will execute the program.** This is the one that
+earlier read as a gap and is not. It is `tests/test_seccomp.cpp`, which
+installs forty-nine filters for real, and it is a test rather than a fuzz
+target for a measured reason given above: a harness that forks per input and
+is called thousands of times a second deadlocks against libFuzzer's own
+process management often enough to make a suite unreliable. The cost of the
+split is that neither half sees the other's failures -- a filter the kernel
+rejects for a reason the geometry does not predict is found by the test only
+if someone writes that policy by hand -- and the benefit is that the geometry
+is walked exhaustively here, which no hand-written policy list does. That
+trade is the right way round, because a miscounted offset is the failure that
+actually happens and it is the one a fuzzer finds.
+
+**Not: that a filter answers a syscall the way the policy says.** The harness
+builds programs and reads their geometry; it does not execute them, so nothing
+here says a `Less` comparison means what the documentation says it means. That
+is `tests/test_seccomp.cpp` too, which issues real syscalls and checks the
+answers. Splitting it this way means the two halves cannot both be wrong in a
+way that cancels out, which is the failure a single combined harness would
+have.
+
 ## Seeds
 
-Twenty-six seeds, all generated by `tools/make_pe_seeds.py` and checked
+Thirty-five seeds, all generated by `tools/make_pe_seeds.py` and checked
 against it by `occ_test_seeds`. They are written rather than checked in by
 hand so that what each one is can be read: a seed whose purpose is unclear is
 a seed nobody regenerates when it stops being useful. Python is not part of
@@ -276,6 +455,15 @@ the build; it is needed to change a seed, never to compile or run one.
 | `zip_size_lies.zip` | a directory size larger than what is there, from a valid offset |
 | `zip_comment_overruns.zip` | a record whose comment runs past the directory |
 | `zip_streamed.apk` | a package with no central directory at all |
+| `seccomp_empty.pol` | no rules at all: the preamble and the trailing fallback alone |
+| `seccomp_one_rule.pol` | a rule with no argument tests, which is the only case where the layout's pad instruction is load-bearing |
+| `seccomp_two_rules.pol` | a fall-through from one rule's failed test into the next rule's entry |
+| `seccomp_widest_rule.pol` | six argument tests, the largest block the layout allows |
+| `seccomp_every_comparison.pol` | all seven comparisons, one rule each |
+| `seccomp_last_arg.pol` | argument index 5, the last one the header permits |
+| `seccomp_every_action.pol` | all five actions, and a `KillProcess` fallback behind them |
+| `seccomp_permissive_fallback.pol` | an `Allow` fallback with denying rules: the policy is safe only because of the rules |
+| `seccomp_low_ceiling.pol` | an explicit ceiling of 65 with a rule below it and a rule above it |
 
 The last three of the loader group and `elf_min.bin` are permanent guards
 rather than starting points: the loader harness traps on a violated invariant
@@ -303,25 +491,59 @@ mistake then reached the fuzz corpus as a crash artifact and cost three rounds
 of "is occ wrong or is the harness wrong". Catching it at generation time
 turns a forty-second investigation into a stack trace.
 
+The seccomp seeds are the same idea applied to something that is not a file. A
+`.pol` seed is a policy's numbers in a fixed-width record, so the generator
+does not merely emit bytes -- it asserts that the bytes it wrote decode back to
+the fallback, the ceiling, each rule's number, action and errno, and each test's
+index and comparison, through the same reduction the harness applies. A
+generator that could write a seed meaning something other than what its comment
+says would be a silent hole, and the assertion is what closes it. Every
+`_sec_field` call carries the check inside it rather than in a test elsewhere,
+because a check in a test is a check somebody can forget to extend.
+
+Two of those assertions earned their place immediately, and both are worth
+naming because a seed that lies is worse than no seed.
+
+`_SEC_ACTION_KILL_THREAD` was unreachable. The harness's action rotation was
+`% 4` against an enum with five values, so no byte produced `KillThread`: its
+emitter branch was never generated, never checked, and the harness passed,
+because four of five actions is not a failure by any assertion in it. It was
+found by generating the seeds and printing what each one decoded to, where a
+seed that named `KillThread` came back as something else. The lesson is the
+one the encoding table exists to enforce: a rotation's modulus has to be
+checked against the enum rather than chosen, and `% 7` against seven
+comparisons being correct does not make `% 4` against five correct.
+
+`seccomp_low_ceiling.pol` asked for a ceiling of 4 and got the default. The
+harness reads a ceiling as `raw % 4 == 0 ? 0 : raw % 4096`, so a raw byte that
+is a multiple of four is spent on the default -- and since 4096 is itself a
+multiple of four, *no* multiple of four below 4096 is reachable, ever. The
+generator now refuses one with an assertion rather than writing out a seed that
+does not mean what it says, and the seed uses 65. The limit itself is kept: it
+narrows nothing that matters, because a fuzzer still reaches those bytes by
+mutation and gets the default, which is the branch they exist for.
+
 
 ## Not reached
 
 **Anything needing a process.** The `run` path and everything under it needs
 a real process, a namespace, and a kernel, and a fuzzer that forks per input
-spends all its time in setup. The parser is where untrusted bytes enter, so
-that is where the budget goes. What this costs is stated rather than left
-implicit: the container, the seccomp emitter, the probe plumbing and the
-uprobe path are all unexercised here.
-
-**The BPF emitter.** `src/isolation/seccomp.cpp` builds filters from a typed
-`SeccompPolicy` rather than from bytes, so there is no untrusted-byte surface
-to hand a fuzzer. Its failure mode is a filter the kernel rejects at install
-time, which is not something a harness in this directory can observe.
+spends all its time in setup -- worse than that, under a sanitizer, where a
+fork runs the runtime's atfork handlers and re-accounts shadow memory, six and
+a half times slower than an unsanitized fork on this machine. The parser is
+where untrusted bytes enter, so that is where the budget goes. What this costs
+is stated rather than left implicit: the container, the probe plumbing and the
+uprobe path are unexercised here.
 
 **The seccomp and container tests are skipped in a fuzz build.** They install
-filters and unshare namespaces, and the sanitizer runtimes do not compose
-with that. The five harnesses here do none of it: no fork per input, no filter
-installed, no ptrace, which is why they run sanitized without trouble.
+filters and unshare namespaces, and the sanitizer runtimes do not compose with
+that -- `occ_test_seccomp`'s policy denies `write(2)`, and ASan places its
+shadow memory with `mmap` on the way out of `fork()`. The six harnesses here do
+none of it: no fork per input, no filter installed, no namespace, no ptrace,
+which is why they run sanitized without trouble. The seccomp emitter is no
+longer on that list of unexercised things -- it is fuzzed here, statically --
+but the kernel's opinion of what it emits is still the skipped test's job, and
+that half is honestly absent from a fuzz build.
 
 **Non-determinism.** Nothing here records what a run depended on. Two runs of
 `occ run` are not expected to produce the same event stream yet; making them
@@ -330,11 +552,20 @@ do so is a milestone of its own.
 ## Coverage, and what it converges to
 
 Measured on the checked-in seeds: 430 edges for `occ_fuzz_pe`, 606 for
-`occ_fuzz_loader`. A minute of `occ_fuzz_pe` over an accumulated corpus moves
-the edge count by two, so "run it longer" is not where the value is at this
-point. What moves it is a new shape -- see `pe_base_zero.bin`, which came out
-of a 3409-input corpus and is worth five edges in the loader harness and two
-in the PE one.
+`occ_fuzz_loader`, 359 for `occ_fuzz_seccomp`. A minute of `occ_fuzz_pe` over
+an accumulated corpus moves the edge count by two, so "run it longer" is not
+where the value is at this point. What moves it is a new shape -- see
+`pe_base_zero.bin`, which came out of a 3409-input corpus and is worth five
+edges in the loader harness and two in the PE one.
+
+The seccomp harness is the one whose rate is worth a number, because the rate
+is the argument. 3,091,554 inputs in 121 seconds, 25,550 a second, with
+no crash, no timeout and no leak. The first version of it managed 1,048 a
+second under the same sanitizer and deadlocked when it did. Nothing about the
+work got cheaper -- the same builder runs and the same program is read back --
+so the whole difference is that it no longer forks, and that is what the split
+bought: an oracle is worth exactly as much as the rate at which you can ask
+the question, and a question that deadlocks is worth nothing at any rate.
 
 Most of what a corpus accumulates is not worth keeping, and the rule for
 deciding is worth stating because it is what makes the corpus reviewable: a

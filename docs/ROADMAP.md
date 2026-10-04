@@ -45,7 +45,7 @@ none to a grep:
 | `test_gdb_interop` | 29 |
 | `test_container` | 25 |
 | `test_check` | 24 |
-| `test_seeds` | 31 |
+| `test_seeds` | 40 |
 
 `test_gdb_interop` is the one that does not run without a peer. It forks the
 host's gdb and drives a real attach, register read and detach through a
@@ -137,9 +137,10 @@ are written now. A reference to a document that is not there is worse than no
 reference: it tells a reader the question has been answered.
 
 **The fuzz harnesses are built, and only in a build that asks for them.**
-`fuzz/` holds five of them -- the ELF reader, the zip reader, the PE reader,
-the PE loader and the GDB RSP codec -- each a `LLVMFuzzerTestOneInput` over
-the parser it names, plus a `seeds/` directory of twenty-six seeds. `docs/BUILD.md` describes
+`fuzz/` holds six of them -- the ELF reader, the zip reader, the PE reader,
+the PE loader, the GDB RSP codec and the seccomp-BPF emitter -- each a
+`LLVMFuzzerTestOneInput` over the parser it names, plus a `seeds/` directory of
+thirty-five seeds. `docs/BUILD.md` describes
 `-DOCC_ENABLE_FUZZ=ON`, which is what `add_subdirectory(fuzz)` is conditioned
 on, and `fuzz/README.md` records what each harness asserts. They are off by
 default because the sanitizer link flags they need are per-consumer, so an
@@ -153,10 +154,25 @@ build throws it away.
 
 **Nothing that needs a process is fuzzed.** The `run` path and everything
 under it needs a real namespace and a real kernel, and a fuzzer that forks per
-input spends its time in setup. The parsers are where untrusted bytes enter,
-so that is where the budget went, and the consequence is worth stating: the
-container, the seccomp emitter, the probe plumbing and the uprobe path are
-unexercised by any harness. `fuzz/README.md` says so in the same terms.
+input spends its time in setup -- and deadlocks against the driver's own
+process management, which is a measured result rather than an assumption. The
+parsers are where untrusted bytes enter, so that is where the budget went, and
+the consequence is worth stating: the container, the probe plumbing and the
+uprobe path are unexercised by any harness. `fuzz/README.md` says so in the
+same terms.
+
+The seccomp emitter is the exception, and it is the exception because it does
+not need a process. It builds a filter from a typed policy rather than from
+bytes, so the harness reads the fuzzer's bytes as that policy and then reads
+the emitted bytecode back for the emitter's own promises: every branch lands
+inside the program, the program ends in a return, the reported count is the
+emitted one, the preamble is the five instructions the layout documents, and
+every rule's number is in the dispatch table. The one thing a fuzzer would
+reach for and cannot have is the kernel's verdict on the result, and that is
+`occ_test_seccomp`'s -- forty-nine filters, really installed, in a build
+without a sanitizer. Building it already found a real hole in the harness
+itself, which is in `fuzz/README.md` under the heading about invariants that
+were wrong.
 
 **Syscall tracing needs a tracepoint that exists.** The eBPF programs attach
 to raw tracepoints whose field offsets are read at runtime. A kernel without

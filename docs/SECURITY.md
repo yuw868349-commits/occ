@@ -105,24 +105,41 @@ surface besides the kernel itself:
   end-of-central-directory record is found by scanning backwards and every
   other offset comes from it.
 
-Five libFuzzer harnesses exist under `fuzz/`, one per parser above plus the
-PE loader. They are written to validate before allocating, to bound every
-length against the buffer actually received, and to never trust a field that
-describes the size of another field. `fuzz/README.md` records what each one
-asserts and, at more length, what each deliberately does not.
+Six libFuzzer harnesses exist under `fuzz/`, one per parser above, plus the PE
+loader and the seccomp-BPF emitter. They are written to validate before
+allocating, to bound every length against the buffer actually received, and to
+never trust a field that describes the size of another field.
+`fuzz/README.md` records what each one asserts and, at more length, what each
+deliberately does not.
 
 Two things on the earlier version of this list do not exist and never did: an
 AXML parser and an adb client. They are named here as absent rather than
 quietly dropped, because a reader who finds them later should know they were
 not covered rather than assume they were and find them gone.
 
-Nor does the seccomp-BPF emitter have a harness, and the reason is not that it
-was overlooked. It builds filters from a typed `SeccompPolicy` rather than
-from bytes, so there is no untrusted input to hand a fuzzer; what it can get
-wrong is emitting a filter the kernel rejects at install time, and observing
-that needs the kernel rather than a test process. It is covered by
-`tests/test_seccomp.cpp` against a live filter instead, which is a stronger
-oracle than an assertion would be.
+The seccomp-BPF emitter is the sixth, and it is split across two places on
+purpose. Its geometry is fuzzed: a fuzzer's bytes are read as a policy's
+fallback, ceiling, rules, actions, errnos and argument comparisons, and the
+emitted bytecode is then read back for the promises the emitter makes about
+it -- every branch lands inside the program, the program ends in a return, the
+reported instruction count is the emitted one, the preamble is the five
+instructions the layout documents, and every rule's number is in the dispatch
+table. That last one is the invariant worth naming here, because a filter
+missing a rule installs cleanly, answers every question it is asked, and
+silently protects less than the policy said.
+
+Its acceptance by the kernel is not fuzzed, and the reason is measured rather
+than preferred. The first version installed each program in a child and
+treated the install's return value as the oracle; it deadlocked intermittently
+under libFuzzer, which calls a harness thousands of times a second and manages
+its own processes while this one was forking underneath it. Six campaigns over
+one corpus, five clean and one hung, with the hang a function of neither the
+input nor the run count. So the kernel oracle stayed where it already was, in
+`tests/test_seccomp.cpp`, which really installs forty-nine filters covering all
+seven comparisons and all five actions in a build without a sanitizer -- a
+stronger oracle than an assertion, and a bounded one. The division loses
+nothing: the test answers whether the kernel will take a filter, and the
+harness answers whether the emitter built the filter it meant to.
 
 The parsers are the part of this codebase most likely to be handed
 adversarial input on purpose, because that is what a reverse engineering

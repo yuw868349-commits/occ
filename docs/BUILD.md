@@ -173,11 +173,11 @@ isolation code the binary ships, which is the point.
 
 ## Fuzz harnesses
 
-**Built, and only in a build that asks for them.** `fuzz/` holds five
+**Built, and only in a build that asks for them.** `fuzz/` holds six
 `LLVMFuzzerTestOneInput` targets -- the ELF reader, the zip reader, the PE
-reader, the PE loader and the GDB RSP codec -- plus a `seeds/` directory of
-twenty-six seeds that `tools/make_pe_seeds.py` writes and `occ_test_seeds`
-checks against it.
+reader, the PE loader, the GDB RSP codec and the seccomp-BPF emitter -- plus a
+`seeds/` directory of thirty-five seeds that `tools/make_pe_seeds.py` writes
+and `occ_test_seeds` checks against it.
 `fuzz/README.md` records what each harness asserts and, at more length, what
 each one deliberately does not.
 
@@ -212,12 +212,23 @@ has no limit at all.
 
 What the harnesses do not cover is stated in `fuzz/README.md` rather than
 left to be discovered. It is worth knowing before reading a green run as more
-than it was: nothing needing a real process is exercised, so the container,
-the BPF emitter, the probe plumbing and the uprobe path are unverified by
-anything in that directory. The seccomp emitter is the part that most needs a
-harness -- it is 402 lines of arithmetic over a structure the kernel rejects
-without explaining why -- and `fuzz/README.md` explains why it has none: its
-input is a typed `SeccompPolicy` rather than bytes.
+than it was: nothing needing a real process is exercised, so the container, the
+probe plumbing and the uprobe path are unverified by anything in that
+directory.
+
+The seccomp emitter is the interesting one, because it is 402 lines of
+arithmetic producing a structure the kernel either executes or refuses without
+explaining why, and because its input is a typed `SeccompPolicy` rather than
+bytes -- so the harness has to invent a surface before there is anything to
+fuzz. It does: the bytes are read as a fixed-width record of the policy's
+fields, and the emitted bytecode is read back for the emitter's own promises
+about it. What it does not do is install the program, which is where the
+kernel's opinion would come in. That was the first design and it does not
+survive libFuzzer: a harness that forks per input deadlocks against the
+driver's process management often enough to make a suite unreliable, and not
+as a function of the input. `occ_test_seccomp` is where the kernel is asked,
+in a build without a sanitizer, and it really installs forty-nine filters.
+`fuzz/README.md` has the measurements.
 
 ## Sanitizer build of the test suite
 

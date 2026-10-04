@@ -54,16 +54,59 @@ add_executable(occ_fuzz_loader fuzz_loader.cpp)
 target_link_libraries(occ_fuzz_loader PRIVATE occ_core)
 target_link_options(occ_fuzz_loader PRIVATE ${OCC_FUZZ_LINK_FLAGS})
 
+# The seccomp emitter builds a filter from a typed policy rather than from
+# bytes, so it has no untrusted-byte surface to fuzz in the way the four
+# parsers do. It is fuzzed anyway, and the reason is that the failure a person
+# actually makes in it is a geometry error: an offset that still installs and
+# answers a different question, a block one instruction short, a rule the
+# dispatch table quietly does not carry. So the harness maps the fuzzer's bytes
+# onto a policy and then reads the emitter's promises back out of the bytecode
+# it produced -- every branch landing inside the program, the program ending in
+# a return, the reported count matching the emitted one, every rule's number
+# present in the dispatch table.
+#
+# What it deliberately does not do is install the program. That was the first
+# design and it does not survive libFuzzer: a harness that forks per input and
+# is called thousands of times a second intermittently deadlocks against the
+# driver's own process management, reproducibly enough to matter (runs=170
+# timed out where 106, 130, 150, 185 and 195 all exited clean) and not at all
+# a function of the input. The kernel oracle stayed, as occ_test_seccomp, which
+# really installs forty-nine filters covering all seven comparisons and all
+# five actions. See the header of fuzz_seccomp.cpp for the measurements.
+#
+# It is built here, sanitized, unlike occ_test_seccomp -- which is skipped in a
+# fuzz build because its policy denies write(2) and ASan places its shadow
+# memory with mmap on the way out of fork(). Nothing here forks, so nothing
+# here has that problem, and that is the reason the emitter's geometry can be
+# fuzzed at full speed in a build the kernel test cannot run in at all.
+add_executable(occ_fuzz_seccomp fuzz_seccomp.cpp)
+target_link_libraries(occ_fuzz_seccomp PRIVATE occ_core)
+target_link_options(occ_fuzz_seccomp PRIVATE ${OCC_FUZZ_LINK_FLAGS})
+
 # The seeds below are real inputs, not noise. A fuzzer starts from a corpus
 # and spends its first minutes broadening what it already reaches, so a
 # corpus of zeros teaches it nothing about a header parser. These are the
 # smallest inputs that get past each parser's first gate.
 #
-# The PE seeds are generated rather than checked in as binaries. A .bin file
-# in a diff is a file nobody can review, and the whole claim of this corpus
-# is that each entry gets past a particular gate -- a claim that has to be
-# readable to be believable. tools/make_pe_seeds.py writes them, and the
-# comments there say which gate each one is for.
+# The PE and seccomp seeds are generated rather than checked in as binaries. A
+# .bin file in a diff is a file nobody can review, and the whole claim of this
+# corpus is that each entry gets past a particular gate -- a claim that has to
+# be readable to be believable. tools/make_pe_seeds.py writes them, and the
+# comments there say which gate each one is for. The seccomp seeds are the
+# better example of why: a .pol file is a policy's numbers in a fixed-width
+# record, so the generator can assert that the bytes it wrote decode back to
+# the fallback, the ceiling, each rule's number, action and errno, and each
+# test's index and comparison. A generator that could write a seed the harness
+# would decode into a different policy would be a silent hole, and the
+# assertion is what closes it.
+#
+# Each seccomp seed names the emitter branch it exists to reach, and the
+# branches are chosen to be the ones the byte-level fuzzer is worst at:
+# an empty policy, a rule with no argument tests (which is the only case where
+# the layout's padding instruction is load-bearing), a fall-through between two
+# rules, the widest possible argument block, all seven comparisons, the last
+# legal argument index, all five actions, a permissive fallback with denying
+# rules, and an explicit low ceiling.
 #
 set(OCC_ZIP_SEEDS
     zip_package.zip
@@ -117,6 +160,37 @@ add_custom_command(
     COMMENT "regenerating the PE fuzzing seed corpus"
     VERBATIM)
 
+set(OCC_SECCOMP_SEEDS
+    seccomp_empty.pol
+    seccomp_one_rule.pol
+    seccomp_two_rules.pol
+    seccomp_widest_rule.pol
+    seccomp_every_comparison.pol
+    seccomp_last_arg.pol
+    seccomp_every_action.pol
+    seccomp_permissive_fallback.pol
+    seccomp_low_ceiling.pol)
+
+set(OCC_SECCOMP_SEED_PATHS)
+foreach(_seed IN LISTS OCC_SECCOMP_SEEDS)
+    list(APPEND OCC_SECCOMP_SEED_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/seeds/${_seed})
+endforeach()
+
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp/.stamp
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${OCC_SECCOMP_SEED_PATHS}
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp/
+    COMMAND ${CMAKE_COMMAND} -E touch
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp/.stamp
+    COMMENT "regenerating the seccomp fuzzing seed corpus"
+    VERBATIM)
+
+add_custom_target(occ_fuzz_seccomp_corpus
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp/.stamp)
+
 add_custom_target(occ_fuzz_pe_corpus
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe/.stamp)
 
@@ -141,7 +215,8 @@ add_custom_target(occ_fuzz_corpus
             ${CMAKE_CURRENT_SOURCE_DIR}/seeds/rsp_g.gdb
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/rsp/
     COMMENT "staging the fuzzing seed corpus")
-add_dependencies(occ_fuzz_corpus occ_fuzz_pe_corpus occ_fuzz_zip_corpus)
+add_dependencies(occ_fuzz_corpus occ_fuzz_pe_corpus occ_fuzz_zip_corpus
+                                occ_fuzz_seccomp_corpus)
 
 # One target that runs each harness for a fixed time, for a caller who wants a
 # smoke test rather than a campaign. The times are short enough to finish in
@@ -168,8 +243,12 @@ add_custom_target(occ_fuzz_smoke
             -max_total_time=20
             -max_len=8192
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/occ_fuzz_seccomp
+            -max_total_time=20
+            -max_len=2048
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp
     DEPENDS occ_fuzz_elf occ_fuzz_rsp occ_fuzz_pe occ_fuzz_loader
-            occ_fuzz_zip
+            occ_fuzz_zip occ_fuzz_seccomp
             occ_fuzz_corpus
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     COMMENT "running each harness briefly against its seeds")
@@ -191,13 +270,21 @@ add_custom_target(occ_fuzz_smoke
 #
 # The seccomp and container tests are not built in this configuration, and
 # the reason is in tests/CMakeLists.txt: a sanitizer cannot survive the
-# seccomp filter it installs or the ptrace attach it performs. None of those
-# five harnesses does either. They call the library over a buffer -- the ELF,
-# PE and zip harnesses parse one, the loader harness walks one, the RSP
-# harness frames one -- with no
-# fork, no exec, no filter and no tracer. The incompatibility that removes
-# two tests from this build does not apply here, and a reader who has just
-# read that it does somewhere else deserves the sentence saying so.
+# seccomp filter it installs or the ptrace attach it performs. None of the
+# six harnesses here does either. They call the library over a buffer -- the
+# ELF, PE and zip harnesses parse one, the loader harness walks one, the RSP
+# harness frames one, the seccomp harness builds a filter from one -- with no
+# fork, no exec, no filter and no tracer. The incompatibility that removes two
+# tests from this build does not apply here, and a reader who has just read
+# that it does somewhere else deserves the sentence saying so.
+#
+# The seccomp harness deserves one more note, because it is the one whose
+# subject matter the skipped test owns. occ_test_seccomp is where the kernel
+# is asked whether it will execute an emitted filter, and it is not built here
+# for the reason above. So the emitter's geometry is fuzzed here and its
+# acceptance is tested there, and neither half is asked to do the other's job:
+# the harness does not fork, and the test does not need a fuzzer's speed. The
+# header of fuzz_seccomp.cpp has the measurement that forced the split.
 #
 # The bound is libFuzzer's own -max_total_time and the ctest TIMEOUT is the
 # backstop, four times larger. That order matters and it is not decoration:
@@ -224,6 +311,17 @@ occ_add_fuzz_run(occ_fuzz_run_rsp    occ_fuzz_rsp    256  rsp)
 occ_add_fuzz_run(occ_fuzz_run_pe     occ_fuzz_pe     4096 pe)
 occ_add_fuzz_run(occ_fuzz_run_loader occ_fuzz_loader 4096 pe)
 occ_add_fuzz_run(occ_fuzz_run_zip    occ_fuzz_zip    8192 zip)
+# 2048, and the number is derived rather than chosen. The seccomp record is
+# fixed-width and bounded, so the largest input that can describe a policy the
+# previous input did not is computable: ten bytes of header (a fallback, a
+# fallback errno, a ceiling, a rule count), then for each of 25 rules ten
+# bytes (a number, an action, an errno, a test count), then for each of that
+# rule's 7 tests six bytes (an index, a comparison, a value). That is
+# 10 + 250 + 1050 = 1310 bytes. 2048 leaves room above it for libFuzzer to
+# spend bytes on mutations rather than on a tail the reader would ignore. The
+# other harnesses need kilobytes because their inputs are files; this one
+# reads a struct, and the struct has a known size.
+occ_add_fuzz_run(occ_fuzz_run_seccomp occ_fuzz_seccomp 2048 seccomp)
 
 # A test that runs a harness against a corpus directory needs that directory
 # populated, and the population is the same copy_if_different chain the
@@ -244,7 +342,8 @@ add_test(NAME occ_fuzz_corpus_dirs
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/elf
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/rsp
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe
-            ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip)
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp)
 add_test(NAME occ_fuzz_corpus_pe
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${OCC_PE_SEED_PATHS}
@@ -253,6 +352,10 @@ add_test(NAME occ_fuzz_corpus_zip
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${OCC_ZIP_SEED_PATHS}
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/zip)
+add_test(NAME occ_fuzz_corpus_seccomp
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${OCC_SECCOMP_SEED_PATHS}
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/seccomp)
 add_test(NAME occ_fuzz_corpus_elf
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_SOURCE_DIR}/seeds/elf_min.bin
@@ -263,14 +366,14 @@ add_test(NAME occ_fuzz_corpus_rsp
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/rsp)
 
 set_tests_properties(occ_fuzz_corpus_dirs PROPERTIES FIXTURES_SETUP fuzz_corpus)
-foreach(_s occ_fuzz_corpus_pe occ_fuzz_corpus_zip occ_fuzz_corpus_elf
-             occ_fuzz_corpus_rsp)
+foreach(_s occ_fuzz_corpus_pe occ_fuzz_corpus_zip occ_fuzz_corpus_seccomp
+             occ_fuzz_corpus_elf occ_fuzz_corpus_rsp)
     set_tests_properties(${_s} PROPERTIES
         FIXTURES_SETUP fuzz_corpus
         DEPENDS occ_fuzz_corpus_dirs)
 endforeach()
 
 foreach(_t occ_fuzz_run_elf occ_fuzz_run_rsp occ_fuzz_run_pe
-             occ_fuzz_run_loader occ_fuzz_run_zip)
+             occ_fuzz_run_loader occ_fuzz_run_zip occ_fuzz_run_seccomp)
     set_tests_properties(${_t} PROPERTIES FIXTURES_REQUIRED fuzz_corpus)
 endforeach()

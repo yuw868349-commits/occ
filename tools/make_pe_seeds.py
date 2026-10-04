@@ -13,6 +13,16 @@ written that way before. A reader who opens this file can see that one of
 them declares thirteen program headers in a file that cannot hold them,
 which is the entire point of it.
 
+Four harnesses have seeds now, and the fourth is a different kind of thing
+from the other three. The parsers are handed a file; the seccomp emitter is
+handed a *policy*, which is a typed struct rather than a byte stream, so
+there is no file format here to describe. The seeds below are therefore the
+harness's own input encoding -- the fields fuzz_seccomp.cpp reads, in the
+order it reads them -- and each one is written to reach a particular branch
+of the emitter. They are generated for the reason the others are, which is
+that a seed nobody can read is a seed nobody can regenerate, and the reading
+is what says which branch a given seed is for.
+
 Run from the repository root:
 
     python3 tools/make_pe_seeds.py fuzz/seeds
@@ -767,6 +777,262 @@ def _zip_seeds():
     return seeds
 
 
+# ---------------------------------------------------------------- seccomp
+
+# The seccomp harness is not handed a file, so there is no format to describe
+# here. What it is handed is the policy encoding fuzz_seccomp.cpp reads, and
+# these are its fields in the order it reads them:
+#
+#     u8    fallback          % 4 -> Allow / Errno / Trap / KillProcess
+#     u32   fallback_error    % 4096 + 1, so never zero
+#     u32   ceiling           % 4 == 0 -> 0 (the default), else % 4096
+#     u8    rule_count        % 25
+#     per rule:
+#       u32   nr
+#       u8    action          % 5 -> Errno / Allow / Trap / KillThread /
+#                                 KillProcess
+#       u32   error           % 4096 + 1, so never zero
+#       u8    test_count      % 7
+#       per test:
+#         u8  index           % 6
+#         u8  cmp             % 7, and % 7 == 6 selects Masked
+#         u32 value
+#
+# Every modulus is stated here because a seed is only useful if it lands where
+# its comment says it does, and "it happens to" is not a property a
+# regenerated seed may keep. The encodings below are therefore computed from
+# these same constants rather than typed as literals, so a change to the
+# harness's decoding is a change to these too.
+
+_SEC_FALLBACK_ERRNO = 0        # % 4 -> 0
+_SEC_FALLBACK_ALLOW = 1         # % 4 -> 1
+_SEC_FALLBACK_TRAP = 2          # % 4 -> 2
+_SEC_FALLBACK_KILL = 3          # % 4 -> 3
+
+_SEC_ACTION_ERRNO = 0           # % 5 -> 0
+_SEC_ACTION_ALLOW = 1           # % 5 -> 1
+_SEC_ACTION_TRAP = 2            # % 5 -> 2
+_SEC_ACTION_KILL_THREAD = 3     # % 5 -> 3
+_SEC_ACTION_KILL_PROCESS = 4    # % 5 -> 4
+
+_SEC_CMP_EQUAL = 0
+_SEC_CMP_NOT_EQUAL = 1
+_SEC_CMP_GREATER = 2
+_SEC_CMP_GREATER_OR_EQUAL = 3
+_SEC_CMP_LESS = 4
+_SEC_CMP_LESS_OR_EQUAL = 5
+_SEC_CMP_MASKED = 6             # % 7 == 6, and the only masked value
+
+# A ceiling of zero means "use the builder's own default", and the default is
+# the value the x32 defence rests on, so the seed that uses it is the one that
+# reaches the range test with the number the header talks about.
+#
+# The harness reads a ceiling as `raw % 4 == 0 ? 0 : raw % 4096`, which is
+# worth stating because it has a consequence that is easy to get wrong from the
+# outside: one raw byte reaches every ceiling, and a byte that is a multiple of
+# four is spent on the default. So three of every four raw bytes pick a
+# concrete ceiling and one picks the default, and a *named* ceiling has to be
+# not a multiple of four to arrive. `seccomp_policy` asserts that, which is why
+# the first version of `seccomp_low_ceiling.pol` said 4 and arrived as the
+# default it was trying not to be.
+_SEC_CEILING_DEFAULT = 0
+
+
+def _sec_ceiling(value):
+    """The raw u32 that decodes to `value` in the harness's ceiling encoding.
+
+    Not every ceiling is nameable, and the reason is arithmetic rather than a
+    choice. The harness reads `raw % 4 == 0 ? 0 : raw % 4096`, so a raw byte
+    reaching a given ceiling is `value + 4096k` -- and since 4096 is itself a
+    multiple of four, every one of those is a multiple of four whenever
+    `value` is, and every one of them decodes to the default instead. So the
+    ceilings this can name are exactly the ones that are not multiples of four,
+    three quarters of the range below 4096, and a request for a multiple of
+    four is refused here rather than silently written out as a seed that means
+    the default.
+
+    That limit is the harness's, not this function's, and it is deliberate
+    enough to keep: the alternative encoding would spend a second bit of
+    entropy deciding default-or-not, and one byte in four choosing the default
+    is a better ratio than one in two. A fuzzer still reaches the multiples of
+    four by mutating a raw byte into them and getting the default, which is the
+    branch those bytes exist for.
+
+    Zero is the exception that proves the rule rather than one. It is a
+    multiple of four, and it is reachable, because every raw byte that decodes
+    to it decodes to *it* -- the default is what all of them mean, so asking
+    for the default by name is exact rather than approximate.
+    """
+    assert 0 <= value < 4096, value
+    assert value % 4 != 0 or value == 0, (value, "unreachable in the encoding")
+    return value
+
+
+def _sec_field(value, modulus):
+    """The byte(s) that decode back to `value % modulus`.
+
+    Written as a division and a multiplication rather than as the remainder
+    alone because a seed generator that emits a value and asserts it decodes
+    correctly is a seed that cannot silently stop meaning what its comment
+    says. The assertion is the point; the arithmetic is how it is satisfied.
+    """
+    remainder = value % modulus
+    encoded = remainder + (modulus * ((value - remainder) // modulus))
+    assert encoded % modulus == remainder, (value, modulus)
+    return encoded
+
+
+def seccomp_policy(*, fallback=_SEC_FALLBACK_ERRNO, fallback_error=38,
+                   ceiling=_SEC_CEILING_DEFAULT, rules=()):
+    """One policy in the encoding the seccomp harness reads.
+
+    `rules` is a sequence of (nr, action, error, tests) where `tests` is a
+    sequence of (index, cmp, value). The result is the byte string a fuzzer
+    would have to produce to make the harness build exactly this policy,
+    which is the only honest way to state a seed for an emitter: the input is
+    a policy, so the seed has to name the policy.
+    """
+    out = bytearray()
+    out.append(_sec_field(fallback, 4))
+    out += struct.pack(">I", _sec_field(fallback_error, 4096))
+    out += struct.pack(">I", _sec_ceiling(ceiling))
+    out.append(_sec_field(len(rules), 25))
+
+    for nr, action, error, tests in rules:
+        out += struct.pack(">I", _sec_field(nr, 4096))
+        out.append(_sec_field(action, 5))
+        out += struct.pack(">I", _sec_field(error, 4096))
+        out.append(_sec_field(len(tests), 7))
+        for index, cmp, value in tests:
+            out.append(_sec_field(index, 6))
+            out.append(_sec_field(cmp, 7))
+            out += struct.pack(">I", _sec_field(value, 4096))
+    return bytes(out)
+
+
+def _seccomp_seeds():
+    """The policies the emitter harness starts from.
+
+    One per branch of the emitter rather than one per action, because the
+    branches are what the bytecode geometry depends on. A policy with one rule
+    and no argument tests is a three-instruction block; a policy with six
+    tests is a thirty-one-instruction block, and the entry's not-taken offset
+    is the difference between the two. The emitter's arithmetic is exercised
+    by the width of a rule, so the corpus has to contain rules at both ends of
+    it or the arithmetic is only ever checked at one width.
+    """
+    seeds = {}
+
+    # The empty policy: a filter that denies everything by the fallback and
+    # dispatches nothing. It is the smallest program the builder can emit and
+    # the one whose instruction count is easiest to get wrong, because there
+    # is no rule to make the count depend on. Everything else is a widening of
+    # this, so it is the seed that has to be right.
+    seeds["seccomp_empty.pol"] = seccomp_policy()
+
+    # One rule, no argument tests. The block is one instruction, which is the
+    # case the layout comment calls out: without the landing pad, the entry's
+    # taken and not-taken offsets would both be one and the two branches
+    # would be the same number.
+    seeds["seccomp_one_rule.pol"] = seccomp_policy(rules=[
+        (39, _SEC_ACTION_ERRNO, 13, ()),      # getpid, denied
+    ])
+
+    # Two rules, the first of which falls through to the second. This is the
+    # case the whole block layout exists for: a rule whose argument test fails
+    # has to resume at the next rule rather than at the fallback, so a policy
+    # with one rule cannot tell a correct emitter from one that jumps straight
+    # to the fallback.
+    seeds["seccomp_two_rules.pol"] = seccomp_policy(rules=[
+        (257, _SEC_ACTION_ERRNO, 13,          # openat
+         ((2, _SEC_CMP_MASKED, 0o100),)),     # denied when O_CREAT is set
+        (39, _SEC_ACTION_ALLOW, 0, ()),        # getpid, allowed
+    ])
+
+    # A rule with all six argument tests: the widest block the API can
+    # describe, and therefore the entry offset closest to the eight-bit jump
+    # field's limit. The builder's own range check cannot fire for any policy
+    # this API can express -- six tests give an offset of 32, against a limit
+    # of 255 -- so the harness asserts the invariant that makes it unreachable
+    # rather than the check itself. If a future change raised the argument
+    # limit, this is the seed that reaches the new geometry.
+    seeds["seccomp_widest_rule.pol"] = seccomp_policy(rules=[
+        (99, _SEC_ACTION_ERRNO, 13,
+         tuple((i, _SEC_CMP_EQUAL, 0) for i in range(6))),
+    ])
+
+    # Every comparison, one rule each. Six of the seven are emitted as an
+    # inverted operator rather than as a distinct opcode, so this is the seed
+    # that reaches the inversion logic -- and a fuzzer that never varies the
+    # comparison would never notice a change to which of jt and jf carries the
+    # match. They are in one policy rather than seven because the harness
+    # installs a filter per input and a corpus of seven single-rule policies
+    # would spend its budget in the fork.
+    seeds["seccomp_every_comparison.pol"] = seccomp_policy(rules=[
+        (28, _SEC_ACTION_ERRNO, 13, ((2, _SEC_CMP_EQUAL, 10),)),
+        (29, _SEC_ACTION_ERRNO, 14, ((2, _SEC_CMP_NOT_EQUAL, 10),)),
+        (30, _SEC_ACTION_ERRNO, 15, ((2, _SEC_CMP_GREATER, 10),)),
+        (31, _SEC_ACTION_ERRNO, 16, ((2, _SEC_CMP_GREATER_OR_EQUAL, 10),)),
+        (32, _SEC_ACTION_ERRNO, 17, ((2, _SEC_CMP_LESS, 10),)),
+        (33, _SEC_ACTION_ERRNO, 18, ((2, _SEC_CMP_LESS_OR_EQUAL, 10),)),
+        (34, _SEC_ACTION_ERRNO, 19, ((2, _SEC_CMP_MASKED, 0o100),)),
+    ])
+
+    # An argument index of 5, the last one seccomp_data has. Index 5 accepted
+    # and index 6 refused is the boundary, and a check written as "index > 5"
+    # passes a test of the refusal alone and is wrong here. The harness makes
+    # both assertions itself on every input, so this seed is here to make sure
+    # the accepted side is reached by the fuzzer rather than only by the
+    # harness's own fixed policy.
+    seeds["seccomp_last_arg.pol"] = seccomp_policy(rules=[
+        (39, _SEC_ACTION_ERRNO, 13, ((5, _SEC_CMP_EQUAL, 0),)),
+    ])
+
+    # Every action, including the two that kill. The harness rewrites a
+    # killing action to a denial before installing, because a child that dies
+    # of SIGSYS cannot report the install -- so the bytecode for KILL_THREAD
+    # and KILL_PROCESS is generated and checked and never installed, which is
+    # stated here because "the seed exercises the kill action" would
+    # otherwise read as more than it is.
+    seeds["seccomp_every_action.pol"] = seccomp_policy(
+        fallback=_SEC_FALLBACK_KILL, rules=[
+            (39, _SEC_ACTION_ALLOW, 0, ()),
+            (40, _SEC_ACTION_TRAP, 0, ()),
+            (41, _SEC_ACTION_KILL_THREAD, 0, ()),
+            (42, _SEC_ACTION_KILL_PROCESS, 0, ()),
+            (43, _SEC_ACTION_ERRNO, 13, ()),
+        ])
+
+    # A fallback that allows, with rules that deny. The interesting shape
+    # because the two disagree: a policy whose default is to let everything
+    # through is only safe because of the rules, so this is the seed that
+    # would catch a rule block emitted with the wrong action.
+    seeds["seccomp_permissive_fallback.pol"] = seccomp_policy(
+        fallback=_SEC_FALLBACK_ALLOW, rules=[
+            (39, _SEC_ACTION_ERRNO, 13, ()),
+            (40, _SEC_ACTION_ERRNO, 14, ()),
+        ])
+
+    # An explicit ceiling, with one rule below it and one above. The builder
+    # emits a JGT against the ceiling, so this is the only seed that reaches
+    # the range test with a number a caller chose rather than the default --
+    # and the two rules straddle it deliberately: 39 is dispatched, 257 is
+    # refused to the fallback before any rule block runs. A policy that
+    # compiles, installs, and denies one number while allowing another is a
+    # fact about the policy rather than a defect, and it is here because the
+    # range test's operand is the one field a caller can set to any number.
+    #
+    # 65 and not 64, because 64 is a multiple of four and the encoding spends
+    # every multiple of four on the default; _sec_ceiling refuses it rather
+    # than writing out a seed that does not mean what this comment says.
+    seeds["seccomp_low_ceiling.pol"] = seccomp_policy(ceiling=65, rules=[
+        (39, _SEC_ACTION_ERRNO, 13, ()),
+        (257, _SEC_ACTION_ERRNO, 14, ()),
+    ])
+
+    return seeds
+
+
 # The seeds for the harnesses that are not the PE one. Kept beside the PE
 # seeds rather than in a second generator because the reason they are
 # generated is the same reason, and a reader looking for "what does this
@@ -782,6 +1048,7 @@ OTHER_SEEDS = {
 }
 
 OTHER_SEEDS.update(_zip_seeds())
+OTHER_SEEDS.update(_seccomp_seeds())
 
 SEEDS = dict(PE_SEEDS)
 SEEDS.update(OTHER_SEEDS)
