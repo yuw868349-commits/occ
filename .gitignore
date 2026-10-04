@@ -5,3 +5,13 @@ build-*/
 *.so
 .cache/
 compile_commands.json
+
+# Local-only. This tree contains development aids that are not part of the
+# project: reference implementations used as oracles during development,
+# scratch targets, and the notes that go with them. They are excluded by
+# directory rather than by file so that adding one is not a change to this
+# list, and the exclusion is total so that a reference implementation can
+# never become something the build or the test suite depends on. See
+# docs/RUNTIME.md, milestone M5.
+tests/local/
+tools/local/

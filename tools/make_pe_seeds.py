@@ -156,6 +156,75 @@ def _short_optional_header(pe, declared_size):
     return bytes(buf)
 
 
+def _loader_regressions(pe):
+    """Shapes the loader harness is required to refuse.
+
+    Each of these is a file the loader accepted before its entry-point and
+    layout checks existed, and each one loads, reports success, and hands the
+    layer above a module that faults on its first instruction. They are seeds
+    rather than checked-in crash bytes for the same reason the other seeds
+    are: a binary in a diff says nothing about what it is, and the point of
+    every one of these is a specific field with a specific value.
+
+    The loader harness traps on a violated invariant rather than returning,
+    so a seed here is a permanent guard: the fuzzer starts next to the
+    boundary instead of having to find it again.
+    """
+    opt = 0x80 + 4 + 20
+    plus = struct.unpack_from("<H", pe, opt)[0] == 0x20B
+    # The section table starts right after the optional header, whose length
+    # the COFF header states.
+    opt_size = struct.unpack_from("<H", pe, 0x80 + 4 + 16)[0]
+    sections_at = opt + opt_size
+
+    def override_entry(buf, rva):
+        # AddressOfEntryPoint is at 16 in both layouts.
+        struct.pack_into("<I", buf, opt + 16, rva)
+
+    def override_section(buf, index, *, va=None, vsize=None, chars=None,
+                         raw_size=None):
+        sh = sections_at + index * 40
+        if va is not None:
+            struct.pack_into("<I", buf, sh + 12, va)
+        if vsize is not None:
+            struct.pack_into("<I", buf, sh + 8, vsize)
+        if raw_size is not None:
+            struct.pack_into("<I", buf, sh + 16, raw_size)
+        if chars is not None:
+            struct.pack_into("<I", buf, sh + 36, chars)
+
+    results = {}
+
+    # (1) The entry point is past every section. The image declares 0x2000
+    #     bytes and the one section occupies [0x1000, 0x2000), but the entry
+    #     RVA is 0x3000, outside both. Before the check existed this loaded
+    #     and produced a module whose entry address was never mapped.
+    buf = bytearray(pe)
+    override_entry(buf, 0x3000)
+    results["pe_bad_entry_rva.bin"] = bytes(buf)
+
+    # (2) The entry point is inside a section that is not executable. The
+    #     section characteristics are read-only, so the entry lands in a
+    #     PAGE_READONLY region -- mapped, and impossible to begin executing
+    #     in. This is the shape the fuzzer produced twice.
+    buf = bytearray(pe)
+    override_entry(buf, 0x1000)
+    override_section(buf, 0, chars=0x40000040)  # MEM_READ only, no execute
+    results["pe_entry_not_executable.bin"] = bytes(buf)
+
+    # (3) A section whose VirtualAddress is zero, so it overlaps the headers.
+    #     The address is legal in the format and unusable: the headers are
+    #     at the image base, and a section there is a section placed over
+    #     them. Before the layout check this recorded the headers and then
+    #     failed, leaving the headers in the map.
+    buf = bytearray(pe)
+    override_entry(buf, 0x1000)
+    override_section(buf, 0, va=0x0, vsize=0x2000)
+    results["pe_section_over_headers.bin"] = bytes(buf)
+
+    return results
+
+
 # The corpus. Each entry exists to get past a specific gate, and the comment
 # says which one -- a seed whose purpose is unclear is a seed nobody
 # regenerates when it stops being useful.
@@ -206,6 +275,17 @@ SEEDS = {
     # that says which layout it is.
     "pe_tiny_optional.bin": _short_optional_header(minimal_pe(), 1),
 }
+
+# The loader's own regressions, kept separate because they are about the
+# loader's contract rather than about the parser's gates, and merged in here
+# so that the PE corpus is one place.
+#
+# The base is the 64-bit image, not the 32-bit one. The loader refuses a
+# non-amd64 image before it reads any layout field, so a regression seed
+# built on the i386 base would be rejected by the machine check and would
+# reach none of the checks it exists to exercise -- which is exactly what
+# happened the first time this was written.
+SEEDS.update(_loader_regressions(minimal_pe(plus=True, machine=0x8664)))
 
 
 def main():

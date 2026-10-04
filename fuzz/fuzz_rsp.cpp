@@ -46,16 +46,27 @@ std::size_t round_trip(const std::string& wire, bool& all_ok) noexcept {
     std::size_t taken = 0;
     while (taken < ready) {
         const auto packet = decoder.take();
-        // A framed packet with a bad checksum is reported rather than
-        // dropped, and its data is empty. Anything else -- a packet that
-        // claims to be good but carries nothing -- would mean the queue
-        // handed back an entry that was never filled in.
-        if (packet.checksum_ok && packet.data.empty()) {
-            all_ok = false;
-        }
+        // What the queue hands back is counted, never silently discarded.
+        // Counting is among the properties asserted for exactly one reason:
+        // a version of this loop that took () more times than feed()
+        // reported would hang, so the count is the loop's own bound.
+        //
+        // Note what is deliberately NOT asserted here: that a packet with a
+        // good checksum carries a non-empty payload. That was asserted
+        // once, and it was wrong. "$#00" -- vMustReplyEmpty -- is a
+        // well-formed packet whose payload is empty, the encoder produces
+        // it for an empty payload, and the decoder accepts it with a good
+        // checksum. An invariant that called that a decoder fault contradicted
+        // the contract in rsp.h and the unit tests in test_observer.cpp, and
+        // the fuzzer found the contradiction the first time it was given
+        // either the empty string or "$#00".
+        (void)packet;
         ++taken;
     }
-    // Nothing beyond what feed() reported may be sitting in the queue.
+    // Nothing beyond what feed() reported may be sitting in the queue. The
+    // empty payload of a "$#00" has size zero, so the size test cannot tell
+    // an empty packet from an empty queue; what it catches is a queue that
+    // handed back a packet with bytes that feed() never announced.
     if (decoder.take().data.size() != 0) {
         all_ok = false;
     }
@@ -181,19 +192,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data,
     //    property a debugger depends on: what goes on the wire comes back
     //    unchanged, including when the payload contains '$', '#' or '}'.
     //
-    //    An empty payload has no round trip to assert. There is no such
-    //    thing as a well-framed empty packet -- its checksum would be the
-    //    sum of nothing -- so both halves of this codec refuse to produce
-    //    one, and asserting that they do would be asserting the bug.
-    if (!input.empty()) {
+    //    The empty payload is included, and including it is the correction
+    //    of an earlier version of this harness that excluded it. That
+    //    version asserted "an empty payload must produce no frame at all",
+    //    on the reasoning that a checksum of nothing is not a packet. The
+    //    reasoning is wrong and the protocol says so: "$#00" is
+    //    vMustReplyEmpty, a packet a debugger sends on purpose and a stub
+    //    is required to answer. It is exactly what encode_packet produces
+    //    for an empty payload and exactly what the decoder accepts, so the
+    //    round trip holds for "" as it holds for every other payload. The
+    //    version that special-cased it trapped on the empty string and on
+    //    "$#00", which is how the contradiction surfaced.
+    {
         const std::string framed = occ::obs::encode_packet(input);
-        if (framed.empty()) {
+        // A frame is always produced, empty payload or not: the framing
+        // characters and the two checksum digits are unconditional and an
+        // encoder that returned nothing would be a peer that went silent.
+        if (framed.size() < 4) {
             __builtin_trap();
         }
         PacketDecoder decoder;
         const std::size_t ready =
             decoder.feed(framed.data(), framed.size());
-        if (ready == 0) {
+        if (ready != 1) {
+            // One frame in, exactly one packet out. Zero would mean the
+            // encoder produced something the decoder does not recognise as
+            // a packet -- which for "$#00" is the same contradiction in the
+            // other direction.
             __builtin_trap();
         }
         const auto packet = decoder.take();
@@ -209,11 +234,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data,
         if (decoder.take().data.size() != 0) {
             __builtin_trap();
         }
-    } else if (!occ::obs::encode_packet(input).empty()) {
-        // The other half of the same rule: an empty payload must produce no
-        // frame at all. A "$#00" here would be a packet this project sends
-        // and its own decoder rejects.
-        __builtin_trap();
     }
 
     // 6. The split, which decides where a command's arguments begin. A

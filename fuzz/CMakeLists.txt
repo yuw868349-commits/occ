@@ -33,6 +33,16 @@ add_executable(occ_fuzz_pe fuzz_pe.cpp)
 target_link_libraries(occ_fuzz_pe PRIVATE occ_core)
 target_link_options(occ_fuzz_pe PRIVATE ${OCC_FUZZ_LINK_FLAGS})
 
+# The loader is a second consumer of the same bytes and a second set of
+# walks. It reads the relocation table and the import directory -- both of
+# which the parser only reports the location of -- and it records regions in
+# an address space. Its harness checks the loader's contract rather than the
+# parser's, which is why it is a separate binary against the same corpus:
+# the invariants differ even though the inputs do not.
+add_executable(occ_fuzz_loader fuzz_loader.cpp)
+target_link_libraries(occ_fuzz_loader PRIVATE occ_core)
+target_link_options(occ_fuzz_loader PRIVATE ${OCC_FUZZ_LINK_FLAGS})
+
 # The seeds below are real inputs, not noise. A fuzzer starts from a corpus
 # and spends its first minutes broadening what it already reaches, so a
 # corpus of zeros teaches it nothing about a header parser. These are the
@@ -43,6 +53,12 @@ target_link_options(occ_fuzz_pe PRIVATE ${OCC_FUZZ_LINK_FLAGS})
 # is that each entry gets past a particular gate -- a claim that has to be
 # readable to be believable. tools/make_pe_seeds.py writes them, and the
 # comments there say which gate each one is for.
+#
+# The last three are the loader's regressions rather than the parser's
+# gates: files the loader used to accept and must refuse, one per shape the
+# loader fuzz harness found. They are the seed half of those findings; the
+# unit tests are the other half and are the ones that run in a default
+# build.
 set(OCC_PE_SEEDS
     pe32_min.bin
     pe32plus_min.bin
@@ -52,7 +68,10 @@ set(OCC_PE_SEEDS
     pe_short_optional.bin
     pe_tiny_optional.bin
     mz_only.bin
-    mz_no_signature.bin)
+    mz_no_signature.bin
+    pe_bad_entry_rva.bin
+    pe_entry_not_executable.bin
+    pe_section_over_headers.bin)
 
 set(OCC_PE_SEED_PATHS)
 foreach(_seed IN LISTS OCC_PE_SEEDS)
@@ -105,6 +124,11 @@ add_custom_target(occ_fuzz_smoke
             -max_total_time=20
             -max_len=4096
             ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe
-    DEPENDS occ_fuzz_elf occ_fuzz_rsp occ_fuzz_pe occ_fuzz_corpus
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/occ_fuzz_loader
+            -max_total_time=20
+            -max_len=4096
+            ${CMAKE_CURRENT_BINARY_DIR}/corpus/pe
+    DEPENDS occ_fuzz_elf occ_fuzz_rsp occ_fuzz_pe occ_fuzz_loader
+            occ_fuzz_corpus
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     COMMENT "running each harness briefly against its seeds")

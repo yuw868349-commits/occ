@@ -547,6 +547,8 @@ add_library(occ_core STATIC
     src/engine/pe_engine.cpp
     src/engine/apk_engine.cpp
     src/runner/run.cpp
+    src/runtime/address_space.cpp
+    src/runtime/loader.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)
