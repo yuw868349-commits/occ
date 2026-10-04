@@ -66,3 +66,17 @@ occ_add_test(occ_test_probe_wiring test_probe_wiring.cpp)
 occ_add_test(occ_test_pe test_pe.cpp)
 occ_add_test(occ_test_runtime_loader test_runtime_loader.cpp)
 occ_add_test(occ_test_gdb_interop test_gdb_interop.cpp)
+
+# occ_test_check is the one test here that drives a built binary rather than
+# the library: it runs "occ check" on a path and reads the exit status and the
+# report. The load verdict is a property of the whole command -- the format
+# detection, the engine table, the loader and the exit code all have to agree
+# -- and calling into any one of them would test the piece instead of the
+# answer. The two definitions below are the path to the binary and the
+# directory the fuzz seeds live in, both resolved by CMake so the test does
+# not guess at build layout.
+occ_add_test(occ_test_check test_check.cpp)
+target_compile_definitions(occ_test_check PRIVATE
+    OCC_BINARY="$<TARGET_FILE:occ>"
+    OCC_SEED_DIR="${CMAKE_SOURCE_DIR}/fuzz/seeds")
+add_dependencies(occ_test_check occ)
