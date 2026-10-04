@@ -6,6 +6,13 @@ build-*/
 .cache/
 compile_commands.json
 
+# Python bytecode. The seed generator is a script and is not part of the
+# build, but running it leaves a __pycache__ behind, and it appeared the
+# first time anything imported it rather than the first time it was run --
+# which is why this is here and not next to the generator.
+__pycache__/
+*.pyc
+
 # Local-only. This tree contains development aids that are not part of the
 # project: reference implementations used as oracles during development,
 # scratch targets, and the notes that go with them. They are excluded by

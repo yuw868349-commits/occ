@@ -31,14 +31,23 @@ from pathlib import Path
 # accepts, laid out the way a linker lays one out: the DOS header, the PE
 # signature at 0x80, the COFF header, a full 224-byte optional header, one
 # section header, then one page of headers and one page of section data.
+#
+# image_base defaults to None, which means "the base a linker would have
+# chosen for this layout": 0x400000 for PE32 and 0x140000000 for PE32+.
+# Passing 0 asks for an image that names no base at all, which is a legal
+# field value and a shape the loader has to answer rather than assume -- see
+# pe_base_zero.bin.
 def minimal_pe(*, plus=False, dll=False, machine=0x014c, subsystem=3,
-               sections=1, section_chars=0x60000020, rdata_size=0x200):
+               sections=1, section_chars=0x60000020, rdata_size=0x200,
+               image_base=None):
     opt_size = 240 if plus else 224
     headers_size = 0x200
     coff = 0x80
     opt = coff + 4 + 20
     sections_at = opt + opt_size
     data_at = headers_size
+    if image_base is None:
+        image_base = 0x140000000 if plus else 0x400000
 
     # Each section gets one page of file data, except .rdata which is sized
     # by the caller: the import table's seed needs room for descriptors and
@@ -73,9 +82,9 @@ def minimal_pe(*, plus=False, dll=False, machine=0x014c, subsystem=3,
     # ImageBase: four bytes at 28 in PE32, eight at 24 in PE32+. This is the
     # offset that differs between the layouts.
     if plus:
-        struct.pack_into("<Q", buf, o + 24, 0x140000000)
+        struct.pack_into("<Q", buf, o + 24, image_base)
     else:
-        struct.pack_into("<I", buf, o + 28, 0x400000)
+        struct.pack_into("<I", buf, o + 28, image_base)
     struct.pack_into("<I", buf, o + 32, 0x1000)      # SectionAlignment
     struct.pack_into("<I", buf, o + 36, 0x200)       # FileAlignment
     struct.pack_into("<I", buf, o + 56, 0x2000)      # SizeOfImage
@@ -298,6 +307,60 @@ PE_SEEDS = {
 # reach none of the checks it exists to exercise -- which is exactly what
 # happened the first time this was written.
 PE_SEEDS.update(_loader_regressions(minimal_pe(plus=True, machine=0x8664)))
+
+
+def _corpus_regressions():
+    """Shapes the accumulated corpus reached and no seed did.
+
+    Every one of these was found by running the PE harness over a few thousand
+    inputs and then asking which verdict each one got -- not by reading the
+    loader for a way to make it fail. That distinction is the reason they are
+    here: a shape invented from the source is a shape the author already
+    believed reachable, so it tests the belief rather than the code. These
+    three came out of the corpus as hash-named files, and what is checked in
+    is the generator call that produces the same verdict from a field anyone
+    can read.
+
+    The rest of the corpus's verdicts are not here, and the reason is worth
+    stating because it is the rule rather than an omission. Most of what the
+    fuzzer found is a field damaged past the point of naming: section 19 at
+    0xffffffff for 0xffffffff bytes, an import directory at RVA 0xe8e8e8e8,
+    a SizeOfHeaders of 0x40189f89. Each reaches a real check, and none of them
+    is a shape a person would write, so a seed built from one would document
+    nothing a reader did not already know from the message. Three that name
+    something are worth the bytes.
+    """
+    results = {}
+
+    # An image that names no base, with no relocation table to fall back on.
+    #
+    # The loader's answer is "no_relocations: the image names no base and the
+    # caller named none", and it is reached by two fields agreeing: ImageBase
+    # zero, and no reloc_rva. Both are legal on their own -- a PIE linked for
+    # zero is not a malformed file -- so the only way to see this is to ask
+    # for it, and every seed that named a base made it unreachable.
+    #
+    # It is the shape that decides where an image lands, which is the first
+    # thing the loader does after agreeing the machine is right, so a change
+    # to the base rule that stopped consulting the caller's preference would
+    # still pass every other seed here.
+    results["pe_base_zero.bin"] = minimal_pe(plus=True, machine=0x8664,
+                                             image_base=0)
+
+    # Two architectures this runtime does not execute.
+    #
+    # The seeds are all i386 or amd64, which between them cover the machine
+    # check agreeing and the machine check refusing. They do not cover the
+    # refusal naming a machine no reader thought to try, and the name comes
+    # from the file rather than from a table in occ -- so a fuzzer that never
+    # saw 0xaa64 had never seen the name it would print for 0xaa64.
+    results["pe_machine_arm.bin"] = minimal_pe(machine=0x01C0)
+    results["pe_machine_arm64.bin"] = minimal_pe(plus=True, machine=0xAA64)
+
+    return results
+
+
+PE_SEEDS.update(_corpus_regressions())
 
 
 # ---------------------------------------------------------------- ELF
