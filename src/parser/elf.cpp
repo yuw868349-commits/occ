@@ -60,8 +60,28 @@ bool is_power_of_two(std::uint64_t v) noexcept {
     return v != 0 && (v & (v - 1)) == 0;
 }
 
+// The three readers below take an offset straight out of the file -- e_phoff,
+// e_shoff, a section header's sh_offset -- so a malformed file chooses it,
+// and the value can be any 64-bit number.
+//
+// The bound is therefore written as a subtraction rather than the more
+// obvious "off + 4 > b.size()". Adding first wraps: an offset of
+// 0xfffffffffffffffc makes off + 4 equal zero, the check passes, and the
+// read that follows lands outside the buffer. Reading one byte before the
+// start is not a crash and not a fault -- it is a value the parser then
+// treats as a header field, which is the harder kind of wrong.
+//
+// Written the other way round, a huge offset fails the subtraction and the
+// reader returns zero, which is what an absent field already returns. The
+// two forms agree for every offset that does not wrap and disagree only for
+// the offsets that would have been unsafe.
+constexpr bool in_range(ByteSpan b, std::size_t off,
+                        std::size_t width) noexcept {
+    return off <= b.size() && b.size() - off >= width;
+}
+
 std::uint16_t rd16(ByteSpan b, std::size_t off) noexcept {
-    if (off + 2 > b.size()) {
+    if (!in_range(b, off, 2)) {
         return 0;
     }
     return static_cast<std::uint16_t>(
@@ -70,7 +90,7 @@ std::uint16_t rd16(ByteSpan b, std::size_t off) noexcept {
 }
 
 std::uint32_t rd32(ByteSpan b, std::size_t off) noexcept {
-    if (off + 4 > b.size()) {
+    if (!in_range(b, off, 4)) {
         return 0;
     }
     return static_cast<std::uint32_t>(b[off]) |
@@ -80,7 +100,7 @@ std::uint32_t rd32(ByteSpan b, std::size_t off) noexcept {
 }
 
 std::uint64_t rd64(ByteSpan b, std::size_t off) noexcept {
-    if (off + 8 > b.size()) {
+    if (!in_range(b, off, 8)) {
         return 0;
     }
     std::uint64_t v = 0;
@@ -230,12 +250,28 @@ ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
         return out;
     }
 
-    const std::uint64_t table_end =
-        out.phoff_ + static_cast<std::uint64_t>(out.phnum_) * kElf64PhdrSize;
-    if (out.phoff_ < kElf64HeaderSize || table_end > bytes.size()) {
+    // The table's end, computed so that it cannot wrap. phoff_ is a 64-bit
+    // field from the file and phnum_ is up to 65535 entries of 56 bytes, so
+    // phoff_ + phnum * 56 is an addition that a crafted file can push past
+    // UINT64_MAX -- and a table_end that wrapped to a small number passes
+    // the "is the table inside the file" test below while describing a
+    // table that is not there at all.
+    //
+    // The subtraction form asks the question directly: is the file long
+    // enough to hold phnum entries starting at phoff_? It cannot be made to
+    // answer wrongly by choosing a large phoff_, because phoff_ is only
+    // ever subtracted from a size it was already compared against.
+    const std::size_t width =
+        static_cast<std::size_t>(out.phnum_) * kElf64PhdrSize;
+    if (out.phoff_ < kElf64HeaderSize ||
+        out.phoff_ > bytes.size() ||
+        bytes.size() - out.phoff_ < width) {
+        const std::uint64_t end =
+            out.phoff_ <= UINT64_MAX - width ? out.phoff_ + width
+                                             : UINT64_MAX;
         out.error_ = LoadError::TruncatedProgramHeaders;
         out.detail_ = "the table runs from " + hex_value(out.phoff_) + " to " +
-                      hex_value(table_end) + " and the file is " +
+                      hex_value(end) + " and the file is " +
                       decimal(bytes.size()) + " bytes";
         return out;
     }
@@ -288,7 +324,13 @@ ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
             if (h.type != SegmentType::Interp) {
                 continue;
             }
-            if (h.offset + h.filesz > bytes.size() || h.filesz == 0) {
+            // The bound is a subtraction for the reason given at the top of
+            // the file: an offset and a size taken from the file can add to
+            // more than SIZE_MAX, and a wrapped sum passes an "is it inside"
+            // test while pointing nowhere near the file.
+            if (h.filesz == 0 || h.offset > bytes.size() ||
+                bytes.size() - h.offset <
+                    static_cast<std::size_t>(h.filesz)) {
                 out.error_ = LoadError::SegmentOutOfFile;
                 out.detail_ = "PT_INTERP runs past the end of the file";
                 return out;
@@ -303,6 +345,23 @@ ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
                 ++n;
             }
             out.interpreter_.assign(p, n);
+            // A segment whose first byte is NUL names an empty path. That
+            // is not a path, and reporting it as one is worse than reporting
+            // nothing: the caller has been told there is an interpreter, so
+            // it will execve whatever string is here -- and an empty string
+            // is a valid argument to execve that fails at run time, in the
+            // child, with an error that names the interpreter rather than
+            // the file that had no path in it.
+            //
+            // The contradiction is refused here rather than papered over,
+            // because has_interpreter() true with an empty interpreter() is
+            // a state the rest of occ has no way to represent correctly.
+            if (out.interpreter_.empty()) {
+                out.has_interpreter_ = false;
+                out.error_ = LoadError::SegmentOutOfFile;
+                out.detail_ = "PT_INTERP names an empty path";
+                return out;
+            }
             break;
         }
     }
@@ -352,7 +411,13 @@ ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
                           hex_value(h.align);
             return out;
         }
-        if (h.offset + h.filesz > bytes.size()) {
+        // The file-backed extent, asked by subtraction. The header supplies
+        // both numbers, so their sum is one a crafted file can push past
+        // SIZE_MAX; a wrapped sum passes this test and describes a range
+        // that is not in the file.
+        if (h.filesz > 0 &&
+            (h.offset > bytes.size() ||
+             bytes.size() - h.offset < static_cast<std::size_t>(h.filesz))) {
             out.error_ = LoadError::SegmentOutOfFile;
             out.detail_ = "a PT_LOAD segment runs from " + hex_value(h.offset) +
                           " for " + hex_value(h.filesz) + " bytes and the "
@@ -365,13 +430,44 @@ ElfImage ElfImage::parse(ByteSpan bytes) noexcept {
                           " has p_memsz smaller than p_filesz";
             return out;
         }
+        // The mapping a segment describes must exist in the address space.
+        //
+        // vaddr + memsz is what a caller adds to learn where the segment
+        // ends, and it is the addition that decides whether the segment fits
+        // at all. A vaddr of 0xfffffd0004000000 with a memsz of 0x7a0000000000
+        // -- both entirely ordinary as numbers -- sums to a value below its
+        // own start, and every consumer of that sum then reads a small number
+        // as a length. The mmap would be made for a few bytes where the file
+        // describes a petabyte.
+        //
+        // A memsz of zero is exempt for the same reason it is elsewhere: it
+        // is a segment that maps nothing, and zero plus anything does not
+        // wrap.
+        if (h.memsz > 0 && h.memsz > UINT64_MAX - h.vaddr) {
+            out.error_ = LoadError::SegmentOutOfFile;
+            out.detail_ = "a PT_LOAD segment at " + hex_value(h.vaddr) +
+                          " has p_memsz " + hex_value(h.memsz) +
+                          ", which does not fit above it in the address space";
+            return out;
+        }
     }
 
     out.lowest_vaddr_ = loads.front().vaddr;
     std::uint64_t high = 0;
     for (const auto& h : loads) {
-        const std::uint64_t end = align_up_safe(h.vaddr, kPageSize) +
-                                  align_up_safe(h.memsz, kPageSize);
+        // The span a segment occupies, rounded out to whole pages. Both
+        // roundings saturate rather than wrap -- align_up_safe returns
+        // UINT64_MAX for a value it cannot round up -- so the sum of the two
+        // is what has to be watched: two saturated values add to a small
+        // one, and highest_vaddr_ is a bound that a caller sizes a mapping
+        // from.
+        //
+        // A pair that cannot be added is the address space's own end, which
+        // is the honest answer for a segment that claims to run to it.
+        const std::uint64_t start = align_up_safe(h.vaddr, kPageSize);
+        const std::uint64_t len = align_up_safe(h.memsz, kPageSize);
+        const std::uint64_t end =
+            len > UINT64_MAX - start ? UINT64_MAX : start + len;
         if (end > high) {
             high = end;
         }

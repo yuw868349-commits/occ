@@ -19,8 +19,18 @@ namespace {
 // a cast through a packed struct. A cast would also be undefined behaviour
 // through alignment and would silently do the wrong thing on a big-endian
 // host, which is exactly the case the ELF endianness field exists to handle.
+// The bound below is a subtraction rather than the more obvious
+// "off + 2 > b.size()" for the reason given in parser/elf.cpp: the offset
+// comes from the file, so an addition wraps and a wrapped check passes. This
+// is the path that runs before any other parser -- it decides which one does
+// -- so it sees the least trustworthy bytes in the file.
+constexpr bool in_range(ByteSpan b, std::size_t off,
+                        std::size_t width) noexcept {
+    return off <= b.size() && b.size() - off >= width;
+}
+
 std::uint16_t read_le16(ByteSpan b, std::size_t off) noexcept {
-    if (off + 2 > b.size()) {
+    if (!in_range(b, off, 2)) {
         return 0;
     }
     return static_cast<std::uint16_t>(
@@ -29,7 +39,7 @@ std::uint16_t read_le16(ByteSpan b, std::size_t off) noexcept {
 }
 
 std::uint32_t read_le32(ByteSpan b, std::size_t off) noexcept {
-    if (off + 4 > b.size()) {
+    if (!in_range(b, off, 4)) {
         return 0;
     }
     return static_cast<std::uint32_t>(b[off]) |
@@ -39,7 +49,7 @@ std::uint32_t read_le32(ByteSpan b, std::size_t off) noexcept {
 }
 
 std::uint64_t read_le64(ByteSpan b, std::size_t off) noexcept {
-    if (off + 8 > b.size()) {
+    if (!in_range(b, off, 8)) {
         return 0;
     }
     std::uint64_t v = 0;
@@ -52,7 +62,7 @@ std::uint64_t read_le64(ByteSpan b, std::size_t off) noexcept {
 
 bool magic_at(ByteSpan b, std::size_t off, const char* magic,
               std::size_t len) noexcept {
-    if (off + len > b.size()) {
+    if (!in_range(b, off, len)) {
         return false;
     }
     for (std::size_t i = 0; i < len; ++i) {

@@ -404,6 +404,96 @@ void test_interp_out_of_file() {
           "a PT_INTERP past the end of the file is rejected");
 }
 
+// The cases below were found by the fuzz harness rather than by reading the
+// reader, which is the point of having one: each is a header field set to a
+// value that makes an ordinary bound check pass by wrapping. They are written
+// as explicit fixtures because a fuzzer cannot be run from a unit test, and
+// a fix with no test is a fix that comes back.
+void test_overflowing_bounds() {
+    // A program header table that starts past the end of the address space.
+    // "phoff + phnum * 56" wraps to a small number, and a check written as
+    // an addition would see a table inside a file that has none.
+    {
+        Image img = base_image(2, 62, 1);
+        put64(img.bytes, 32, UINT64_MAX - 8);
+        const ElfImage e = parse(img);
+        check(!e.ok(), "a program table past the address space is refused");
+        check(e.error() == LoadError::TruncatedProgramHeaders,
+              "  and it is refused as a truncated table");
+    }
+    // The same table, at an offset that is merely very large rather than
+    // wrapping. Both must be refused, and refused for the same reason, or a
+    // fix for the wrap leaves this one open.
+    {
+        Image img = base_image(2, 62, 1);
+        put64(img.bytes, 32, 1ULL << 62);
+        const ElfImage e = parse(img);
+        check(!e.ok(), "a program table far past the file is refused");
+    }
+    // A segment whose file range wraps: offset and filesz both near the top
+    // of the address space, summing to less than either.
+    {
+        Image img = base_image(2, 62, 1);
+        put_phdr(img.bytes, 0, 1, 5, 4096, 0x400000, 512, 512, 4096);
+        put64(img.bytes, kHeaderSize + 32, UINT64_MAX - 16);   // p_filesz
+        put64(img.bytes, kHeaderSize + 8, UINT64_MAX - 8);     // p_offset
+        const ElfImage e = parse(img);
+        check(!e.ok(), "a segment whose file range wraps is refused");
+    }
+    // A segment that claims more address space than exists above it.
+    // vaddr + memsz wraps, and a caller computing the end of the mapping
+    // would read the wrapped value as a length -- a petabyte described as a
+    // few bytes. Both numbers here are ordinary; only their sum is not.
+    {
+        Image img = base_image(2, 62, 1);
+        put_phdr(img.bytes, 0, 1, 5, 4096, 0xfffffd0004000000ULL,
+                 0, 0x7a0000000000ULL, 4096);
+        const ElfImage e = parse(img);
+        check(!e.ok(), "a segment that does not fit in the address space is "
+                       "refused");
+    }
+    // memsz of zero is exempt: it maps nothing, and zero at the top of the
+    // address space is still zero. A fix that refused this would break a
+    // legal file, so the boundary is pinned from both sides.
+    {
+        Image img = base_image(2, 62, 1);
+        put_phdr(img.bytes, 0, 1, 5, 4096, UINT64_MAX - 4095, 0, 0, 4096);
+        const ElfImage e = parse(img);
+        check(e.ok(), "a segment of zero size at the top of the address space "
+                      "is still legal");
+    }
+}
+
+void test_interp_empty_path() {
+    // A PT_INTERP whose first byte is NUL names a path of length zero.
+    // Reporting has_interpreter() true alongside an empty path is a state
+    // the rest of occ cannot act on: the loader would execve("") and the
+    // failure would name the interpreter rather than the file.
+    {
+        Image img = base_image(3, 62, 2);
+        put_phdr(img.bytes, 0, 1, 5, 4096, 0x400000, 512, 512, 4096);
+        // The path is a single NUL byte: filesz of 1 starting at 4097, so
+        // the byte is inside the file and is the segment's whole content.
+        img.bytes[4097] = 0;
+        put_phdr(img.bytes, 1, 3, 4, 4097, 0x400200, 1, 1, 1);
+        const ElfImage e = parse(img);
+        check(!e.ok(), "a PT_INTERP naming an empty path is refused");
+    }
+    // The segment immediately after it, so the refusal is shown to be about
+    // the empty path rather than about the fixture's second segment.
+    {
+        Image img = base_image(3, 62, 2);
+        put_phdr(img.bytes, 0, 1, 5, 4096, 0x400000, 512, 512, 4096);
+        const char* interp = "/lib64/ld-linux-x86-64.so.2";
+        std::memcpy(img.bytes.data() + 4096, interp, std::strlen(interp) + 1);
+        put_phdr(img.bytes, 1, 3, 4, 4096, 0x400200,
+                 std::strlen(interp) + 1, std::strlen(interp) + 1, 1);
+        const ElfImage e = parse(img);
+        check(e.ok() && e.has_interpreter() && !e.interpreter().empty(),
+              "a PT_INTERP naming a real path is accepted");
+    }
+}
+
 void test_gnu_stack() {
     {
         Image img = base_image(2, 62, 2);
@@ -508,6 +598,8 @@ int main() {
     test_truncated_table();
     test_interpreter();
     test_interp_out_of_file();
+    test_overflowing_bounds();
+    test_interp_empty_path();
     test_gnu_stack();
     test_gnu_relro();
     test_sorting();
