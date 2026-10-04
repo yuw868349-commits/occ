@@ -82,7 +82,12 @@ struct SectionSpec {
     const char* name = nullptr;
     std::uint32_t virtual_address = 0;
     std::uint32_t virtual_size = 0;
-    std::uint32_t raw_size = 0;
+    // Zero means "one page", which is what most sections in a fixture want.
+    // A negative value means "this section stores nothing at all", which is
+    // what .bss and a linker's padding sections are. The two are different
+    // claims about the file, and a builder that can only make the first one
+    // cannot express the second.
+    std::int32_t raw_size = 0;
     std::uint32_t characteristics = 0;
 };
 
@@ -140,7 +145,18 @@ Built build(const Spec& s) {
     std::size_t cursor = headers_size;
     std::vector<std::pair<std::size_t, std::size_t>> layout; // (raw_offset, size)
     for (const SectionSpec& sec : s.sections) {
-        const std::size_t raw = sec.raw_size != 0 ? sec.raw_size : 0x200;
+        // A negative raw size means "this section stores nothing", which is
+        // what .bss and a linker's padding sections are. It is spelled as a
+        // negative number because zero is already meaningful in the other
+        // direction -- SectionSpec::raw_size defaults to zero meaning "use
+        // the builder's default of one page" -- and a builder that cannot
+        // express the common case is a builder that will get it wrong.
+        if (sec.raw_size < 0) {
+            layout.emplace_back(0u, 0u);
+            continue;
+        }
+        const std::size_t raw =
+            sec.raw_size != 0 ? static_cast<std::size_t>(sec.raw_size) : 0x200;
         const std::uint32_t raw_offset =
             raw == 0 ? 0 : static_cast<std::uint32_t>(cursor);
         cursor += raw;
@@ -219,7 +235,9 @@ Built build(const Spec& s) {
                     name.size() < 8 ? name.size() : 8);
         put32(b.bytes, sh + 8, sec.virtual_size);
         put32(b.bytes, sh + 12, sec.virtual_address);
-        put32(b.bytes, sh + 16, sec.raw_size);
+        // The size written is the layout's, not the spec's: the spec says
+        // "one page" or "nothing" and the layout says what that came out as.
+        put32(b.bytes, sh + 16, static_cast<std::uint32_t>(layout[i].second));
         put32(b.bytes, sh + 20, static_cast<std::uint32_t>(layout[i].first));
         put32(b.bytes, sh + 36, sec.characteristics);
     }
@@ -413,6 +431,90 @@ void test_raw_size_exceeds_virtual_size() {
     // not resolvable as an image address.
     check(!p.to_file_offset(0x1100, off),
           "raw>virtual: past the virtual size does not resolve");
+}
+
+// SizeOfHeaders larger than the file.
+//
+// Found by fuzz/fuzz_pe.cpp, twice, and the two findings were one defect.
+//
+// SizeOfHeaders is not only a number. It is the threshold that decides which
+// of the two coordinate systems an RVA belongs to, so a file that overstates
+// it reclassifies every address in its image. A 378-byte file claiming four
+// gigabytes of headers had a section at RVA 0x1000 resolved to *file* offset
+// 0x1000 instead of 0x200 -- the header rule claimed it before the section
+// table was consulted. Nothing crashed, every offset was inside the file, and
+// every one of them was wrong.
+//
+// That is worse than a crash, because a caller has no way to notice. The
+// other half of the same bug was sharper: the bound on a header-region RVA
+// compared the file's length as "greater than", so an RVA exactly equal to
+// the file's length resolved to that length -- one byte past the end.
+//
+// The file is refused. There is no correct answer to give about a file whose
+// headers cannot be where it says they are, and reporting one would mean
+// choosing which of the two wrong answers to give.
+void test_headers_size_larger_than_the_file() {
+    Spec s = base_spec();
+    const std::size_t size = build(s).bytes.size();
+
+    // Each of these is a file that claims more headers than it has bytes.
+    // The bound is the file, so one byte over is enough.
+    const std::uint32_t claims[] = {0x40000000u, 0x10000u,
+                                    static_cast<std::uint32_t>(size) + 1u,
+                                    0xffffffffu};
+    for (std::uint32_t claim : claims) {
+        Spec t = base_spec();
+        Built b = build(t);
+        put32(b.bytes, b.opt + 60, claim);
+        const PeImage p = parse_image(b.bytes);
+
+        char msg[96];
+        std::snprintf(msg, sizeof msg,
+                      "SizeOfHeaders of 0x%x in a %zu-byte file is refused",
+                      claim, size);
+        check(!p.ok(), msg);
+        std::snprintf(msg, sizeof msg,
+                      "SizeOfHeaders of 0x%x is reported as a bad size", claim);
+        check(p.error() == PeError::BadHeaderSize, msg);
+
+        // A refused parse reports nothing. A caller checks ok() and then
+        // trusts everything else, so sections surviving a refusal would be
+        // worse than the refusal itself.
+        std::snprintf(msg, sizeof msg,
+                      "SizeOfHeaders of 0x%x leaves no sections behind", claim);
+        check(p.sections().empty(), msg);
+        std::snprintf(msg, sizeof msg,
+                      "SizeOfHeaders of 0x%x states the size it claimed", claim);
+        check(p.error_detail().find("SizeOfHeaders") != std::string::npos, msg);
+    }
+
+    // A file whose headers exactly fill it is fine, so the bound is not off
+    // by one in the tight direction either.
+    Spec e = base_spec();
+    Built eb = build(e);
+    put32(eb.bytes, eb.opt + 60, static_cast<std::uint32_t>(size));
+    check(parse_image(eb.bytes).ok(),
+          "SizeOfHeaders exactly equal to the file's length is accepted");
+
+    // And the boundary itself, on a file with a sane header region: the last
+    // header byte resolves, the first byte past the headers is inside the
+    // file and belongs to no section, and the file's length -- which is an RVA
+    // under the old comparison -- resolves to nothing.
+    const PeImage q = parse_image(build(s).bytes);
+    check(q.ok(), "sane headers: parses");
+    check(q.headers_size() == 0x200, "sane headers: 0x200 as built");
+
+    std::uint64_t off = 0;
+    check(q.to_file_offset(0x1ff, off) && off == 0x1ff,
+          "sane headers: the last header byte resolves to itself");
+    check(!q.to_file_offset(0x200, off),
+          "sane headers: the first RVA past the headers resolves through no "
+          "section");
+    check(q.to_file_offset(0x1000, off) && off == 0x200,
+          "sane headers: a section RVA maps through the section, not as a "
+          "file offset");
+    check(!q.to_file_offset(static_cast<std::uint64_t>(size), off),
+          "sane headers: the file's length does not resolve");
 }
 
 // Several sections, with the gap between them. The RVA has to land in the
@@ -952,6 +1054,63 @@ void test_directory_count_within_header_but_no_import() {
 
 // --------------------------------------------------------------- name fields
 
+// A section declaring raw data at offset zero.
+//
+// This one was found by fuzz/fuzz_pe.cpp, not by reasoning. The reader used
+// to exempt "raw offset of zero with a non-zero size" on the theory that a
+// packer fills it in later -- and that exemption let a 1182-byte file claim
+// a 32 MiB section, which every caller that maps or reads sections then
+// believed. The exemption was removed; the case is here so it stays removed.
+//
+// The offset of zero is not special. Offset zero is the DOS header, so a
+// section there overlaps the file's own headers, and a file claiming it is
+// describing a region that is not section data at all.
+void test_section_at_offset_zero() {
+    // The size is large enough that "zero plus this" cannot be inside any file
+    // this test builds. It is written into the header after the fixture is
+    // built rather than declared as a section, because the builder sizes the
+    // file to fit whatever it is told -- and a fixture that really did carry
+    // 32 MiB of section data would be a 32 MiB fixture.
+    Spec s;
+    s.sections.push_back({".text", 0x1000, 0x200, 0x200, 0x60000020});
+    Built b = build(s);
+    // Force the first section's raw offset to zero and its size to 32 MiB.
+    put32(b.bytes, b.sections_at + 16, 0x2000000);
+    put32(b.bytes, b.sections_at + 20, 0);
+
+    const PeImage p = parse_image(b.bytes);
+    check(!p.ok(), "raw offset zero with a size: refused");
+    check(p.error() == PeError::BadSectionTable,
+          "raw offset zero with a size: reported as a bad table");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("0x2000000") != std::string::npos,
+              "raw offset zero: the message states the size it claimed");
+    }
+
+    // A section of zero raw size at offset zero is the legitimate version of
+    // this, and it is what .bss and a linker's padding sections look like.
+    // The negative spells "stores nothing" to the builder.
+    Spec t;
+    t.sections.push_back({".bss", 0x1000, 0x4000, -1, 0xc0000040});
+    Built tb = build(t);
+    const PeImage q = parse_image(tb.bytes);
+    check(q.ok(), "a zero-size section at offset zero is accepted");
+    check(q.sections().size() == 1, "zero-size section: reported");
+    if (!q.sections().empty()) {
+        check(q.sections()[0].raw_size == 0, "zero-size section: size is zero");
+        // Nothing is file-backed, so nothing resolves to an offset -- and
+        // everything inside its virtual range is zero fill instead.
+        check(q.sections()[0].raw_offset == 0, "zero-size section: offset is zero");
+        std::uint64_t off = 1;
+        bool zero_filled = false;
+        check(q.resolve_rva(0x1000, off, zero_filled),
+              "zero-size section: its first RVA resolves");
+        check(zero_filled, "zero-size section: as zero fill");
+        check(!q.to_file_offset(0x1000, off),
+              "zero-size section: with no file offset");
+    }
+}
+
 // A section name that uses all eight bytes has no terminator. Reading it as
 // a C string runs into the next header's first byte, which is the virtual
 // size -- so the name comes back with four binary characters appended.
@@ -1225,6 +1384,7 @@ int main() {
     test_dll();
     test_rva_conversion();
     test_raw_size_exceeds_virtual_size();
+    test_headers_size_larger_than_the_file();
     test_multiple_sections();
     test_section_at_top_of_address_space();
     test_short_optional_header_is_refused();
@@ -1247,6 +1407,7 @@ int main() {
     test_section_raw_range_overflow();
     test_directory_count_larger_than_header();
     test_directory_count_within_header_but_no_import();
+    test_section_at_offset_zero();
     test_full_width_section_name();
     test_section_name_with_embedded_padding();
     test_dll_characteristics();

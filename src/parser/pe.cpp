@@ -370,6 +370,8 @@ const char* pe_error_name(PeError e) noexcept {
         return "a data directory points outside the file";
     case PeError::TruncatedImportTable:
         return "the import table is truncated";
+    case PeError::BadHeaderSize:
+        return "SizeOfHeaders is larger than the file";
     }
     return "unknown";
 }
@@ -660,14 +662,19 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         s.raw_offset = rd32(bytes, at + kOffSectionRawOffset);
         s.characteristics = rd32(bytes, at + kOffSectionCharacteristics);
 
-        // A section's raw data has to be in the file, with two exceptions
-        // that are normal rather than malformed: a section of zero raw size
-        // is one the file does not store at all (.bss, uninitialized data),
-        // and a section whose raw offset is zero with a non-zero size is a
-        // packer that will fill it in later. Both are reported as the file
-        // states them and neither is treated as an error, because treating
-        // them as one makes the reader refuse files that load.
-        if (s.raw_size != 0 && s.raw_offset != 0) {
+        // A section's raw data has to be in the file. One case is exempt: a
+        // section of zero raw size stores nothing at all, which is what .bss
+        // and the padding a linker emits look like.
+        //
+        // A raw offset of zero with a non-zero size used to be exempt too,
+        // on the reasoning that a packer might fill it in later. That
+        // exemption was wrong, and the fuzz harness found it: it lets a
+        // file declare a 32 MiB section at offset zero in a 1 KB file, and
+        // every caller that maps or reads sections then believes it. "The
+        // file says this" is not the test; the test is whether the bytes are
+        // there, and they are not. A packer that wants the offset filled in
+        // has to write the offset.
+        if (s.raw_size != 0) {
             if (s.raw_offset > bytes.size() ||
                 bytes.size() - s.raw_offset < s.raw_size) {
                 return fail(PeError::BadSectionTable,
@@ -679,6 +686,54 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             }
         }
         out.sections_.push_back(s);
+    }
+
+    // --- SizeOfHeaders, checked against the sections it has to cover
+    //
+    // The value says how much of the file the linker reserved for the
+    // headers. It is also the threshold that decides which of the two
+    // coordinate systems an RVA belongs to, so a file that overstates it
+    // does not merely carry a wrong number -- it reclassifies every address
+    // in the image.
+    //
+    // Found by fuzz/fuzz_pe.cpp, twice, in two forms. A file claiming four
+    // gigabytes of headers in three hundred bytes made the header rule claim
+    // every section's RVA before the section table was consulted, so a
+    // section at RVA 0x1000 resolved to *file* offset 0x1000 instead of
+    // 0x200. Nothing crashed, every offset was inside the file, and every
+    // one of them was wrong -- which is worse than a crash, because a caller
+    // has no way to notice. The same overstatement also let an RVA equal to
+    // the file's length resolve to that length, one byte past the end.
+    //
+    // Both are the same defect and both are answered here rather than at the
+    // conversion: the file has said something that cannot be true, so it is
+    // refused before any address is classified by it. The bound is the file
+    // rather than the sections, because the file is the thing that cannot
+    // grow -- and a file whose headers claim more than its own length is
+    // malformed whatever its sections say.
+    if (out.headers_size_ != 0 &&
+        out.headers_size_ > static_cast<std::uint64_t>(bytes.size())) {
+        return fail(PeError::BadHeaderSize,
+                    "SizeOfHeaders is " + hex_value(out.headers_size_) +
+                        ", which is more than the file's " +
+                        decimal(bytes.size()) + " bytes");
+    }
+    // The headers also have to be at least as large as the headers this
+    // reader just parsed out of them -- the DOS header, the COFF header, the
+    // optional header and the section table all live inside that region, so a
+    // SizeOfHeaders below the section table's end would place section data
+    // inside the headers and the two rules would overlap.
+    const std::size_t headers_claimed =
+        static_cast<std::size_t>(out.headers_size_);
+    if (out.headers_size_ != 0 && headers_claimed < table_bytes + table) {
+        // Not fatal: a linker can pad the section table with a section whose
+        // header lies past the declared region, and refusing would reject
+        // files that load. It is noted rather than enforced because the
+        // conversion's own bound -- the file's length -- is what keeps the
+        // overlap from producing an out-of-range offset.
+        out.headers_cover_table_ = false;
+    } else {
+        out.headers_cover_table_ = true;
     }
 
     // --- the import table
@@ -800,8 +855,16 @@ bool PeImage::resolve_rva(std::uint64_t rva, std::uint64_t& file_offset,
     // The headers. They are at the front of the file and belong to no
     // section, and the section table itself is in here -- so a reader that
     // only searched the section table could never find the section table.
+    //
+    // The bound is the file's, not the header's. SizeOfHeaders is a claim
+    // about how much of the file the linker reserved, and a file can claim
+    // four gigabytes of it in three hundred bytes; believing that would hand
+    // a caller an offset past the end of the file, one byte at a time. The
+    // comparison is against bytes_size_ so that an RVA equal to the file's
+    // length -- one past the last byte -- resolves to nothing. That off-by-one
+    // was found by fuzz/fuzz_pe.cpp.
     if (headers_size_ != 0 && rva < headers_size_) {
-        if (rva > bytes_size_) {
+        if (rva >= bytes_size_) {
             return false;
         }
         file_offset = rva;

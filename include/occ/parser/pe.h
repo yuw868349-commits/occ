@@ -114,6 +114,13 @@ enum class PeError : std::uint8_t {
     // A data directory's RVA does not resolve to anywhere in the file.
     DirectoryOutOfFile,
     TruncatedImportTable,
+    // SizeOfHeaders claims more of the file than the file has. This is not
+    // a wrong number, it is a reclassification: the value decides which of
+    // the two coordinate systems an RVA belongs to, so a file that overstates
+    // it has every address in its image reclassified as a file offset. The
+    // file is refused rather than reported, because there is no correct answer
+    // to give about a file whose headers cannot be where it says they are.
+    BadHeaderSize,
 };
 
 [[nodiscard]] const char* pe_error_name(PeError e) noexcept;
@@ -307,6 +314,14 @@ private:
     std::uint32_t reloc_size_ = 0;
     std::uint32_t import_rva_ = 0;
     std::uint32_t import_size_ = 0;
+
+    // Whether SizeOfHeaders actually reaches past the section table. A file
+    // can declare a region smaller than the headers this reader parsed out of
+    // it -- a linker with an unusual section ordering, or a file that has
+    // been edited. It is recorded rather than refused, because the conversion
+    // is bounded by the file's length either way and refusing would reject
+    // files that load. Reported so a caller that cares can see it.
+    bool headers_cover_table_ = true;
 
     std::vector<PeSection> sections_;
     std::vector<std::string> imports_;
