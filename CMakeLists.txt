@@ -134,15 +134,20 @@ if(NOT DEFINED OCC_LIBCXX_ROOT)
     # Clang unpacked from a release tarball builds against the libc++ that
     # shipped in the very same tarball. Without this, a libc++ installed
     # from a distribution package can be chosen first -- it sits at
-    # /usr/lib/llvm-23 and holds perfectly good headers -- and the two sets of
-    # headers then disagree about the C library. The failure is a wall of
+    # /usr/lib/llvm-23 and holds perfectly good headers -- and headers from
+    # one install then meet a compiler from another. The failure is a wall of
     # "reference to unresolved using declaration" for strncmp and friends,
     # raised from inside <cstring>, on a machine where strncmp is obviously
-    # present. Same version number, different install, incompatible headers.
+    # present.
     #
-    # Only a compiler that lives in an LLVM tool tree of its own gets this
-    # priority. A distribution clang sits above a sysroot, not above a
-    # toolchain, and a sysroot is not a libc++ root however complete it looks.
+    # The version number does not tell the two apart, which is what makes this
+    # worth the preference below. Both installs report the same libc++
+    # version; they differ in the configuration their headers were built
+    # with, so what meets the compiler is a header set the compiler was never
+    # tested against. The mismatch is therefore invisible in anything a build
+    # log would name, and the error it produces describes a C library function
+    # rather than the pair of installs that caused it.
+    #
     # Only a Clang that lives in an LLVM tool tree of its own gets this
     # priority. A distribution clang sits above a sysroot rather than above a
     # toolchain, and a sysroot is not a libc++ root however complete it looks.
@@ -167,6 +172,79 @@ endif()
 
 set(OCC_USE_LIBCXX ON CACHE BOOL "Build against libc++ instead of libstdc++")
 set(OCC_STATIC_LINK ON CACHE BOOL "Link the main binary statically")
+
+# A libc++ that is present is not a libc++ this compiler can use. The pairing
+# has a floor -- libc++ 23 asks for Clang 21 or GCC 15 and says so in a
+# #warning the moment it is included -- and a machine below that floor has a
+# perfectly complete libc++ installed that it cannot compile a single line
+# with. Guessing cannot detect this: the directory holds the headers and the
+# libraries, so every check above it passes.
+#
+# So the compiler is asked directly, once, with the include path this build
+# would really use. The question is answered by a compile rather than by
+# parsing a version, because the version in the directory name is the
+# distribution's and not necessarily the one whose floor applies.
+if(OCC_USE_LIBCXX AND OCC_LIBCXX_ROOT)
+    set(_occ_probe_dir "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/occ_libcxx_probe")
+    file(MAKE_DIRECTORY "${_occ_probe_dir}")
+    file(WRITE "${_occ_probe_dir}/probe.cpp"
+         "#include <string>\n#include <vector>\nint main() {\n"
+         "  std::vector<std::string> v;\n  v.push_back(\"probe\");\n"
+         "  return static_cast<int>(v[0].size());\n}\n")
+
+    set(_occ_probe_ok TRUE)
+    set(_occ_probe_include "")
+    set(_occ_probe_reason "")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set(_occ_probe_flags "-stdlib=libc++")
+    else()
+        # GCC has no -stdlib, but it will still compile against libc++ headers
+        # put on its include path, which is exactly what has to be tested.
+        set(_occ_probe_flags "")
+    endif()
+
+    foreach(suffix /include/x86_64-unknown-linux-gnu/c++/v1 /include/c++/v1)
+        if(EXISTS "${OCC_LIBCXX_ROOT}${suffix}/print")
+            set(_occ_probe_include "${OCC_LIBCXX_ROOT}${suffix}")
+            break()
+        endif()
+    endforeach()
+
+    if(NOT _occ_probe_include)
+        set(_occ_probe_ok FALSE)
+        set(_occ_probe_reason "no libc++ include directory under ${OCC_LIBCXX_ROOT}")
+    else()
+        execute_process(
+            COMMAND "${CMAKE_CXX_COMPILER}" ${_occ_probe_flags}
+                    -std=c++23 -isystem "${_occ_probe_include}" -c
+                    "${_occ_probe_dir}/probe.cpp" -o "${_occ_probe_dir}/probe.o"
+            RESULT_VARIABLE _occ_probe_result
+            OUTPUT_VARIABLE _occ_probe_output
+            ERROR_VARIABLE _occ_probe_output)
+        if(NOT _occ_probe_result EQUAL 0)
+            set(_occ_probe_ok FALSE)
+            string(REGEX MATCH "Libc\\+\\+ only supports[^\"]*"
+                   _occ_probe_reason "${_occ_probe_output}")
+            if(NOT _occ_probe_reason)
+                set(_occ_probe_reason "the compiler rejected it")
+            endif()
+        endif()
+    endif()
+
+    if(NOT _occ_probe_ok)
+        # Falling back is the right answer and not a second-class one: the
+        # alternative is a build that cannot start. The reason is reported
+        # because a build that silently stops using the standard library it
+        # was configured with is its own kind of surprise, and because the
+        # reason is the only thing that says what to install.
+        message(WARNING
+            "occ: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} "
+            "cannot use the libc++ at ${OCC_LIBCXX_ROOT} (${_occ_probe_reason}); "
+            "falling back to libstdc++. Install a newer compiler, or point "
+            "-DOCC_LIBCXX_ROOT at a libc++ this compiler supports.")
+        set(OCC_USE_LIBCXX OFF)
+    endif()
+endif()
 
 if(OCC_USE_LIBCXX AND OCC_LIBCXX_ROOT)
     message(STATUS "occ: libc++ root ${OCC_LIBCXX_ROOT}")
@@ -229,14 +307,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # When several GCC installations are present, Clang 19 and later warn that a
-# future release will change which one it prefers. The warning is informative
-# but it fires on every translation unit, and this build treats warnings as
-# errors. Naming the directory makes the choice explicit and the build quiet.
+# future release will change which one it prefers, and name the one they would
+# pick over the one in use. The warning is informative, but this build treats
+# warnings as errors, so it has to be silenced rather than tolerated.
+#
+# Naming the directory is what silences it, and it has to reach the link line
+# as well as the compile line. The warning is emitted while the driver decides
+# which libstdc++ to use, which happens when the link command is assembled --
+# not once per translation unit -- so a compile-only option leaves every
+# executable in the build printing it. Both are set here for that reason.
 if(OCC_COMPILER_IS_CLANG AND OCC_USE_LIBCXX)
     foreach(ver 15 14)
         if(EXISTS "/usr/lib/gcc/x86_64-linux-gnu/${ver}")
-            add_compile_options(
+            set(OCC_GCC_INSTALL_DIR
                 "--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/${ver}")
+            add_compile_options("${OCC_GCC_INSTALL_DIR}")
+            add_link_options("${OCC_GCC_INSTALL_DIR}")
             set(OCC_GCC_LIB_DIR "/usr/lib/gcc/x86_64-linux-gnu/${ver}")
             break()
         endif()
@@ -263,6 +349,22 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion
                     -Wsign-conversion -Wcast-qual -Wdouble-promotion
                     -Wformat=2 -Wundef -Wnull-dereference -Wimplicit-fallthrough)
+
+# GCC's -Wnull-dereference does not mean what Clang's does, and where the two
+# share a name only Clang's is worth having. GCC runs the analysis through
+# libstdc++ headers, where a small-string-optimized string is built by a
+# constructor that branches on capacity, and the branch that is not taken
+# looks like a null store. Adding a std::string to a std::vector is enough to
+# reach it. The diagnostic is correct about C and unreliable about C++, and
+# with warnings as errors that makes the whole build fail on correct code --
+# so it is dropped for GCC rather than trusted there.
+#
+# It stays on for Clang, where it is a real check on this project's own code.
+# Nothing else is relaxed: every other warning in the list above applies to
+# both compilers and is meant to.
+if(NOT OCC_COMPILER_IS_CLANG)
+    add_compile_options(-Wno-error=null-dereference)
+endif()
 
 # ---------------------------------------------------------------- options
 
