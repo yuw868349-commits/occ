@@ -286,18 +286,39 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         // than inferred from them. A host with no tracefs produces the same
         // outcome for every probe, and a single sentence about the host is
         // a better report than seventy-three identical ones about symbols.
+        //
+        // The probes are recorded either way, and the else branch is the
+        // point of asking separately. A run that could not place its probes
+        // and a run that placed none still looks different to a reader of
+        // the stream: the first has a record per requested probe saying it
+        // was refused and why, the second has no records because nothing was
+        // requested. Emitting nothing in the unavailable case would collapse
+        // those two into the same empty answer, and the emptiness is exactly
+        // what a reader has to be able to interpret.
+        out.probes_requested = plan.probes.size();
+
         const obs::ProbeAvailability avail = obs::Uprobes::availability();
         if (!avail.available) {
             out.probes_unavailable = avail.reason;
             out.degradations.push_back(
                 "function-level observation is off: " + avail.reason +
                 "; the run continues with syscall-level observation");
+            for (const engine::ProbeRequest& spec : plan.probes) {
+                auto& e = events.begin(obs::EventKind::ProbeAttached);
+                e.add("label", spec.label);
+                e.add("symbol", spec.symbol);
+                e.add("module", spec.module);
+                e.add("outcome", "unavailable");
+                e.add("ok", false);
+                e.add("detail", avail.reason);
+                events.commit();
+            }
+            out.probes_attached = 0;
         } else {
             std::vector<obs::Placement> placements;
             const std::size_t attached =
                 placer.place(plan.probes, placements, &events);
 
-            out.probes_requested = plan.probes.size();
             out.probes_attached = attached;
 
             // Every requested probe gets a probe_attached record, so a
