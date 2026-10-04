@@ -1,5 +1,24 @@
 cmake_minimum_required(VERSION 3.20)
 
+# The compiler check has to already know which standard library this build
+# uses, and it runs before project() gets a chance to look at the toolchain
+# below. A Clang installed from a release tarball carries no libstdc++ at all,
+# so the probe program CMake compiles to test the compiler fails to link with
+# "cannot find -lstdc++" and configuration stops -- before any of this file's
+# own configuration is read, and regardless of whether the flags further down
+# are correct. Setting the default here, ahead of project(), is what makes the
+# probe link.
+#
+# This only sets a default. Passing -DCMAKE_CXX_FLAGS on the command line
+# still wins, because an explicit choice by whoever is building should not be
+# overridden by a guess made on their behalf.
+if(NOT DEFINED CMAKE_CXX_FLAGS OR CMAKE_CXX_FLAGS STREQUAL "")
+    if(EXISTS "/usr/lib/llvm-23/include/c++/v1/print" OR
+       EXISTS "/usr/lib/llvm-23/include/x86_64-unknown-linux-gnu/c++/v1/print")
+        set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
+    endif()
+endif()
+
 project(occ LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -50,19 +69,45 @@ if(OCC_USE_LIBCXX AND OCC_LIBCXX_ROOT)
         endif()
     endforeach()
 
-    add_compile_options(-stdlib=libc++)
-    add_link_options(-stdlib=libc++)
+    # -stdlib is a clang and Apple-clang option. GCC has never heard of it and
+    # rejects the command line outright, so a machine that has libc++ headers
+    # installed but a GCC default compiler cannot build at all. That
+    # combination is easy to hit: installing a libc++ package is enough to
+    # create it, and the failure is a wall of "unrecognized command-line
+    # option" that says nothing about which compiler is at fault.
+    #
+    # So the flag goes only to a compiler that understands it. GCC does not
+    # need it because the headers are already on the include path above and it
+    # will link what it is told to link.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        add_compile_options(-stdlib=libc++)
+        add_link_options(-stdlib=libc++)
+    else()
+        message(STATUS
+            "occ: compiler is ${CMAKE_CXX_COMPILER_ID}, not adding -stdlib=libc++")
+    endif()
     set(OCC_CXX_LIBS c++ c++abi)
 else()
     message(STATUS "occ: libc++ not found, falling back to libstdc++")
     set(OCC_CXX_LIBS)
 endif()
 
+# The flags below are all Clang options. GCC rejects each of them by name, and
+# it rejects them before reading a single source file, so a build that reaches
+# this point with GCC as the compiler cannot start at all. Every Clang-specific
+# option is therefore gated on the compiler, not on libc++ being present: the
+# two are independent, and a machine can easily have libc++ headers installed
+# and a GCC default compiler.
+set(OCC_COMPILER_IS_CLANG OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(OCC_COMPILER_IS_CLANG ON)
+endif()
+
 # When several GCC installations are present, Clang 19 and later warn that a
 # future release will change which one it prefers. The warning is informative
 # but it fires on every translation unit, and this build treats warnings as
 # errors. Naming the directory makes the choice explicit and the build quiet.
-if(OCC_USE_LIBCXX)
+if(OCC_COMPILER_IS_CLANG AND OCC_USE_LIBCXX)
     foreach(ver 15 14)
         if(EXISTS "/usr/lib/gcc/x86_64-linux-gnu/${ver}")
             add_compile_options(
@@ -78,7 +123,12 @@ endif()
 # the cause, so exactly one is chosen. libgcc is chosen where a GCC runtime
 # is present, which it is wherever a C++ toolchain is installed.
 if(OCC_USE_LIBCXX AND OCC_STATIC_LINK)
-    add_link_options(--unwindlib=libgcc)
+    if(OCC_COMPILER_IS_CLANG)
+        add_link_options(--unwindlib=libgcc)
+    else()
+        # GCC has no such option and does not need one: it links libgcc_eh
+        # itself when it sees an exception-handling call.
+    endif()
 endif()
 
 if(OCC_STATIC_LINK)
