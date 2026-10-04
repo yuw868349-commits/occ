@@ -80,3 +80,24 @@ target_compile_definitions(occ_test_check PRIVATE
     OCC_BINARY="$<TARGET_FILE:occ>"
     OCC_SEED_DIR="${CMAKE_SOURCE_DIR}/fuzz/seeds")
 add_dependencies(occ_test_check occ)
+
+# occ_test_seeds guards the fuzz corpus against the generator that writes it.
+#
+# The corpus is generated because a checked-in binary says only what it is,
+# and that only holds while the files and the generator agree. Nothing else
+# would notice a drift: the harnesses read whatever bytes are in the
+# directory, so a seed that no longer matches the program describing it would
+# still run and still pass while reaching different code than it was written
+# to reach.
+#
+# Both paths are handed in by CMake rather than assembled here, because a
+# test that located the repository's own files by relative path would be the
+# first thing to break under an out-of-tree build.
+#
+# It needs python3 and skips cleanly without it -- see the note the test
+# prints when it does, which says plainly that a seed can drift unnoticed
+# then. Python stays out of the build; this is the only thing that runs it.
+occ_add_test(occ_test_seeds test_seeds.cpp)
+target_compile_definitions(occ_test_seeds PRIVATE
+    OCC_SEED_GENERATOR="${CMAKE_SOURCE_DIR}/tools/make_pe_seeds.py"
+    OCC_SEED_DIR="${CMAKE_SOURCE_DIR}/fuzz/seeds")
