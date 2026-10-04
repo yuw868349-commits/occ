@@ -23,7 +23,7 @@ the observation layer is the product, and it is the deepest part.
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 1,599 assertions across thirteen binaries. The counts are what
+The test suite is 1,829 assertions across sixteen binaries. The counts are what
 the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
@@ -33,16 +33,19 @@ none to a grep:
 | `test_engine` | 420 |
 | `test_pe` | 278 |
 | `test_observer` | 263 |
+| `test_runtime_loader` | 247 |
 | `test_elf` | 150 |
 | `test_uprobe` | 108 |
 | `test_ntdll_probes` | 102 |
-| `test_seccomp` | 63 |
+| `test_seccomp` | 49 |
 | `test_placer` | 46 |
 | `test_event` | 43 |
 | `test_detect` | 36 |
 | `test_probe_wiring` | 36 |
 | `test_gdb_interop` | 29 |
 | `test_container` | 25 |
+| `test_check` | 24 |
+| `test_seeds` | 22 |
 
 `test_gdb_interop` is the one that does not run without a peer. It forks the
 host's gdb and drives a real attach, register read and detach through a
@@ -134,16 +137,26 @@ are written now. A reference to a document that is not there is worse than no
 reference: it tells a reader the question has been answered.
 
 **The fuzz harnesses are built, and only in a build that asks for them.**
-`fuzz/` holds three of them -- ELF, PE and the RSP packet decoder -- each a
-`LLVMFuzzerTestOneInput` over the parser it names, plus a `seeds/` directory.
-`docs/BUILD.md` describes `-DOCC_ENABLE_FUZZ=ON`, which is what
-`add_subdirectory(fuzz)` is conditioned on. They are off by default because
-the sanitizer link flags they need are per-consumer, so an ordinary build does
-not pay for them.
+`fuzz/` holds four of them -- the ELF reader, the PE reader, the PE loader and
+the GDB RSP codec -- each a `LLVMFuzzerTestOneInput` over the parser it names,
+plus a `seeds/` directory of seventeen seeds. `docs/BUILD.md` describes
+`-DOCC_ENABLE_FUZZ=ON`, which is what `add_subdirectory(fuzz)` is conditioned
+on, and `fuzz/README.md` records what each harness asserts. They are off by
+default because the sanitizer link flags they need are per-consumer, so an
+ordinary build does not pay for them.
 
-What they are not is continuous. There is no fuzzing service and no corpus
-beyond what is checked in, so they are a thing a person runs rather than a
-thing that runs. That distinction is the one worth keeping straight.
+What they are not is continuous. There is no fuzzing service, so they are a
+thing a person runs rather than a thing that runs -- though a bounded run of
+each is a ctest, so an ordinary `ctest` in a fuzz build does reach them. What
+the accumulated corpus holds is not checked in: it is untracked, and a clean
+build throws it away.
+
+**Nothing that needs a process is fuzzed.** The `run` path and everything
+under it needs a real namespace and a real kernel, and a fuzzer that forks per
+input spends its time in setup. The parsers are where untrusted bytes enter,
+so that is where the budget went, and the consequence is worth stating: the
+container, the seccomp emitter, the probe plumbing and the uprobe path are
+unexercised by any harness. `fuzz/README.md` says so in the same terms.
 
 **Syscall tracing needs a tracepoint that exists.** The eBPF programs attach
 to raw tracepoints whose field offsets are read at runtime. A kernel without
@@ -176,7 +189,7 @@ up front is cheaper than a user discovering it.
 
 **`capabilities` has no dedicated test file.** Zero, against a pair of
 wrappers in `src/syscall/syscall.cpp` that a container setup calls to drop what
-it should not keep. The seccomp half has grown to 63 assertions covering a BPF
+it should not keep. The seccomp half has grown to 49 assertions covering a BPF
 emitter that is 402 lines of arithmetic on a structure the kernel rejects
 without explanation; the capability half has a syscall wrapper and no test that
 it is reached with the right arguments. The security boundary is the part with
@@ -215,8 +228,12 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 1,599 assertions and needs no network. Two of the thirteen
+The test suite is 1,829 assertions and needs no network. Two of the sixteen
 binaries need a target binary and a host that permits namespaces and seccomp,
-and one needs a gdb on `PATH`; those are skipped rather than failed where the
-host does not have them, and the skip says so in a note. A claim in this file
-that can be checked should be checked that way before it is believed.
+one needs a gdb on `PATH`, and one needs a `python3` to re-run the seed
+generator; those are skipped rather than failed where the host does not have
+them, and the skip says so in a note. That last one is worth naming here: it
+is the only test whose skip weakens a guarantee rather than a measurement,
+because nothing else would notice a seed drifting away from the generator
+that describes it. A claim in this file that can be checked should be checked
+that way before it is believed.

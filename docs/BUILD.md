@@ -12,16 +12,21 @@ failures look nothing alike.
 ### Verified combinations
 
 Every row below was built from a clean configure with warnings as errors on,
-and the test suite run. "Clean" means zero errors and zero warnings.
+and the full test suite run. "Clean" means zero errors and zero warnings.
 
 | Compiler | Standard library | Result |
 |---|---|---|
-| Clang 23.1.2 | libc++ 23 | clean, 6/6 |
-| Clang 20.1.2 | libc++ 20 | clean, 6/6 |
-| GCC 16.0.1 | libstdc++ | clean, 6/6 |
+| Clang 23.1.2 | libc++ 23 | clean, 16/16 |
+| Clang 20.1.2 | libc++ 20 | not re-verified since the suite grew |
+| GCC 16.0.1 | libstdc++ | clean, 16/16 |
 | GCC 16.0.1 | libc++ 23 | falls back to libstdc++ |
 | GCC 14.2 | libc++ 20 | falls back to libstdc++ |
 | GCC 13.3 | libc++ 23 | falls back to libstdc++ |
+
+The two rows marked clean were re-run most recently; the older Clang row is
+left as it was rather than restated as current, because a number nobody has
+re-measured is not a result. It was true when it was written and the suite
+has grown since, so treat it as history.
 
 The reference build is Clang with libc++ from the LLVM release tree. The
 reason is the static link: libc++'s static archives are self-contained and are
@@ -168,25 +173,50 @@ isolation code the binary ships, which is the point.
 
 ## Fuzz harnesses
 
-**Not built.** `fuzz/` is an empty directory, so `-DOCC_ENABLE_FUZZ=ON` fails
-configuration at `add_subdirectory(fuzz)` rather than producing harnesses. The
-commands below are what the build is intended to support once they exist; they
-do not work today.
+**Built, and only in a build that asks for them.** `fuzz/` holds four
+`LLVMFuzzerTestOneInput` targets -- the ELF reader, the PE reader, the PE
+loader and the GDB RSP codec -- plus a `seeds/` directory of seventeen seeds
+that `tools/make_pe_seeds.py` writes and `occ_test_seeds` checks against it.
+`fuzz/README.md` records what each harness asserts and, at more length, what
+each one deliberately does not.
 
-Sanitizers and libFuzzer cannot be combined with a fully static link, so
-the fuzz build would be separate and dynamic:
+They need Clang, because libFuzzer's runtime is linked against libstdc++ and a
+GCC build rejects `-fsanitize=fuzzer-no-link` outright. `OCC_ENABLE_FUZZ=ON`
+therefore forces `OCC_USE_LIBCXX=OFF` in the cache; asking for both does not
+fail, it quietly builds against libstdc++ instead. Sanitizers and libFuzzer
+cannot be combined with a fully static link, so the fuzz build is separate and
+dynamic:
 
 ```
 cmake -S . -B build-fuzz -G Ninja \
   -DOCC_ENABLE_FUZZ=ON \
   -DOCC_ENABLE_TESTS=OFF \
+  -DCMAKE_CXX_COMPILER=/usr/lib/llvm-23/bin/clang++ \
+  -DCMAKE_C_COMPILER=/usr/lib/llvm-23/bin/clang \
   -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer,address,undefined"
 cmake --build build-fuzz
 ```
 
-The isolation layer is the part that most needs a harness: seccomp BPF is 338
-lines of arithmetic over a structure the kernel rejects without explaining
-why, and it currently has 11 assertions against it.
+`occ_fuzz_smoke` runs each harness briefly. Each is also a bounded ctest, so
+an ordinary `ctest` in this build really does reach them:
+
+```
+ctest --test-dir build-fuzz -R occ_fuzz_run
+```
+
+`OCC_FUZZ_CTEST_SECONDS` sets how long each runs, 30 by default. The ctest
+`TIMEOUT` is not decoration -- libFuzzer handed a malformed `-max_total_time`
+does not fail, it runs forever -- so a test whose only limit is libFuzzer's
+has no limit at all.
+
+What the harnesses do not cover is stated in `fuzz/README.md` rather than
+left to be discovered. It is worth knowing before reading a green run as more
+than it was: nothing needing a real process is exercised, so the container,
+the BPF emitter, the probe plumbing and the uprobe path are unverified by
+anything in that directory. The seccomp emitter is the part that most needs a
+harness -- it is 402 lines of arithmetic over a structure the kernel rejects
+without explaining why -- and `fuzz/README.md` explains why it has none: its
+input is a typed `SeccompPolicy` rather than bytes.
 
 ## Sanitizer build of the test suite
 

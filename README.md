@@ -42,8 +42,16 @@ Every run gets:
 - A seccomp-BPF filter, default-deny, built from an in-tree bytecode
   emitter.
 
-The isolation layer is the security boundary of this project and is
-fuzzed as such.
+The isolation layer is the security boundary of this project. Its seccomp
+emitter is tested against a filter the kernel actually installs -- 49
+assertions, one per rule operator -- and its container setup is tested for
+the things that have to be refused, such as an overlay mount with no upper
+directory, which must fail and say at which stage it failed.
+
+It is not fuzzed. The emitter's input is a typed policy rather than bytes,
+so there is nothing to hand a fuzzer that a caller controls; `fuzz/README.md`
+explains what the four parser harnesses do cover and, at more length, what
+none of them reaches.
 
 ## Privilege model
 

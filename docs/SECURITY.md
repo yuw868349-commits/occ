@@ -95,15 +95,30 @@ of them are worth knowing about.
 These components parse data from the target and are the primary attack
 surface besides the kernel itself:
 
-- ELF, PE, ZIP, and AXML parsers.
-- The eBPF bytecode emitter, which reads tracefs `format` files.
-- The GDB RSP packet parser, which accepts bytes from a socket.
-- The adb protocol client.
+- The ELF reader.
+- The PE reader.
+- The GDB RSP packet decoder, which accepts bytes from a socket.
+- The zip reader in the format detector, which reads a local file header to
+  tell an Android package from any other archive.
 
-Each has a libFuzzer harness under `fuzz/`. They are written to validate
-before allocating, to bound every length against the buffer actually
-received, and to never trust a field that describes the size of another
-field.
+Four libFuzzer harnesses exist under `fuzz/`, one per parser above plus the
+PE loader. They are written to validate before allocating, to bound every
+length against the buffer actually received, and to never trust a field that
+describes the size of another field. `fuzz/README.md` records what each one
+asserts and, at more length, what each deliberately does not.
+
+Two things on the earlier version of this list do not exist and never did: an
+AXML parser and an adb client. They are named here as absent rather than
+quietly dropped, because a reader who finds them later should know they were
+not covered rather than assume they were and find them gone.
+
+Nor does the seccomp-BPF emitter have a harness, and the reason is not that it
+was overlooked. It builds filters from a typed `SeccompPolicy` rather than
+from bytes, so there is no untrusted input to hand a fuzzer; what it can get
+wrong is emitting a filter the kernel rejects at install time, and observing
+that needs the kernel rather than a test process. It is covered by
+`tests/test_seccomp.cpp` against a live filter instead, which is a stronger
+oracle than an assertion would be.
 
 The parsers are the part of this codebase most likely to be handed
 adversarial input on purpose, because that is what a reverse engineering
