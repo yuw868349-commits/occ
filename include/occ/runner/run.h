@@ -60,6 +60,38 @@ struct RunOptions {
     // isolation facts should not pay for observation it did not ask for.
     bool observe = false;
 
+    // Whether to place the probes the engine asked for and report a hit
+    // every time the target enters one of the functions.
+    //
+    // This implies observe, and the implication is not incidental: a probe
+    // is a fact reported through the same stream as the stops, and a run
+    // that placed probes with no session to read their rings would leave
+    // the tracefs events behind for the next run to find. It is separate
+    // from observe because a caller who wants a syscall trace should not
+    // silently get an ELF read of a Wine installation as well, and separate
+    // from the engine because the engine says which probes it wants and
+    // this says whether anyone is going to watch them.
+    bool probe = false;
+
+    // Forces the probe layer on or off, overriding what `probe` would
+    // otherwise imply. OCC_PROBE is consulted for this, because the
+    // decision depends on a host property -- whether tracefs is mounted --
+    // that a caller may know better than the run does.
+    //
+    // An explicit off is not the same as an absence. A caller who has said
+    // "no probes" has asked for a syscall-only run and should not be told
+    // about a probe layer that was unavailable, because nothing was asked
+    // of it.
+    enum class ProbeMode : std::uint8_t {
+        // Act on `probe`, and on what the host offers.
+        Automatic,
+        // Place probes and report a degradation when the host refuses.
+        Force,
+        // Place nothing and report nothing.
+        Disabled,
+    };
+    ProbeMode probe_mode = ProbeMode::Automatic;
+
     // Whether to watch for write-then-execute transitions while observing.
     // It implies observe, because a tracker with no stops has nothing to
     // drain the watch events between.
@@ -119,6 +151,17 @@ struct RunOptions {
     // practice means not a directory the target can reach twice.
     std::string scratch_dir;
 };
+
+// Whether a run should try to place probes, given the flag and the mode.
+//
+// A named function rather than three lines inside run(), because it is the
+// one place where "no" and "not asked" have to stay apart and inside a
+// hundred-line setup path there is nothing that holds them apart. The rule
+// is small and total: Force means yes, Disabled means no, and Automatic
+// means whatever the flag says. A caller reading this can see that an
+// explicit off outranks the flag without reading the run.
+[[nodiscard]] bool wants_probes(bool probe_flag,
+                               RunOptions::ProbeMode mode) noexcept;
 
 // How a run ended.
 struct RunResult {
@@ -188,6 +231,20 @@ struct RunResult {
     std::uint64_t wx_bytes_total = 0;
     std::uint64_t wx_lost_samples = 0;
     bool wx_unavailable = false;
+
+    // What the probes saw. `probes_requested` counts what the engine asked
+    // for, `probes_attached` counts what the kernel accepted, and
+    // `probe_hits` counts the calls. The three are reported rather than one
+    // ratio because each of their differences means something else: a
+    // request that was not attached is a hole in the coverage, and an
+    // attached probe with no hits is either a function that was never
+    // called or a ring that was never polled.
+    std::uint64_t probes_requested = 0;
+    std::uint64_t probes_attached = 0;
+    std::uint64_t probe_hits = 0;
+    std::uint64_t probe_lost = 0;
+    // The layer's own sentence when no probe could be placed at all.
+    std::string probes_unavailable;
 };
 
 // Reads `path`, reports what the image is, and runs it under the container

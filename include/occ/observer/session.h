@@ -27,6 +27,7 @@
 #include "occ/observer/rsp.h"
 #include "occ/observer/watchpoint.h"
 #include "occ/observer/wx.h"
+#include "occ/probe/placer.h"
 
 namespace occ::obs {
 
@@ -103,6 +104,21 @@ struct SessionConfig {
     // than a listener.
     std::uint16_t gdb_port = 0;
 
+    // The probes to watch, and the layer that placed them.
+    //
+    // The session does not place them. A probe's offset comes from an ELF
+    // read of a module the engine named, and the engine is what knows which
+    // module that is: a session that resolved symbols itself would be a
+    // second reader of the same image, disagreeing with the first at
+    // exactly the moment it matters. So the placer runs before the target
+    // starts -- the probe has to be in place before the tracee reaches the
+    // function -- and the session is handed the layer to poll.
+    //
+    // Null means no function-level observation. The syscall trace is
+    // unaffected either way, which is the point of keeping the two
+    // independent.
+    ProbePlacer* probes = nullptr;
+
     // Whether to hold the target at its first stop until a debugger
     // arrives.
     //
@@ -147,6 +163,18 @@ struct SessionResult {
     // reported as a fact rather than as a failure because the rest of the
     // session is unaffected.
     bool wx_unavailable = false;
+
+    // Function-level observation. The hit count is the honest measure of
+    // how much of the target the probes saw, and the lost count is the part
+    // of it they did not: "the ring wrapped" and "the function was never
+    // called" are the same absence in a stream that carries neither.
+    std::uint64_t probe_hits = 0;
+    std::uint64_t probe_lost = 0;
+    // How many of the layer's probes were actually polled. A probe that
+    // registered but never subscribed has no descriptor, so it can never
+    // produce a hit -- and a consumer that was told "twelve probes" would
+    // read no hits from the twelfth as a function that was never called.
+    std::uint64_t probes_watched = 0;
 
     int exit_code = 0;
     int term_signal = 0;

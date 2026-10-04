@@ -9,33 +9,39 @@ that added this file.
 
 ## Where the code is
 
-About 14,300 lines across 49 files. The distribution is uneven on purpose —
+About 20,700 lines across 62 files. The distribution is uneven on purpose —
 the observation layer is the product, and it is the deepest part.
 
 | Area | Files | State |
 |---|---|---|
-| `src/observer/` | 8 | The deepest part. Event schema, ptrace control, RSP server, transport, watchpoints, W^X tracking |
+| `src/observer/` | 10 | The deepest part. Event schema, ptrace control, RSP server, transport, watchpoints, W^X tracking, uprobes, the Wine ntdll probe table |
 | `src/util/` | 4 | Strings, spans, filesystem, logging |
 | `src/isolation/` | 2 | Namespaces, overlay root, cgroup v2, seccomp BPF, capabilities |
 | `src/syscall/` | 2 | Syscall numbers, errno, kernel ABI |
-| `src/parser/` | 2 | ELF parsing, format detection |
+| `src/parser/` | 3 | ELF parsing including the dynamic symbols, PE parsing, format detection |
 | `src/runner/` | 1 | Spawns a target under the isolation and observation layers |
-| `src/probe/` | 1 | `occ doctor` |
-| `src/engine/` | 0 | Empty. See below |
+| `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
+| `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 441 assertions across six binaries. The counts are what the
-binaries print, not what the sources appear to contain — the two differ,
+The test suite is 1,532 assertions across twelve binaries. The counts are what
+the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
 
 | Test | Assertions |
 |---|---|
-| `test_observer` | 253 |
-| `test_elf` | 80 |
+| `test_engine` | 419 |
+| `test_pe` | 278 |
+| `test_observer` | 262 |
+| `test_elf` | 150 |
+| `test_ntdll_probes` | 102 |
+| `test_uprobe` | 84 |
+| `test_seccomp` | 63 |
+| `test_placer` | 41 |
 | `test_event` | 36 |
 | `test_detect` | 36 |
+| `test_probe_wiring` | 36 |
 | `test_container` | 25 |
-| `test_seccomp` | 11 |
 
 ## What works
 
@@ -73,56 +79,83 @@ draws that line explicitly.
 
 ## What does not work
 
-**No engine dispatch.** This is the largest gap and the README is wrong about
-it. `src/parser/detect.cpp` recognises ELF, PE and APK, and `occ check` reports
-them. But `occ run` never calls it: `runner::run` executes the target without
-consulting the format at all. There is no PE engine, no APK engine and no SYS
-engine — `src/engine/` and `include/occ/engine/` are empty directories that no
-code refers to.
+**The PE engine runs until it needs a loader, and then it needs one this
+host often does not have.** The dispatch exists: `runner::run` detects the
+format, asks `engine_for` which engine takes it, and every format it
+recognises has one. `src/engine/` holds `exe_engine.cpp` for ELF,
+`pe_engine.cpp` for PE, and `apk_engine.cpp` for APK, and `engine.cpp` is the
+table that names them.
 
-What that means in practice: `occ run` is a general-purpose executor. Against
-an ELF target on Linux it has the full observation surface. Against a PE
-target it will exec the file, which on a Linux host means the kernel's binfmt
-handler rather than a loader under this project's control — so the uprobe
-machinery the README describes for Wine is not in the tree either. An APK is a
-zip, and running one as a process is not the same as running its native code.
+What remains bounded is the PE path, and it is bounded by a fact about the
+host rather than a gap in the code. A Windows image needs a Wine loader, and
+a container usually has Wine's runtime libraries without the loader binary. The
+engine says so by name and refuses the run rather than exec'ing the file and
+letting the kernel's binfmt handler produce a process nobody configured. On a
+host with a Wine installation the engine assembles the run -- the loader, a
+per-run prefix under the run's scratch directory, the library directory bound
+read-only, the `.so`-side `Nt*` probes planned and placed -- and on a host
+without one it reports which of those it could not find.
+
+The APK engine is the shallowest of the three. An APK is a zip and its native
+code is a `lib/*/lib*.so` inside it; what the engine does is the part that has
+a definite answer, which is to name the DEX and the native libraries rather
+than to run the archive as a process.
 
 **Three documents the README promised did not exist.** `docs/ROADMAP.md`,
-`docs/RSP.md` and `docs/COMPAT.md` were all referenced from the README — two of
-them in the document index — and none of them were in the tree. All three are
-written now. A reference to a document that is not there is worse than no
+`docs/RSP.md` and `docs/COMPAT.md` were all referenced from the README -- two
+of them in the document index -- and none of them were in the tree. All three
+are written now. A reference to a document that is not there is worse than no
 reference: it tells a reader the question has been answered.
 
-**Fuzz harnesses are not built.** `fuzz/` is an empty directory, and
-`docs/BUILD.md` has a section describing how to build with
-`-DOCC_ENABLE_FUZZ=ON`. That option is wired to `add_subdirectory(fuzz)`, so
-turning it on fails configuration rather than producing harnesses. The build
-option, the documentation and the tree disagree, and the tree is the one that
-is right.
+**The fuzz harnesses are built, and only in a build that asks for them.**
+`fuzz/` holds three of them -- ELF, PE and the RSP packet decoder -- each a
+`LLVMFuzzerTestOneInput` over the parser it names, plus a `seeds/` directory.
+`docs/BUILD.md` describes `-DOCC_ENABLE_FUZZ=ON`, which is what
+`add_subdirectory(fuzz)` is conditioned on. They are off by default because
+the sanitizer link flags they need are per-consumer, so an ordinary build does
+not pay for them.
+
+What they are not is continuous. There is no fuzzing service and no corpus
+beyond what is checked in, so they are a thing a person runs rather than a
+thing that runs. That distinction is the one worth keeping straight.
 
 **Syscall tracing needs a tracepoint that exists.** The eBPF programs attach
 to raw tracepoints whose field offsets are read at runtime. A kernel without
 the expected tracepoint produces no syscall events rather than an error, and
 the run continues. `occ doctor` reports what the host has.
 
+**Function-level observation needs a tracefs.** A uprobe is registered by
+writing a line into tracefs and subscribed to with a `perf_event_open` on the
+tracepoint id the kernel assigns. A host without tracefs mounted, or with
+`perf_event_paranoid` set so the open is refused, places no probes at all --
+the run continues at syscall level and every `probe_attached` record says
+`ok: false` with a reason. Placing the probes is implemented; reaching the
+kernel that has to accept them is the part that depends on the host.
+
 **Hardware watchpoints are four.** W^X tracking over a region larger than the
 debug registers can express is partial by construction.
 
 ## Known rough edges
 
-**PE fidelity is bounded by the loader.** The README describes Wine as the PE
-loader with hooks on its Unix side. That design is not implemented, so this is
-a statement of intent rather than a description. When it is built, the
+**PE fidelity is bounded by the loader.** The engine runs the image under a
+Wine loader it found on the host, with the loader's own library directory
+bound read-only and a per-run prefix. How faithful that is follows from which
+Wine is installed, and the engine has no way to tell a Wine that runs an image
+from one that starts and then faults inside it: both produce a process that
+exits, and the exit code comes from Wine rather than from the image. That
 boundary is worth stating again: timing-sensitive, SEH-detail-sensitive and
-undocumented-structure-sensitive checks will diverge from genuine Windows, and
-some PE targets will never reach a state with analytical value. Saying so up
-front is cheaper than a user discovering it.
+undocumented-structure-sensitive checks will diverge from genuine Windows,
+and some PE targets will never reach a state with analytical value. Saying so
+up front is cheaper than a user discovering it.
 
-**`seccomp` and `capabilities` are the thinnest tests.** 11 and no dedicated
-file respectively, against a seccomp BPF emitter that is 338 lines of
-arithmetic on a structure the kernel will reject without explanation. The
-security boundary is the part with the least test coverage, which is the wrong
-way round and is stated here rather than left to be discovered.
+**`capabilities` has no dedicated test file.** Zero, against a pair of
+wrappers in `src/syscall/syscall.cpp` that a container setup calls to drop what
+it should not keep. The seccomp half has grown to 63 assertions covering a BPF
+emitter that is 402 lines of arithmetic on a structure the kernel rejects
+without explanation; the capability half has a syscall wrapper and no test that
+it is reached with the right arguments. The security boundary is the part with
+the least test coverage, which is the wrong way round and is stated here rather
+than left to be discovered.
 
 **Container error reporting lost its stage for a long time.** A setup failure
 was reconstructed from a sentinel exit code with a zero errno, which the error
@@ -156,6 +189,8 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 441 assertions and needs no network and no target binary.
-A claim in this file that can be checked should be checked that way before it
-is believed.
+The test suite is 1,532 assertions and needs no network. Two of the twelve
+binaries need a target binary and a host that permits namespaces and seccomp;
+those are skipped rather than failed where it does not, and the skip says so in
+a note. A claim in this file that can be checked should be checked that way
+before it is believed.

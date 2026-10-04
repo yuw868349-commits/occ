@@ -352,6 +352,12 @@ Hits are attributed by which probe's ring buffer produced them, not by
 anything in the record: each probe has its own buffer, so a hit cannot be
 misattributed to another probe even if two probes share a module.
 
+A hit is not a stop. The kernel writes a record into a perf ring and the
+target never pauses, so a program can enter a probed function many times
+between two of its own syscalls. The session polls the probe descriptors
+between stops and drains again after each one, which is why a `probe_hit`
+appears in the stream without any `session_end` stop count having moved.
+
 What is **not** on this event yet: the argument registers. A uprobe can read
 up to six argument registers at the entry point, and the argument names are in
 the probe table, but nothing reads them yet -- so this event carries no
@@ -359,10 +365,14 @@ the probe table, but nothing reads them yet -- so this event carries no
 that is absent is a field a consumer can detect; one filled with zeroes would
 look like a call with six zero arguments.
 
-**The emitter for this kind is not wired up.** The kind is defined and the
-decoder exists, but the observation loop does not yet emit it -- so a consumer
-sees `probe_attached` records and no hits. That is the honest state of it, and
-it is written here rather than left for a consumer to discover.
+**A hit count that is short is reported.** The kernel drops records when a
+ring fills faster than the observer drains it, and the count of what it
+dropped is carried on the ring. A run whose rings dropped records adds a
+sentence to `degradations`, which reaches stderr. The stream itself does not
+carry the number: a consumer that counts `probe_hit` records is counting the
+calls the observer saw, and that is the honest number for a stream. What it
+must not do is read a short count as a target that made fewer calls, which is
+why the notice exists.
 
 ## What is not in the stream
 
@@ -393,6 +403,17 @@ and the syscall stream it produces is a mixture of the target's requests and
 the loader's. The `probe_attached` records are how that is detectable rather
 than inferable: a consumer that needs function-level observation should check
 that at least one probe attached before trusting an absence.
+
+That check is necessary and not sufficient, and the second half is worth
+stating. A probe that attached can still produce no hits, and the two reasons
+are indistinguishable in the stream alone: the function was never called, or
+its ring was never drained. The second cannot happen in this implementation --
+the session polls every subscribed probe on every pass and drains again at the
+end -- but a consumer reading a stream has no way to tell a target that made
+no calls from an observer that missed them, and no field on `probe_hit` can
+settle it. The only thing that can is the absence of a lost-hit notice in
+`degradations`, which is on stderr and not in the stream. Where a hit count is
+load-bearing, correlate the two.
 
 **Argument values on a hit.** As noted under `probe_hit`, nothing reads the
 argument registers yet. This tool would rather say so than report six zeroes

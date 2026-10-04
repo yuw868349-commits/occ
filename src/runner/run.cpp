@@ -3,6 +3,7 @@
 #include "occ/engine/engine.h"
 #include "occ/observer/session.h"
 #include "occ/parser/detect.h"
+#include "occ/probe/placer.h"
 #include "occ/syscall/errno.h"
 #include "occ/syscall/syscall.h"
 #include "occ/util/fs.h"
@@ -99,6 +100,21 @@ RunResult refuse(RunResult out, obs::Writer& events,
 }
 
 } // namespace
+
+bool wants_probes(bool probe_flag, RunOptions::ProbeMode mode) noexcept {
+    switch (mode) {
+    case RunOptions::ProbeMode::Disabled:
+        return false;
+    case RunOptions::ProbeMode::Force:
+        return true;
+    case RunOptions::ProbeMode::Automatic:
+        return probe_flag;
+    }
+    // Unreachable, and a false rather than an abort: an enum with a value
+    // from outside the three is a caller that did not use the type, and the
+    // safe answer for "should I touch the kernel's tracing" is no.
+    return false;
+}
 
 engine::LoadedImage inspect(const std::string& path, obs::Writer* events,
                            std::string& read_error) {
@@ -245,6 +261,66 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     }
     out.degradations = plan.degradations;
 
+    // The probes. Placed before the target starts and after the plan that
+    // named them, because a uprobe is attached to a file the tracee has
+    // not mapped yet: the kernel resolves the path and the offset and arms
+    // the trap in the page cache, so the probe is live the moment the
+    // loader maps the library. Placing them afterwards would miss exactly
+    // the calls that happen during startup, which for Wine's ntdll is all
+    // of the interesting ones.
+    //
+    // The decision to try at all is three-valued rather than a bool. A
+    // caller who asked for probes wants the request honoured even on a host
+    // that cannot place them, because the `probe_attached` records with
+    // `ok: false` are how the coarseness of the trace is made visible. A
+    // caller who disabled them has asked for nothing and gets nothing.
+    obs::ProbePlacer placer;
+    const bool probes_wanted = wants_probes(options.probe, options.probe_mode);
+
+    if (probes_wanted && !plan.probes.empty()) {
+        // The availability question is asked before the placements rather
+        // than inferred from them. A host with no tracefs produces the same
+        // outcome for every probe, and a single sentence about the host is
+        // a better report than seventy-three identical ones about symbols.
+        const obs::ProbeAvailability avail = obs::Uprobes::availability();
+        if (!avail.available) {
+            out.probes_unavailable = avail.reason;
+            out.degradations.push_back(
+                "function-level observation is off: " + avail.reason +
+                "; the run continues with syscall-level observation");
+        } else {
+            std::vector<obs::Placement> placements;
+            const std::size_t attached =
+                placer.place(plan.probes, placements, &events);
+
+            out.probes_requested = plan.probes.size();
+            out.probes_attached = attached;
+
+            // Every requested probe gets a probe_attached record, so a
+            // reader can count the holes by kind. The summary here is for
+            // the person reading the terminal, and it names the first
+            // symbol that failed rather than only its number, because a
+            // count says how many and a name says which.
+            if (attached != plan.probes.size()) {
+                std::string first;
+                std::string reason;
+                for (const obs::Placement& p : placements) {
+                    if (p.outcome != obs::PlacementOutcome::Attached &&
+                        first.empty()) {
+                        first = p.symbol;
+                        reason = p.detail;
+                    }
+                }
+                out.degradations.push_back(
+                    std::to_string(attached) + " of " +
+                    std::to_string(plan.probes.size()) +
+                    " probes were attached; the first that was not is " +
+                    first + ": " + reason);
+            }
+        }
+    }
+
+
     // The container configuration comes from the options and the engine.
     // The options contribute what the caller asked for; the engine
     // contributes what the format needs to run at all.
@@ -350,6 +426,11 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         sc.wx_regions = options.wx_regions;
         sc.wx_anonymous_only = options.wx_anonymous_only;
         sc.wx_max_region_bytes = options.wx_max_region_bytes;
+        // The layer is handed over whether or not it placed anything. The
+        // session asks it for descriptors and gets none from an empty
+        // layer, which costs one vector allocation and saves the session
+        // from having to know why a layer might be empty.
+        sc.probes = &placer;
 
         const obs::SessionResult sr = obs::observe(sc, events);
         out.stops = sr.stops;
@@ -363,6 +444,25 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         out.wx_bytes_total = sr.wx_bytes_total;
         out.wx_lost_samples = sr.wx_lost_samples;
         out.wx_unavailable = sr.wx_unavailable;
+        out.probe_hits = sr.probe_hits;
+        out.probe_lost = sr.probe_lost;
+
+        // A probe with no subscription has no ring and can never fire, so a
+        // layer that was registered and never subscribed to is a coverage
+        // claim that cannot be honoured. Reported rather than left as an
+        // unexplained absence of hits.
+        if (out.probes_attached != 0 && sr.probes_watched == 0) {
+            out.degradations.push_back(
+                "the probes were registered but none of them was subscribed "
+                "to, so no hit can be reported");
+        }
+        if (sr.probe_lost != 0) {
+            out.degradations.push_back(
+                std::to_string(sr.probe_lost) +
+                " probe hits were lost by the kernel; the hit count is short "
+                "by that much and the calls behind them are not in the "
+                "stream");
+        }
 
         if (sr.failed) {
             out.failed = true;

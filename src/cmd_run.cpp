@@ -36,6 +36,9 @@ void print_run_usage() {
         "  --cgroup <dir>     create the run's cgroup under <dir>\n"
         "  --env <K=V>        set an environment variable for the target\n"
         "  --observe          trace the target with ptrace as it runs\n"
+        "  --probe            place the probes the engine asks for and\n"
+        "                     report a hit per call (implies --observe)\n"
+        "  --no-probe         place none, whatever the engine asked for\n"
         "  --track-wx         watch for write-then-execute transitions\n"
         "  --wx-all           consider file-backed regions too, not just\n"
         "                     anonymous ones\n"
@@ -59,7 +62,18 @@ void print_run_usage() {
         "can be attached at any point during the run. Port 0 asks the kernel\n"
         "for any free port. --gdb-wait holds the target at its first stop\n"
         "until a debugger connects, which is what makes 'break main' work\n"
-        "instead of racing the program's first instructions\n");
+        "instead of racing the program's first instructions\n"
+        "\n"
+        "--probe places uprobes on the functions the engine named -- for a\n"
+        "Windows image, the Nt* entry points of Wine's Unix-side ntdll --\n"
+        "and writes a probe_hit record each time the target enters one.\n"
+        "This is what separates the target's requests from the loader's:\n"
+        "a syscall trace of a Wine run is a trace of both together. The\n"
+        "probe layer needs a mounted tracefs and a permitted\n"
+        "perf_event_open; when it has neither the run continues with\n"
+        "syscall-level observation and says so in probe_attached records.\n"
+        "OCC_PROBE=0 forces the layer off and OCC_PROBE=1 forces it on\n"
+        "even where the engine's own plan would not ask for it\n");
 }
 
 // Parses an unsigned decimal, or a hexadecimal number written with a 0x
@@ -280,6 +294,21 @@ int cmd_run(int argc, char** argv) {
             options.env.emplace_back(v);
         } else if (arg == "--observe") {
             options.observe = true;
+        } else if (arg == "--probe") {
+            // A run that places probes is a run that observes them. There is
+            // no useful middle state: the probes would be registered, no
+            // session would poll their rings, and the tracefs events would
+            // outlive the run that created them.
+            options.probe = true;
+            options.probe_mode = runner::RunOptions::ProbeMode::Force;
+            options.observe = true;
+        } else if (arg == "--no-probe") {
+            // An explicit off is not the same as an absence, which is why
+            // this sets the mode rather than only clearing the flag: a
+            // caller who has asked for no probes is not asking to be told
+            // that a probe layer was unavailable.
+            options.probe = false;
+            options.probe_mode = runner::RunOptions::ProbeMode::Disabled;
         } else if (arg == "--track-wx") {
             // Tracking implies tracing: the tracker drains watch events
             // between stops, and with no stops there is nowhere to drain
@@ -370,6 +399,28 @@ int cmd_run(int argc, char** argv) {
         emit_events = want != nullptr && want[0] == '1';
     }
 
+    // The environment's answer on probes is consulted after the flags and
+    // overrides them, which is the direction that makes it useful. The
+    // decision that this variable exists to make is about the host -- a
+    // container without tracefs, a machine where perf_event_open is denied
+    // -- and a caller who exported it has said something about every run
+    // they are about to make. An explicit --no-probe is the one exception,
+    // because a caller who typed it on this command line meant this command
+    // line.
+    if (options.probe_mode != runner::RunOptions::ProbeMode::Disabled) {
+        const char* probe_env = ::getenv("OCC_PROBE");
+        if (probe_env != nullptr && probe_env[0] != '\0') {
+            if (probe_env[0] == '0') {
+                options.probe = false;
+                options.probe_mode = runner::RunOptions::ProbeMode::Disabled;
+            } else if (probe_env[0] == '1') {
+                options.probe = true;
+                options.probe_mode = runner::RunOptions::ProbeMode::Force;
+                options.observe = true;
+            }
+        }
+    }
+
     // Bound before the target starts. The port has to be printed before
     // anyone can connect to it, and a person reading a port number off a
     // terminal is exactly the person who is about to type it into gdb.
@@ -405,6 +456,21 @@ int cmd_run(int argc, char** argv) {
 
     const runner::RunResult result =
         runner::run(target, target_argv, options, events);
+
+    // The degradations go to stderr and never into the stream.
+    //
+    // They are sentences addressed to the person who ran the command, and
+    // the event stream is a machine-readable record of what happened. A
+    // degradation is a fact about what did *not* happen, and a record of a
+    // thing that did not happen is exactly the kind of line a consumer
+    // would be wrong to read as one. The stream carries the same facts in
+    // structured form -- a probe_attached record with ok false, a session
+    // that reports no hits -- so a consumer loses nothing by this being on
+    // stderr, and a person who was told their trace is coarser than they
+    // asked for does not have to grep for it.
+    for (const std::string& d : result.degradations) {
+        std::fprintf(stderr, "occ: %s\n", d.c_str());
+    }
 
     if (result.failed) {
         // A refusal names the reason directly; a failing syscall names the

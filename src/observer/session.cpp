@@ -1216,6 +1216,15 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
     // loop ends when it is empty rather than when one particular pid exits.
     std::vector<int> traced{config.pid};
 
+    // How many of the layer's probes actually have a subscription. A probe
+    // that was registered and never subscribed has no descriptor and can
+    // never fire, so the number that matters to a reader of the hit stream
+    // is this one and not the layer's size.
+    if (config.probes != nullptr) {
+        out.probes_watched =
+            static_cast<std::uint64_t>(config.probes->layer().fds().size());
+    }
+
     // ---------------------------------------------------------- wx setup
     //
     // The regions to watch come either from the caller, which is the case
@@ -1343,6 +1352,48 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             events.commit();
         }
         out.wx_lost_samples = watchpoints.lost_samples();
+    };
+
+    // Drains every probe ring and reports each hit.
+    //
+    // A uprobe hit is not a stop. The kernel writes a record into a perf
+    // ring associated with the probe, and the traced process never pauses:
+    // a target can enter a probed function a thousand times between two of
+    // its own syscalls. This is why a uprobe costs the target far less than
+    // a breakpoint with the same coverage, and it is also why the hits have
+    // to be drained wherever the loop happens to be, rather than in a
+    // handler for a stop that would never come.
+    //
+    // The hits are attributed by which ring produced them and not by
+    // anything in the record. Each probe owns its own buffer, so the name
+    // recovered here is the name of the probe whose descriptor was polled,
+    // which is a stronger statement than a name looked up from an id: the
+    // kernel cannot deliver a probe's record to another probe's ring.
+    std::vector<UprobeHit> probe_hits;
+    auto drain_probes = [&]() {
+        if (config.probes == nullptr) {
+            return;
+        }
+        Uprobes& layer = config.probes->layer();
+        if (layer.size() == 0) {
+            return;
+        }
+        probe_hits.clear();
+        (void)layer.read_hits(probe_hits);
+        for (const UprobeHit& hit : probe_hits) {
+            ++out.probe_hits;
+            auto& e = events.begin(EventKind::ProbeHit);
+            e.add("pid", static_cast<std::uint64_t>(hit.pid));
+            e.add("tid", static_cast<std::uint64_t>(hit.tid));
+            e.add("label", hit.name);
+            e.add_hex("ip", hit.ip);
+            events.commit();
+        }
+        // Reported per drain rather than once at the end: a run whose rings
+        // wrapped is a run whose hit count is short, and a consumer reading
+        // the stream as it arrives has to be able to see that before the
+        // session ends.
+        out.probe_lost = layer.lost_hits();
     };
 
     // The syscall state per process. A syscall stop alternates between
@@ -1538,9 +1589,55 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             continue;
         }
 
+        // A session with probes cannot wait indefinitely for a ptrace stop.
+        //
+        // A uprobe does not stop the target, so its record arrives while
+        // the tracee is running and no wait will ever report it. A loop
+        // that blocked on waitpid would therefore hold every hit in the
+        // ring until the target's next syscall -- and a target that enters
+        // a probed function and then computes for a second would have its
+        // entire function-level trace delivered a second late, in a burst,
+        // or not at all if the ring wrapped first.
+        //
+        // So the probe descriptors are polled with no wait behind them. The
+        // order is deliberate: readiness is established first, and only
+        // then is a hit consumed. Polling, draining, and only afterwards
+        // checking for a stop would reverse the two, and a stop that was
+        // already pending when the drain ran would be attributed to the
+        // wrong point in the target's history.
+        //
+        // The poll timeout is the one thing here that is a choice rather
+        // than a fact. Zero would make the loop spin, and an infinite
+        // timeout would make it miss. Fifty milliseconds is short enough
+        // that a hit is reported while the target is still in the function
+        // that produced it in every case a person is watching, and long
+        // enough that a target making hundreds of calls a second does not
+        // cost the observer a wakeup per call.
+        if (config.probes != nullptr) {
+            const std::vector<int> probe_fds = config.probes->layer().fds();
+            if (!probe_fds.empty()) {
+                std::vector<sys::PollFd> pfds(probe_fds.size());
+                for (std::size_t i = 0; i < probe_fds.size(); ++i) {
+                    pfds[i].fd = probe_fds[i];
+                    pfds[i].events = 0x0001; // POLLIN
+                    pfds[i].revents = 0;
+                }
+                const auto ready = sys::poll(pfds.data(), pfds.size(), 50);
+                if (!ready.failed() && ready.value > 0) {
+                    drain_probes();
+                }
+            }
+        }
+
         Stop stop = tracer.wait(0);
 
         ++out.stops;
+
+        // The probes are drained again after the stop, because a record
+        // that arrived between the poll above and the wait below would
+        // otherwise wait for the next pass -- which on a target that stops
+        // once and exits is never.
+        drain_probes();
 
         if (stop.kind == StopKind::Exited) {
             // The wait reported either an exit or a failure. The signal
@@ -1897,6 +1994,20 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             continue;
         }
     }
+
+    // The last drain of the probe rings. A target that entered a probed
+    // function and then exited immediately would otherwise have that call
+    // recorded in a ring nobody read, which is the one case the probes
+    // exist for -- the same argument as the write tracker's final flush,
+    // and for the same reason: the interesting call is often the last one.
+    //
+    // This drain is unconditional rather than gated on a poll, because the
+    // session is ending and there is nothing left to wait for. The hits are
+    // read whether or not the descriptor was reported ready; a ring that
+    // holds a record is a ring whose record was produced, and a readiness
+    // check here would drop hits that were written between the last poll
+    // and the target's exit.
+    drain_probes();
 
     // The session is over. Any process still in the traced set is one whose
     // exit the loop did not see, which happens when the debugger detached
