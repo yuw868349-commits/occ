@@ -160,6 +160,39 @@ Depends on: `parser::PeImage`, which already parses the headers and
 sections. The loader adds the mapping, the relocation pass, and the TLS
 initialization.
 
+**Landed.** `include/occ/runtime/address_space.h` and `loader.h`, with the
+implementations beside them and `tests/test_runtime_loader.cpp` over a
+fixture that writes a real PE byte by byte. What the loader refuses, and
+why each refusal is load-bearing:
+
+  * an image that is not amd64, by name, because "this is an ARM64 image"
+    and "this file is damaged" call for different actions;
+  * an image that asks for a base it cannot have and has no relocation
+    table to fix itself up with;
+  * a section whose virtual range leaves the user window;
+  * a relocation block whose size is smaller than its own header, whose
+    DIR64 entry points outside the image, or whose type is one this
+    runtime does not apply;
+  * two sections that overlap, or a section that starts inside the
+    headers -- reported as a fact about the file, not as a conflict with
+    the caller's space;
+  * an entry point that is past every section, in a gap between two
+    sections, or in a section that is not executable. A zero entry RVA is
+    not an error: a resource-only DLL declares one.
+
+The last two were found by the loader's own fuzz harness rather than by
+reading, and each one was an image that loaded, reported success, and
+handed the layer above a module that faults on its first instruction.
+That is the class of failure this layer exists to catch and the reason
+the harness runs the same corpus as the parser.
+
+The contract that a load which is not ok leaves the address space
+unchanged is checked by the tests and by the harness, and it is what
+lets a caller retry at another base. It has three parts: the placement
+plan, the relocation walk and the entry-point check all happen before
+the first region is recorded, and the recording itself goes through
+`record_batch`, which is all-or-nothing.
+
 ### M2 — ntdll, memory and handles
 
 `NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtFreeVirtualMemory`,
