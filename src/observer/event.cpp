@@ -44,6 +44,10 @@ const char* event_kind_name(EventKind k) noexcept {
         return "memory_write";
     case EventKind::Exec:
         return "exec";
+    case EventKind::ProbeAttached:
+        return "probe_attached";
+    case EventKind::ProbeHit:
+        return "probe_hit";
     case EventKind::Note:
         return "note";
     }

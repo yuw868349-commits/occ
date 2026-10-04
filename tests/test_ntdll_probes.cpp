@@ -67,14 +67,10 @@ void test_no_symbol_appears_twice() {
     check(true, "no symbol appears twice in the table");
 }
 
-void test_every_entry_names_a_symbol_and_an_api() {
+void test_every_entry_names_a_symbol() {
     for (const NtdllProbe& p : ntdll_probes()) {
         if (p.symbol.empty()) {
             check(false, "every entry names a symbol to probe");
-            return;
-        }
-        if (p.api.empty()) {
-            check(false, "every entry names the API the target called");
             return;
         }
         // A symbol with a space in it is a sentence that was put in the
@@ -88,7 +84,6 @@ void test_every_entry_names_a_symbol_and_an_api() {
         }
     }
     check(true, "every entry names a symbol to probe");
-    check(true, "every entry names the API the target called");
     check(true, "and every symbol is a single token");
 }
 
@@ -183,31 +178,15 @@ void test_lookup_by_symbol_finds_every_entry() {
     check(true, "every symbol resolves through the lookup");
 }
 
-void test_lookup_by_api_finds_every_entry() {
-    for (const NtdllProbe& p : ntdll_probes()) {
-        const NtdllProbe* found = ntdll_probe_for_api(p.api);
-        if (found == nullptr) {
-            std::fprintf(stderr, "api lookup failed for %.*s\n",
-                         static_cast<int>(p.api.size()), p.api.data());
-            check(false, "every api name resolves through the lookup");
-            return;
-        }
-    }
-    check(true, "every api name resolves through the lookup");
-}
-
 void test_lookup_of_an_unknown_name_is_null() {
     check(ntdll_probe_for_symbol("NtThisIsNotARealFunction") == nullptr,
           "an unknown symbol is not found");
-    check(ntdll_probe_for_api("SomethingElseEntirely") == nullptr,
-          "an unknown api name is not found");
     check(ntdll_probe_for_symbol("") == nullptr,
           "an empty symbol is not found");
-    check(ntdll_probe_for_api("") == nullptr, "an empty api name is not found");
 }
 
 void test_arg_returns_the_named_arguments() {
-    const NtdllProbe* p = ntdll_probe_for_api("NtCreateFile");
+    const NtdllProbe* p = ntdll_probe_for_symbol("NtCreateFile");
     if (p == nullptr) {
         check(false, "NtCreateFile is in the table");
         return;
@@ -354,13 +333,12 @@ void test_probeable_symbols_have_file_offsets() {
 int main() {
     test_the_table_is_not_empty();
     test_no_symbol_appears_twice();
-    test_every_entry_names_a_symbol_and_an_api();
+    test_every_entry_names_a_symbol();
     test_symbols_start_with_a_known_prefix();
     test_the_categories_cover_the_table();
     test_the_categories_a_reader_would_look_for_have_entries();
     test_category_names_are_distinct_tokens();
     test_lookup_by_symbol_finds_every_entry();
-    test_lookup_by_api_finds_every_entry();
     test_lookup_of_an_unknown_name_is_null();
     test_arg_returns_the_named_arguments();
     test_sonames_are_named();

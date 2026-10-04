@@ -10,7 +10,7 @@ and which are conditional. Where the two disagree, the emitters are right.
 
 One emitter is not in the sample and is documented here anyway, because
 knowing a kind exists but never arrives is a fact a consumer needs. See
-`file_opened` below.
+`file_opened`, `section`, `import`, `probe_attached` and `probe_hit` below.
 
 ## Shape
 
@@ -23,7 +23,7 @@ Every record carries three fields, present on every event without exception:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `kind` | string | One of the thirteen names below, or `"unknown"` |
+| `kind` | string | One of the seventeen names below, or `"unknown"` |
 | `session` | integer | Session id. Distinguishes concurrent sessions on one socket |
 | `t` | integer | `CLOCK_MONOTONIC` in nanoseconds |
 
@@ -42,8 +42,25 @@ Booleans are `true`/`false`, unquoted.
 ## The kinds
 
 `session_start`, `session_end`, `process_spawn`, `process_exit`,
-`image_loaded`, `mapping`, `file_opened`, `syscall_blocked`,
-`breakpoint_hit`, `signal`, `memory_write`, `exec`, `note`.
+`image_loaded`, `mapping`, `section`, `import`, `file_opened`,
+`syscall_blocked`, `breakpoint_hit`, `signal`, `memory_write`, `exec`,
+`probe_attached`, `probe_hit`, `note`.
+
+`section` and `import` are PE-only. A `section` is one section of a PE image,
+reported with its own numbers rather than as a mapping: a section is a range of
+the file and a range of the address space, and the loader is what turns one
+into the other, so reporting it as a mapping would claim a correspondence the
+file does not make. An `import` is one DLL the image imports, in the order the
+import directory lists them.
+
+`probe_attached` and `probe_hit` are the function-level observation pair. A
+probe is a uprobe placed on an entry point inside a library the target loads --
+for a PE run, an `Nt*` function of Wine's Unix-side `ntdll`. `probe_attached`
+is a fact about the run's setup and is emitted once per probe;
+`probe_hit` is a fact about the target and is emitted as often as the target
+enters the function. Attaching is reported even when it fails, because a run
+that placed nine of ten probes and did not say which one it missed has a
+silent hole in its output.
 
 `note` carries diagnostics from occ itself — a target that could not be
 exec'd, a capability that could not be acquired. Its `text` field is a
@@ -208,6 +225,22 @@ and `zero_fill` is how much of it is zero rather than file-backed. `index` is
 the program header order, which is the order a loader sees. One event per
 `PT_LOAD`, so `index` is sparse: a typical small binary reports 0, 3, 6.
 
+`section` — `index`, `name`, `virtual_address`, `virtual_size`, `raw_offset`,
+`raw_size`, `readable`, `writable`, `executable`, `characteristics`,
+`zero_fill`, `tail_not_mapped`. PE only. A section is not a mapping: it is a
+range of the file and a range of the address space, and the loader is what
+turns one into the other, so the two sizes are reported as the file wrote them
+rather than as a mapping. `virtual_size` exceeding `raw_size` gives `zero_fill`;
+the reverse gives `tail_not_mapped`, whose virtual range is not backed by the
+file at all. Both are stated as values because a consumer that subtracts one
+from the other gets the right answer in the first case and a meaningless number
+in the second.
+
+`import` — `dll`. PE only, one event per imported DLL in the order the import
+directory lists them. The list is variable-length, so it is one event per name
+rather than a field: a field whose length depends on the target is a field a
+consumer has to guess the end of.
+
 `file_opened` — `pid`, `path`, `ret`, `flags`, `flags_known`. Emitted when a
 path syscall returns, not when it is called, because only the return says
 whether the file was opened at all: a path that was tried and failed is
@@ -281,6 +314,56 @@ if it is an ELF is reported separately by `image_loaded`. An exec that failed
 does not produce this event; it appears as a `syscall exit` whose `ret` is
 negative.
 
+`probe_attached` — `label`, `symbol`, `module`, `outcome`, `ok`, then `offset`
+and `kind` when `ok`, and `detail` when not, and `note` when the request
+carried one. Emitted once per probe the engine asked for, including the ones
+that could not be placed.
+
+`outcome` is one of six names, and each is a different thing to do about it:
+
+| `outcome` | What happened |
+|---|---|
+| `attached` | The probe is registered and subscribed |
+| `module_missing` | The library the symbol lives in is not on the loader's path |
+| `module_unreadable` | The library was found and is not an ELF this build reads |
+| `symbol_missing` | The symbol is not in the module, or is there and is not a defined function at a non-zero address |
+| `no_file_offset` | The symbol's address is in a part of a segment the file does not back |
+| `kernel_refused` | The address resolved and the kernel refused the registration or the subscription; `detail` says which |
+
+`symbol_missing` covers two cases deliberately, and `detail` distinguishes
+them: a name that is absent and a name that is present but is an import or a
+data object call for different actions, and only the sentence can say which.
+`offset` is a hex string and is the **file offset**, not the symbol's virtual
+address -- the two differ whenever the segment's file offset differs from its
+virtual address, which is the normal case for a multi-segment library.
+
+`ok: false` is not a failed run. A host without tracefs places no probes at
+all and the run continues at syscall-level observation; the events are how a
+consumer learns that its own trace is coarser than it wanted, rather than
+concluding from empty output that the target never made those calls.
+
+`probe_hit` — `pid`, `tid`, `label`, `ip`. Emitted when the target enters a
+probed function. `label` is the name the request gave the probe, which is what
+ties a hit back to the `probe_attached` record that placed it; `ip` is the
+address inside the function, which is the probed address because an entry
+probe fires at its first byte.
+
+Hits are attributed by which probe's ring buffer produced them, not by
+anything in the record: each probe has its own buffer, so a hit cannot be
+misattributed to another probe even if two probes share a module.
+
+What is **not** on this event yet: the argument registers. A uprobe can read
+up to six argument registers at the entry point, and the argument names are in
+the probe table, but nothing reads them yet -- so this event carries no
+`args` and a consumer that needs the arguments does not have them. A field
+that is absent is a field a consumer can detect; one filled with zeroes would
+look like a call with six zero arguments.
+
+**The emitter for this kind is not wired up.** The kind is defined and the
+decoder exists, but the observation loop does not yet emit it -- so a consumer
+sees `probe_attached` records and no hits. That is the honest state of it, and
+it is written here rather than left for a consumer to discover.
+
 ## What is not in the stream
 
 **The target's output.** stdout and stderr belong to the target. Interleaving
@@ -300,6 +383,20 @@ deliberate one.
 **Anything from a run that failed before the session opened.** If occ cannot
 isolate, it reports on stderr and emits no events. A stream that existed would
 imply an observation happened.
+
+**Function-level detail on a host that cannot place probes.** A uprobe needs a
+mounted tracefs and a `perf_event_open` the security policy allows, and a
+container frequently has neither. When that is the case the stream carries
+`probe_attached` records with `ok: false` and a reason, and no `probe_hit`
+records at all. The target's work inside a library function is then invisible,
+and the syscall stream it produces is a mixture of the target's requests and
+the loader's. The `probe_attached` records are how that is detectable rather
+than inferable: a consumer that needs function-level observation should check
+that at least one probe attached before trusting an absence.
+
+**Argument values on a hit.** As noted under `probe_hit`, nothing reads the
+argument registers yet. This tool would rather say so than report six zeroes
+that read as arguments.
 
 ## Reading the stream
 

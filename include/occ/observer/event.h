@@ -48,6 +48,19 @@ enum class EventKind : std::uint8_t {
     Signal,
     MemoryWrite,
     Exec,
+    // A uprobe was placed, or an attempt to place one failed. Emitted once
+    // per probe rather than once per run, because a run that placed nine of
+    // ten probes and did not say which one it missed is a run whose output
+    // has a silent hole in it.
+    //
+    // This is separate from a hit: attaching is a fact about the run's
+    // setup and happens once, and a hit is a fact about the target and
+    // happens as often as the target calls the function.
+    ProbeAttached,
+    // A probed function was entered or returned from. Carries the probe's
+    // name, the pid and tid that hit it, and whatever argument registers
+    // were read.
+    ProbeHit,
     Note,
 };
 

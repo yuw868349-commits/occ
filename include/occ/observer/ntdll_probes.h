@@ -75,13 +75,6 @@ struct NtdllProbe {
     // a missing event rather than an error.
     std::string_view symbol;
 
-    // The Windows-facing name, which is what the target thinks it called.
-    // Kept separate from the symbol because they are not always equal -- the
-    // Unix side spells a few of them without the Nt prefix -- and because a
-    // reader looking for "NtCreateFile" should find it even when the symbol
-    // is something else.
-    std::string_view api;
-
     ProbeCategory category = ProbeCategory::Other;
 
     // Argument names, in the order the calling convention passes them. Empty
@@ -122,11 +115,6 @@ struct NtdllProbe {
 // API name, because the symbol is what a probe is placed on.
 [[nodiscard]] const NtdllProbe* ntdll_probe_for_symbol(
     std::string_view symbol) noexcept;
-
-// The entry for an API name, or nullptr. Separate from the symbol lookup
-// because a caller reading a report has the Windows name and a caller
-// placing a probe has the symbol.
-[[nodiscard]] const NtdllProbe* ntdll_probe_for_api(std::string_view api) noexcept;
 
 // How many probes are in the table. Reported by `occ doctor` and by the
 // engine's degradation notes, so that "no probes were placed" can be

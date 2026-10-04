@@ -233,6 +233,14 @@ public:
     }
     [[nodiscard]] std::size_t size() const noexcept { return probes_.size(); }
 
+    // The tracefs root this layer resolved, empty until the first
+    // registration resolved one. Reported because a caller that placed ten
+    // probes wants to say which tracefs they went into, and because a layer
+    // that placed none can be asked where it would have.
+    [[nodiscard]] const std::string& tracefs_root() const noexcept {
+        return root_;
+    }
+
     // How many hits the kernel reported as lost. A lost hit is a call the
     // observer never saw, and in a call-counting tool that is a wrong
     // number rather than a missing one. Kept for the same reason the watch

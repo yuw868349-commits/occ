@@ -17,15 +17,20 @@
 #include "occ/engine/engine.h"
 
 #include "occ/observer/event.h"
+#include "occ/observer/ntdll_probes.h"
 #include "occ/parser/detect.h"
+#include "occ/parser/elf.h"
 #include "occ/util/fs.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <sys/stat.h>
 
 #include <unistd.h>
 
@@ -907,6 +912,381 @@ void test_pe_plan_needs_a_scratch_directory() {
     check(plan.program.empty(), "a refused plan has no program");
 }
 
+// A copy of the ntdll with one symbol's section index cleared.
+//
+// The engine drops a symbol that is not probeable, and on a real ntdll every
+// symbol in the table is a defined function -- so that branch is unreachable
+// from a real file and would be untested. This makes it reachable the way it
+// happens in the world: a Wine whose version has the name but not a body for
+// it, which is what an import with a definition elsewhere looks like.
+//
+// The patch is one field of one symbol entry: st_shndx, which is what says
+// which section holds the symbol's body, cleared to zero. Zero is SHN_UNDEF,
+// which is exactly how the linker marks a name that is referred to and not
+// defined here.
+bool write_ntdll_with_undefined_symbol(const std::string& src,
+                                       const std::string& dst,
+                                       const std::string& symbol) {
+    auto bytes = fs::read_file_bytes(src);
+    if (!bytes || bytes->empty()) {
+        return false;
+    }
+    std::vector<std::uint8_t> data = *bytes;
+
+    const parser::ElfImage image =
+        parser::ElfImage::parse(ByteSpan{data.data(), data.size()});
+    if (!image.ok() || !image.has_symbols()) {
+        return false;
+    }
+
+    // The name offset is looked for in the dynamic string table, which is
+    // the one the dynamic symbol entries index into -- and not any other
+    // string table in the file. A file has a .strtab as well, its offsets
+    // are into a different table, and searching the wrong one produces a
+    // number that matches no symbol in this table at all.
+    //
+    // The table is reached through the dynsym section's link rather than by
+    // picking the first STRTAB in the file, because which STRTAB is the
+    // right one is exactly the fact that has to be got right.
+    const parser::SectionHeader* dynsym = nullptr;
+    for (const parser::SectionHeader& s : image.sections()) {
+        if (s.type == static_cast<std::uint32_t>(parser::SectionType::Dynsym)) {
+            dynsym = &s;
+            break;
+        }
+    }
+    if (dynsym == nullptr || dynsym->link >= image.sections().size()) {
+        return false;
+    }
+    const parser::SectionHeader& strtab = image.sections()[dynsym->link];
+    if (strtab.type != static_cast<std::uint32_t>(parser::SectionType::Strtab)) {
+        return false;
+    }
+
+    std::size_t name_off = std::string::npos;
+    for (std::uint64_t i = 0; i + symbol.size() < strtab.size; ++i) {
+        const std::uint64_t at = strtab.offset + i;
+        if (at + symbol.size() + 1 > data.size()) {
+            break;
+        }
+        if (std::memcmp(data.data() + at, symbol.data(), symbol.size()) == 0 &&
+            data[at + symbol.size()] == 0) {
+            name_off = static_cast<std::size_t>(i);
+            break;
+        }
+    }
+    if (name_off == std::string::npos) {
+        return false;
+    }
+
+    const std::uint64_t stride = dynsym->entsize == 0 ? 24 : dynsym->entsize;
+    for (std::uint64_t off = 0; off + stride <= dynsym->size; off += stride) {
+        const std::uint64_t at = dynsym->offset + off;
+        if (at + stride > data.size()) {
+            break;
+        }
+        const std::uint32_t st_name =
+            static_cast<std::uint32_t>(data[at]) |
+            (static_cast<std::uint32_t>(data[at + 1]) << 8) |
+            (static_cast<std::uint32_t>(data[at + 2]) << 16) |
+            (static_cast<std::uint32_t>(data[at + 3]) << 24);
+        if (st_name != name_off) {
+            continue;
+        }
+        // st_shndx is a 16-bit field at offset 6 of the entry.
+        data[at + 6] = 0;
+        data[at + 7] = 0;
+        const std::string out(reinterpret_cast<const char*>(data.data()),
+                              data.size());
+        return fs::write_file(dst, out);
+    }
+    return false;
+}
+
+// A Wine installation assembled from what the host actually has.
+//
+// A host can have Wine's libraries and not Wine's loader -- a distribution's
+// runtime-only package is exactly that -- and on such a host the PE engine
+// refuses for a reason that is correct and that hides everything after it.
+// The probe path is what this exercise is about, so the loader is supplied
+// here: a directory with an executable named wine64, and a lib directory
+// beside it holding a link to the real ntdll when one is installed.
+//
+// This is not a mock of Wine. Nothing here fakes Wine's behaviour: the
+// engine only looks for a file and checks the executable bit, and the ntdll
+// that gets symbol-resolved is the host's real one.
+struct SyntheticWine {
+    std::string root;
+    std::string bin_dir;
+    std::string lib_dir;
+    bool ok = false;
+
+    SyntheticWine() = default;
+    SyntheticWine(const SyntheticWine&) = delete;
+    SyntheticWine& operator=(const SyntheticWine&) = delete;
+    SyntheticWine(SyntheticWine&& o) noexcept { *this = std::move(o); }
+    SyntheticWine& operator=(SyntheticWine&& o) noexcept {
+        if (this != &o) {
+            if (!root.empty()) {
+                (void)fs::remove_tree(root);
+            }
+            root = std::move(o.root);
+            bin_dir = std::move(o.bin_dir);
+            lib_dir = std::move(o.lib_dir);
+            ok = o.ok;
+            o.ok = false;
+        }
+        return *this;
+    }
+    ~SyntheticWine() {
+        if (!root.empty()) {
+            (void)fs::remove_tree(root);
+        }
+    }
+};
+
+// The real ntdll, if this host has one.
+std::string real_ntdll() {
+    for (const char* dir : {"/usr/lib/x86_64-linux-gnu/wine/x86_64-unix",
+                            "/usr/lib64/wine/x86_64-unix",
+                            "/usr/lib/wine/x86_64-unix"}) {
+        for (const char* name : {"ntdll.so", "ntdll.dll.so"}) {
+            const std::string p = std::string(dir) + "/" + name;
+            if (fs::exists(p)) {
+                return p;
+            }
+        }
+    }
+    return {};
+}
+
+SyntheticWine make_synthetic_wine(const char* undefined_symbol = nullptr) {
+    SyntheticWine out;
+    char tmpl[] = "/tmp/occ_engine_wine_XXXXXX";
+    if (::mkdtemp(tmpl) == nullptr) {
+        return out;
+    }
+    out.root = tmpl;
+    out.bin_dir = out.root + "/bin";
+    out.lib_dir = out.root + "/lib/wine";
+    if (!fs::mkdir_p(out.bin_dir, 0700) || !fs::mkdir_p(out.lib_dir, 0700)) {
+        return out;
+    }
+
+    // A program named wine64 that is executable. The engine checks the
+    // executable bit and nothing else, so a shell script is as good as a
+    // binary here -- and a shell script is what a distribution's shim is.
+    const std::string loader = out.bin_dir + "/wine64";
+    if (!fs::write_file(loader, "#!/bin/sh\nexit 0\n")) {
+        return out;
+    }
+    if (::chmod(loader.c_str(), 0755) != 0) {
+        return out;
+    }
+
+    // The library directory has to be found under the loader's tree, which
+    // is <root>/lib/wine when the loader is <root>/bin/wine64.
+    const std::string unix_dir = out.lib_dir + "/x86_64-unix";
+    if (!fs::mkdir_p(unix_dir, 0700)) {
+        return out;
+    }
+    const std::string ntdll = real_ntdll();
+    if (!ntdll.empty()) {
+        // A copy rather than a link, because the engine reads the file and
+        // a dangling link would make this host look like one with no ntdll.
+        const std::string dst = unix_dir + "/ntdll.so";
+        if (undefined_symbol != nullptr) {
+            if (!write_ntdll_with_undefined_symbol(ntdll, dst,
+                                                   undefined_symbol)) {
+                return out;
+            }
+        } else {
+            auto bytes = fs::read_file_bytes(ntdll);
+            if (!bytes || bytes->empty()) {
+                return out;
+            }
+            const std::string content(
+                reinterpret_cast<const char*>(bytes->data()), bytes->size());
+            if (!fs::write_file(dst, content)) {
+                return out;
+            }
+        }
+    }
+
+    out.ok = true;
+    return out;
+}
+
+// The probe plan, against a Wine assembled from this host's own libraries.
+//
+// The loader is named through OCC_WINE_LOADER rather than through PATH,
+// because the engine caches its search in a function-local static: a test
+// that changed PATH after another PE plan had run would be reading a cached
+// answer and testing nothing. Naming the loader explicitly is also what the
+// variable exists for -- a caller that wants a particular installation of
+// several says which.
+void test_pe_plan_requests_the_ntdll_probes() {
+    const SyntheticWine wine = make_synthetic_wine();
+    if (!wine.ok) {
+        return;
+    }
+    if (real_ntdll().empty()) {
+        std::fprintf(stderr, "note: no Wine ntdll on this host; the probe "
+                             "planning check was skipped\n");
+        return;
+    }
+
+    TempFile f;
+    check(f.write(make_pe(0x8664)), "the PE fixture was written");
+    if (!f.wrote) {
+        return;
+    }
+
+    const LoadedImage image = engine::pe_engine().load(f.path, nullptr);
+    if (!image.ok) {
+        check(false, "the PE fixture loads");
+        return;
+    }
+
+    const std::string loader = wine.bin_dir + "/wine64";
+    if (::setenv("OCC_WINE_LOADER", loader.c_str(), 1) != 0) {
+        return;
+    }
+    // The loader the plan reports has to be the one that was named, not
+    // whichever one a PATH search would have found.
+    const struct EnvGuard {
+        ~EnvGuard() { (void)::unsetenv("OCC_WINE_LOADER"); }
+    } guard;
+
+    EngineRequest request;
+    request.path = f.path;
+    request.argv = {f.path};
+    request.scratch_dir = wine.root + "/scratch";
+    (void)fs::mkdir_p(request.scratch_dir, 0700);
+
+    const LaunchPlan plan = engine::pe_engine().plan(request, image);
+
+    // The loader is found now, so the plan is real and the probes are the
+    // thing under test.
+    if (!plan.refusal.empty()) {
+        std::fprintf(stderr, "note: the synthetic Wine was refused: %s\n",
+                     plan.refusal.c_str());
+        return;
+    }
+
+    check(!plan.probes.empty(),
+          "a PE plan against a Wine with a real ntdll asks for probes");
+    if (plan.probes.empty()) {
+        for (const std::string& d : plan.degradations) {
+            std::fprintf(stderr, "  degradation: %s\n", d.c_str());
+        }
+        return;
+    }
+
+    for (const engine::ProbeRequest& p : plan.probes) {
+        check(!p.module.empty(), "every probe names a module");
+        check(!p.symbol.empty(), "every probe names a symbol");
+        check(!p.label.empty(), "every probe has a label to report under");
+        check(p.symbol.starts_with("Nt") || p.symbol.starts_with("Zw") ||
+                  p.symbol.starts_with("Rtl") || p.symbol.starts_with("Ldr"),
+              "every probe is on an ntdll entry point");
+    }
+
+    // The module is Wine's Unix-side ntdll, which is the ELF with the
+    // bodies -- not the PE ntdll.dll, where the same names are thunks.
+    check(plan.probes[0].module.find("ntdll") != std::string::npos,
+          "the probes are in a file named ntdll");
+    check(plan.probes[0].module.find(".so") != std::string::npos,
+          "and it is the shared object rather than the PE image");
+    check(plan.probes[0].module.find("x86_64-unix") != std::string::npos ||
+              plan.probes[0].module.find("i386-unix") != std::string::npos,
+          "and it is the Unix-side build");
+
+    // Every probe in the table that this ntdll exports should have been
+    // requested. The count is the table's, or less when this Wine lacks
+    // some of the symbols -- and less is only allowed with a degradation
+    // saying so.
+    check(plan.probes.size() <= obs::ntdll_probe_count(),
+          "no more probes were requested than the table holds");
+    check(plan.probes.size() > 0, "and at least one was");
+}
+
+// A Wine whose ntdll has a name that is not a body.
+//
+// The engine has to drop it and say so. A name that is exported and undefined
+// is what a version difference looks like: the symbol table has it, the
+// address is zero or belongs to another module, and placing a probe on it
+// produces a kernel refusal that names an offset rather than the mismatch that
+// caused it.
+//
+// This runs against a second Wine because the loader is named per call rather
+// than cached, which is what makes two installations reachable in one process.
+void test_pe_plan_drops_a_symbol_with_no_body() {
+    const char* const target = "NtClose";
+    SyntheticWine wine = make_synthetic_wine(target);
+    if (!wine.ok) {
+        std::fprintf(stderr, "note: the patched ntdll could not be built\n");
+        return;
+    }
+    if (real_ntdll().empty()) {
+        return;
+    }
+
+    TempFile f;
+    if (!f.write(make_pe(0x8664)) || !f.wrote) {
+        return;
+    }
+    const LoadedImage image = engine::pe_engine().load(f.path, nullptr);
+    if (!image.ok) {
+        return;
+    }
+
+    const std::string loader = wine.bin_dir + "/wine64";
+    if (::setenv("OCC_WINE_LOADER", loader.c_str(), 1) != 0) {
+        return;
+    }
+    const struct EnvGuard {
+        ~EnvGuard() { (void)::unsetenv("OCC_WINE_LOADER"); }
+    } guard;
+
+    EngineRequest request;
+    request.path = f.path;
+    request.argv = {f.path};
+    request.scratch_dir = wine.root + "/scratch";
+    (void)fs::mkdir_p(request.scratch_dir, 0700);
+
+    const LaunchPlan plan = engine::pe_engine().plan(request, image);
+    if (!plan.refusal.empty()) {
+        return;
+    }
+
+    // The patched symbol is not in the requests, and everything else is.
+    bool patched_requested = false;
+    for (const engine::ProbeRequest& p : plan.probes) {
+        if (p.symbol == target) {
+            patched_requested = true;
+        }
+    }
+    check(!patched_requested,
+          "a symbol whose section index is cleared is not requested");
+
+    // The count is one short of the table, which is what makes the drop
+    // visible rather than inferred from a shorter list.
+    check(plan.probes.size() == obs::ntdll_probe_count() - 1,
+          "exactly one probe is missing from the request list");
+
+    // And it is said out loud. A run that placed some of its probes and did
+    // not name the one it missed has a hole nobody can see.
+    bool said_so = false;
+    for (const std::string& d : plan.degradations) {
+        if (d.find(target) != std::string::npos) {
+            said_so = true;
+        }
+    }
+    check(said_so,
+          "and the degradation names the symbol this Wine does not define");
+}
+
 void test_pe_plan_does_not_repeat_the_target() {
     // The caller's argv[0] is the target. The loader is given the target
     // once. Handing it twice produces a loader that treats the second copy
@@ -947,6 +1327,14 @@ void test_pe_plan_does_not_repeat_the_target() {
 } // namespace
 
 int main() {
+    // First, and deliberately so. The engine caches its Wine search in a
+    // function-local static, and this test is the one that names a loader
+    // explicitly -- so it has to run before any other PE plan has populated
+    // that cache. A test that ran later would read the cached answer and
+    // assert nothing.
+    test_pe_plan_requests_the_ntdll_probes();
+    test_pe_plan_drops_a_symbol_with_no_body();
+
     test_every_format_has_a_decision();
     test_dispatch_is_by_format_not_by_name();
     test_engines_are_the_declared_ones();

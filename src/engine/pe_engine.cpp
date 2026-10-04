@@ -1,5 +1,7 @@
 #include "occ/engine/engine.h"
 
+#include "occ/observer/ntdll_probes.h"
+#include "occ/parser/elf.h"
 #include "occ/parser/pe.h"
 #include "occ/util/fs.h"
 
@@ -107,6 +109,35 @@ void consider(WineSearch* out, const std::string& dir, const char* name,
 // once. The function-local static is constructed on first use rather than
 // at load time so that a program that never runs a PE never walks PATH.
 WineSearch find_wine() noexcept {
+    // An explicit loader, if the caller named one.
+    //
+    // This branch is read on every call rather than cached with the search,
+    // and the difference is deliberate. The search's answer is a property of
+    // the host and cannot change within a process; the named loader is a
+    // property of the request, and a process that plans two runs against two
+    // installations has two answers. Caching it would make the second plan
+    // silently use the first one's Wine.
+    //
+    // The name is the loader itself and is used as given, including the
+    // executable bit being checked: a path that is named and not executable
+    // is a configuration mistake, and falling back to a search would run a
+    // different Wine than the one that was asked for.
+    if (const char* explicit_loader = ::getenv("OCC_WINE_LOADER")) {
+        if (explicit_loader[0] != '\0') {
+            WineSearch named_out;
+            const std::string named(explicit_loader);
+            if (fs::exists(named) && ::access(named.c_str(), X_OK) == 0) {
+                // Both slots hold it. The plan picks by the image's width
+                // rather than by which slot is filled, so a named loader has
+                // to be reachable from both or a 32-bit image would be told
+                // there is no 32-bit Wine when the caller said there is.
+                named_out.wine64 = named;
+                named_out.wine = named;
+            }
+            return named_out;
+        }
+    }
+
     static const WineSearch found = [] {
         WineSearch out;
         const char* path = ::getenv("PATH");
@@ -189,6 +220,140 @@ WineLayout wine_layout(const std::string& loader) noexcept {
         out.lib_dir = "/usr/lib/wine";
     }
 
+    return out;
+}
+
+// Wine's Unix-side ntdll, which is the file the probes go into.
+//
+// It is the host-native ELF, not the PE ntdll.dll. A Windows program's
+// NtCreateFile is a thunk into __wine_syscall_dispatcher, which indexes a
+// table of Unix functions; the one with a body to place a probe on is the
+// Unix function, and it lives in the .so.
+//
+// The search order is the layout Wine installs under on the distributions
+// that ship it, most specific first. The host's uname machine is not
+// consulted: the directory name is the target ISA Wine was built for, which
+// is the image's ISA and not necessarily the running kernel's -- a 32-bit
+// Wine on a 64-bit kernel lives under i386-unix and still runs.
+struct NtdllLocation {
+    // The file, empty when it could not be found.
+    std::string path;
+    // Why it could not be found, for the degradation note.
+    std::string reason;
+};
+
+NtdllLocation find_ntdll(const std::string& lib_dir,
+                         std::uint32_t address_bits) noexcept {
+    NtdllLocation out;
+
+    // The loader's own directory tree first, because that is the one
+    // installation the plan is already committed to. A Wine in /opt has its
+    // ntdll beside it, and a search that preferred /usr would place probes
+    // in a different Wine than the one being run.
+    //
+    // lib_dir is already the Wine library directory -- wine_layout returns
+    // .../lib/wine, not .../lib -- so the ISA directory goes directly under
+    // it. A second "wine" component here would be a path that does not exist
+    // on any installation, and the search would then fall through to the
+    // packaged locations and probe a different Wine than the one planned.
+    std::vector<std::string> dirs;
+    if (!lib_dir.empty()) {
+        const std::string isa = address_bits == 32 ? "i386" : "x86_64";
+        dirs.push_back(lib_dir + "/" + isa + "-unix");
+        dirs.push_back(lib_dir + "/" + isa + "-windows");
+    }
+    // The packaged locations, which are where a distribution puts it when
+    // the loader is a shim in /usr/bin that exec's these.
+    const std::string isa = address_bits == 32 ? "i386" : "x86_64";
+    for (const char* root : {"/usr/lib/x86_64-linux-gnu/wine",
+                             "/usr/lib64/wine",
+                             "/usr/lib/wine",
+                             "/usr/lib/i386-linux-gnu/wine"}) {
+        dirs.push_back(std::string(root) + "/" + isa + "-unix");
+    }
+
+    for (const std::string& dir : dirs) {
+        for (std::string_view name : obs::ntdll_sonames()) {
+            const std::string candidate = dir + "/" + std::string(name);
+            if (fs::exists(candidate)) {
+                out.path = candidate;
+                return out;
+            }
+        }
+    }
+
+    out.reason =
+        "Wine's Unix-side ntdll was not found, so no function-level probes "
+        "could be placed; the run continues with syscall-level observation, "
+        "which sees Wine's own library traffic mixed with the target's";
+    return out;
+}
+
+// Reads the probes out of the table and drops the ones whose symbols the
+// ntdll on this host does not have.
+//
+// The table was checked against a real Wine when it was written, but a host
+// may have a different Wine: a version that renamed a function, or a build
+// configured without one. Placing a probe needs an address, and a symbol
+// that is not in this file has none -- so the ones that are missing are
+// counted and reported rather than attempted. Attempting them would make
+// the kernel refuse a line the engine wrote, and the failure would be
+// attributed to the run rather than to the version mismatch that caused it.
+struct ProbePlan {
+    std::vector<ProbeRequest> requests;
+    std::size_t dropped = 0;
+    std::size_t total = 0;
+    std::string first_dropped;
+};
+
+ProbePlan build_probes(const std::string& ntdll_path) noexcept {
+    ProbePlan out;
+    out.total = obs::ntdll_probe_count();
+
+    auto bytes = fs::read_file_bytes(ntdll_path);
+    if (!bytes || bytes->empty()) {
+        // The file exists and cannot be read. That is a different problem
+        // from the symbol being absent and it costs every probe rather than
+        // some, so everything is counted as dropped and the reason is not
+        // about any one symbol.
+        out.dropped = out.total;
+        out.first_dropped = "the module could not be read";
+        return out;
+    }
+
+    const parser::ElfImage image =
+        parser::ElfImage::parse(ByteSpan{bytes->data(), bytes->size()});
+    if (!image.ok()) {
+        out.dropped = out.total;
+        out.first_dropped = "the module is not an ELF this build can read";
+        return out;
+    }
+    if (!image.has_symbols()) {
+        // A stripped ntdll keeps its dynamic symbols or it could not be
+        // loaded by the linker, so this means the symbol table is damaged
+        // rather than absent. Either way there are no addresses.
+        out.dropped = out.total;
+        out.first_dropped =
+            "the module has no readable dynamic symbol table";
+        return out;
+    }
+
+    for (const obs::NtdllProbe& p : obs::ntdll_probes()) {
+        const parser::Symbol* s = image.find_symbol(p.symbol);
+        if (s == nullptr || !s->probeable()) {
+            ++out.dropped;
+            if (out.first_dropped.empty()) {
+                out.first_dropped = std::string(p.symbol);
+            }
+            continue;
+        }
+        ProbeRequest req;
+        req.module = ntdll_path;
+        req.symbol = std::string(p.symbol);
+        req.label = std::string(p.symbol);
+        req.note = std::string(p.note);
+        out.requests.push_back(std::move(req));
+    }
     return out;
 }
 
@@ -446,6 +611,47 @@ LaunchPlan PeEngine::plan(const EngineRequest& request,
     // a run that starts several processes and buys a run that leaves
     // nothing running.
     out.env.emplace_back("WINESERVER=");
+
+    // The probes.
+    //
+    // A syscall trace of a Wine run is a trace of the target and the loader
+    // together, and the loader's file traffic is most of it. Placing probes
+    // on the Nt* entry points of Wine's Unix-side ntdll is what separates
+    // them: a hit at NtCreateFile is the Windows program asking for a file,
+    // and it fires whether the request ends in a host open, in a wineserver
+    // round trip, or nowhere at all.
+    //
+    // Failing to find the ntdll or the symbols is a degradation and not a
+    // refusal. The run still happens and is still observed at the syscall
+    // level; it is only coarser, and SECURITY.md says why that trade is made
+    // rather than refusing a target that runs perfectly well without probes.
+    const NtdllLocation ntdll = find_ntdll(layout.lib_dir, image.address_bits);
+    if (ntdll.path.empty()) {
+        out.degradations.push_back(ntdll.reason);
+        return out;
+    }
+
+    const ProbePlan probes = build_probes(ntdll.path);
+    if (probes.requests.empty()) {
+        out.degradations.push_back(
+            "no ntdll probe could be placed on " + ntdll.path +
+            ": " + probes.first_dropped +
+            "; the run continues with syscall-level observation");
+        return out;
+    }
+
+    if (probes.dropped != 0) {
+        // Named rather than counted, because the count says how many and the
+        // name says which, and a run reporting "62 of 73" leaves a reader
+        // wondering whether the missing ones were the ones they cared about.
+        out.degradations.push_back(
+            std::to_string(probes.requests.size()) + " of " +
+            std::to_string(probes.total) + " ntdll probes were placed; the "
+            "first symbol this Wine does not export is " +
+            probes.first_dropped);
+    }
+
+    out.probes = probes.requests;
 
     return out;
 }

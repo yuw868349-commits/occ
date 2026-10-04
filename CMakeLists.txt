@@ -536,6 +536,7 @@ add_library(occ_core STATIC
     src/observer/watchpoint.cpp
     src/observer/uprobe.cpp
     src/observer/ntdll_probes.cpp
+    src/probe/placer.cpp
     src/observer/wx.cpp
     src/observer/rsp.cpp
     src/observer/session.cpp

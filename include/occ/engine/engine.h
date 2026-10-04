@@ -88,6 +88,36 @@ struct LoadedImage {
     std::uint32_t address_bits = 0;
 };
 
+// One function the engine wants probed, named by symbol rather than by
+// address.
+//
+// By symbol and not by address because the engine cannot resolve an address:
+// the library the symbol lives in has not been loaded yet when the plan is
+// made, and its load address is a decision the dynamic linker makes per run.
+// The engine knows which file the symbol should be in and which symbol it is,
+// and the step that turns that into an offset happens after the file is found
+// on disk -- which is the same file the loader will map.
+struct ProbeRequest {
+    // The file the symbol is expected to live in. A bare file name is a
+    // search of the loader's path; a path with a slash in it is used as
+    // given. The distinction is deliberate and is the caller's to make: a
+    // caller that knows the file names it, and a caller that only knows the
+    // library names the library.
+    std::string module;
+
+    // The symbol to look up in that module's dynamic symbol table.
+    std::string symbol;
+
+    // The name the probe is reported under. Distinct from the symbol because
+    // a report is read by a person and because the same symbol may be probed
+    // at two offsets under two labels.
+    std::string label;
+
+    // Why this probe is worth having, for the event that reports it. Empty
+    // is allowed.
+    std::string note;
+};
+
 // What the runner is going to execute.
 //
 // This is the whole of an engine's effect on the process. The runner builds
@@ -112,6 +142,19 @@ struct LaunchPlan {
     // loader's libraries; without them the exec succeeds and the target
     // dies in the dynamic linker, which is a worse report than a refusal.
     std::vector<isolation::ContainerConfig::BindMount> binds;
+
+    // The functions the engine wants observed from inside the target.
+    //
+    // This is a request rather than an action for the reason the whole plan
+    // is: placing a probe means resolving a symbol in a file and writing to
+    // tracefs, and both of those can fail in ways that produce a degradation
+    // rather than a refusal. The runner places them after the target is
+    // running, so that a host without tracefs loses the probes and keeps the
+    // syscall-level observation, which is the trade SECURITY.md describes.
+    //
+    // Empty for an engine whose format needs none, which is every format
+    // that runs as itself.
+    std::vector<ProbeRequest> probes;
 
     // The root this run needs, empty when the caller's is right. A PE
     // engine that builds a prefix needs somewhere the prefix can be
