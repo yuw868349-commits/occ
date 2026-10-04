@@ -757,6 +757,175 @@ void test_apk_load_reads_the_package_and_reports_no_regions() {
           "the event names the format");
 }
 
+// A package with a central directory, so the member list is readable and the
+// engine has something to report.
+//
+// The fixture above has a local header and nothing else, which is enough to
+// be detected as a package and not enough to name a member list. This one is
+// a whole archive: a local header, a central directory naming a manifest and
+// two native libraries, and an end-of-central-directory record. It is the
+// shape `occ run` sees on a real APK, and it is the case the engine's
+// reporting exists for.
+std::vector<std::uint8_t> apk_with_members() {
+    std::vector<std::uint8_t> b;
+
+    auto local = [&b](const char* name, std::uint16_t method,
+                      std::uint32_t size) {
+        const std::size_t n = std::strlen(name);
+        const std::size_t at = b.size();
+        b.resize(at + 30 + n + (method == 0 ? size : 0));
+        put32(b, at, 0x04034b50);
+        put16(b, at + 4, 20);
+        put16(b, at + 8, method);
+        put32(b, at + 18, size);
+        put32(b, at + 22, size);
+        put16(b, at + 26, static_cast<std::uint16_t>(n));
+        std::memcpy(b.data() + at + 30, name, n);
+    };
+    auto central = [&b](const char* name, std::uint16_t method,
+                        std::uint32_t comp, std::uint32_t uncomp) {
+        const std::size_t n = std::strlen(name);
+        const std::size_t at = b.size();
+        b.resize(at + 46 + n);
+        put32(b, at, 0x02014b50);
+        put16(b, at + 4, 20);
+        put16(b, at + 6, 20);
+        put16(b, at + 10, method);
+        put32(b, at + 20, comp);
+        put32(b, at + 24, uncomp);
+        put16(b, at + 28, static_cast<std::uint16_t>(n));
+        std::memcpy(b.data() + at + 46, name, n);
+    };
+
+    local("AndroidManifest.xml", 0, 18);
+    central("AndroidManifest.xml", 0, 18, 18);
+    central("lib/arm64-v8a/libfoo.so", 0, 4096, 4096);
+    central("lib/x86_64/libfoo.so", 8, 300, 900);
+    // Two members that are neither, so the bounded report has something to
+    // leave out. A real package is mostly made of these.
+    central("classes.dex", 8, 40000, 120000);
+    central("res/layout/main.xml", 8, 900, 2400);
+
+    // The EOCD, with the directory's real extent. Measured rather than
+    // tracked: the records above are appended to one buffer, so the
+    // directory is everything from the first central header to here.
+    const std::size_t first_central = 30 + 19 + 18;
+    const std::uint32_t cd_size =
+        static_cast<std::uint32_t>(b.size() - first_central);
+    const std::size_t at = b.size();
+    b.resize(at + 22);
+    put32(b, at, 0x06054b50);
+    put16(b, at + 8, 5);
+    put16(b, at + 10, 5);
+    put32(b, at + 12, cd_size);
+    put32(b, at + 16, static_cast<std::uint32_t>(first_central));
+    return b;
+}
+
+void test_apk_load_reports_the_package_members() {
+    // The engine's own comment says the reporting is kept because the
+    // manifest and the library list are facts about the file, and its
+    // refusal tells the caller to extract a library from under lib/. These
+    // assertions are what make that comment true: an engine that reported
+    // nothing would still pass every other test here, because ok, entry and
+    // region_count are all the same as before.
+    TempFile f;
+    const std::vector<std::uint8_t> b = apk_with_members();
+    check(f.write(b), "the package fixture with a directory was written");
+    if (!f.wrote) {
+        return;
+    }
+
+    const parser::Detection d = parser::detect_file(f.path);
+    check(d.format == Format::Apk, "the fixture is detected as an APK");
+    check(d.zip_members.size() == 5,
+          "detection read the five members the directory names");
+
+    Captured cap;
+    const LoadedImage image = engine::apk_engine().load(f.path, &cap.writer);
+    const std::string stream = cap.read();
+
+    check(image.ok, "the package is readable");
+    check(stream.find("\"members\":5") != std::string::npos,
+          "the load event carries the member count");
+    check(stream.find("\"package_member\":\"AndroidManifest.xml\"") !=
+              std::string::npos,
+          "the manifest is reported");
+    check(stream.find("\"package_member\":\"lib/arm64-v8a/libfoo.so\"") !=
+              std::string::npos,
+          "a native library is reported");
+
+    // Both sizes and the stored flag, because the pair is what tells a
+    // caller whether reading a member means inflating anything. The
+    // arm64 library is stored and the x86 one is not, so a reader can see
+    // that the two are reported differently rather than both coming from one
+    // field.
+    check(stream.find("\"uncompressed_size\":4096,\"compressed_size\":4096") !=
+              std::string::npos,
+          "a stored member reports equal sizes");
+    check(stream.find("\"uncompressed_size\":900,\"compressed_size\":300") !=
+              std::string::npos,
+          "a deflated member reports both sizes");
+    check(stream.find("\"stored\":true") != std::string::npos,
+          "the stored flag is reported");
+    check(stream.find("\"method\":8") != std::string::npos,
+          "the compression method is reported");
+
+    // One event per member, not one array. Asserted by counting rather than
+    // by looking, because the shape of the stream is the claim: a consumer
+    // tailing a run can act on a member as it arrives.
+    // Counted on the whole key rather than on the bare word: the omitted
+    // member event carries "package_members_omitted", which contains
+    // "package_member" as a substring and would be counted as a fourth
+    // member. That is the kind of assertion that passes for the wrong
+    // reason, so it is written to count only the key.
+    std::size_t member_events = 0;
+    for (std::size_t at2 = stream.find("\"package_member\":");
+         at2 != std::string::npos;
+         at2 = stream.find("\"package_member\":", at2 + 1)) {
+        ++member_events;
+    }
+    check(member_events == 3,
+          "one event per reported member, and not one per archive member");
+
+    // The report is bounded and says what it left out, so a package with
+    // more libraries than the cap does not read as a complete list. The
+    // fixture's dex and resources are the omitted members here.
+    check(stream.find("\"package_members_omitted\":2") != std::string::npos,
+          "the omitted member count is reported");
+}
+
+void test_apk_load_of_a_package_with_no_directory_reports_no_members() {
+    // A streamed zip: the manifest is there, so it is a package, and there is
+    // no central directory to name anything else. The count must be zero
+    // rather than absent, and nothing may be invented to fill the report.
+    TempFile f;
+    std::vector<std::uint8_t> b(64, 0);
+    put32(b, 0, 0x04034b50);
+    put16(b, 4, 20);
+    put16(b, 8, 0);
+    put16(b, 26, 19);
+    const char* name = "AndroidManifest.xml";
+    for (int i = 0; i < 19; ++i) {
+        b[30 + static_cast<std::size_t>(i)] =
+            static_cast<std::uint8_t>(name[i]);
+    }
+    check(f.write(b), "the streamed fixture was written");
+    if (!f.wrote) {
+        return;
+    }
+
+    Captured cap;
+    const LoadedImage image = engine::apk_engine().load(f.path, &cap.writer);
+    const std::string stream = cap.read();
+
+    check(image.ok, "a package with no directory is still readable");
+    check(stream.find("\"members\":0") != std::string::npos,
+          "a package with no central directory reports no members");
+    check(stream.find("package_member") == std::string::npos,
+          "and reports none of them rather than none of the right ones");
+}
+
 // ------------------------------------------------------------------ plan
 
 void test_elf_plan_runs_the_target_itself() {
@@ -1365,6 +1534,8 @@ int main() {
     test_pe32_reports_32_bits();
     test_load_without_a_writer_writes_nothing_and_still_answers();
     test_apk_load_reads_the_package_and_reports_no_regions();
+    test_apk_load_reports_the_package_members();
+    test_apk_load_of_a_package_with_no_directory_reports_no_members();
     test_elf_plan_runs_the_target_itself();
     test_plan_of_a_failed_load_refuses();
     test_apk_plan_refuses_with_an_actionable_reason();

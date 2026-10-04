@@ -327,11 +327,106 @@ bool read_first_zip_member(ByteSpan b, ZipMember& out) noexcept {
     out.name.assign(reinterpret_cast<const char*>(b.data() + kZipLocalHeaderSize),
                     name_len);
     // Method 0 is stored, 8 is deflate. Android requires the manifest to be
-    // stored so that a package can be inspected without inflating anything.
+    // stored so that a package can be read without inflating anything.
     out.stored = method == 0;
     out.compressed_size = comp_size;
     (void)extra_len;
     return true;
+}
+
+// The end-of-central-directory record, and the two that can precede it.
+constexpr std::uint32_t kZipEocdMagic = 0x06054b50;
+constexpr std::uint32_t kZipCentralMagic = 0x02014b50;
+
+// The EOCD is 22 bytes plus a comment of up to 65535, which is what makes it
+// findable from the end: a reader that only knew the fixed size would miss
+// every archive written with a comment, and a comment is ordinary -- it is
+// where a build stamps its own name.
+constexpr std::size_t kZipEocdSize = 22;
+
+// A central directory record is 46 bytes plus the name, the extra field and
+// the comment, all of variable length and all declared inside it.
+constexpr std::size_t kZipCentralSize = 46;
+
+// How far back the EOCD is searched. The format allows a 65535-byte comment
+// and nothing else, so this is the whole legal range; a file whose last bytes
+// are not an EOCD has no central directory this reader can find, whatever it
+// is.
+constexpr std::size_t kZipEocdSearchLimit = kZipEocdSize + 0xFFFF;
+
+// How many members one archive may declare.
+//
+// There is no limit in the format, and both the count and the directory's
+// size come from the file. Without a ceiling, a 22-byte EOCD claiming four
+// billion members would send a reader looking for four billion records in a
+// file that has none, and the search would end at the file's end having found
+// fewer -- so it terminates either way, but it terminates after doing the
+// work. This bounds the work, and a file with more members than this is
+// reported with the ones that were read rather than refused: the members that
+// were read are real.
+constexpr std::uint64_t kZipMemberLimit = 65535;
+
+// One member as an evidence line.
+//
+// The name, how it is stored, and both sizes. The uncompressed size is here
+// because the pair is the point: a member that deflates to a third of itself
+// is a fact worth reporting before anyone tries to read it, and a member
+// whose two sizes are equal is stored, which is the case Android requires
+// for the manifest.
+//
+// Not the compression method's number. Method 8 is deflate and 0 is stored,
+// and those two are the only ones a reader here distinguishes; printing "
+// method 8" for a member that is simply deflated would be a fact about an
+// encoding rather than about the file.
+std::string zip_member_line(const ZipMemberInfo& m) {
+    std::string out;
+    out += m.stored ? "stored  " : "deflated";
+    out += "  ";
+    append_uint(out, m.uncompressed_size);
+    out += " bytes";
+    if (m.compressed_size != m.uncompressed_size) {
+        out += " (";
+        append_uint(out, m.compressed_size);
+        out += " on disk)";
+    }
+    out += "  ";
+    out += m.name;
+    return out;
+}
+
+// Adds the member list to a detection's evidence.
+//
+// The count line comes first and is unconditional when a directory was
+// read, because "the archive holds 4 members and 2 of them are listed" is a
+// different piece of information from the two lines, and a reader who only
+// saw the lines would not know which they are looking at.
+//
+// When the directory was read but the archive holds more members than the
+// report lists, a trailing line says so. Without it a package with 40
+// libraries would print 32 of them and read as a complete answer, which is
+// the failure mode a bounded report has and the only way to avoid it is to
+// say where the bound was.
+void report_zip_members(Detection& out) {
+    if (out.zip_members.empty()) {
+        return;
+    }
+
+    std::string count = "the central directory names ";
+    append_uint(count, out.zip_members.size());
+    count += out.zip_members.size() == 1 ? " member" : " members";
+    out.evidence.push_back(std::move(count));
+
+    const std::vector<ZipMemberInfo> shown = zip_report_members(out.zip_members);
+    for (const ZipMemberInfo& m : shown) {
+        out.evidence.push_back("  " + zip_member_line(m));
+    }
+
+    if (shown.size() < out.zip_members.size()) {
+        std::string more = "  ... and ";
+        append_uint(more, out.zip_members.size() - shown.size());
+        more += " more that are not the manifest or a native library";
+        out.evidence.push_back(std::move(more));
+    }
 }
 
 } // namespace
@@ -412,6 +507,143 @@ const char* elf_type_name(ElfType t) noexcept {
     return "unknown";
 }
 
+// Reads the central directory into `out`. Returns false when the archive has
+// no central directory this reader can locate, which is not an error: a
+// truncated or streamed zip is a real thing and the members it does have are
+// still readable.
+//
+// Every offset here comes from the file. The EOCD is found by scanning
+// backwards from the end; the directory's position and size come from it; the
+// number of members comes from it; and each record's name, extra and comment
+// lengths come from that record. So each of those is asked against the buffer
+// that is actually there, by subtraction where the addition would wrap, and
+// the walk stops at the first record that does not fit.
+bool read_zip_members(ByteSpan b, std::vector<ZipMemberInfo>& out) {
+    out.clear();
+    if (b.size() < kZipEocdSize) {
+        return false;
+    }
+
+    // The EOCD is the last record in the file unless a comment follows it, so
+    // the search starts at the far end of the legal range and walks down to
+    // the fixed size. Scanning the whole file instead would be simpler and
+    // would find an EOCD in the middle of a member's data, which is a
+    // signature that means nothing there.
+    const std::size_t window =
+        b.size() < kZipEocdSearchLimit ? b.size() : kZipEocdSearchLimit;
+    const std::size_t lowest = b.size() - window;
+    std::size_t eocd = b.size();
+    for (std::size_t i = b.size() - kZipEocdSize + 1; i-- > lowest;) {
+        if (read_le32(b, i) == kZipEocdMagic) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd == b.size()) {
+        return false;
+    }
+
+    // The count is the one on this disk (two 16-bit fields); the other is the
+    // same number for a zip spanning removable media, which has no meaning
+    // here. Both are read rather than trusted: a file that claims more members
+    // than the directory can hold is refused by the bound below rather than
+    // by believing the count.
+    const std::uint64_t declared =
+        static_cast<std::uint64_t>(read_le16(b, eocd + 10));
+    const std::uint64_t cd_size = read_le32(b, eocd + 12);
+    const std::uint64_t cd_offset = read_le32(b, eocd + 16);
+
+    if (cd_offset > b.size() || b.size() - cd_offset < cd_size) {
+        return false;
+    }
+    if (declared > kZipMemberLimit) {
+        return false;
+    }
+
+    std::size_t at = static_cast<std::size_t>(cd_offset);
+    const std::size_t end = at + static_cast<std::size_t>(cd_size);
+
+    for (std::uint64_t i = 0; i < declared; ++i) {
+        if (at > end || end - at < kZipCentralSize) {
+            break;
+        }
+        if (read_le32(b, at) != kZipCentralMagic) {
+            break;
+        }
+
+        ZipMemberInfo m;
+        m.compression_method = read_le16(b, at + 10);
+        m.compressed_size = read_le32(b, at + 20);
+        m.uncompressed_size = read_le32(b, at + 24);
+        const std::uint16_t name_len = read_le16(b, at + 28);
+        const std::uint16_t extra_len = read_le16(b, at + 30);
+        const std::uint16_t comment_len = read_le16(b, at + 32);
+        m.stored = m.compression_method == 0;
+
+        // The three lengths are added before being compared, and the sum is
+        // what has to fit inside the directory this record claims to be in.
+        // Asking each separately would pass a record whose name fits while
+        // its comment does not, and the name is the only one read here -- so
+        // a comment length that overruns would move the next record's start
+        // past the end and the walk would stop one record early for a reason
+        // that looks like a corrupt directory rather than a bad length.
+        const std::size_t variable =
+            static_cast<std::size_t>(name_len) + extra_len + comment_len;
+        if (end - at - kZipCentralSize < variable) {
+            break;
+        }
+
+        m.name.assign(reinterpret_cast<const char*>(b.data() + at + kZipCentralSize),
+                      name_len);
+        out.push_back(std::move(m));
+        at += kZipCentralSize + variable;
+    }
+
+    return !out.empty();
+}
+
+// The members worth reporting, and the order they are reported in.
+//
+// A package's interesting entries are the ones a caller would point occ at:
+// the manifest, and the native libraries under lib/. Everything else -- the
+// dex, the resources, the signature -- is either not runnable here or not
+// interesting to someone who asked what is in the package. Reporting all of
+// it would be a transcript rather than an answer, and a real package has
+// thousands of entries.
+//
+// The list is capped so that an archive claiming a million members cannot
+// turn a report into a flood, and the cap is applied after the interesting
+// ones so that a package with its libraries late in the directory still
+// reports them.
+std::vector<ZipMemberInfo> zip_report_members(
+    const std::vector<ZipMemberInfo>& all) {
+    std::vector<ZipMemberInfo> out;
+    constexpr std::size_t kMaxReported = 32;
+
+    auto take = [&out](const ZipMemberInfo& m) {
+        if (out.size() < kMaxReported) {
+            out.push_back(m);
+        }
+    };
+
+    // The manifest first, because it is the member whose presence and
+    // compression method are what make the file a package at all.
+    for (const ZipMemberInfo& m : all) {
+        if (m.name == "AndroidManifest.xml") {
+            take(m);
+            break;
+        }
+    }
+    // Then the native libraries, which is what a caller can actually observe:
+    // each one is a file occ could be pointed at instead of the package.
+    for (const ZipMemberInfo& m : all) {
+        if (m.name.rfind("lib/", 0) == 0) {
+            take(m);
+        }
+    }
+    return out;
+}
+
 Detection detect_bytes(ByteSpan bytes) noexcept {
     Detection out;
     out.file_size = bytes.size();
@@ -472,6 +704,15 @@ Detection detect_bytes(ByteSpan bytes) noexcept {
 
     ZipMember member;
     if (read_first_zip_member(bytes, member)) {
+        // The central directory, which is where the full member list lives.
+        // Read for every archive rather than only for a package, because a
+        // zip that is not a package is still a zip and "what is in it" is the
+        // question a caller asked either way. A failure to read it is not
+        // reported here: a streamed zip has no central directory and the
+        // first member is still a fact about the file, so the evidence
+        // below stands on its own and the member list is simply empty.
+        (void)read_zip_members(bytes, out.zip_members);
+
         // An Android package is a zip whose first member is the manifest,
         // and the manifest is required to be stored rather than deflated so
         // that it can be read without inflating anything.
@@ -480,16 +721,17 @@ Detection detect_bytes(ByteSpan bytes) noexcept {
             out.evidence.push_back(
                 "the first zip member is AndroidManifest.xml, stored "
                 "uncompressed");
-            return out;
+        } else {
+            if (member.name == "AndroidManifest.xml") {
+                out.evidence.push_back(
+                    "the first zip member is AndroidManifest.xml but it is "
+                    "deflated; a valid package stores it");
+            }
+            out.format = Format::Zip;
+            out.evidence.push_back("the first zip member is \"" + member.name +
+                                   "\"");
         }
-        if (member.name == "AndroidManifest.xml") {
-            out.evidence.push_back(
-                "the first zip member is AndroidManifest.xml but it is "
-                "deflated; a valid package stores it");
-        }
-        out.format = Format::Zip;
-        out.evidence.push_back("the first zip member is \"" + member.name +
-                               "\"");
+        report_zip_members(out);
         return out;
     }
 

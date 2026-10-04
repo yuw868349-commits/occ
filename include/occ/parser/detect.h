@@ -73,6 +73,29 @@ enum class ElfType : std::uint16_t {
 [[nodiscard]] const char* elf_machine_name(ElfMachine m) noexcept;
 [[nodiscard]] const char* elf_type_name(ElfType t) noexcept;
 
+// One member of a zip archive, as the central directory describes it.
+//
+// The central directory rather than the local headers, because it is the
+// only place the format guarantees a full list: a reader that walked local
+// headers would have to trust that every one of them is intact and in order,
+// and a truncated archive's local headers can disagree with the directory
+// that indexes them. The directory is one structure with a declared size, so
+// "how many members" is a field rather than something to infer.
+struct ZipMemberInfo {
+    std::string name;
+    // Method 0 is stored, 8 is deflate. Anything else is named by
+    // compression_method rather than assumed, because an unknown method is a
+    // fact about the file and not an error in it.
+    std::uint16_t compression_method = 0;
+    std::uint64_t compressed_size = 0;
+    std::uint64_t uncompressed_size = 0;
+    // The member's contents are read or not. Android requires the manifest
+    // to be stored so that a package can be inspected without inflating
+    // anything; occ does not inflate anything either, so this says what
+    // would have to happen rather than what happened.
+    bool stored = false;
+};
+
 // Everything the detection learned. A field is left at its default when the
 // format does not define it, and `evidence` holds the offsets and sizes that
 // produced the verdict.
@@ -90,6 +113,17 @@ struct Detection {
     // header, which is how Android stores its ahead-of-time compiled output.
     bool bare_program_header = false;
 
+    // Zip fields, populated for a zip and for an Android package. Empty for
+    // every other format, which is what "this format has no members" means.
+    //
+    // This is here rather than on the engine's loaded image because it is a
+    // fact about the file that detection already established: the reader
+    // walks the central directory to decide whether the file is a package at
+    // all, so the names are in hand before any engine is chosen, and an
+    // engine that wanted to report them would otherwise have to read the
+    // archive a second time and could disagree with the first reading.
+    std::vector<ZipMemberInfo> zip_members;
+
     std::uint64_t file_size = 0;
 
     // Human-readable lines describing what was matched. Kept short: this is
@@ -106,5 +140,28 @@ struct Detection {
 // container path, which may be looking at a file it can only reach through
 // a descriptor.
 [[nodiscard]] Detection detect_bytes(ByteSpan bytes) noexcept;
+
+// Reads the member list out of a zip archive's central directory, appending
+// to `out` whatever it could read. Returns false when the archive has no
+// central directory this reader can locate, which is not a failure: a
+// streamed or truncated zip is a real thing and the members it does have are
+// still readable.
+//
+// Public because the APK engine reports a package's members and already has
+// the file's bytes in hand. Exposing this is what keeps that report a
+// re-parse of one buffer rather than a second read of the file, and it is
+// the same function detection used, so the two cannot disagree.
+//
+// Clears `out` first, so a caller that reuses one vector for several
+// archives does not accumulate their members into one list.
+[[nodiscard]] bool read_zip_members(ByteSpan bytes,
+                                   std::vector<ZipMemberInfo>& out);
+
+// The members worth reporting about a package, in the order they are
+// reported: AndroidManifest.xml first, then everything under lib/. Bounded,
+// because a real package has thousands of entries and a report of all of
+// them is a transcript rather than an answer.
+[[nodiscard]] std::vector<ZipMemberInfo> zip_report_members(
+    const std::vector<ZipMemberInfo>& all);
 
 } // namespace occ::parser
