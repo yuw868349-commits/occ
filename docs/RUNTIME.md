@@ -935,6 +935,169 @@ harness can distinguish from a no-op. One is in the test file rather than the
 runtime, and one is the rollback above — the two places where what is being
 checked is the suite's own honesty rather than the loader's behaviour.
 
+### Import resolution — `include/occ/runtime/exports.h`
+
+The fourth step of loading an image was the step that had no implementation.
+`LoadContext::resolve` is a function pointer the loader calls once per import,
+and nothing in the tree assigned it: the IAT walk found every descriptor,
+parsed every thunk, honoured the ordinal flag and checked the target's
+writability, and then had no way to learn that `kernel32!CreateFileW` lives at
+an address. A registry of modules and the rules for looking a symbol up in one
+is that missing half.
+
+It is a registry and not a loader, and the distinction is the honest part of
+the design rather than a way of making the work smaller. Loading a Windows DLL
+means executing its entry point and recursively resolving *its* imports, which
+is the layer above this one and is not built yet. What is built here is the
+lookup half of Wine's `fixup_imports`: given a set of placed modules, find the
+address a name names. When the loader can really load a DLL this file gains a
+loader; the shape of everything below it does not change.
+
+The four rules are Wine's, read out of `dlls/ntdll/loader.c` rather than
+guessed at.
+
+**A module name is matched without regard to case.** `find_basename_module`
+passes `TRUE` to `RtlEqualUnicodeString`, and the `TRUE` is the
+case-insensitive flag. An import spelled `KERNEL32.DLL` and a host that
+registered `kernel32.dll` are the same module to the operating system, and a
+case-sensitive comparison here would refuse an import Windows resolves — with
+the refusal attributed to the guest.
+
+**An export name is matched exactly.** This is the same loader and the other
+direction, and the pair is the single most useful thing this file records.
+`find_name_in_exports` does a binary search over the *sorted name array* with
+`strcmp`, so Win32 export names are case-sensitive: a DLL exporting only
+`Sleep` does not answer to `sleep`, and a program importing `sleep` fails to
+link on real Windows. The first version of this file used one comparison for
+both and the mutation harness caught it — folding the case of an export name
+resolves an import Windows refuses, which is the same class of corruption as
+believing a stale hint, in the other direction: a real address for a name
+nobody exported. Two rules that differ, two functions that say so.
+
+The search is a linear scan, and saying that is better than sorting a copy per
+lookup and calling the result a binary search: `PeImage::exports()` is in
+*address-table* order, not the sorted name-table order, so a binary search over
+it would be a search for nothing. The table is a few hundred entries at most,
+and a resolver that is O(n) on a table that fits in a cache line or two is not
+what makes an import slow.
+
+**A hint is tried first and believed only after a name comparison.** Wine's
+order and Wine's reason (`find_named_export` compares `strcmp(ename, name)`
+before returning `ordinals[hint]`). A hint is an index the linker wrote; the
+sorted name table is the truth. A stale hint believed resolves a real import
+to the wrong function with no report at all, which is a corruption rather than
+a mistake.
+
+**A forwarder is followed, and following one is bounded.** An export whose RVA
+lands inside the export directory is a string naming a symbol in a *different*
+module, so following it is a second lookup and the address that comes back
+belongs to the module that answered. `find_forwarded_export` recurses through
+`load_dll` with no depth bound, so two modules forwarding to each other is a
+load that never returns; the bound of four is the reason this one terminates,
+and a cycle is stopped rather than survived.
+
+Two things this layer refuses that a loader is allowed to do. A module
+described but not placed answers nothing rather than handing back an RVA as an
+address — a caller that stored it would store base-zero and jump to the start
+of the address space, and `occ check` relies on this: it has no resolver by
+design, and imports are recorded and left alone. And an import that cannot be
+resolved writes *nothing* to the IAT rather than a stub address, because the
+loader reports the unresolved import as an event and a caller that can read the
+record can say what was missing.
+
+Two cases run the whole path rather than calling `resolve` directly: a real PE32+
+image with an import table naming `kernel32.dll!CreateFileW` by name and
+`kernel32.dll!Sleep` by ordinal, loaded through `load_image_retrying` with the
+registry wired in as `LoadContext::resolve`, and the same image with no resolver
+at all. The named import lands in the IAT at the registry's answer and the
+ordinal — 0x37, past the end of a three-entry table — leaves its slot holding the
+thunk the file described. So the second case's claim is that the slot is
+*unchanged*, asserted against a named constant rather than a literal so the
+reader can tell "unchanged" from "zero".
+
+Reading the IAT is the part worth describing, because it is why these cases
+cannot be faked. The loader's writes land in real memory at the module's base —
+`AddressSpace` is the ledger of what is mapped, not the memory itself — so the
+assertion reads the process's address space directly at
+`LoadResult::imports[i].iat_va`. That distinction is the whole point:
+`target_va` is the loader's *account* of what it wrote, and the slot is where a
+program jumps. A loader that recorded the right address and stored the wrong one
+satisfies every assertion that reads the record.
+
+Three things about the fixture are worth recording because each cost a debugging
+session, and each failed in the way that looks like a *different* bug:
+
+- **The relocation directory's RVA was written as a tail-relative offset.** The
+  directory named RVA `0xFC0`, below the section's own start, so `resolve_rva`
+  failed and the loader refused the image as `BadRelocation` — from the
+  *relocation* walk, for a field in the import area. Every other offset in the
+  fixture is named the same way (`dll_at`, `thunk_at`, `iat_at`, `desc_at` are
+  all tail-relative), so this one silently not being so was the point of naming
+  them.
+- **A base-relocation table with a terminator block.** The format is right to
+  have one — a real table ends with an eight-byte block whose page RVA is zero.
+  occ's loader does not walk that far: it stops on `cursor + 8 <= reloc_end`, so
+  a terminator *inside* the declared size is read as a block whose size field is
+  zero, and the image is refused as malformed with no detail string to explain
+  it. The terminator is the version of this fixture that looks more correct and
+  fails.
+- **`0x140000000` is not a free base under AddressSanitizer.** A probe found the
+  whole four megabytes from `0x140000000` to `0x141000000` occupied, and the
+  retry policy's downward scan is sixty-four attempts of sixty-four kilobytes —
+  exactly four megabytes, so it reported "the image was still in the way after
+  64 bases" about a range that was never going to open. Both cases now ask the
+  kernel for a base with a zero-base probe map and give it straight back, the
+  same way `test_placement.cpp` finds one, and for the same reason: a written-down
+  address is a claim about the process that stops being true when the process is
+  different.
+
+The first case is placed away from the base its own header names, on purpose.
+The header says `0x140000000` and the placed base is whatever the process had
+free, so the load delta is nonzero and the fixture's single `HIGHLOW`
+relocation is *applied* rather than skipped. A fixture that happened to land on
+its own base would pass with the relocation path never entered.
+
+**121 checks, 19 mutations, none surviving.** Three of the 19 are rejected by
+the compiler and counted separately rather than as coverage, because a change
+the type system refuses is a stronger guarantee than any test and a report that
+folded them in would be claiming credit it did not earn.
+
+The harness runs every mutant under **two** builds and requires both to fail,
+which is not redundancy. A hint bound one too generous reads past the end of
+the table, and the plain run then reads whatever the allocator left there —
+usually an empty string, so the hint is skipped anyway and the answer is right.
+That mutant survived the first run of this harness, and the reason is the more
+useful finding: every hint the suite supplied was either inside the table (0, 1,
+2) or far outside it (0xFFFF), and `hint < size` and `hint <= size` agree about
+every one of those. A table of three entries has no hint that lands between
+"the last index" and "far away". The fixture that separates them is
+`hint == size`, and it only separates them under AddressSanitizer, which
+reports the heap-buffer-overflow at the mutated line and names the allocation.
+A boundary test that passes for the wrong reason is the kind that lets the next
+mistake through, so the suite now has one that cannot.
+
+One check is documented rather than mutated. `walk`'s own
+`index >= module.exports.size()` cannot be reached with a bad index by any
+input: four paths reach `walk` and all four establish the bound first, and
+`walk` is private with all four callers in the same file. An earlier version of
+the harness carried that mutation and reported it surviving, correctly. The
+check stays because it is the one place in the file that indexes the table, so
+it is the one place that has to be right about the bound no matter what the
+callers do — including the fifth one somebody adds later and forgets. Deleting
+it turns a safe refactor into a heap read. The harness says it is untested
+rather than leaving a "survived" that somebody eventually deletes out of the
+script.
+
+The harness restores the source and then rebuilds both trees on its way out, in
+an `EXIT` trap rather than a line at the end of the script. Restoring the source
+is not enough: the last mutant compiled is still in the build directories, it
+compiles, and the next `ctest` runs it and reports a failure that has nothing to
+do with any code under test. That happened here, and it is worse than a harness
+that crashes — a crash is honest about what happened, while a stale mutant is a
+green build that lies. The trap covers `SIGINT` for the same reason: a harness
+interrupted halfway through nineteen mutants has one of them built, and whoever
+interrupted it left believing the tree was clean.
+
 ### M2 — ntdll, memory and handles
 
 `NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtFreeVirtualMemory`,

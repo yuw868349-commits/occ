@@ -550,6 +550,7 @@ add_library(occ_core STATIC
     src/runtime/address_space.cpp
     src/runtime/mapper.cpp
     src/runtime/loader.cpp
+    src/runtime/exports.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)
