@@ -194,12 +194,125 @@ the first region is recorded, and the recording itself goes through
 `record_batch`, which is all-or-nothing.
 
 **What the loader does not do yet, stated plainly.** It reports an
-image's shape; it does not run it. Nothing is mapped from the file,
-no relocation is written, and no IAT slot is filled -- the loader
-computes every one of those values and stops before the first store. So
-the milestone is not "M1 is done" but "M1's decisions are made and
-checked, and the stores that follow them are not". The layer that will
-perform the stores is below.
+image's shape; it does not run it. Without a mapper, nothing is mapped
+from the file, no relocation is written, and no IAT slot is filled -- the
+loader computes every one of those values and stops before the first store.
+That is `occ check`'s mode and it is a contract rather than a fallback: a
+checker that mapped every file it looked at would be a runtime with a file
+browser attached. With a mapper -- `LoadContext::placement` -- the same
+decisions produce memory, and the milestone is "M1 decides, and the stores
+that follow the decisions are made and checked".
+
+### The placement layer
+
+`LoadContext::placement` is the difference between the two things a caller can
+want from `load_image`, and it is a pointer rather than a flag because the two
+are not a matter of degree. With a mapper, the image's bytes are copied into
+memory, its relocations are written, its IAT is filled and its sections are
+given their final protections; the module returned describes memory a program
+can execute. Without one, every decision is still made and every refusal is
+still reported, and nothing is mapped.
+
+The order is the contract, and it is the order Windows uses:
+
+1. **Plan.** The window check, the section overlap check, the relocation walk
+   and the entry-point check all run before anything is mapped. A file that
+   cannot be placed is refused without having been placed, which is what lets
+   a caller retry at another base without unwinding a half-populated map.
+2. **Map, all read-write.** Every region goes in writable whatever the
+   section's flags say, and the flags are applied afterwards. The alternative
+   cannot work: a relocation routinely names an address in a read-only
+   section, because a read-only section is full of pointers to the image's own
+   functions and those pointers are exactly what a relocation rewrites.
+3. **Copy the file's bytes** — headers and sections, with the section data
+   bounded by both the file and the region.
+4. **Apply the relocations.**
+5. **Write the IAT** — after the relocations, because the IAT of a relocated
+   image holds RVAs until the relocation pass has run, and an IAT written
+   first would be rewritten by the relocations into an address plus a delta.
+6. **Set the final protections**, section by section.
+
+Steps 4 through 6 are the only ones that touch memory, and a failure in any of
+them rolls back every mapping step 2 made. The rollback is by base address
+from the batch rather than from the space, in reverse order, and it is not
+reported over the failure that caused it.
+
+`tests/test_placement.cpp` holds this layer to the rule `test_mapper.cpp` is
+held to, applied one level up: a claim that a byte was placed is proved by
+reading that byte back out of the mapped address and comparing it with the
+file. The bytes in the file are the independent witness -- comparing the
+loader's output against itself would agree with a loader that misplaced
+everything as long as it misplaced it consistently.
+
+**The relocation types, and three of them were wrong.** Writing the
+placement layer's tests is what found this, and it is worth recording
+because the errors were not subtle in the code -- they were confident.
+`IMAGE_REL_BASED_HIGH`, `IMAGE_REL_BASED_LOW` and `IMAGE_REL_BASED_HIGHADJ`
+are **16-bit** types, invented for machines whose instructions held half an
+address each. This runtime implemented HIGH as a 32-bit add, LOW as a no-op,
+and HIGHADJ as a 32-bit add whose adjustment was read from the bytes *after*
+the field in the image. Each of those is a plausible-looking implementation,
+and together they passed every test in `test_runtime_loader.cpp`.
+
+The authority is the Windows Research Kernel's `LdrProcessRelocationBlock`
+(`dlls/ntdll/ldr/ldrreloc.c`), which is the only place the arithmetic is
+written down. Quoted here for the algorithm, in the kernel's own shape:
+
+```c
+case IMAGE_REL_BASED_HIGHADJ:
+    if (Offset & LDRP_RELOCATION_FINAL) { ++NextOffset; --SizeOfBlock; break; }
+    Temp = *(PUSHORT)FixupVA << 16;
+    ++NextOffset;
+    --SizeOfBlock;
+    Temp += (LONG)(*(PSHORT)NextOffset);
+    Temp += (ULONG)Diff;
+    Temp += 0x8000;
+    *(PUSHORT)FixupVA = (USHORT)(Temp >> 16);
+    break;
+```
+
+Three parts of that are load-bearing and none is decoration:
+
+- The adjustment is the **next relocation entry's own 16 bits**, not bytes in
+  the image. An entry is a 4-bit type and a 12-bit offset with no room for a
+  value, so the linker spends a whole second entry on the number. On the
+  machines that emit HIGHADJ the bytes after the field are the *low half* of
+  the immediate pair -- a different number entirely. HIGHADJ therefore
+  consumes two slots, and the entry walk has to know that: a walker that
+  treats the adjustment as a relocation of its own applies the delta twice.
+- The adjustment is **signed**. A linker emits a negative carry when the low
+  half was negative, and reading it as unsigned turns a subtraction of 8 into
+  an addition of 65528.
+- The `0x8000` is a **rounding term**, not an offset. An implementation that
+  omits it is off by one on every field whose low half is below `0x8000` --
+  a third of them -- and only on those, which is the worst possible way to be
+  wrong.
+
+Wine skips all three of the 16-bit types on win64 (`#ifndef _WIN64`), so there
+was no Wine behaviour to copy and no test that could have disagreed with this
+one. LOW in particular is applied here rather than skipped: "no amd64 linker
+emits it" is a claim about linkers, and a loader that refuses a file it could
+place is not more faithful than one that places it wrong.
+
+**A test that agreed with a wrong implementation.** The fixture that caught
+the three had to be built twice. The first version left the 16 bits after
+HIGHADJ's field at zero and gave the entry an adjustment of -8; a mutation
+that moved the adjustment's source from the entry to the image passed every
+assertion in the file. The reason is arithmetic rather than a missing check:
+both the preferred base and the placement base are page aligned, so the
+delta's low 16 bits are zero, and two 16-bit adjustments can differ by at
+most 65535 -- which cannot change the *high* half of a 32-bit sum unless it
+crosses a 16-bit boundary. `-8 + 0x8000` carries nothing and so did the zero
+that replaced it, so both sources computed the same field. The fixture now
+uses `-32768`, whose sum with the rounding term is exactly `0x10000` and
+carries, and a neighbouring half of `0x0100`, which does not.
+
+There was a second failure in the same place, and it was the test's fault
+rather than the loader's: the expected value was computed with the same
+arithmetic from the same constants and compared against a load from the
+mapped address, which the optimizer is entitled to fold into reading its own
+answer. It did. The expectations now go through `volatile`, which says an
+expectation is a value and not an alias for the thing under test.
 
 ### The mapping layer — `include/occ/runtime/mapper.h`
 

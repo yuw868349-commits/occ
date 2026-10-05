@@ -66,6 +66,7 @@ occ_add_test(occ_test_probe_wiring test_probe_wiring.cpp)
 occ_add_test(occ_test_pe test_pe.cpp)
 occ_add_test(occ_test_runtime_loader test_runtime_loader.cpp)
 occ_add_test(occ_test_mapper test_mapper.cpp)
+occ_add_test(occ_test_placement test_placement.cpp)
 occ_add_test(occ_test_gdb_interop test_gdb_interop.cpp)
 
 # occ_test_check is the one test here that drives a built binary rather than
