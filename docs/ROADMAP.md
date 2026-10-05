@@ -23,7 +23,7 @@ the observation layer is the product, and it is the deepest part.
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 1,977 assertions across seventeen binaries. The counts are what
+The test suite is 1,980 assertions across seventeen binaries. The counts are what
 the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
@@ -37,7 +37,7 @@ none to a grep:
 | `test_elf` | 150 |
 | `test_uprobe` | 108 |
 | `test_ntdll_probes` | 102 |
-| `test_mapper` | 84 |
+| `test_mapper` | 87 |
 | `test_seccomp` | 49 |
 | `test_placer` | 46 |
 | `test_event` | 43 |
@@ -245,7 +245,7 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 1,977 assertions and needs no network. Two of the seventeen
+The test suite is 1,980 assertions and needs no network. Two of the seventeen
 binaries need a target binary and a host that permits namespaces and seccomp,
 one needs a gdb on `PATH`, and one needs a `python3` to re-run the seed
 generator; those are skipped rather than failed where the host does not have

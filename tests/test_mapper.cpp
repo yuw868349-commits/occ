@@ -20,11 +20,12 @@
 // returned Success from an empty function, which is a mapper that would make
 // the loader worse than the one it replaced.
 //
-// The accesses that must fail are attempted in a forked child. A protection
-// that works produces a SIGSEGV, and a SIGSEGV in the test process is a
-// process that dies having proved nothing; a child that dies of SIGSEGV is a
-// child whose death is the observation, and the parent reads the wait status
-// and learns whether the signal was the one that was supposed to happen.
+// The accesses that must fail are attempted in a forked child, because a
+// protection that works produces a SIGSEGV and a SIGSEGV in the test process
+// is a process that died having proved nothing. The child installs its own
+// fault handler and reports the signal and the faulting address back through
+// a pipe rather than letting the parent read a wait status; the reason, and
+// what it cost to find out, is written at length on run_in_child below.
 
 #include "occ/runtime/address_space.h"
 #include "occ/runtime/mapper.h"
@@ -34,6 +35,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -166,75 +168,229 @@ bool reads_pattern(const void* at, std::size_t bytes,
     return true;
 }
 
-// Runs `body` in a forked child and reports how it ended.
+// Runs `body` in a forked child and reports what the child observed.
 //
-// The three outcomes a caller has to tell apart are: it finished, it died of
-// a signal the protection was supposed to cause, and it died of a signal it
-// was not supposed to cause. Collapsing the last two into "the child died" is
-// how a test of a guard ends up passing because the child ran out of stack.
-struct ChildOutcome {
-    bool exited_normally = false;
-    int exit_code = 0;
-    bool signalled = false;
+// The design here is not "the child died and the parent reads the wait
+// status", and getting there cost a rewrite. That version was wrong twice
+// over, and both faults showed up only in a sanitized build.
+//
+// First: a child that faults under AddressSanitizer does not die of SIGSEGV.
+// The runtime installs its own handler, prints a report, and calls abort(), so
+// the parent sees SIGABRT. A test that asserts WTERMSIG(status) == SIGSEGV
+// therefore passes in an ordinary build and fails in a sanitized one, for a
+// reason that has nothing to do with the code under test. A test whose result
+// depends on which sanitizer is linked is a test of the sanitizer.
+//
+// Second, and worse: the wait status cannot say *where* the fault was. A
+// child that segfaults because the protection worked and a child that
+// segfaults because the address was never mapped are the same observation to
+// the parent, and telling them apart is the whole question. The answer has to
+// come from the child.
+//
+// So the child installs its own SIGSEGV handler and reports what it saw
+// through a pipe: the signal it got and the address the kernel named. The
+// handler is installed with sigaction and SA_SIGINFO, and it is installed in
+// the child rather than inherited, because a handler is not inherited across
+// exec but is across fork -- so a child that forgot to install one would
+// silently use the parent's and the test would be measuring the parent.
+//
+// This also makes the child survive the fault, which is what lets it report
+// more than one thing. A single child can touch four addresses and report
+// four observations, and the parent learns whether each fault was at the
+// address it named.
+struct Observation {
     int signal_number = 0;
+    std::uint64_t address = 0;
 };
 
-ChildOutcome run_in_child(void (*body)(void*), void* arg) noexcept {
+struct ChildOutcome {
+    // The child ran to completion and every access it attempted behaved.
+    bool completed = false;
+    // The child exited non-zero without having been signalled, which is how
+    // it says "an access succeeded that should have faulted" or "a value did
+    // not read back".
+    int exit_code = 0;
+    // Every access that faulted, in the order the child made them.
+    std::vector<Observation> faults;
+    // True when the child was killed by a signal the handler did not see,
+    // which means the fault was one this file does not expect -- a stack
+    // overflow in the handler, or a write to the pipe's own buffer.
+    bool died_unexpectedly = false;
+    int fatal_signal = 0;
+};
+
+// The write end of the report pipe, in the child. A global because a signal
+// handler may not take anything but a lock-free object, and because the
+// handler has no way to be given an argument. sig_atomic_t rather than int so
+// that a compiler cannot reorder the store past the fault it describes.
+volatile sig_atomic_t report_fd = -1;
+
+// The handler.
+//
+// Async-signal-safe and nothing else: a store, a write, an _exit. No
+// stdio, no allocation, no formatting, because a handler that is interrupted
+// by a second fault has nowhere to go. The address comes from siginfo_t
+// rather than from the instruction pointer, because si_addr is the data
+// address the fault was about and the instruction pointer is where the code
+// happened to be -- for a read of a mapped-but-protected page those are the
+// same, and for a wild pointer they are not, and the difference is exactly
+// what a test of "was this address protected" needs to see.
+void on_fault(int sig, siginfo_t* info, void*) noexcept {
+    if (report_fd < 0) {
+        ::_exit(90);
+    }
+    Observation o;
+    o.signal_number = sig;
+    o.address = (info != nullptr && info->si_addr != nullptr)
+                    ? static_cast<std::uint64_t>(
+                          reinterpret_cast<std::uintptr_t>(info->si_addr))
+                    : 0;
+    // A short write is not handled and cannot be: the pipe buffer is a page
+    // and the number of observations is four. If it ever were not, the parent
+    // sees fewer observations than accesses and the case fails, which is the
+    // right way for that to fail.
+    const ssize_t n = ::write(report_fd, &o, sizeof(o));
+    (void)n;
+    // _exit rather than siglongjmp: continuing after a protection fault
+    // would mean the memory might be readable now, and the whole point is
+    // that the parent decides what the fault meant.
+    ::_exit(0);
+}
+
+void install_fault_handler() noexcept {
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    (void)::sigaction(SIGSEGV, &sa, nullptr);
+    (void)::sigaction(SIGBUS, &sa, nullptr);
+}
+
+// Forks, runs `body`, and collects what the child reported.
+//
+// `body` returns the exit code the child should use if every access behaved
+// as the caller expected. A body that expects a fault does not return at all
+// -- the handler exits the process -- so a body returning normally has proved
+// that nothing it did was supposed to fault.
+ChildOutcome run_in_child(int (*body)(void*), void* arg) noexcept {
     ChildOutcome out;
-    const pid_t pid = ::fork();
-    if (pid < 0) {
-        out.signalled = true;
-        out.signal_number = -1;
+
+    int fds[2] = {-1, -1};
+    if (::pipe2(fds, O_CLOEXEC) != 0) {
+        out.died_unexpectedly = true;
+        out.fatal_signal = -1;
         return out;
     }
-    if (pid == 0) {
-        // _exit rather than exit: the parent's stdio buffers are copied into
-        // this process and a flush here would write them out twice.
-        body(arg);
-        ::_exit(0);
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(fds[0]);
+        ::close(fds[1]);
+        out.died_unexpectedly = true;
+        out.fatal_signal = -1;
+        return out;
     }
+
+    if (pid == 0) {
+        ::close(fds[0]);
+        report_fd = fds[1];
+        install_fault_handler();
+        // The code, not a report that a fault happened. A body that expects
+        // no fault and gets one is a body that returns 0 from the handler's
+        // _exit, so this line is only reached when nothing faulted.
+        const int code = body(arg);
+        ::_exit(code);
+    }
+
+    ::close(fds[1]);
+
+    // Read the report before the wait, because the pipe has a limited buffer
+    // and a child that reported more than fits would block on the write
+    // while the parent is in waitpid. Reading first drains it, and the
+    // read returns zero at the child's exit rather than blocking forever
+    // because the write end is closed in the parent now.
+    for (;;) {
+        Observation o;
+        const ssize_t n = ::read(fds[0], &o, sizeof(o));
+        if (n == static_cast<ssize_t>(sizeof(o))) {
+            out.faults.push_back(o);
+            continue;
+        }
+        break;
+    }
+    ::close(fds[0]);
+
     int status = 0;
     if (::waitpid(pid, &status, 0) != pid) {
-        out.signalled = true;
-        out.signal_number = -1;
+        out.died_unexpectedly = true;
+        out.fatal_signal = -1;
         return out;
     }
     if (WIFEXITED(status)) {
-        out.exited_normally = true;
         out.exit_code = WEXITSTATUS(status);
+        out.completed = (out.exit_code == 0);
     } else if (WIFSIGNALED(status)) {
-        out.signalled = true;
-        out.signal_number = WTERMSIG(status);
+        // A signal the handler did not see. Under a sanitizer this is what a
+        // fault looks like when the runtime's own handler got there first,
+        // which is why the child installs one rather than relying on the
+        // default: the default is not the same program on every build.
+        out.died_unexpectedly = true;
+        out.fatal_signal = WTERMSIG(status);
     }
     return out;
 }
 
-// The two child bodies. Each takes the address to touch through a pointer
-// because a forked child has its own copy of the parent's address space and
-// the address the parent mapped is a valid address in the child too -- which
-// is the property the whole test rests on and is worth stating, because it is
+// Whether the child faulted at exactly `addr`.
+//
+// The address is checked as well as the signal because "it faulted" and "it
+// faulted *there*" are different claims, and only the second one is the claim
+// being made. A mapper that unmapped the wrong region, or one that left a
+// second mapping over the address, produces a child that faults at an address
+// the parent did not name, and a test that only counted faults would call
+// that a pass.
+bool faulted_at(const ChildOutcome& c, std::uint64_t addr) noexcept {
+    for (const Observation& o : c.faults) {
+        if (o.address == addr &&
+            (o.signal_number == SIGSEGV || o.signal_number == SIGBUS)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The child bodies. Each takes the address to touch through a pointer because
+// a forked child has its own copy of the parent's address space and the
+// address the parent mapped is a valid address in the child too -- which is
+// the property the whole test rests on and is worth stating, because it is
 // the reason there is no re-mapping in the child.
-void child_write_then_read(void* at) noexcept {
+int child_write_then_read(void* at) noexcept {
     write_pattern(at, 4096, 1);
     // The read-back is in the child too, so a page that mapped but did not
     // retain what was written fails here rather than in the parent, where the
     // copy-on-write would have hidden it.
-    ::_exit(reads_pattern(at, 4096, 1) ? 0 : 3);
+    return reads_pattern(at, 4096, 1) ? 0 : 3;
 }
 
-void child_touch_protected(void* at) noexcept {
-    // A read of a PROT_NONE page. If the protection is real this does not
-    // return; if it is not, the child writes a byte and exits 0, which the
-    // parent reports as a protection that was accepted and not applied.
+int child_touch_protected(void* at) noexcept {
     auto* p = static_cast<volatile std::uint8_t*>(at);
     const std::uint8_t v = *p;
-    ::_exit(v == 0xff ? 0 : 4);
+    // Reaching this line means the access did not fault, which is the whole
+    // observation: the parent reads the pipe, not the exit code, and a body
+    // that reported through its exit status would have nothing to say about
+    // an address the parent did not name. The value is consumed through a
+    // volatile so the load survives the optimizer -- without a use, deleting
+    // the load is legal and the test would pass against a mapper that never
+    // protected anything.
+    static volatile std::uint8_t sink;
+    sink = static_cast<std::uint8_t>(sink + v);
+    return 0;
 }
 
-void child_write_to_readonly(void* at) noexcept {
+int child_write_to_readonly(void* at) noexcept {
     auto* p = static_cast<volatile std::uint8_t*>(at);
     *p = 0x11;
-    ::_exit(0);
+    return 0;
 }
 
 // ------------------------------------------------------------ the cases
@@ -269,8 +425,9 @@ void test_a_mapping_is_writable_memory() {
     // that was recorded but not made faults here.
     const ChildOutcome c = run_in_child(child_write_then_read,
                                         reinterpret_cast<void*>(r.value));
-    check(c.exited_normally && c.exit_code == 0,
-          "the mapped pages hold what was written to them");
+    check(c.completed, "the mapped pages hold what was written to them");
+    check(c.faults.empty(),
+          "writing to a read-write region faults nowhere");
 
     check(m.unmap(r.value).ok(), "unmap succeeds");
 }
@@ -299,8 +456,8 @@ void test_unmapping_removes_the_pages() {
     // and this child would exit normally.
     const ChildOutcome c =
         run_in_child(child_touch_protected, reinterpret_cast<void*>(at));
-    check(c.signalled && c.signal_number == SIGSEGV,
-          "the pages are gone after unmap");
+    check(faulted_at(c, at),
+          "the pages are gone after unmap: the fault is at that address");
 }
 
 // A protection is a protection, not a field in a struct.
@@ -321,7 +478,7 @@ void test_protect_really_protects() {
     // everything PROT_NONE would pass a test that only checked the refusal.
     const ChildOutcome writable =
         run_in_child(child_write_then_read, reinterpret_cast<void*>(at));
-    check(writable.exited_normally && writable.exit_code == 0,
+    check(writable.completed,
           "read-write memory is writable before the protection changes");
 
     check(m.protect(at, PageProtection::NoAccess).ok(),
@@ -340,8 +497,8 @@ void test_protect_really_protects() {
     // And the kernel agrees, which is the part only a real access can show.
     const ChildOutcome blocked =
         run_in_child(child_touch_protected, reinterpret_cast<void*>(at));
-    check(blocked.signalled && blocked.signal_number == SIGSEGV,
-          "a no-access page faults on read");
+    check(faulted_at(blocked, at),
+          "a no-access page faults on read, at that address");
 
     // Read-only is not no-access: readable, not writable. The two are
     // different protections and a runtime that collapsed them would pass the
@@ -356,13 +513,13 @@ void test_protect_really_protects() {
 
     const ChildOutcome still_readable =
         run_in_child(child_touch_protected, reinterpret_cast<void*>(at));
-    check(!still_readable.signalled,
+    check(still_readable.completed && still_readable.faults.empty(),
           "a read-only page is still readable");
 
     const ChildOutcome write_blocked =
         run_in_child(child_write_to_readonly, reinterpret_cast<void*>(at));
-    check(write_blocked.signalled && write_blocked.signal_number == SIGSEGV,
-          "a read-only page faults on write");
+    check(faulted_at(write_blocked, at),
+          "a read-only page faults on write, at that address");
 
     check(m.unmap(at).ok(), "unmap after the protection changes succeeds");
 }
@@ -467,7 +624,7 @@ void test_refusals_leave_nothing_behind() {
     // right and memory that is not.
     const ChildOutcome c = run_in_child(child_write_then_read,
                                         reinterpret_cast<void*>(first.value));
-    check(c.exited_normally && c.exit_code == 0,
+    check(c.completed,
           "the first mapping survived the refused one");
     check(space.regions().size() == 1,
           "the refused mapping did not reach the ledger");
@@ -531,22 +688,72 @@ void test_unmap_addresses_a_region_exactly() {
     check(m.unmap(r.value).ok(), "unmapping at the start succeeds");
 }
 
+// Finds `bytes` of address space that nothing is mapped at, by asking the
+// kernel to map it, noting where it landed, and giving it straight back.
+//
+// The hard-coded bases this replaces were wrong in an ordinary build too, they
+// just happened to be free: a fixed address is an assumption about what else
+// is in the process, and a sanitized build invalidates it by putting its
+// shadow memory exactly there. The failure is not subtle -- a batch refused
+// with EEXIST at an address the test itself chose -- and it is the kind of
+// assumption that passes everywhere and then fails on a machine with a
+// different allocator.
+//
+// Asking the kernel rather than reading /proc/self/maps is what makes the
+// answer right: the kernel is the authority on what is free, and asking costs
+// one mapping. A caller that wants three adjacent regions asks for three times
+// as much, and the adjacency is the kernel's rather than an assumption.
+//
+// The mapping is released before returning, and that is the part the first
+// version of this function got wrong. It reported the address it had just
+// taken and left it mapped, so every caller received an address that was
+// already occupied -- and the caller then failed with EEXIST at an address
+// this function had certified as free, which is a contradiction worth more
+// than a comment about not making assumptions.
+//
+// Returns zero when no such range could be found, and the caller reports that
+// rather than proceeding with an address it did not get.
+std::uint64_t find_free_range(std::uint64_t bytes) noexcept {
+    // A mapper of its own, so the probe does not land in the ledger the
+    // calling case is asserting about. A ledger holding a region the case
+    // never mapped would make "the ledger has all three" true for the wrong
+    // reason.
+    AddressSpace probe_space;
+    Mapper probe(probe_space);
+    const Result<std::uint64_t> r =
+        probe.map(0, bytes, PageProtection::NoAccess, RegionKind::Private);
+    if (!r.ok()) {
+        return 0;
+    }
+    // Given back before returning, and the result checked: a probe that could
+    // not release what it took has not found a free range, it has moved one.
+    const Result<std::uint64_t> released = probe.unmap(r.value);
+    if (!released.ok()) {
+        return 0;
+    }
+    return r.value;
+}
+
 // The batch is all of the mapping or none of it, on both sides.
 void test_map_batch_is_all_or_nothing() {
     AddressSpace space;
     Mapper m(space);
 
-    // Three regions that are all placeable. The base is chosen far enough
-    // above the window floor to be out of the way of everything else the
-    // process has, so the test is about the batch and not about a collision
-    // with the C library.
-    const std::uint64_t base = 0x200000000ULL;
+    // Three adjacent regions that are all placeable, on a base the kernel
+    // says is free rather than one this file picked.
+    const std::uint64_t kUnit = 64 * 1024;
+    const std::uint64_t base = find_free_range(3 * kUnit);
+    check(base != 0, "found three adjacent regions' worth of free space");
+    if (base == 0) {
+        return;
+    }
+
     std::vector<Mapper::Candidate> batch = {
-        {base, 64 * 1024, PageProtection::ReadWrite, RegionKind::Image, ".text",
+        {base, kUnit, PageProtection::ReadWrite, RegionKind::Image, ".text",
          1},
-        {base + 64 * 1024, 64 * 1024, PageProtection::ReadWrite,
+        {base + kUnit, kUnit, PageProtection::ReadWrite,
          RegionKind::Image, ".data", 2},
-        {base + 128 * 1024, 64 * 1024, PageProtection::ReadOnly,
+        {base + 2 * kUnit, kUnit, PageProtection::ReadOnly,
          RegionKind::Image, ".rdata", 3},
     };
 
@@ -560,13 +767,13 @@ void test_map_batch_is_all_or_nothing() {
     // only the struct.
     const ChildOutcome first_ok =
         run_in_child(child_write_then_read, reinterpret_cast<void*>(base));
-    check(first_ok.exited_normally && first_ok.exit_code == 0,
+    check(first_ok.completed,
           "the first region of the batch is real memory");
 
     const ChildOutcome third_blocked =
         run_in_child(child_write_to_readonly,
-                     reinterpret_cast<void*>(base + 128 * 1024));
-    check(third_blocked.signalled && third_blocked.signal_number == SIGSEGV,
+                     reinterpret_cast<void*>(base + 2 * kUnit));
+    check(faulted_at(third_blocked, base + 2 * kUnit),
           "the read-only region of the batch really is read-only");
 
     // The kernel's own map, as a third reading of the same three protections.
@@ -577,18 +784,19 @@ void test_map_batch_is_all_or_nothing() {
     const std::string maps = read_self_maps();
     check(maps_has(maps, base, "rw-p"),
           "the kernel says the first region is rw");
-    check(maps_has(maps, base + 128 * 1024, "r--p"),
+    check(maps_has(maps, base + 2 * kUnit, "r--p"),
           "the kernel says the third region is read-only");
-    check(maps_has(maps, base + 64 * 1024, "rw-p"),
+    check(maps_has(maps, base + kUnit, "rw-p"),
           "the kernel says the second region is rw");
 
     // Now a batch that fails. The third candidate overlaps the first, which
     // the ledger would refuse -- but by then two regions are already mapped,
     // so the question is whether they are mapped *after* the refusal.
-    const std::uint64_t far = 0x300000000ULL;
+    const std::uint64_t far = find_free_range(2 * kUnit);
+    check(far != 0, "found free space for the batch that will be refused");
     std::vector<Mapper::Candidate> bad = {
-        {far, 64 * 1024, PageProtection::ReadWrite, RegionKind::Private, "", 0},
-        {far + 32 * 1024, 64 * 1024, PageProtection::ReadWrite,
+        {far, kUnit, PageProtection::ReadWrite, RegionKind::Private, "", 0},
+        {far + kUnit / 2, kUnit, PageProtection::ReadWrite,
          RegionKind::Private, "", 0},
     };
     const Result<std::uint64_t> refused = m.map_batch(bad);
@@ -608,23 +816,22 @@ void test_map_batch_is_all_or_nothing() {
     // succeeds where it must fault.
     const ChildOutcome gone =
         run_in_child(child_touch_protected, reinterpret_cast<void*>(far));
-    check(gone.signalled && gone.signal_number == SIGSEGV,
-          "the refused batch unmapped the regions it had already mapped");
+    check(faulted_at(gone, far),
+          "the refused batch unmapped the region it had already mapped");
 
     // A batch refused before it maps anything: an unaligned base is caught
     // in the validation sweep, so not even the first candidate is mapped.
-    const std::uint64_t later = 0x400000000ULL;
+    const std::uint64_t later = find_free_range(2 * kUnit);
     std::vector<Mapper::Candidate> unaligned = {
-        {later, 64 * 1024, PageProtection::ReadWrite, RegionKind::Private, "",
-         0},
-        {later + 64 * 1024 + 1, 64 * 1024, PageProtection::ReadWrite,
+        {later, kUnit, PageProtection::ReadWrite, RegionKind::Private, "", 0},
+        {later + kUnit + 1, kUnit, PageProtection::ReadWrite,
          RegionKind::Private, "", 0},
     };
     check(!m.map_batch(unaligned).ok(),
           "a batch with an unaligned base is refused");
     const ChildOutcome never_mapped =
         run_in_child(child_touch_protected, reinterpret_cast<void*>(later));
-    check(never_mapped.signalled && never_mapped.signal_number == SIGSEGV,
+    check(faulted_at(never_mapped, later),
           "the refused batch never mapped its first candidate");
 
     // And the batch that did succeed is still whole.
@@ -632,7 +839,7 @@ void test_map_batch_is_all_or_nothing() {
           "the successful batch is untouched by the failures after it");
 
     for (int i = 0; i < 3; ++i) {
-        (void)m.unmap(base + static_cast<std::uint64_t>(i) * 64 * 1024);
+        (void)m.unmap(base + static_cast<std::uint64_t>(i) * kUnit);
     }
     check(space.regions().empty(), "the whole successful batch unmapped");
 }

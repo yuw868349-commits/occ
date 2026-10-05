@@ -271,15 +271,43 @@ comment says — a per-region count is only a per-region count.
 `tests/test_mapper.cpp` holds every mapping case to one rule: a case that
 claims a mapping works must prove it by writing to the bytes and reading
 them back, and a case that claims a protection was applied must prove it by
-failing to touch them. The accesses that must fault are attempted in a
-forked child, because a `SIGSEGV` in the test process is a process that
-died having proved nothing. The read-only region of a batch is checked
-three ways — the child faults on write, the ledger says `ReadOnly`, and
+failing to touch them. The read-only region of a batch is checked three ways
+— the child faults on write, the ledger says `ReadOnly`, and
 `/proc/self/maps` says `r--p` — because a mapper that translated every
 protection to `PROT_READ|PROT_WRITE` would return success for all of them
 and only the kernel's own map distinguishes them.
 
-84 checks. Three mutations were tried against it and each is caught by the
+The accesses that must fault run in a forked child, and the first version of
+that was wrong in a way only a sanitized build found. It had the child die and
+the parent read `WTERMSIG(status) == SIGSEGV`. Under AddressSanitizer the
+child does not die of `SIGSEGV`: the runtime installs its own handler, prints
+a report, and aborts, so the parent sees `SIGABRT` and eleven cases fail for a
+reason that has nothing to do with the mapper. A test whose result depends on
+which sanitizer is linked is a test of the sanitizer.
+
+Worse, the wait status cannot say *where* the fault was. A child that
+segfaulted because the protection worked and a child that segfaulted because
+the address was never mapped are the same observation to the parent, and
+telling them apart is the entire question. So the child now installs its own
+`SIGSEGV`/`SIGBUS` handler with `sigaction` and `SA_SIGINFO`, and reports the
+signal and the kernel's `si_addr` back through a pipe. The child is
+instrumented and the handler is the same on every build, so the observation
+does not change with the build; and the parent can now assert *the fault was
+at the address I named*, which a wait status could never support.
+
+The same run turned up a second defect of the same kind, in the addresses
+rather than the mechanism. The batch cases asked for `0x200000000` and two
+other fixed addresses, on the reasoning that they were far enough above the
+window floor to be out of the way. A fixed address is an assumption about
+what else is in the process, and a sanitized build invalidates it by putting
+its shadow memory exactly there. They are now found by asking the kernel for
+a range and giving it straight back — and the first version of *that* reported
+the address it had just taken without releasing it, so every caller received
+an address already occupied, and then failed with `EEXIST` at an address the
+finder had certified as free. A probe that cannot release what it took has
+not found a free range; it has moved one.
+
+87 checks. Three mutations were tried against it and each is caught by the
 case written for it: removing `MAP_FIXED_NOREPLACE` (11 failures), removing
 the batch's rollback (1 failure, the case that exists for exactly that), and
 stripping modifiers instead of refusing them (6 failures).
