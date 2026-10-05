@@ -223,15 +223,30 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
     //
     //   0  ld arg_hi
     //   1  jeq 0    : a zero high half continues at 3
-    //   2  ja +2    : a non-zero high half abandons the rule
+    //   2  ja +N    : a non-zero high half abandons the rule
     //   3  ld arg_lo
     //   4  cmp <value> : a match continues at 5; a miss abandons the rule
     //
-    // Instruction 1 jumps by 1, which skips instruction 2. When the test is
-    // not the last of its rule, instruction 2 jumps by 2 and instruction 4
-    // jumps by 1, both landing on the next test's instruction 0. When it is
-    // the last, both land past the rule's action instead: instruction 2 by
-    // 3, instruction 4 by 1.
+    // Both abandon offsets are distances, and both are computed from how many
+    // tests are still ahead rather than written as literals:
+    //
+    //   instruction 2 jumps (remaining * kInsnPerTest - 2)
+    //   instruction 4 jumps (remaining * kInsnPerTest - 4)
+    //
+    // `remaining` counts this test and every test after it in the rule. The
+    // last test of the rule has remaining == 1, which gives 3 and 1: past
+    // the rule's action and to it respectively. A test with more tests
+    // behind it has to clear them as well, and the formula widens with
+    // them, so a miss lands on the next test in the rule rather than on the
+    // next rule's entry.
+    //
+    // Literals cannot express this. The distances 3 and 1 are correct for a
+    // last test and wrong for every other one: with two tests, instruction 2
+    // of the first jumps 2 and lands on instruction 4 of the second -- a
+    // comparison against whatever the high-half load left in the
+    // accumulator -- and instruction 4 of the first jumps 1 and lands on
+    // instruction 1 of the second, whose operand is the constant 0, so a
+    // rule whose first test misses can still match its second.
 
     std::vector<Insn> insns;
     insns.reserve(8 + rule_count * 8);
@@ -263,11 +278,14 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
 
         for (std::size_t t = 0; t < args; ++t) {
             const auto& test = rule.args[t];
-            const bool last = (t + 1 == args);
+            const std::size_t remaining = args - t;
 
             insns.push_back(ld_arg_hi(test.index));
             insns.push_back(branch(jump(BPF_JEQ), 0, 1, 0));
-            insns.push_back(branch(BPF_JMP | BPF_JA, last ? 3u : 2u, 0, 0));
+            insns.push_back(branch(BPF_JMP | BPF_JA,
+                                   static_cast<std::uint32_t>(remaining *
+                                                              kInsnPerTest - 2),
+                                   0, 0));
             insns.push_back(ld_arg_lo(test.index));
 
             // The comparison, and what a miss has to do.
@@ -333,20 +351,22 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
             }
 
             // A match continues to the next instruction; a miss abandons the
-            // rule. When the test is last, the next instruction is the
-            // action, so abandoning means stepping past it. When it is not,
-            // the next instruction is the following test, which is where a
-            // miss belongs.
+            // rule and resumes at the next test, or past the rule's action
+            // when this test is the last one. The distance is
+            // `remaining * kInsnPerTest - 4`, which is 1 for a last test and
+            // widens as the tests still ahead are added, so both cases are
+            // the same expression.
             //
             // Which of jt and jf carries the match depends on the operator:
             // `branch` puts the true outcome in jt, so a non-negated test
             // continues on a match and a negated one continues on a miss --
             // the two are the same instruction with the offsets exchanged.
+            const std::uint8_t abandon =
+                static_cast<std::uint8_t>(remaining * kInsnPerTest - 4);
             const std::uint8_t on_match = 0;
-            const std::uint8_t on_miss = 1;
             insns.push_back(branch(jump(op), value,
-                                   inverted ? on_miss : on_match,
-                                   inverted ? on_match : on_miss));
+                                   inverted ? abandon : on_match,
+                                   inverted ? on_match : abandon));
         }
 
         insns.push_back(stmt(BPF_RET | BPF_K, ret_for(rule.action, rule.error)));

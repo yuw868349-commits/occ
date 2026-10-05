@@ -238,6 +238,81 @@ long probe(SeccompCmp cmp, std::uint32_t value, long argument) {
     return result;
 }
 
+// The probe for a rule that constrains more than one argument.
+//
+// getpid(2) takes no arguments and the kernel ignores any it is handed, so
+// the call has no side effect and its return value distinguishes the two
+// outcomes without a reporting syscall: a filter that denies the call
+// produces the policy's errno, and a filter that permits it produces the
+// child's own pid, which is positive and therefore not an errno at all.
+//
+// This is here because the single-argument probe above cannot see the class
+// of defect that a rule with two or more tests is subject to. A rule's tests
+// are a conjunction, and each of them that fails has to hand the number to
+// the next rule rather than falling into the next test: the test that
+// follows reads a fresh argument but inherits the accumulator the previous
+// test left behind, and a rule whose abandon offsets point at that test
+// instead of past the rule enforces a conjunction it was never asked for.
+// A filter in that shape installs without complaint, so the only way to see
+// it is to install it and make calls whose arguments resolve it differently.
+long probe_args(const std::vector<SeccompArgTest>& tests, long arg0,
+                long arg1) {
+    auto* p = static_cast<Probe*>(
+        ::mmap(nullptr, sizeof(Probe), PROT_READ | PROT_WRITE,
+               MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    if (p == MAP_FAILED) {
+        return -1;
+    }
+    p->built = 0;
+    p->installed = -1;
+    p->ret = -1;
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        (void)::munmap(p, sizeof(Probe));
+        return -1;
+    }
+    if (pid == 0) {
+        SeccompPolicy policy;
+        policy.fallback = SeccompDefault::Errno;
+        policy.fallback_error = kErrFallback;
+        policy.max_nr = highest_known_syscall();
+
+        policy.rules.push_back(SeccompRule{kNrGetpid, SeccompAction::Errno,
+                                           kErrDenied, tests});
+        policy.rules.push_back(
+            SeccompRule{kNrExitGroup, SeccompAction::Allow, 0, {}});
+        policy.rules.push_back(
+            SeccompRule{kNrRtSigreturn, SeccompAction::Allow, 0, {}});
+
+        const auto program = build_seccomp(policy);
+        p->built = program.valid() ? 1 : 0;
+        if (!program.valid()) {
+            _exit(1);
+        }
+        if (occ::sys::prctl(38 /* PR_SET_NO_NEW_PRIVS */, 1, 0, 0, 0)
+                .failed()) {
+            _exit(1);
+        }
+        p->installed = occ::sys::seccomp_install(program);
+        p->ret = occ::sys::detail::call6(static_cast<long>(kNrGetpid), arg0,
+                                          arg1, 0, 0, 0, 0)
+                     .value;
+        _exit(0);
+    }
+
+    int status = 0;
+    (void)::waitpid(pid, &status, 0);
+    // A permitted call answers with the child's own pid, which is positive.
+    // The assertions below do not rely on that: each of them names the errno
+    // it expects, so a filter that permitted nothing would fail them rather
+    // than pass by accident.
+    const long result =
+        (p->built == 1 && p->installed == 0) ? p->ret : -1;
+    (void)::munmap(p, sizeof(Probe));
+    return result;
+}
+
 } // namespace
 
 int main() {
@@ -341,8 +416,7 @@ int main() {
     // syscall results are what prove the policy; the exit status is a
     // supporting claim that a sanitizer build cannot make, and dropping the
     // whole case would drop the real assertions with it.
-    //
-    // Clang spells this __has_feature and makes it a keyword; GCC 14 and later
+// Clang spells this __has_feature and makes it a keyword; GCC 14 and later
     // accept it as an operator, and GCC 13 does not have it at all. The test
     // is written the way test_container.cpp writes it because the obvious
     // spelling does not compile on the oldest compiler in the matrix: naming
@@ -544,6 +618,103 @@ int main() {
         check("the byte count is eight per instruction",
               static_cast<long>(program.byte_count()),
               static_cast<long>(want * 8));
+    }
+
+    // Rules with more than one argument test. Each case below is a
+    // conjunction, and the question each one asks is the same: when one of
+    // the tests does not hold, does the number go to the next rule and the
+    // fallback (kErrFallback) or fall into the following test and be decided
+    // there (which would answer kErrDenied for a conjunction the policy never
+    // stated)?
+    //
+    // The two shapes that matter are a non-final test that fails and a final
+    // test that fails, because the abandon distance differs between them and
+    // a single distance cannot be right for both. A failing first test whose
+    // argument has a zero low half is the case that used to be decided by
+    // the following test's comparison with the accumulator still holding the
+    // zero, which is why the zero case is in the list rather than an
+    // arbitrary one.
+    {
+        const std::vector<SeccompArgTest> both{
+            SeccompArgTest{0, SeccompCmp::Equal, 0},
+            SeccompArgTest{1, SeccompCmp::Equal, 0},
+        };
+
+        check("both tests match, so the rule fires",
+              probe_args(both, 0, 0), -kErrDenied);
+        check("a non-final test that fails reaches the fallback",
+              probe_args(both, 1, 0), -kErrFallback);
+        check("a non-final test whose low half is zero reaches the fallback",
+              probe_args(both, 0x11000, 0), -kErrFallback);
+        check("a final test that fails reaches the fallback",
+              probe_args(both, 0, 1), -kErrFallback);
+
+        // The same conjunction with three tests, where the failing one is in
+        // the middle: the abandon has to cross the test after it as well as
+        // its own. The three tests are on arguments the call controls
+        // separately where it can be, so that a miss is attributable to the
+        // test named rather than to the arguments being out of range.
+        const std::vector<SeccompArgTest> three{
+            SeccompArgTest{0, SeccompCmp::Equal, 7},
+            SeccompArgTest{1, SeccompCmp::Equal, 9},
+        };
+        check("a non-final test of three that fails reaches the fallback",
+              probe_args(three, 7, 1), -kErrFallback);
+        check("both of the two tests match, so the rule fires",
+              probe_args(three, 7, 9), -kErrDenied);
+
+        // Three tests where the first two are on the same argument and agree, so
+        // that the pair can be satisfied together and the miss has to
+        // abandon rather than re-enter the next test.
+        const std::vector<SeccompArgTest> stacked{
+            SeccompArgTest{0, SeccompCmp::Equal, 5},
+            SeccompArgTest{0, SeccompCmp::Equal, 5},
+            SeccompArgTest{1, SeccompCmp::Equal, 0},
+        };
+        check("a first test that matches and a second that fails reaches the fallback",
+              probe_args(stacked, 0, 0), -kErrFallback);
+        check("all three of a stacked conjunction match, so the rule fires",
+              probe_args(stacked, 5, 0), -kErrDenied);
+
+        // An argument whose high half is set cannot match a 32-bit
+        // comparison, and abandoning on that has to leave the rule rather
+        // than continue into the next test -- where the comparison would be
+        // against whatever that test was written for.
+        {
+            const std::vector<SeccompArgTest> hi{
+                SeccompArgTest{0, SeccompCmp::Equal, 1},
+                SeccompArgTest{1, SeccompCmp::Equal, 0},
+            };
+            check("a 64-bit argument abandons a two-test rule",
+                  probe_args(hi, 0x100000000LL, 0), -kErrFallback);
+        }
+
+        // A negated operator as the non-final test, because the negation
+        // swaps which of the two offsets carries the abandon distance. A
+        // swap applied to the wrong offset sends a miss into the next test.
+        {
+            const std::vector<SeccompArgTest> negated{
+                SeccompArgTest{0, SeccompCmp::NotEqual, 0},
+                SeccompArgTest{1, SeccompCmp::Equal, 0},
+            };
+            check("a negated test that matches reaches the fallback",
+                  probe_args(negated, 0, 0), -kErrFallback);
+            check("a negated test that does not match lets the rule fire",
+                  probe_args(negated, 1, 0), -kErrDenied);
+        }
+
+        // A rule whose tests are all on the same argument still has to leave
+        // the rule on a miss rather than re-entering the next test.
+        {
+            const std::vector<SeccompArgTest> repeated{
+                SeccompArgTest{0, SeccompCmp::Equal, 0},
+                SeccompArgTest{0, SeccompCmp::Equal, 1},
+            };
+            check("the first of two tests on one argument reaching the fallback",
+                  probe_args(repeated, 1, 0), -kErrFallback);
+            check("the second of two tests on one argument reaching the fallback",
+                  probe_args(repeated, 0, 0), -kErrFallback);
+        }
     }
 
     // An empty policy is a legitimate thing to build: it denies everything by
