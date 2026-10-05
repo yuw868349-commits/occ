@@ -822,6 +822,89 @@ int main() {
               static_cast<long>(program.code()[4].k), 100);
     }
 
+    // A caller that raises the ceiling above the x32 bit has asked for a
+    // filter that cannot dispatch an x32 caller. It is refused rather than
+    // emitted, because the range test is the only defence: the kernel
+    // clears the marker before dispatch, so a number carrying bit 30 never
+    // equals a rule's own nr, and a ceiling that admitted it would send
+    // every x32 syscall down the fallback branch while looking like a
+    // filter that merely denies a lot.
+    {
+        SeccompPolicy policy;
+        policy.fallback_error = 38;
+        policy.max_nr = 0x40000000u;
+        policy.rules.push_back(
+            SeccompRule{kNrWrite, SeccompAction::Errno, 22, {}});
+        const auto program = build_seccomp(policy);
+        check_true("a ceiling at the x32 bit is refused", !program.valid());
+
+        // One above the bit is the same answer, and one below it is a
+        // ceiling this builder has no reason to refuse.
+        policy.max_nr = 0x40000001u;
+        check_true("a ceiling above the x32 bit is refused",
+                   !build_seccomp(policy).valid());
+        policy.max_nr = 0x3fffffffu;
+        check_true("a ceiling just below the x32 bit is accepted",
+                   build_seccomp(policy).valid());
+    }
+
+    // errno range. The kernel's payload field is 16 bits, so 4095 is the
+    // largest errno that survives being written into a seccomp_data answer,
+    // and a negative errno -- which is how this library reports errors to
+    // its own callers -- does not survive at all: masked to 16 bits it
+    // becomes a number nobody wrote down. The previous check was `!= 0`,
+    // which accepted -22 and 99999 alike, and the emitter masked both,
+    // silently turning the first into 65514 and the second into 34463.
+    {
+        SeccompPolicy policy;
+        policy.fallback = SeccompDefault::Errno;
+        policy.fallback_error = -22;
+        check_true("a negative fallback errno is refused",
+                   !build_seccomp(policy).valid());
+
+        policy.fallback_error = 4096;
+        check_true("a fallback errno above 4095 is refused",
+                   !build_seccomp(policy).valid());
+
+        // The boundary itself: 4095 is the last value the payload can carry
+        // and must be accepted, which a check written as `<= 4096` would
+        // refuse.
+        policy.fallback_error = 4095;
+        const auto upper = build_seccomp(policy);
+        check_true("a fallback errno of 4095 is accepted", upper.valid());
+        check("the errno is emitted without masking",
+              static_cast<long>(upper.code()[5].k & 0xffffu), 4095);
+
+        policy.fallback_error = 1;
+        check_true("a fallback errno of 1 is accepted",
+                   build_seccomp(policy).valid());
+    }
+
+    // A rule errno is checked on the same range and for the same reason, and
+    // the rule's answer is a different instruction from the fallback's, so a
+    // check on one does not cover the other.
+    {
+        SeccompPolicy policy;
+        policy.fallback_error = 38;
+        policy.rules.push_back(
+            SeccompRule{kNrWrite, SeccompAction::Errno, -22, {}});
+        check_true("a negative rule errno is refused",
+                   !build_seccomp(policy).valid());
+
+        policy.rules.back().error = 4096;
+        check_true("a rule errno above 4095 is refused",
+                   !build_seccomp(policy).valid());
+
+        policy.rules.back().error = 4095;
+        const auto program = build_seccomp(policy);
+        check_true("a rule errno of 4095 is accepted", program.valid());
+        // The layout is a six-instruction preamble, then per rule an entry,
+        // a pad and the block. This is the first and only rule, so its
+        // action is instruction 8: 6 preamble, 6 entry, 7 pad, 8 action.
+        check("the rule errno is emitted without masking",
+              static_cast<long>(program.code()[8].k & 0xffffu), 4095);
+    }
+
     // Installing a program that was never built has to fail rather than
     // install an empty filter, because an empty filter installed
     // successfully would be a filter that permits everything. A default-
@@ -833,6 +916,69 @@ int main() {
                    !unbuilt.valid());
         check("an unbuilt program is refused at install",
               static_cast<long>(occ::sys::seccomp_install(unbuilt)), -22);
+    }
+
+    // BPF_MAXINSNS is 4096, and the kernel refuses a longer filter with
+    // E2BIG. The install-time guard named 0xfffd -- 65533 -- which is not a
+    // limit the kernel has: a program of that length passes this check and
+    // then fails at the syscall, which reports a constraint failure rather
+    // than the policy being too long, and leaves the caller to guess which.
+    //
+    // The install runs in a child, because installing it here would leave
+    // the test process itself behind this fallback: every syscall it makes
+    // afterwards -- the write(2) of the next line, the exit_group(2) that
+    // ends it -- is answered with ENOSYS by a filter the harness asked for
+    // rather than one it was given. seccomp filters cannot be removed, so a
+    // test that installs one on its own runner can only be the last thing
+    // that runner does.
+    {
+        // The widest rule this builder accepts -- six arguments, one per
+        // field seccomp_data has -- is 32 instructions, so the limit is not
+        // reachable from a hand-written policy and the guard is what stands
+        // between one and the kernel's E2BIG. A build that widened the
+        // per-test layout would have to move this number.
+        const auto widest = [] {
+            SeccompPolicy p;
+            p.fallback_error = 38;
+            p.rules.push_back(SeccompRule{
+                kNrWrite, SeccompAction::Errno, 22,
+                {SeccompArgTest{0, SeccompCmp::Equal, 0},
+                 SeccompArgTest{1, SeccompCmp::Equal, 0},
+                 SeccompArgTest{2, SeccompCmp::Equal, 0},
+                 SeccompArgTest{3, SeccompCmp::Equal, 0},
+                 SeccompArgTest{4, SeccompCmp::Equal, 0},
+                 SeccompArgTest{5, SeccompCmp::Equal, 0}}});
+            return build_seccomp(p);
+        }();
+        check_true("the widest rule is far below the kernel's limit",
+                   widest.valid() && widest.insn_count() <= 4096);
+
+        // And the install the guard protects, asked for in a child that
+        // reports through a shared mapping.
+        auto* p = static_cast<Probe*>(
+            ::mmap(nullptr, sizeof(Probe), PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+        if (p == MAP_FAILED) {
+            check_true("a mapping for the install report exists", false);
+        } else {
+            p->built = 0;
+            p->installed = -1;
+            p->ret = -1;
+            const auto program = build_seccomp(SeccompPolicy{});
+            const pid_t install_pid = ::fork();
+            if (install_pid == 0) {
+                (void)occ::sys::prctl(38 /* PR_SET_NO_NEW_PRIVS */, 1, 0, 0, 0);
+                p->installed = occ::sys::seccomp_install(program);
+                _exit(0);
+            }
+            int install_status = 0;
+            (void)::waitpid(install_pid, &install_status, 0);
+            check("a program within the kernel's length limit installs",
+                  p->installed, 0);
+            check("such a program is within the kernel's limit by count",
+                  static_cast<long>(program.insn_count() <= 4096), 1);
+            (void)::munmap(p, sizeof(Probe));
+        }
     }
 
     // Installing on another thread is not supported, and saying so is the

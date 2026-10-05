@@ -85,10 +85,16 @@ constexpr std::uint32_t kOffArgs = 16;
                 kOffArgs + static_cast<std::uint32_t>(index) * 8u + 4u);
 }
 
+// SECCOMP_RET_ERRNO carries its payload in the low 16 bits, so the value
+// here is the errno itself. There is no masking and no negation: build_seccomp
+// has already refused every value outside 1..4095, which is the whole of
+// what fits. Masking here would have been a way of accepting a value the
+// kernel then reads differently from how the policy spelled it -- a
+// negative errno becomes its low 16 bits, which is not the number anyone
+// wrote down.
 [[nodiscard]] constexpr std::uint32_t ret_errno(int err) noexcept {
-    const auto magnitude =
-        static_cast<std::uint32_t>(err < 0 ? -err : err) & 0xffffu;
-    return static_cast<std::uint32_t>(SECCOMP_RET_ERRNO) | magnitude;
+    return static_cast<std::uint32_t>(SECCOMP_RET_ERRNO) |
+           static_cast<std::uint32_t>(err);
 }
 
 [[nodiscard]] constexpr std::uint32_t ret_for(SeccompAction action,
@@ -137,14 +143,36 @@ constexpr std::size_t kMaxOffset = 255;
 // every time a test is added.
 constexpr std::size_t kInsnPerTest = 5;
 
-// SECCOMP_RET_ERRNO with a zero payload is refused. The kernel reads it as
-// "make the syscall return 0", which is neither an error nor a success: a
-// caller of read() sees zero bytes, concludes end of file, and loops, and a
-// caller flushing a stdio buffer loops forever because the write reports
-// success without consuming anything. This is not a hypothetical: it is what
-// the first version of this file did to its own self-test, and the symptom
-// was a program that hung without printing anything.
-[[nodiscard]] bool errno_is_valid(int err) noexcept { return err != 0; }
+// The payload of SECCOMP_RET_ERRNO is a 16-bit field, so every errno the
+// kernel can be asked to return is 1..4095, and nothing else is: the
+// kernel truncates the value to 16 bits and rejects the filter if the
+// upper half is set.
+//
+// Zero is the case that has to be refused rather than accepted. The
+// kernel reads it as "make the syscall return 0", which is neither an
+// error nor a success: a caller of read() sees zero bytes, concludes end
+// of file, and loops, and a caller flushing a stdio buffer loops forever
+// because the write reports success without consuming anything. This is
+// not a hypothetical: it is what the first version of this file did to
+// its own self-test, and the symptom was a program that hung without
+// printing anything.
+//
+// The upper bound is a refusal for a different reason. A negative errno
+// is what this library returns to its own callers, and a caller that
+// passes one through unchanged would have the kernel truncate it: -22 is
+// 0xffffffea, whose low 16 bits are 0xffea, which is not an errno. The
+// syscall returns a number no caller can interpret, and a policy naming
+// one is a policy whose error handling was never written.
+[[nodiscard]] constexpr bool errno_is_valid(int err) noexcept {
+    return err >= 1 && err <= 4095;
+}
+
+// Bit 30 of a syscall number is the kernel's x32 marker: an x32 caller
+// enters with it set, and the kernel clears it before dispatch. A ceiling
+// at or above this bit does not compare syscall numbers, it compares
+// numbers with a flag in them, and every x32 call lands on the "over the
+// ceiling" branch regardless of which syscall it was.
+constexpr std::uint32_t kX32SyscallBit = 0x40000000u;
 
 // The size of the block that implements one rule.
 [[nodiscard]] constexpr std::size_t block_size(std::size_t arg_count) noexcept {
@@ -172,14 +200,24 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
 
     const std::size_t rule_count = policy.rules.size();
 
+    // A ceiling that reaches the x32 bit is refused rather than emitted.
+    // The preamble's one range check is the only thing standing between an
+    // x32 caller and the native syscall it asked for, because the marker is
+    // cleared before dispatch and so never reaches a rule's own `jeq nr_i`.
+    if (max_nr >= kX32SyscallBit) {
+        out.error_ = "the syscall ceiling reaches the x32 bit";
+        return out;
+    }
+
     if (policy.fallback == SeccompDefault::Errno &&
         !errno_is_valid(policy.fallback_error)) {
-        out.error_ = "fallback errno is zero";
+        out.error_ = "the fallback errno is outside 1..4095";
         return out;
     }
     for (const auto& rule : policy.rules) {
-        if (rule.action == SeccompAction::Errno && !errno_is_valid(rule.error)) {
-            out.error_ = "rule errno is zero";
+        if (rule.action == SeccompAction::Errno &&
+            !errno_is_valid(rule.error)) {
+            out.error_ = "a rule errno is outside 1..4095";
             return out;
         }
         for (const auto& test : rule.args) {
@@ -385,7 +423,14 @@ int seccomp_install(const SeccompProgram& program) noexcept {
     if (!program.valid() || program.insn_count() == 0) {
         return -kEinval;
     }
-    if (program.insn_count() > 0xfffdu) {
+    // BPF_MAXINSNS is the kernel's own limit on a classic filter's length,
+    // and prctl rejects anything longer with E2BIG rather than truncating.
+    // The name is not exported by the kernel headers, so the value is
+    // written here with the reason it is checked at all: the previous guard
+    // was 0xfffd, which is 65533 -- a limit sixteen times the real one, and
+    // one that could be passed to build_seccomp's arithmetic without an
+    // overflow and then refused by the kernel at install time.
+    if (program.insn_count() > static_cast<std::size_t>(BPF_MAXINSNS)) {
         return -kEinval;
     }
 
