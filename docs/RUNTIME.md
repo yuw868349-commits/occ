@@ -203,6 +203,132 @@ browser attached. With a mapper -- `LoadContext::placement` -- the same
 decisions produce memory, and the milestone is "M1 decides, and the stores
 that follow the decisions are made and checked".
 
+### The export table
+
+`PeImage` parses the export directory; nothing consumes it yet. That is
+deliberate, and the reason is worth more than the feature: the export table
+is the first structure in this reader that **cannot** be walked correctly by
+extending the import walk, because its three arrays are joined by indices and
+every index is a place a file can disagree with itself.
+
+Wine's implementation is a fair target for comparison here, because it is the
+thing to beat. `dlls/ntdll/loader.c` resolves exports through
+`find_named_export` and `find_ordinal_export`, and every one of the following
+is a real difference rather than a stylistic one:
+
+| | Wine | occ |
+|---|---|---|
+| name lookup | binary search over `AddressOfNames` | the name is attached to its entry during the walk, so there is no lookup to get wrong |
+| name array order | assumed sorted, never checked | order is irrelevant; the file's order is honoured |
+| counts | not cross-checked against the file's length | each array is bounded by the file before it is walked |
+| `Base` | used in an unsigned subtraction that only works because the result "must" be in range | added in 64 bits and narrowed, so a base near the top of the range reports rather than wraps |
+| forwarder cycle | recurses with no cycle detection (Wine Bug 60130; the fix, MR11701, is still unmerged) | not resolved in this layer at all — see below |
+| forwarder string | no length bound, no termination check | read through the same bounded reader as every other name in the file |
+| `AddressOfFunctions == 0` | dereferences the module base | refused |
+| `Name` field | ignored | ignored, and the reason is written down |
+
+The binary search is the substantive one, and the test that proves it is
+worth reading. `find_name_in_exports` probes the middle of the name table and
+narrows by `strcmp`. The format *requires* the pointers to be sorted so that
+a reader may do this. Nothing enforces it. `test_export_names_out_of_order`
+builds a table in the order `{Gamma, Alpha, Beta}` — a rotation of the sorted
+order, which is the arrangement most likely to produce a wrong answer rather
+than an outright failure. A search for `Alpha` there probes the middle,
+compares equal, and is correct by luck. A search for `Beta` probes the
+middle, goes left, finds `Gamma`, concludes it is greater, and reports
+not-found. occ attaches each name to `AddressOfNameOrdinals[i]` as it walks,
+so the table's order never enters into it: the cost is that names are read in
+the file's order rather than searched for, and the benefit is that a file
+which violates the specification still resolves.
+
+**What the parser stops at, and why.** A forwarder is parsed into the module
+and symbol it names — `KERNEL32.Sleep`, `MYDLL.#27` — and left there.
+Resolving one means finding that module's own export table, which means a
+module table, and this runtime does not have one yet; it is M2's asset.
+Implementing the recursion now would mean writing a temporary module table
+and deleting it, and the deletion would leave the parser different from what
+the loader needs. The division of labour is therefore: **everything that is a
+fact about the file is parsed here, and the one thing that is not — where a
+forwarder actually points — is left to the layer that can answer it.** Wine
+resolves forwarders by calling `load_dll` (`loader.c:963-974`), which changes
+the process's module graph as a side effect of resolving a name; a reader
+that answers "what does this DLL export" should not have that effect.
+
+**Nine defects in Wine's export handling, and what each one costs.** Read from
+`wine-mirror/wine` master and checked against the specification:
+
+| # | defect | consequence |
+|---|---|---|
+| D1 | forwarder cycle, no detection | stack overflow (Bug 60130; fix unmerged) |
+| D2 | counts not cross-checked against file length | reads past the image |
+| D3 | table RVAs not range-checked | `get_rva` is bare pointer arithmetic (`ntdll_misc.h:109`) |
+| D4 | name termination not checked | `strcmp` reads past the buffer |
+| D5 | name array order assumed, never checked | wrong answer, silently |
+| D6 | `Base` not validated; `ord - Base` relies on unsigned wraparound happening to fail | a TRACE line prints garbage |
+| D7 | forwarder string unbounded | one export can be a 4 GB read |
+| D8 | `AddressOfFunctions == 0` dereferences the PE header | resolves to the module's own DOS header |
+| D9 | resolving a forwarder loads a module | the process's module graph changes |
+
+D3 is the reason occ parses from a `ByteSpan` rather than from a mapped
+image: `get_rva` is only correct for memory that is already there, and this
+reader is given bytes.
+
+**Two decisions that look like omissions and are not.**
+
+The directory record's `Name` field is not read. It is an RVA to the module's
+own name, and there is nothing in this file to use it for: a caller that
+wants the name has it from wherever it opened the image. Reading it would
+give occ a refusal Wine does not have — a DLL whose export table is perfectly
+walkable and whose `Name` RVA happens to be zero would be rejected, and
+Windows loads it. That is the difference between refusing a file that cannot
+work and refusing a file that would have worked, and only one of those is a
+reader's job.
+
+The entry condition tests the RVA alone and leaves the declared size to the
+record check. A file with an RVA and a size of zero has said it has an export
+directory and also said the directory holds nothing, and the second claim
+makes the first impossible: the record lives in the directory. Skipping the
+walk on a zero size would report that as a DLL with no exports, which is a
+thing a program acts on. Wine resolves the RVA without consulting `Size`
+either — `RtlImageDirectoryEntryToData` returns on `!VirtualAddress` alone —
+and reaches the same conclusion one check later, at
+`exp_size < sizeof(*exports)`. The same condition was removed from the import
+walk, where it had the same defect and had never been tested.
+
+**What the tests are.** `tests/test_pe.cpp` grew from 278 to 466 assertions;
+the export section is 130 of them. Seven mutations were run against the
+production code, and the table below is the result. Every one is a mistake
+this reader is known to have been protected against, and the point of running
+them is that the second one is not protected against by anything except the
+first:
+
+| # | mutation | result |
+|---|---|---|
+| 1 | ordinal is the index, without the base | CAUGHT — 11 failures |
+| 2 | forwarder interval closed on the right (`>`) | CAUGHT — 1 failure |
+| 3 | forwarder DLL split at the *first* dot | CAUGHT — 4 failures |
+| 4 | name written at the name table's position, not at the index | CAUGHT — 8 failures |
+| 5 | out-of-range index clamped instead of refused | CAUGHT — 2 failures |
+| 6 | empty slots not trimmed | CAUGHT — 1 failure |
+| 7 | forwarder ordinal parsed with `strtoul` | CAUGHT — 8 failures |
+
+Mutation 6 is the one worth explaining, because it found a redundant check
+rather than a missing one. The address-table walk had `if (rva == 0) continue`
+*and* a trim at the end; the trim made the first unreachable, so removing the
+first changed nothing and the mutation escaped. Two statements of the same
+fact is not a belt and braces, it is two places to forget. The check now
+exists once, after the walk, and the comment at each site says where the other
+one went.
+
+The fixture is `build_export_image` in `tests/test_pe.cpp`, and it writes
+every byte at a fixed offset: `.text` at RVA 0x1000, `.rdata` at RVA 0x2000,
+the record at 40 bytes, then the address table, the name-pointer table, the
+ordinal table, and the strings. A test that wants a name which will not read
+says `unterminated` on that name; a test that wants a forwarder which will not
+read says it on the forwarder; a test that wants a file cut short says
+`truncate_to`. One builder, because a shared builder that grew a flag per test
+would be a builder whose flags interact in ways no single test exercises.
+
 ### The placement layer
 
 `LoadContext::placement` is the difference between the two things a caller can

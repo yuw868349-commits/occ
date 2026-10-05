@@ -79,11 +79,12 @@ constexpr std::size_t kOff64HeadersSize = 60;
 constexpr std::size_t kOff64NumberOfRvaAndSizes = 108;
 
 // The data directories start after NumberOfRvaAndSizes and are sixteen
-// RVA/size pairs. Only two are read: the import table and the base
-// relocations. The rest are reported nowhere because nothing here uses them,
-// and a reader that parses what it does not need is a reader with more ways
-// to be wrong.
+// RVA/size pairs. Only three are read: the export table, the import table and
+// the base relocations. The rest are reported nowhere because nothing here
+// uses them, and a reader that parses what it does not need is a reader with
+// more ways to be wrong.
 constexpr std::size_t kDirSize = 8;
+constexpr std::size_t kDirExport = 0;
 constexpr std::size_t kDirImport = 1;
 constexpr std::size_t kDirReloc = 5;
 constexpr std::size_t kOff32Directories = 96;
@@ -138,6 +139,86 @@ constexpr std::size_t kMaxImportDescriptors = 4096;
 // The length of a name the reader will copy. A real DLL name is well under
 // 260 characters; a longer one is not a name this reader should hold.
 constexpr std::size_t kMaxNameLength = 512;
+
+// IMAGE_EXPORT_DIRECTORY -- forty bytes, twelve fields, and eleven of them
+// say something. Characteristics is reserved and must be zero; the two
+// version fields are a linker's bookkeeping that nothing in this runtime has
+// an opinion about; TimeDateStamp is one for reproducibility. They are named
+// anyway, because a reader that skips a field silently and a reader that
+// knows it is skipping are different readers six months apart.
+constexpr std::size_t kExportDirectorySize = 40;
+constexpr std::size_t kOffExportName = 12;        // RVA of the DLL's name
+constexpr std::size_t kOffExportBase = 16;        // first ordinal
+constexpr std::size_t kOffExportNumFunctions = 20;
+constexpr std::size_t kOffExportNumNames = 24;
+constexpr std::size_t kOffExportFunctions = 28;   // RVA of the address table
+constexpr std::size_t kOffExportNames = 32;       // RVA of the name-pointer table
+constexpr std::size_t kOffExportNameOrdinals = 36; // RVA of the ordinal table
+
+// The Name field is not read, and kOffExportName is here only so the record
+// is laid out in the file's order rather than in the order this reader needs.
+//
+// Name is an RVA to the module's own name, and there is nothing in this file
+// it can be used for: a caller that wants the name already has it from
+// wherever it opened the image, and the field exists for a linker writing the
+// record rather than for a reader resolving one. Reading it would be a way
+// to refuse a file for a reason that has nothing to do with what the caller
+// came for -- a DLL whose export table is perfectly walkable and whose Name
+// RVA happens to point at a zero would be rejected by a reader that checked
+// it, and Windows would load it. That is the difference between refusing a
+// file that cannot work and refusing a file that would have worked, and only
+// one of those is a reader's job.
+
+// The record's layout, checked at compile time rather than described in a
+// comment. Every field this reader uses is inside the forty bytes, in the
+// order it reads them, and none of them is the one it skips. A constant
+// mistyped here would be a silent misread of every export in every file, and
+// a comment cannot fail a build.
+static_assert(kOffExportBase == 16 && kOffExportBase >= kOffExportName + 4,
+              "the base field must follow the name field and be four bytes "
+              "wide");
+static_assert(kOffExportNumFunctions == kOffExportBase + 4,
+              "NumberOfFunctions must follow the base");
+static_assert(kOffExportNumNames == kOffExportNumFunctions + 4,
+              "NumberOfNames must follow NumberOfFunctions");
+static_assert(kOffExportFunctions == kOffExportNumNames + 4,
+              "AddressOfFunctions must follow NumberOfNames");
+static_assert(kOffExportNames == kOffExportFunctions + 4,
+              "AddressOfNames must follow AddressOfFunctions");
+static_assert(kOffExportNameOrdinals == kOffExportNames + 4,
+              "AddressOfNameOrdinals must follow AddressOfNames");
+static_assert(kOffExportNameOrdinals + 4 == kExportDirectorySize,
+              "the record ends after the last field this reader reads");
+
+// The widths of the three tables. All three are indexed by the same kind of
+// thing and none of them is interchangeable with another: the address table
+// is a list of 32-bit addresses, the name-pointer table a list of 32-bit
+// addresses *to strings*, and the ordinal table a list of 16-bit indices.
+// Reading the last as 32-bit would double every stride and walk into the
+// middle of whatever follows, which is why each is named where it is used
+// rather than factored into one "element size".
+constexpr std::size_t kExportAddressWidth = 4;
+constexpr std::size_t kExportNamePointerWidth = 4;
+constexpr std::size_t kExportOrdinalWidth = 2;
+
+// The bound on the export table's walk, in entries.
+//
+// A PE's export count is a 32-bit field, so without a cap a file claiming
+// four billion names would have this reader walk four billion of them -- one
+// per iteration, each resolving an RVA -- before the file ran out. The import
+// walk has the same cap for the same reason and the same justification: a
+// bound is what makes the walk bounded. 65536 is far above any real DLL.
+// kernel32 exports around two thousand; the largest figure any real image is
+// known to use is under ten thousand, and the cap is not a limit on what this
+// reader will accept so much as a floor on how long it can be made to work.
+constexpr std::size_t kMaxExportedSymbols = 65536;
+
+// A forwarder names its target as "DLL.symbol" or "DLL.#27", and the split is
+// the *last* dot -- a symbol name may itself contain one, and a DLL name
+// legally may too on the systems that let it. Splitting at the first would
+// read "kernel32.dll.Sleep" as a DLL called "kernel32" and a symbol called
+// "dll.Sleep", which is neither thing.
+constexpr char kForwarderOrdinalPrefix = '#';
 
 // --------------------------------------------------------------- reading
 
@@ -370,6 +451,10 @@ const char* pe_error_name(PeError e) noexcept {
         return "a data directory points outside the file";
     case PeError::TruncatedImportTable:
         return "the import table is truncated";
+    case PeError::TruncatedExportDirectory:
+        return "the export directory is truncated";
+    case PeError::BadExportTable:
+        return "the export table is malformed";
     case PeError::BadHeaderSize:
         return "SizeOfHeaders is larger than the file";
     }
@@ -418,6 +503,7 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         out.detail_ = std::move(detail);
         out.sections_.clear();
         out.imports_.clear();
+        out.exports_.clear();
         return out;
     };
 
@@ -602,7 +688,10 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         const std::size_t usable = count < available ? count : available;
         for (std::size_t i = 0; i < usable; ++i) {
             const std::size_t at = dirs_at + i * kDirSize;
-            if (i == kDirImport) {
+            if (i == kDirExport) {
+                out.export_rva_ = rd32(bytes, at);
+                out.export_size_ = rd32(bytes, at + 4);
+            } else if (i == kDirImport) {
                 out.import_rva_ = rd32(bytes, at);
                 out.import_size_ = rd32(bytes, at + 4);
             } else if (i == kDirReloc) {
@@ -742,7 +831,14 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     // whose import directory RVA is set but resolves to nothing is a claim
     // the file does not keep, and reporting it is the difference between "no
     // imports" and "the import table is broken".
-    if (out.import_rva_ != 0 && out.import_size_ != 0) {
+    //
+    // The condition tests the RVA alone, and the declared size is left to
+    // the descriptor check below for the same reason the export walk does
+    // the same thing: a size of zero alongside a non-zero RVA is a file
+    // claiming a directory with nothing in it, which is a contradiction to
+    // report rather than an absence to infer. Wine resolves the RVA without
+    // consulting Size as well.
+    if (out.import_rva_ != 0) {
         std::uint64_t dir_off = 0;
         bool zero_filled = false;
         if (!out.resolve_rva(out.import_rva_, dir_off, zero_filled) ||
@@ -840,6 +936,455 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                                     name)) {
                 out.imports_.push_back(std::move(name));
             }
+        }
+    }
+
+    // --- the export table
+    //
+    // Parsed, and that is a departure from how the import table is treated
+    // here. Imports are a list of names and a DLL's name is the only thing
+    // this reader has ever wanted from them, so the structure is walked past.
+    // An export is three arrays that mean nothing separately: an address with
+    // no name, a name with no address, and an index that ties them together.
+    // A reader that reported the address table and left the rest to a caller
+    // would be reporting a table with holes in it, and the caller would have
+    // to walk the same three arrays again to fill them -- which is the shape
+    // of the one semantic path this project refuses to have.
+    //
+    // The division of labour is deliberate: everything read here is a fact
+    // *about the file*, and the one thing that is not -- where a forwarder
+    // actually points, which needs another DLL's export table and therefore a
+    // module table this runtime does not have -- is left to the layer above.
+    // A forwarder is parsed into the DLL and symbol it names and stops there.
+    if (out.export_rva_ != 0) {
+        std::uint64_t dir_off = 0;
+        bool zero_filled = false;
+        if (!out.resolve_rva(out.export_rva_, dir_off, zero_filled) ||
+            zero_filled) {
+            // Zero fill is not a directory. The address resolved and there is
+            // nothing behind it, and treating that as "this DLL exports
+            // nothing" would turn a file that claims an export table and
+            // cannot keep it into a DLL with no exports -- a claim a program
+            // would act on.
+            return fail(PeError::DirectoryOutOfFile,
+                        "the export directory is at RVA " +
+                            hex_value(out.export_rva_) +
+                            ", which is not backed by the file");
+        }
+        if (dir_off > bytes.size()) {
+            return fail(PeError::DirectoryOutOfFile,
+                        "the export directory resolves to file offset " +
+                            hex_value(dir_off) + ", past the end of a file " +
+                            decimal(bytes.size()) + " bytes long");
+        }
+        const std::size_t dir_at = static_cast<std::size_t>(dir_off);
+
+        // The directory record itself, before any field in it is read. A
+        // declared size smaller than the record cannot hold the record, and
+        // the twelve fields are laid out in the order they must be read: a
+        // reader that checked the array counts first would be trusting a
+        // number it has not established is readable.
+        //
+        // This also covers a declared size of zero, and that is the reason
+        // the entry condition above tests the RVA alone. A file with an RVA
+        // and a size of zero has said it has an export directory and also
+        // said the directory holds nothing -- two claims, one of which the
+        // other makes impossible, because the record lives in the directory
+        // and the directory has no bytes. Skipping the walk on a zero size
+        // would report that as a DLL with no exports, which is a thing a
+        // program acts on. Wine resolves the RVA without consulting Size for
+        // the same reason and reaches the same conclusion one check later:
+        // find_named_export refuses anything under sizeof(*exports).
+        if (out.export_size_ < kExportDirectorySize) {
+            return fail(PeError::TruncatedExportDirectory,
+                        "the export directory declares " +
+                            decimal(out.export_size_) +
+                            " bytes, which cannot hold one " +
+                            decimal(kExportDirectorySize) +
+                            "-byte directory record");
+        }
+        if (!in_range(bytes, dir_at, kExportDirectorySize)) {
+            return fail(PeError::DirectoryOutOfFile,
+                        "the export directory at file offset " +
+                            hex_value(dir_off) + " is truncated by the end of "
+                            "a file " + decimal(bytes.size()) + " bytes long");
+        }
+
+        out.export_base_ = rd32(bytes, dir_at + kOffExportBase);
+        const std::uint32_t num_functions =
+            rd32(bytes, dir_at + kOffExportNumFunctions);
+        const std::uint32_t num_names =
+            rd32(bytes, dir_at + kOffExportNumNames);
+        const std::uint32_t functions_rva =
+            rd32(bytes, dir_at + kOffExportFunctions);
+        const std::uint32_t names_rva = rd32(bytes, dir_at + kOffExportNames);
+        const std::uint32_t ordinals_rva =
+            rd32(bytes, dir_at + kOffExportNameOrdinals);
+
+        // The two counts are independent and the file is not required to make
+        // them agree. NumberOfFunctions is the length of the address table
+        // and therefore the number of ordinals the image uses; NumberOfNames
+        // is how many of those ordinals are reachable by name. A DLL that
+        // exports five thousand symbols by ordinal and names ten of them is
+        // ordinary, and a reader that required the counts to match would
+        // refuse it.
+        //
+        // NumberOfFunctions is capped because it drives the address-table
+        // walk, and an uncapped 32-bit count is a file that has asked for
+        // four billion iterations. NumberOfNames is capped for the same
+        // reason and with the same value, though it is a smaller number in
+        // every real image.
+        //
+        // The cap is reported rather than applied, exactly as the import walk
+        // does it. A reader that stopped silently at the cap and returned a
+        // short list would be telling the caller this DLL exports this many
+        // symbols, which is a claim about the file. The diagnostic says what
+        // the file claimed instead.
+        if (num_functions > kMaxExportedSymbols) {
+            return fail(PeError::BadExportTable,
+                        "the export directory claims " +
+                            decimal(num_functions) +
+                            " addresses in its address table, which is past "
+                            "the " + decimal(kMaxExportedSymbols) +
+                            " this reader walks");
+        }
+        if (num_names > kMaxExportedSymbols) {
+            return fail(PeError::BadExportTable,
+                        "the export directory claims " + decimal(num_names) +
+                            " names in its name pointer table, which is past "
+                            "the " + decimal(kMaxExportedSymbols) +
+                            " this reader walks");
+        }
+
+        // A DLL that exports nothing declares zero for both counts and an RVA
+        // of zero for the address table. That is not an error and there is
+        // nothing to walk, so the walk is skipped rather than attempted. The
+        // order matters: the counts are read before the arrays are resolved,
+        // because a file that claims no names must not be failed for naming
+        // an array it does not need.
+        if (num_functions == 0) {
+            // A name with no address table to point into is a claim the file
+            // cannot keep: the name-ordinal table's entries are indices into
+            // the address table, so with no address table every one of them
+            // is out of range. Refused rather than ignored, because the
+            // alternative is a name with no address, which is a thing a
+            // caller would have to detect.
+            if (num_names != 0) {
+                return fail(PeError::BadExportTable,
+                            "the export directory names " + decimal(num_names) +
+                                " exports but declares no address table for "
+                                "them to point into");
+            }
+        } else {
+            // The address table. Resolved once, and every entry read through
+            // the same bound check rather than trusting the count, because the
+            // count and the file's length are two different claims and the
+            // walk has to be bounded by the one that is true.
+            std::uint64_t functions_off = 0;
+            bool functions_zero = false;
+            if (!out.resolve_rva(functions_rva, functions_off,
+                                 functions_zero) ||
+                functions_zero) {
+                return fail(PeError::BadExportTable,
+                            "the export address table is at RVA " +
+                                hex_value(functions_rva) +
+                                ", which is not backed by the file");
+            }
+            // The multiplication is by a constant width and a count already
+            // bounded by the cap, so it cannot overflow a 64-bit size_t; the
+            // subtraction is what makes the comparison below safe rather than
+            // a sum that would have wrapped.
+            const std::size_t functions_at =
+                static_cast<std::size_t>(functions_off);
+            if (functions_at > bytes.size() ||
+                bytes.size() - functions_at <
+                    static_cast<std::size_t>(num_functions) *
+                        kExportAddressWidth) {
+                return fail(PeError::BadExportTable,
+                            "the export address table declares " +
+                                decimal(num_functions) + " entries, which do "
+                                "not all fit in a file " +
+                                decimal(bytes.size()) + " bytes long");
+            }
+
+            out.exports_.resize(num_functions);
+
+            // The name tables, in one pass. They are read together because
+            // they are only meaningful together: entry i of the name-pointer
+            // table, entry i of the ordinal table, and the entry of the
+            // address table that the ordinal names are one fact, and reading
+            // any two of them without the third produces a name attached to an
+            // address it does not belong to.
+            if (num_names != 0) {
+                std::uint64_t names_off = 0;
+                std::uint64_t ordinals_off = 0;
+                bool names_zero = false;
+                bool ordinals_zero = false;
+                if (!out.resolve_rva(names_rva, names_off, names_zero) ||
+                    names_zero) {
+                    return fail(PeError::BadExportTable,
+                                "the export name pointer table is at RVA " +
+                                    hex_value(names_rva) +
+                                    ", which is not backed by the file");
+                }
+                if (!out.resolve_rva(ordinals_rva, ordinals_off,
+                                     ordinals_zero) ||
+                    ordinals_zero) {
+                    return fail(PeError::BadExportTable,
+                                "the export ordinal table is at RVA " +
+                                    hex_value(ordinals_rva) +
+                                    ", which is not backed by the file");
+                }
+                const std::size_t names_at =
+                    static_cast<std::size_t>(names_off);
+                const std::size_t ordinals_at =
+                    static_cast<std::size_t>(ordinals_off);
+                if (names_at > bytes.size() ||
+                    bytes.size() - names_at <
+                        static_cast<std::size_t>(num_names) *
+                            kExportNamePointerWidth) {
+                    return fail(PeError::BadExportTable,
+                                "the export name pointer table declares " +
+                                    decimal(num_names) +
+                                    " entries, which do not all fit in a "
+                                    "file " + decimal(bytes.size()) +
+                                    " bytes long");
+                }
+                if (ordinals_at > bytes.size() ||
+                    bytes.size() - ordinals_at <
+                        static_cast<std::size_t>(num_names) *
+                            kExportOrdinalWidth) {
+                    return fail(PeError::BadExportTable,
+                                "the export ordinal table declares " +
+                                    decimal(num_names) +
+                                    " entries, which do not all fit in a "
+                                    "file " + decimal(bytes.size()) +
+                                    " bytes long");
+                }
+
+                for (std::size_t i = 0; i < num_names; ++i) {
+                    // The index, not the ordinal. This is the field the
+                    // format is most often misread on: it is an offset into
+                    // the address table, and the ordinal a program imports by
+                    // is that index plus the base. Adding the base here
+                    // instead would be a one-character difference between
+                    // this reader and one that resolves the wrong function
+                    // for every named export in a DLL whose base is not 1.
+                    const std::uint16_t index = rd16(
+                        bytes, ordinals_at + i * kExportOrdinalWidth);
+
+                    // An index past the end of the address table is a claim
+                    // the file cannot keep. It is checked rather than
+                    // skipped: skipping would leave a name attached to
+                    // nothing, and a caller resolving that name would get
+                    // whatever the vector happens to have at that position.
+                    if (index >= num_functions) {
+                        return fail(PeError::BadExportTable,
+                                    "name " + decimal(i) + " of " +
+                                        decimal(num_names) +
+                                        " names address-table entry " +
+                                        decimal(index) +
+                                        ", and the address table has only " +
+                                        decimal(num_functions) + " entries");
+                    }
+
+                    std::string name;
+                    if (!out.read_rva_string(
+                            bytes, rd32(bytes, names_at +
+                                                 i * kExportNamePointerWidth),
+                            name)) {
+                        // A name that will not read ends the association but
+                        // not the table. The entries before it are real
+                        // exports and dropping them would understate what the
+                        // image provides; the entries after it are equally
+                        // real and may well read. So the walk stops, exactly
+                        // as the import walk stops at a name it cannot read,
+                        // and what was collected is kept.
+                        //
+                        // The alternative -- refusing the file -- would be
+                        // wrong in a way that is hard to see: a DLL whose
+                        // export table has one unreadable name is a DLL that
+                        // works for every other symbol, and refusing it
+                        // removes a program that ran before.
+                        break;
+                    }
+                    out.exports_[index].name = std::move(name);
+                }
+            }
+
+            // The ordinals, and the forwarder test, for every address-table
+            // entry. The vector has already been sized to the address table
+            // and the names have already been attached by index, so this loop
+            // only has to number each slot and decide what its address means.
+            for (std::size_t i = 0; i < num_functions; ++i) {
+                const std::uint32_t rva =
+                    rd32(bytes, functions_at + i * kExportAddressWidth);
+                PeExport& e = out.exports_[i];
+
+                // A slot the file left at zero is not an export, and the
+                // check is not here. It is at the end of this block, where
+                // the entries are trimmed -- one check, after the walk, for
+                // a fact about the whole table. Putting it here as well
+                // would be a second statement of the same thing, and the two
+                // would have to be kept in step: a reader with both would
+                // have two places to forget, and a mutation that removed
+                // only this one would be invisible because the other would
+                // still hold.
+
+                // The ordinal. The base is added in a 64-bit temporary and
+                // then narrowed, which is what makes a file that claims a
+                // base near the top of the 32-bit range produce a report
+                // rather than a wrapped ordinal. A file may legitimately set
+                // the base to zero, and this honors that: ordinals then start
+                // at zero and the image is saying so.
+                e.rva = rva;
+                e.ordinal = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(i) + out.export_base_);
+
+                // The forwarder test, and it is an address comparison rather
+                // than a bit in the table because the format has no bit for
+                // it: an export whose address falls inside the export
+                // directory is not an address at all but the location of a
+                // string that names another DLL's symbol. The interval is the
+                // directory's own RVA and size, and it is half-open -- an
+                // export pointing exactly at the end of the directory is past
+                // it, and reading a forwarder from there would read the
+                // section that follows.
+                //
+                // The comparison is done in 64 bits and the end is computed
+                // by addition, which is safe because both operands are
+                // 32-bit and their sum cannot reach the top of a 64-bit
+                // value. A file declaring a directory that runs to the top of
+                // the address space therefore produces a test that is false
+                // for every export rather than one that is true for all of
+                // them.
+                const std::uint64_t dir_start = out.export_rva_;
+                const std::uint64_t dir_end =
+                    dir_start + static_cast<std::uint64_t>(out.export_size_);
+                if (static_cast<std::uint64_t>(rva) < dir_start ||
+                    static_cast<std::uint64_t>(rva) >= dir_end) {
+                    continue;
+                }
+                e.is_forwarder = true;
+
+                // The string. Read through the same bounded reader as every
+                // other name in this file, which is what keeps a forwarder
+                // from being the one place a file can make this reader walk
+                // to the end of a large section: read_rva_string stops at the
+                // first NUL, refuses a string that has none inside the file,
+                // and refuses one longer than any name.
+                std::string target;
+                if (!out.read_rva_string(bytes, rva, target)) {
+                    // A forwarder we cannot read is a claim the file does
+                    // not keep, and it is refused rather than recorded as a
+                    // forwarder to nothing. The export is left in place with
+                    // its address and its name, so a reader that only wanted
+                    // the names still has them; what is refused is the file,
+                    // because a DLL whose forwarder cannot be read is a DLL
+                    // whose import will fail later and less clearly.
+                    return fail(PeError::BadExportTable,
+                                "a forwarder for the export at RVA " +
+                                    hex_value(rva) + " is not a readable "
+                                    "string in the file");
+                }
+
+                // The split, at the last dot. `NTDLL.RtlAllocateHeap` and
+                // `KERNEL32.Sleep` are the ordinary forms; a module whose
+                // name contains a dot -- which Windows permitted for 16-bit
+                // compatibility and which files in the wild still carry --
+                // makes the first dot the wrong one to split at, and the
+                // resulting half-DLL would resolve to nothing.
+                const std::size_t dot = target.rfind('.');
+                if (dot == std::string::npos || dot == 0 ||
+                    dot + 1 >= target.size()) {
+                    // No dot at all, a leading dot, or a trailing one. Each
+                    // names a string the format does not define, and each is
+                    // a file making a claim this reader cannot keep.
+                    return fail(PeError::BadExportTable,
+                                "the forwarder \"" + target +
+                                    "\" is not of the form DLL.symbol or "
+                                    "DLL.#ordinal");
+                }
+                e.forwarder_dll = target.substr(0, dot);
+                const std::string symbol = target.substr(dot + 1);
+                if (symbol[0] == kForwarderOrdinalPrefix) {
+                    // The ordinal form. The number is parsed by hand rather
+                    // than with a library function because the format accepts
+                    // only decimal digits here and a parser that accepted
+                    // "+27", " 27" or "0x1b" would resolve a forwarder the
+                    // operating system would not.
+                    //
+                    // An empty or non-numeric rest is refused. "#" alone is
+                    // not a forwarder to ordinal zero; it is a string the
+                    // format does not define.
+                    std::uint32_t ordinal = 0;
+                    bool digits = !symbol.empty();
+                    for (std::size_t k = 1; k < symbol.size(); ++k) {
+                        const char c = symbol[k];
+                        if (c < '0' || c > '9') {
+                            digits = false;
+                            break;
+                        }
+                        // The multiply-add is done in 64 bits and the result
+                        // is range-checked rather than truncated: a forwarder
+                        // naming an ordinal with twenty digits is a file
+                        // making a claim no address table can satisfy, and
+                        // truncating it would name a different one.
+                        const std::uint64_t next =
+                            static_cast<std::uint64_t>(ordinal) * 10u +
+                            static_cast<std::uint64_t>(c - '0');
+                        if (next > 0xFFFFFFFFull) {
+                            digits = false;
+                            break;
+                        }
+                        ordinal = static_cast<std::uint32_t>(next);
+                    }
+                    if (!digits) {
+                        return fail(PeError::BadExportTable,
+                                    "the forwarder \"" + target +
+                                        "\" names an ordinal that is not a "
+                                        "number");
+                    }
+                    e.forwarder_by_ordinal = true;
+                    // The ordinal is recorded as the file states it. Whether
+                    // it is inside this DLL's own range is not this reader's
+                    // question -- the number belongs to the *forwarded* DLL and
+                    // is meaningless here -- but a value of zero is refused,
+                    // because the format numbers exports from the base field
+                    // up and a base of zero would have to be stated by the
+                    // target, which is a fact this file does not carry.
+                    if (ordinal == 0) {
+                        return fail(PeError::BadExportTable,
+                                    "the forwarder \"" + target +
+                                        "\" names ordinal zero");
+                    }
+                    e.forwarder_ordinal = ordinal;
+                } else {
+                    e.forwarder_name = symbol;
+                }
+            }
+
+            // The vector is trimmed to what was actually filled. The resize
+            // above made it the address table's length so that the name loop
+            // could index it, and the entries a file left at zero are still in
+            // it -- each one an export with no name, no RVA and the ordinal it
+            // would have had. They are removed here rather than reported as
+            // exports of address zero, which is the base of every image and
+            // therefore a claim that would resolve to the module's own header.
+            //
+            // This is the only place an empty slot is recognized, and it is
+            // placed after the walk rather than inside it for a reason worth
+            // stating: an address of zero is also what an unreadable forwarder
+            // would look like if the read were allowed to fail into it, and a
+            // check inside the loop would have to be written to tell the two
+            // apart. Trimming once, at the end, cannot be fooled by either --
+            // a slot the file left empty and a slot whose string would not
+            // read are both absent from the result, and neither is reported as
+            // an export of the image base.
+            out.exports_.erase(
+                std::remove_if(out.exports_.begin(), out.exports_.end(),
+                               [](const PeExport& e) { return e.rva == 0; }),
+                out.exports_.end());
         }
     }
 

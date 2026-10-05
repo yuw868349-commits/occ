@@ -114,6 +114,21 @@ enum class PeError : std::uint8_t {
     // A data directory's RVA does not resolve to anywhere in the file.
     DirectoryOutOfFile,
     TruncatedImportTable,
+    // The export directory declares fewer bytes than one 40-byte directory
+    // record needs. A distinct fact from a truncated import table, and naming
+    // a different repair: a DLL with an unusable export directory still has an
+    // import table a loader can walk, and treating the two the same would
+    // refuse a file whose problem is confined to the half nobody imports by.
+    TruncatedExportDirectory,
+    // One of the export directory's three tables -- addresses, names, or name
+    // ordinals -- resolves to somewhere the file does not cover, or an entry
+    // inside one of them names a string that will not read.
+    //
+    // Refused rather than reported as "no exports". An export directory that
+    // is present and unreadable is a different claim from one that is absent,
+    // and a reader that conflates them turns a broken DLL into a DLL with no
+    // exports -- which is a thing a program can act on.
+    BadExportTable,
     // SizeOfHeaders claims more of the file than the file has. This is not
     // a wrong number, it is a reclassification: the value decides which of
     // the two coordinate systems an RVA belongs to, so a file that overstates
@@ -161,6 +176,66 @@ struct PeSection {
     // question does not repeat the comparison that could overflow.
     std::uint64_t virtual_end() const noexcept;
     std::uint64_t raw_end() const noexcept;
+};
+
+// One entry of a PE's export table, as the file states it.
+//
+// The three fields that make up an export are the name, the ordinal and the
+// RVA, and they come from three different arrays in the file. The ordinal in
+// particular is not stored in the file as the number a caller would call an
+// ordinal: the name-ordinal table holds an *index* into the address table,
+// and the number a program imports by is that index plus the directory's
+// base. What is recorded here is the number as the outside world sees it,
+// because a caller asking "what is exported as Sleep" wants the ordinal that
+// an import would name, not the offset of its entry.
+//
+// A forwarder is a fourth thing, and it is the one place where "the RVA of an
+// export" is not an address of anything in this image. A forwarder's RVA
+// points at a string inside the export directory itself, and that string
+// names a symbol in a different DLL. It is kept as the parsed target rather
+// than as the string because a string here would be a second thing to
+// re-parse, and a re-parse is where a reader and a caller would come to
+// disagree about which of several dots separates the DLL from the symbol.
+struct PeExport {
+    // The public name, or empty for an export that has none. A PE is allowed
+    // to give some, all or none of its exports a name, and an unnamed one is
+    // reachable by ordinal alone. An empty name is therefore a fact about the
+    // export and not a failure to read it.
+    std::string name;
+
+    // The ordinal as the outside world sees it: the address table's index
+    // plus the directory's base. Two things follow from that arithmetic being
+    // done here rather than by the caller. A base of zero is legal in the
+    // format, and a file that states one gets it honored rather than being
+    // treated as though ordinals must start at one. And the sum is taken in a
+    // type that holds it, so a file claiming a base near the top of the 32-bit
+    // range does not produce an ordinal that wrapped.
+    std::uint32_t ordinal = 0;
+
+    // The address of the export, relative to the image base. Zero means the
+    // slot has no export in it, which the format uses for a symbol that was
+    // removed but whose slot was kept so the ordinals after it do not move.
+    // A zero here is not a forwarder to address zero and not a missing value;
+    // it is an index that was deliberately left empty.
+    std::uint32_t rva = 0;
+
+    // Whether this export is a forwarder, which is decided by the address
+    // falling inside the export directory rather than by any bit in the
+    // table. The three fields below are then the parsed form of the string
+    // at `rva`.
+    bool is_forwarder = false;
+
+    // The DLL a forwarder names and the symbol it names there. The DLL part
+    // is kept as the file spells it, without case folding: the operating
+    // system's loader does not fold it either, and a reader that normalized
+    // it would resolve a name the operating system would not.
+    std::string forwarder_dll;
+    std::string forwarder_name;
+
+    // Which of the two a forwarder names. By name is the common case;
+    // "KERNEL32.#27" is the other and carries a number instead of a name.
+    bool forwarder_by_ordinal = false;
+    std::uint32_t forwarder_ordinal = 0;
 };
 
 class PeImage {
@@ -263,6 +338,43 @@ public:
         return imports_;
     }
 
+    // The exports, in address-table order -- which is the order the ordinals
+    // are assigned in, so `exports()[i].ordinal` is the ordinal of the export
+    // at index i, biased by the directory's base. That order is not the order
+    // of the names, and the two are not required to correspond: an export may
+    // have no name, and two names may share one entry only through the
+    // name-ordinal table's saying so.
+    //
+    // A slot the address table leaves at zero produces no entry here. That is
+    // a real gap in the sequence -- the ordinals on either side of it are not
+    // adjacent -- and a caller that indexes this vector by ordinal has to ask
+    // rather than assume. `export_ordinal_base()` is provided for exactly
+    // that, and it is the only way to recover the ordinal of an entry without
+    // trusting the array's position.
+    [[nodiscard]] const std::vector<PeExport>& exports() const noexcept {
+        return exports_;
+    }
+
+    // The first ordinal this image uses, which is the directory's base field.
+    // Ordinarily 1, but the format only says it is "usually" 1, and a file
+    // that says otherwise is a file this reader reports rather than corrects.
+    // A caller turning a name into an ordinal, or the reverse, needs this; the
+    // arithmetic is done in the reader so that it is done the same way once.
+    [[nodiscard]] std::uint32_t export_ordinal_base() const noexcept {
+        return export_base_;
+    }
+
+    // The export directory, as an RVA and a size, reported the way the
+    // relocations are. The size matters to a caller and not to this reader:
+    // an export whose RVA falls inside the directory is a forwarder rather
+    // than an address, and that test needs the extent, not just the start.
+    [[nodiscard]] std::uint64_t export_rva() const noexcept {
+        return export_rva_;
+    }
+    [[nodiscard]] std::uint32_t export_size() const noexcept {
+        return export_size_;
+    }
+
     // The base relocation directory, reported rather than parsed. A
     // relocation reader is a larger piece of work and nothing in the engine
     // needs its contents -- what matters for analysis is that a reloc table
@@ -314,6 +426,9 @@ private:
     std::uint32_t reloc_size_ = 0;
     std::uint32_t import_rva_ = 0;
     std::uint32_t import_size_ = 0;
+    std::uint64_t export_rva_ = 0;
+    std::uint32_t export_size_ = 0;
+    std::uint32_t export_base_ = 0;
 
     // Whether SizeOfHeaders actually reaches past the section table. A file
     // can declare a region smaller than the headers this reader parsed out of
@@ -325,6 +440,10 @@ private:
 
     std::vector<PeSection> sections_;
     std::vector<std::string> imports_;
+    // The parsed export table. Declared after the imports because the two are
+    // read in that order, and a reader that kept its state in reading order
+    // would be easier to check against the file layout than one that did not.
+    std::vector<PeExport> exports_;
 };
 
 } // namespace occ::parser

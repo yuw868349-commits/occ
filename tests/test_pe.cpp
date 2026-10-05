@@ -102,6 +102,12 @@ struct Spec {
     // The import directory, as an RVA and a size. Zero means none.
     std::uint32_t import_rva = 0;
     std::uint32_t import_size = 0;
+    // The export directory, same. Zero means none. Kept separate from the
+    // import's rather than folded into a table of directories, because a
+    // fixture sets one or the other and a builder that made both come from
+    // one struct would have a test that meant to move one of them move both.
+    std::uint32_t export_rva = 0;
+    std::uint32_t export_size = 0;
     std::uint32_t reloc_rva = 0;
     std::uint32_t reloc_size = 0;
     std::uint32_t dir_count = 16;
@@ -214,6 +220,10 @@ Built build(const Spec& s) {
     const std::size_t dirs = o + (s.plus ? 112 : 96);
     const std::size_t count_at = o + (s.plus ? 108 : 92);
     put32(b.bytes, count_at, s.dir_count);
+    if (s.export_rva != 0) {
+        put32(b.bytes, dirs + 0 * 8, s.export_rva);
+        put32(b.bytes, dirs + 0 * 8 + 4, s.export_size);
+    }
     if (s.import_rva != 0) {
         put32(b.bytes, dirs + 1 * 8, s.import_rva);
         put32(b.bytes, dirs + 1 * 8 + 4, s.import_size);
@@ -867,6 +877,1104 @@ void test_import_name_without_terminator() {
           "unterminated name: discarded rather than reported as a fragment");
 }
 
+// ------------------------------------------------------------- the exports
+//
+// The export table is three tables and a directory record, and the mistakes
+// available in it are different in kind from the import table's. The import
+// table is a list of things in a fixed order, so a reader either walks it or
+// it does not. The export table is a set of parallel arrays joined by
+// indices, and every one of those indices is a place a file can disagree
+// with itself:
+//
+//   - AddressOfNameOrdinals holds an *index into the address table*, not an
+//     ordinal. Reading it as an ordinal silently resolves the wrong function
+//     for every named export of any DLL whose base is not 1.
+//   - NumberOfFunctions and NumberOfNames are independent counts. A DLL can
+//     export five thousand symbols by ordinal and name ten of them.
+//   - An address of zero is a slot with no export, not an export at the
+//     image base.
+//   - The name-pointer array is *specified* to be sorted, and nothing
+//     enforces it. A file that does not sort it is still a file Windows
+//     loads, and a reader that binary-searches it is a reader that answers
+//     wrongly rather than slowly.
+//   - An address inside the directory's own extent is a forwarder: a string
+//     naming another module's symbol. The extent is half-open, and the
+//     boundary between "an address" and "a string" is exactly where an
+//     off-by-one is invisible.
+//
+// The fixtures below write every one of those bytes at a known offset, so a
+// failure names a field rather than a zero that happened to be there.
+
+// One name in the name-pointer table, and the address-table index its
+// ordinal names. Kept as a pair rather than as a parallel array because the
+// two are one fact: entry i of the name table and the index it resolves to
+// are the same statement, and a fixture that stored them separately could
+// put them out of step without meaning to.
+struct ExportName {
+    std::string name;
+    std::uint16_t index = 0;
+    // Point this name at a run of non-zero bytes with no terminator instead
+    // of at its own string. The name is still written -- so the table is
+    // still the size the file says it is -- but the pointer no longer
+    // resolves to anything readable, which is the case a reader has to
+    // survive. A fixture that could only produce readable names could not
+    // produce this one, and a reader that had never met it would be a reader
+    // whose behaviour here was never chosen.
+    bool unterminated = false;
+};
+
+// A forwarder: the address-table index it sits at, and the string the
+// address is made to point at. The builder places the string inside the
+// directory's extent and points the entry at it, which is the only way to
+// produce the case at all -- a forwarder is defined by where its address
+// lands, not by anything written in the table.
+struct ExportForwarder {
+    std::uint16_t index = 0;
+    std::string target;
+    // Point the address at the unterminated run instead of at the string,
+    // which is the case a forwarder has to survive: an address inside the
+    // directory that is not a readable string. See ExportName's field of the
+    // same name for why a fixture has to be able to say this.
+    bool unterminated = false;
+};
+
+struct ExportLayout {
+    // The base field. Almost always 1; a file saying otherwise is legal and
+    // is the only way to tell a reader that added it from one that did not.
+    std::uint32_t base = 1;
+    // The address table, by index. A zero is a slot the file leaves empty.
+    std::vector<std::uint32_t> addresses;
+    // The name table, in the order it is written. Not necessarily sorted:
+    // that is the point.
+    std::vector<ExportName> names;
+    // Forwarders, applied after the address table is written and overriding
+    // whatever the entry at that index held.
+    std::vector<ExportForwarder> forwarders;
+    // The declared counts and size, when the file lies about them.
+    //
+    // Negative means "whatever was actually written", which is what a
+    // well-formed file does. Zero is not that: a file may legitimately
+    // declare zero of something, and a fixture that could not say so would
+    // make "declares nothing" untestable -- which is the one case where the
+    // reader's decision differs most sharply from its behaviour everywhere
+    // else. The distinction is a signed one because the interesting values
+    // are zero and there is no unsigned value that means "unset".
+    int declared_functions = -1;
+    int declared_names = -1;
+    int declared_size = -1;
+    // The four RVAs the directory holds, when the file points one of them
+    // somewhere other than where the builder put the table. Zero means "the
+    // real location".
+    std::uint32_t dir_rva = 0;
+    std::uint32_t functions_rva = 0;
+    std::uint32_t names_rva = 0;
+    std::uint32_t ordinals_rva = 0;
+    // Cut the file to this many bytes. Zero means "the whole file".
+    //
+    // Present for one reason, and it is not to make a table run off the end:
+    // a file cut inside a section is refused at the section table, before any
+    // directory is read, so it cannot reach the export checks. It is here for
+    // the case where the *file's own framing* is what a test needs to change
+    // -- see the truncation test below, which asserts that the section check
+    // is what fires, so that the fact is recorded rather than rediscovered
+    // the next time a fixture tries this and gets an error it did not
+    // expect.
+    std::size_t truncate_to = 0;
+};
+
+// Where everything lives, fixed rather than computed from the layout's
+// inputs, so a test can name any byte. .text is at RVA 0x1000 (file 0x200)
+// and .rdata at RVA 0x2000 (file 0x600); the export directory is the first
+// thing in .rdata, and the three tables and every string follow it.
+constexpr std::size_t kExpDirFile = 0x600;
+constexpr std::size_t kExpDirRva = 0x2000;
+constexpr std::size_t kExpDirSize = 40;
+
+// Writes a NUL-terminated string at a file offset and returns its RVA.
+// Returned rather than passed in because the caller has to write a table
+// entry pointing at a string it has not placed yet, and computing the RVA
+// at both ends is how a fixture ends up disagreeing with itself.
+std::uint32_t put_export_string(std::vector<std::uint8_t>& bytes,
+                                std::size_t at, const std::string& s) {
+    std::memcpy(&bytes[at], s.data(), s.size());
+    bytes[at + s.size()] = '\0';
+    return static_cast<std::uint32_t>(kExpDirRva + (at - kExpDirFile));
+}
+
+PeImage build_export_image(const ExportLayout& e, Built* out_built = nullptr) {
+    Spec s;
+    s.dll = true;
+    s.sections.push_back({".text", 0x1000, 0x400, 0x400, 0x60000020});
+    s.sections.push_back({".rdata", 0x2000, 0x600, 0x600, 0x40000040});
+    // The directory's RVA is known now; its *size* is not, because the size
+    // is the extent of the record plus the three tables plus every string,
+    // and the strings are placed below. Both are written into the data
+    // directory by hand at the end of this function, once the extent is
+    // known, rather than by the builder -- the builder would write a size of
+    // zero and a second build() to fix it would move every string the tables
+    // point at.
+    Built b = build(s);
+
+    const std::size_t num_functions =
+        e.declared_functions >= 0
+            ? static_cast<std::size_t>(e.declared_functions)
+            : e.addresses.size();
+    const std::size_t num_names =
+        e.declared_names >= 0 ? static_cast<std::size_t>(e.declared_names)
+                              : e.names.size();
+
+    // The three tables, laid out in the order the directory record names
+    // them. Offsets from the record are fixed: +28, +32, +36.
+    const std::size_t functions_at = kExpDirFile + kExpDirSize;
+    const std::size_t names_at =
+        functions_at + e.addresses.size() * 4;
+    const std::size_t ordinals_at = names_at + e.names.size() * 4;
+
+    // --- the address table
+    for (std::size_t i = 0; i < e.addresses.size(); ++i) {
+        put32(b.bytes, functions_at + i * 4, e.addresses[i]);
+    }
+
+    // --- the name table and its ordinals
+    for (std::size_t i = 0; i < e.names.size(); ++i) {
+        put16(b.bytes, ordinals_at + i * 2, e.names[i].index);
+    }
+
+    // --- the strings, and the name pointers that will point at them
+    //
+    // Every name is written, so the name table is the length the directory
+    // says it is whatever any of them turns out to be. A name marked
+    // unterminated still gets its string; only its pointer is redirected,
+    // afterwards, to a run of bytes with no terminator in it.
+    std::size_t cursor = ordinals_at + e.names.size() * 2;
+    std::vector<std::uint32_t> name_rvas;
+    name_rvas.reserve(e.names.size());
+    for (const ExportName& n : e.names) {
+        name_rvas.push_back(put_export_string(b.bytes, cursor, n.name));
+        cursor += n.name.size() + 1;
+    }
+
+    // The unterminated run, when some name or forwarder asked for one.
+    // Filled from here -- which is the end of the last string, and so *past*
+    // every name the file also wrote -- to the end of the file, with a
+    // non-zero byte so there is no terminator anywhere inside it. Past the
+    // last string is the whole point: a run starting at the first string
+    // would also be unterminated but would eat the readable names along with
+    // it, and a test for "one name does not read" would silently become a
+    // test for "no name reads".
+    std::uint32_t unterminated_rva = 0;
+    bool wants_unterminated = false;
+    for (const ExportName& n : e.names) {
+        wants_unterminated = wants_unterminated || n.unterminated;
+    }
+    for (const ExportForwarder& f : e.forwarders) {
+        wants_unterminated = wants_unterminated || f.unterminated;
+    }
+    // --- the forwarders, which are addresses pointing into the strings that
+    // are about to be written. Placed after the names so that a forwarder
+    // pointing at a name is a thing a test has to ask for rather than one it
+    // gets by accident.
+    for (const ExportForwarder& f : e.forwarders) {
+        if (f.unterminated) {
+            continue;   // its address is written below, with the name pointers
+        }
+        const std::uint32_t rva = put_export_string(b.bytes, cursor, f.target);
+        cursor += f.target.size() + 1;
+        put32(b.bytes, functions_at + f.index * 4, rva);
+    }
+
+    // The unterminated run, last, so it cannot eat a string this function is
+    // still going to write. It runs from the end of the last string to the
+    // end of the file, filled with a non-zero byte, so there is no terminator
+    // anywhere inside it -- which is the condition being produced. A run of
+    // any fixed length would be terminated by whatever the linker put next.
+    //
+    // It starts *past* every string the file also wrote, so a fixture asking
+    // for one unreadable name among two readable ones gets exactly that; a
+    // run starting at the first string would be equally unterminated and
+    // would take the readable ones with it, turning the test into a different
+    // one.
+    std::size_t extent_end = cursor;
+    if (wants_unterminated) {
+        for (std::size_t i = cursor; i < b.bytes.size(); ++i) {
+            b.bytes[i] = 'A';
+        }
+        unterminated_rva =
+            static_cast<std::uint32_t>(kExpDirRva + (cursor - kExpDirFile));
+        // And the extent has to cover it. An address outside the directory is
+        // not a forwarder at all, so a run past the end would turn the
+        // forwarder case into the plain-address case without anything
+        // failing.
+        extent_end = b.bytes.size();
+    }
+
+    // The name pointers and the unterminated forwarders' addresses, last of
+    // all, because they may hold the run's address and the run's address is
+    // not known until the run exists. Both go after everything else for the
+    // same reason: a pointer written before the thing it points at was placed
+    // is a pointer to nothing, and a fixture that produced one would be
+    // testing a reader against a file no linker produces.
+    for (std::size_t i = 0; i < name_rvas.size(); ++i) {
+        put32(b.bytes, names_at + i * 4,
+              e.names[i].unterminated ? unterminated_rva : name_rvas[i]);
+    }
+    for (const ExportForwarder& f : e.forwarders) {
+        if (f.unterminated) {
+            put32(b.bytes, functions_at + f.index * 4, unterminated_rva);
+        }
+    }
+
+    // Truncation, applied last. Every write above lands inside the full
+    // file and this cuts it, so a fixture cannot write past its own end and
+    // a test that wants a table to run off the end gets exactly that: a
+    // directory record that is still whole, and a table that is not.
+    //
+    // It is applied after the extent is computed so the extent is clamped to
+    // what the file actually holds. A fixture that declared an extent past
+    // its own end would be making a second claim alongside the one the test
+    // is about, and a failure would not say which claim was caught.
+    const std::size_t extent = extent_end - kExpDirFile;
+
+    // --- the directory record
+    put32(b.bytes, kExpDirFile + 0, 0);            // Characteristics
+    put32(b.bytes, kExpDirFile + 4, 0);            // TimeDateStamp
+    put32(b.bytes, kExpDirFile + 8, 0);            // version, minor
+    put32(b.bytes, kExpDirFile + 12, 0);           // Name: not read
+    put32(b.bytes, kExpDirFile + 16, e.base);
+    put32(b.bytes, kExpDirFile + 20,
+          static_cast<std::uint32_t>(num_functions));
+    put32(b.bytes, kExpDirFile + 24,
+          static_cast<std::uint32_t>(num_names));
+    put32(b.bytes, kExpDirFile + 28,
+          e.functions_rva != 0
+              ? e.functions_rva
+              : static_cast<std::uint32_t>(kExpDirRva +
+                                            (functions_at - kExpDirFile)));
+    put32(b.bytes, kExpDirFile + 32,
+          e.names_rva != 0
+              ? e.names_rva
+              : static_cast<std::uint32_t>(kExpDirRva +
+                                            (names_at - kExpDirFile)));
+    put32(b.bytes, kExpDirFile + 36,
+          e.ordinals_rva != 0
+              ? e.ordinals_rva
+              : static_cast<std::uint32_t>(kExpDirRva +
+                                            (ordinals_at - kExpDirFile)));
+
+    // The directory entry, patched in because the size is only known now and
+    // a second build() would move every string the tables above point at.
+    const std::size_t dirs = b.opt + 96;
+    put32(b.bytes, dirs + 0 * 8,
+          e.dir_rva != 0
+              ? e.dir_rva
+              : static_cast<std::uint32_t>(kExpDirRva));
+    put32(b.bytes, dirs + 0 * 8 + 4,
+          e.declared_size >= 0
+              ? static_cast<std::uint32_t>(e.declared_size)
+              : static_cast<std::uint32_t>(extent));
+
+    if (out_built != nullptr) {
+        *out_built = b;
+    }
+    // The cut, last, after the record and the directory entry are written.
+    // Both of those live in the first 0x200 bytes of the file, so a prefix
+    // long enough to hold the record still holds both -- which is what makes
+    // "the table runs off the end" a statement about the table and not about
+    // the record. A test wanting that cuts to inside .rdata.
+    if (e.truncate_to != 0) {
+        b.bytes.resize(e.truncate_to);
+    }
+    return parse_image(b.bytes);
+}
+
+// The ordinary case: three exports, all named, all with distinct addresses,
+// base 1. Everything else in this section is a way of being wrong relative
+// to this.
+void test_export_table() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200, 0x1300};
+    e.names = {{"Alpha", 0}, {"Beta", 1}, {"Gamma", 2}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "export: parses");
+    check(p.error() == PeError::None, "export: no error");
+    check(p.export_ordinal_base() == 1, "export: base is 1");
+    check(p.export_rva() == kExpDirRva, "export: directory rva");
+    check(p.exports().size() == 3, "export: three exports");
+    if (p.exports().size() == 3) {
+        check(p.exports()[0].name == "Alpha", "export: first name");
+        check(p.exports()[0].ordinal == 1, "export: first ordinal");
+        check(p.exports()[0].rva == 0x1100, "export: first address");
+        check(p.exports()[1].name == "Beta", "export: second name");
+        check(p.exports()[1].ordinal == 2, "export: second ordinal");
+        check(p.exports()[2].name == "Gamma", "export: third name");
+        check(p.exports()[2].ordinal == 3, "export: third ordinal");
+        check(p.exports()[2].rva == 0x1300, "export: third address");
+        check(!p.exports()[0].is_forwarder, "export: an address is not a "
+                                            "forwarder");
+        check(p.exports()[0].forwarder_dll.empty(),
+              "export: a plain address has no forwarder dll");
+    }
+}
+
+// A DLL that exports by ordinal only. The format says some, all, or none of
+// the exported symbols may have names, and a reader that required names
+// would refuse a legitimate and common shape.
+void test_export_by_ordinal_only() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200, 0x1300};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "ordinal-only: parses");
+    check(p.exports().size() == 3, "ordinal-only: three exports");
+    if (p.exports().size() == 3) {
+        check(p.exports()[0].name.empty(), "ordinal-only: the first is unnamed");
+        check(p.exports()[0].ordinal == 1, "ordinal-only: first ordinal");
+        check(p.exports()[2].ordinal == 3, "ordinal-only: third ordinal");
+        check(p.exports()[2].rva == 0x1300, "ordinal-only: still has an "
+                                              "address");
+    }
+}
+
+// A base other than 1. The field the format says is "usually" 1, and a
+// reader that assumes it resolves the wrong function for every named import
+// of this DLL. The ordinals are the indices plus the base; the addresses are
+// the addresses.
+void test_export_base_not_one() {
+    ExportLayout e;
+    e.base = 5;
+    e.addresses = {0x1100, 0x1200, 0x1300};
+    e.names = {{"Alpha", 0}, {"Beta", 1}, {"Gamma", 2}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "base 5: parses");
+    check(p.export_ordinal_base() == 5, "base 5: reported as five");
+    check(p.exports().size() == 3, "base 5: three exports");
+    if (p.exports().size() == 3) {
+        // 5, 6, 7 -- and if the reader treated the ordinal table's field as
+        // an ordinal instead of an index, these would be 1, 2, 3 and every
+        // name would be attached to the wrong address.
+        check(p.exports()[0].ordinal == 5, "base 5: first ordinal is five");
+        check(p.exports()[1].ordinal == 6, "base 5: second ordinal is six");
+        check(p.exports()[2].ordinal == 7, "base 5: third ordinal is seven");
+        check(p.exports()[0].name == "Alpha", "base 5: first name");
+        check(p.exports()[0].rva == 0x1100, "base 5: first address");
+    }
+}
+
+// A base of zero. The format permits it -- the field is an ordinary
+// 32-bit value -- and a reader that treated zero as "unset" would report the
+// wrong ordinals for a file that is legal and that Windows loads.
+void test_export_base_zero() {
+    ExportLayout e;
+    e.base = 0;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"Alpha", 0}, {"Beta", 1}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "base 0: parses");
+    check(p.export_ordinal_base() == 0, "base 0: reported as zero");
+    if (p.exports().size() == 2) {
+        check(p.exports()[0].ordinal == 0, "base 0: first ordinal is zero");
+        check(p.exports()[1].ordinal == 1, "base 0: second ordinal is one");
+    }
+}
+
+// An address table with a hole in it. The slot at index 1 is zero, which the
+// format defines as "no export here" -- not an export at RVA zero, which is
+// the base of every image and would resolve to the module's own headers.
+//
+// The consequence worth stating is that the ordinals either side of the hole
+// are not adjacent: the third export's ordinal is 3, not 2. A reader that
+// renumbered after dropping the hole would hand out an ordinal no program
+// asked for, and the program's import would resolve to the wrong function.
+void test_export_empty_slot() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0, 0x1300};
+    e.names = {{"Alpha", 0}, {"Gamma", 2}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "hole: parses");
+    check(p.exports().size() == 2, "hole: the empty slot is not an export");
+    if (p.exports().size() == 2) {
+        check(p.exports()[0].ordinal == 1, "hole: first ordinal is one");
+        check(p.exports()[0].name == "Alpha", "hole: first name");
+        // Index 2 plus base 1. A reader that dropped the hole and
+        // renumbered would say two.
+        check(p.exports()[1].ordinal == 3, "hole: the ordinals skip the hole");
+        check(p.exports()[1].rva == 0x1300, "hole: third address");
+        check(p.exports()[1].name == "Gamma", "hole: third name");
+    }
+}
+
+// A name table that is not in dictionary order. The format requires the
+// pointers to be sorted so that a reader may binary-search them; nothing
+// enforces it, and files that do not sort it exist. This is the case a
+// binary search answers wrongly and a linear scan answers correctly, and it
+// is the reason this reader does not binary-search.
+//
+// The names are chosen so that a binary search would not merely miss: the
+// table is a rotation of the sorted order, which is the arrangement most
+// likely to produce a wrong answer rather than an outright failure. A search
+// for "Alpha" in {Gamma, Alpha, Beta} probes the middle, compares "Alpha"
+// against "Alpha", and stops -- correct by luck. A search for "Beta" probes
+// the middle, "Beta" is less than "Alpha", goes left, and finds "Gamma",
+// which is greater, so it reports not-found.
+void test_export_names_out_of_order() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200, 0x1300};
+    e.names = {{"Gamma", 2}, {"Alpha", 0}, {"Beta", 1}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "unsorted: parses");
+    check(p.exports().size() == 3, "unsorted: three exports");
+    if (p.exports().size() == 3) {
+        // The vector is in address-table order, so the names come back
+        // re-sorted by index rather than in the order the file listed them.
+        check(p.exports()[0].name == "Alpha", "unsorted: Alpha is first");
+        check(p.exports()[0].rva == 0x1100, "unsorted: Alpha's address");
+        check(p.exports()[1].name == "Beta", "unsorted: Beta is second");
+        check(p.exports()[1].rva == 0x1200, "unsorted: Beta's address");
+        check(p.exports()[2].name == "Gamma", "unsorted: Gamma is third");
+        check(p.exports()[2].rva == 0x1300, "unsorted: Gamma's address");
+    }
+}
+
+// A name table that is unsorted *and* whose ordinals point backwards, so the
+// name and the address are two independent facts and both have to be right.
+// "Delta" is at name-table position 0 and names address-table entry 2.
+void test_export_unsorted_with_shuffled_ordinals() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200, 0x1300};
+    e.names = {{"Delta", 2}, {"Alpha", 0}, {"Charlie", 1}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "shuffled: parses");
+    if (p.exports().size() == 3) {
+        check(p.exports()[0].name == "Alpha", "shuffled: Alpha");
+        check(p.exports()[0].rva == 0x1100, "shuffled: Alpha's address");
+        check(p.exports()[1].name == "Charlie", "shuffled: Charlie");
+        check(p.exports()[1].rva == 0x1200, "shuffled: Charlie's address");
+        check(p.exports()[2].name == "Delta", "shuffled: Delta");
+        check(p.exports()[2].rva == 0x1300, "shuffled: Delta's address");
+    }
+}
+
+// Two names pointing at one address-table entry. The format permits it --
+// the ordinal table is an index list and nothing says the indices are
+// distinct -- and both names are real, so both are reported. A reader that
+// assumed one name per export would report one of them and lose the other.
+void test_export_two_names_one_entry() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"Alias", 0}, {"Real", 0}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "alias: parses");
+    check(p.exports().size() == 2, "alias: two address-table entries");
+    if (p.exports().size() == 2) {
+        // The second name overwrites the first in the same slot, because the
+        // vector is in address-table order and both name entry 0. The file
+        // said two names and this reader keeps one of them; the alternative
+        // -- a vector with two entries for one address -- would break the
+        // ordinal-to-position correspondence the rest of the reader relies
+        // on. Checked here so the loss is a decision on record rather than a
+        // surprise.
+        check(p.exports()[0].name == "Real",
+              "alias: the last name for an entry wins");
+        check(p.exports()[0].rva == 0x1100, "alias: the address is right");
+    }
+}
+
+// A forwarder naming another DLL's export by name. This is the common form:
+// ntdll's RtlAllocateHeap is really in kernel32 on some builds, and the
+// export table says so with a string.
+void test_export_forwarder_by_name() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"LocalAlloc", 0}, {"RtlAllocateHeap", 1}};
+    e.forwarders = {{1, "KERNEL32.Sleep"}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "forward: parses");
+    check(p.exports().size() == 2, "forward: two exports");
+    if (p.exports().size() == 2) {
+        check(p.exports()[0].is_forwarder == false,
+              "forward: the first is a plain address");
+        check(p.exports()[1].is_forwarder, "forward: the second is a forwarder");
+        check(p.exports()[1].forwarder_dll == "KERNEL32",
+              "forward: the dll is KERNEL32");
+        check(p.exports()[1].forwarder_name == "Sleep",
+              "forward: the symbol is Sleep");
+        check(!p.exports()[1].forwarder_by_ordinal,
+              "forward: it is not the ordinal form");
+        check(p.exports()[1].forwarder_ordinal == 0,
+              "forward: no ordinal is recorded");
+        // The name is the export's own name, not the target's. They are two
+        // different strings and a reader that reported the target's name here
+        // would make every forwarder look like an alias of itself.
+        check(p.exports()[1].name == "RtlAllocateHeap",
+              "forward: the export keeps its own name");
+    }
+}
+
+// The ordinal form: MYDLL.#27. The number is the *target module's* ordinal,
+// so it is meaningless in this file and is reported rather than resolved.
+void test_export_forwarder_by_ordinal() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"Alpha", 0}, {"Beta", 1}};
+    e.forwarders = {{1, "MYDLL.#27"}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "forward ordinal: parses");
+    if (p.exports().size() == 2) {
+        check(p.exports()[1].is_forwarder, "forward ordinal: is a forwarder");
+        check(p.exports()[1].forwarder_dll == "MYDLL",
+              "forward ordinal: the dll is MYDLL");
+        check(p.exports()[1].forwarder_by_ordinal,
+              "forward ordinal: the ordinal form is recognized");
+        check(p.exports()[1].forwarder_ordinal == 27,
+              "forward ordinal: 27 is recorded as stated");
+        check(p.exports()[1].forwarder_name.empty(),
+              "forward ordinal: no name is recorded");
+    }
+}
+
+// A module name containing a dot. Windows permitted this for 16-bit
+// compatibility and files in the wild still carry it, which makes the first
+// dot the wrong one to split on: "OLD.DLL.Real" must resolve the symbol
+// "Real" in "OLD.DLL", and a reader splitting at the first dot produces
+// "OLD" and "DLL.Real", neither of which exists.
+void test_export_forwarder_module_with_a_dot() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200, 0x1300};
+    e.names = {{"Alpha", 0}, {"Beta", 1}, {"Gamma", 2}};
+    e.forwarders = {{1, "OLD.DLL.Real"}, {2, "A.B.C.D.Symbol"}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "dotted: parses");
+    if (p.exports().size() == 3) {
+        check(p.exports()[1].forwarder_dll == "OLD.DLL",
+              "dotted: split at the last dot");
+        check(p.exports()[1].forwarder_name == "Real",
+              "dotted: the symbol is the last component");
+        check(p.exports()[2].forwarder_dll == "A.B.C.D",
+              "dotted: a name with three dots splits once");
+        check(p.exports()[2].forwarder_name == "Symbol",
+              "dotted: the symbol after the last dot");
+    }
+}
+
+// The half-open boundary. An address exactly at the end of the directory is
+// past it -- it is in the section that follows, and reading a forwarder from
+// there would read whatever the linker put next. An address exactly at the
+// start is inside it. Both are checked, because an off-by-one here produces
+// a wrong answer on a real file rather than a crash.
+void test_export_forwarder_boundary_is_half_open() {
+    ExportLayout e;
+    e.addresses = {0x1100};
+    e.names = {{"Alpha", 0}};
+    e.forwarders = {{0, "KERNEL32.Sleep"}};
+    const PeImage p = build_export_image(e);
+
+    check(p.exports().size() == 1, "boundary: the first fixture has one");
+    if (p.exports().size() == 1) {
+        check(p.exports()[0].is_forwarder,
+              "boundary: an address inside the extent is a forwarder");
+    }
+
+    // The address one byte past the end of the directory. The extent is
+    // whatever the builder computed and declared, which is why it is read
+    // back out of the image rather than recomputed here: a second
+    // implementation of the layout in the test would agree with a mistake in
+    // the builder for the same reason the mistake was made.
+    const std::uint32_t past_end =
+        static_cast<std::uint32_t>(p.export_rva() + p.export_size());
+
+    ExportLayout e2;
+    e2.addresses = {0x1100, past_end};
+    e2.names = {{"Alpha", 0}, {"Beta", 1}};
+    const PeImage p2 = build_export_image(e2);
+
+    check(p2.ok(), "boundary: a file parses");
+    check(p2.export_size() > 0, "boundary: the extent is not empty");
+    if (p2.exports().size() == 2) {
+        check(!p2.exports()[1].is_forwarder,
+              "boundary: the end of the extent is not inside it");
+        check(p2.exports()[1].rva == past_end,
+              "boundary: the address is reported as given");
+        // And the one before it, which is the same fixture with the address
+        // moved back inside. A reader whose comparison were <= would call
+        // this one a forwarder too, and the two checks are the pair that
+        // says the interval is half-open rather than merely bounded.
+        ExportLayout e3;
+        e3.addresses = {0x1100, past_end - 1};
+        e3.names = {{"Alpha", 0}, {"Beta", 1}};
+        const PeImage p3 = build_export_image(e3);
+        // The extent differs between the two fixtures -- one name table with
+        // the same names -- so "one byte before the end of e2's extent" is
+        // not necessarily inside e3's. Asserted rather than assumed, and the
+        // assertion is the useful part: if the two extents ever differed, the
+        // boundary this test claims to be checking would not exist.
+        check(p3.export_size() == p2.export_size(),
+              "boundary: the two fixtures declare the same extent");
+        if (p3.exports().size() == 2) {
+            check(p3.exports()[1].is_forwarder,
+                  "boundary: one byte inside the extent is a forwarder");
+        }
+    }
+}
+
+// Strings the format does not define. Each of these names a thing a forwarder
+// cannot be, and each is refused rather than guessed at: a reader that
+// guessed would resolve a symbol the operating system would not, and the
+// program's failure would be somewhere else entirely.
+void test_export_forwarder_malformed() {
+    const char* bad[] = {
+        "NoDotAtAll",          // no separator
+        ".LeadingDot",         // empty module
+        "TrailingDot.",        // empty symbol
+        "KERNEL32.#",          // ordinal form with no digits
+        "KERNEL32.#+27",       // a sign the format does not have
+        "KERNEL32.#0x1b",      // a base the format does not have
+        "KERNEL32.# 27",       // leading space
+        "KERNEL32.#27 ",       // trailing space
+        "KERNEL32.#-1",        // negative
+        "KERNEL32.#4294967296", // one past the 32-bit range
+    };
+    for (const char* target : bad) {
+        ExportLayout e;
+        e.addresses = {0x1100};
+        e.names = {{"Alpha", 0}};
+        e.forwarders = {{0, target}};
+        const PeImage p = build_export_image(e);
+        char msg[128];
+        std::snprintf(msg, sizeof msg, "bad forwarder \"%s\": refused",
+                      target);
+        check(!p.ok(), msg);
+        std::snprintf(msg, sizeof msg,
+                      "bad forwarder \"%s\": reports a bad export table",
+                      target);
+        check(p.error() == PeError::BadExportTable, msg);
+    }
+    check(true, "bad forwarder: every malformed form was refused");
+}
+
+// The ordinal forms that are legal, next to the ones that are not, so the
+// boundary is stated by both sides. "#0" is refused on its own terms and not
+// because the parse failed: the format numbers exports from the base field
+// up, and a forwarder naming ordinal zero names an export whose existence
+// depends on a base this file does not carry.
+void test_export_forwarder_ordinal_forms() {
+    const char* good[] = {"KERNEL32.#1", "KERNEL32.#27",
+                          "KERNEL32.#4294967295"};
+    for (const char* target : good) {
+        ExportLayout e;
+        e.addresses = {0x1100};
+        e.names = {{"Alpha", 0}};
+        e.forwarders = {{0, target}};
+        const PeImage p = build_export_image(e);
+        char msg[128];
+        std::snprintf(msg, sizeof msg, "ordinal forwarder \"%s\": accepted",
+                      target);
+        check(p.ok(), msg);
+        if (p.exports().size() == 1) {
+            check(p.exports()[0].forwarder_by_ordinal, msg);
+        }
+    }
+    check(true, "ordinal forwarder: every legal form was accepted");
+
+    // "#0" separately, because it parses and is refused for a different
+    // reason than the forms above.
+    ExportLayout e;
+    e.addresses = {0x1100};
+    e.names = {{"Alpha", 0}};
+    e.forwarders = {{0, "KERNEL32.#0"}};
+    const PeImage p = build_export_image(e);
+    check(!p.ok(), "forwarder #0: refused");
+    check(p.error() == PeError::BadExportTable, "forwarder #0: bad table");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("ordinal zero") != std::string::npos,
+              "forwarder #0: the message says why");
+    }
+}
+
+// A directory declaring fewer bytes than the record needs. There is no
+// arrangement of a 40-byte record in 8 bytes, and it is a different fact
+// from a truncated import table -- a DLL with an unusable export directory
+// still has an import table a loader can walk, and a reader that conflated
+// the two would refuse a file whose problem is confined to the half nobody
+// imports by.
+void test_export_directory_too_small() {
+    for (std::size_t declared : {std::size_t{0}, std::size_t{1},
+                                 std::size_t{16}, std::size_t{39}}) {
+        ExportLayout e;
+        e.addresses = {0x1100};
+        e.names = {{"Alpha", 0}};
+        e.declared_size = static_cast<int>(declared);
+        const PeImage p = build_export_image(e);
+        char msg[96];
+        std::snprintf(msg, sizeof msg,
+                      "export: a %zu-byte directory is refused", declared);
+        check(!p.ok(), msg);
+        std::snprintf(msg, sizeof msg,
+                      "export: a %zu-byte directory reports a truncated "
+                      "record", declared);
+        check(p.error() == PeError::TruncatedExportDirectory, msg);
+    }
+    // 40 exactly is enough, and the boundary is the interesting part.
+    ExportLayout e;
+    e.addresses = {0x1100};
+    e.names = {{"Alpha", 0}};
+    e.declared_size = 40;
+    const PeImage p = build_export_image(e);
+    check(p.ok(), "export: a 40-byte directory is enough");
+    check(p.error() == PeError::None,
+          "export: 40 bytes is not a truncated record");
+}
+
+// A directory at an RVA no section covers. The same refusal the import
+// directory gets, for the same reason: "there is no export table" and "the
+// export table is somewhere I cannot read" are different claims.
+void test_export_directory_out_of_file() {
+    ExportLayout e;
+    e.addresses = {0x1100};
+    e.names = {{"Alpha", 0}};
+    e.dir_rva = 0x8000;
+    const PeImage p = build_export_image(e);
+
+    check(!p.ok(), "export: an unresolvable directory is refused");
+    check(p.error() == PeError::DirectoryOutOfFile,
+          "export: reports the directory");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("0x8000") != std::string::npos,
+              "export: the message names the RVA");
+    }
+}
+
+// A directory in a section's zero fill. The RVA resolves and there is
+// nothing behind it, which is not the same as there being no directory.
+void test_export_directory_in_zero_fill() {
+    Spec s;
+    s.dll = true;
+    s.sections.push_back({".text", 0x1000, 0x400, 0x400, 0x60000020});
+    // Virtual size larger than the raw data, so the tail is zero fill.
+    s.sections.push_back({".rdata", 0x2000, 0x800, 0x200, 0x40000040});
+    s.export_rva = 0x2400;   // inside the virtual size, past the raw data
+    s.export_size = 40;
+    const Built b = build(s);
+    const PeImage p = parse_image(b.bytes);
+
+    check(!p.ok(), "export: a zero-filled directory is refused");
+    check(p.error() == PeError::DirectoryOutOfFile,
+          "export: a zero-filled directory is not 'no exports'");
+}
+
+// One of the three tables pointing somewhere the file does not cover. The
+// directory record is readable and the counts are sane, so only the table's
+// own RVA gives it away -- which is why each is checked separately.
+void test_export_table_out_of_file() {
+    struct Which {
+        const char* what;
+        std::uint32_t ExportLayout::*field;
+    };
+    const Which tables[] = {
+        {"the address table", &ExportLayout::functions_rva},
+        {"the name pointer table", &ExportLayout::names_rva},
+        {"the ordinal table", &ExportLayout::ordinals_rva},
+    };
+    for (const Which& w : tables) {
+        ExportLayout e;
+        e.addresses = {0x1100, 0x1200};
+        e.names = {{"Alpha", 0}, {"Beta", 1}};
+        e.*(w.field) = 0x9000;
+        const PeImage p = build_export_image(e);
+        char msg[128];
+        std::snprintf(msg, sizeof msg, "export: %s out of file is refused",
+                      w.what);
+        check(!p.ok(), msg);
+        std::snprintf(msg, sizeof msg,
+                      "export: %s out of file reports a bad table", w.what);
+        check(p.error() == PeError::BadExportTable, msg);
+    }
+    check(true, "export: every table was checked separately");
+}
+
+// A count the file cannot back with bytes. The address table declares a
+// thousand entries; .rdata is 0x600 bytes and the table starts 40 bytes into
+// it, so the declared entries run about six hundred bytes past the end of
+// the file. The count is not a lie the reader can detect on its own -- the
+// directory is whole and its RVA resolves -- so the check that catches it is
+// the one that asks whether all the entries are inside the file.
+//
+// The file is *not* cut short to produce this, and that is deliberate. A cut
+// file fails earlier, at the section table, because a section whose raw data
+// runs past the end of the file is refused before any directory is read. So a
+// truncated fixture would test the section check wearing this test's name,
+// and the export table's own bound would never be reached. A file that is
+// whole and declares more than it holds is the case this check exists for.
+void test_export_count_larger_than_the_file() {
+    ExportLayout e;
+    e.addresses = {0x1100};
+    e.declared_functions = 1000;
+    const PeImage p = build_export_image(e);
+
+    check(!p.ok(), "export: a count past the end of the file is refused");
+    check(p.error() == PeError::BadExportTable,
+          "export: reports a bad table");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("fit in a file") != std::string::npos,
+              "export: the message says the file ran out");
+        check(p.error_detail().find("1000") != std::string::npos,
+              "export: the message names the count the file claimed");
+    }
+}
+
+// A name table longer than the address table it indexes. Every entry of the
+// ordinal table is then an index past the end, and a reader that clamped
+// would attach the name to whatever happened to be there.
+void test_export_name_index_out_of_range() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"Alpha", 0}, {"Bad", 7}};
+    const PeImage p = build_export_image(e);
+
+    check(!p.ok(), "export: an out-of-range name index is refused");
+    check(p.error() == PeError::BadExportTable,
+          "export: reports a bad table");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("address-table entry 7") !=
+                  std::string::npos,
+              "export: the message names the entry");
+    }
+}
+
+// Names declared with no address table to point into. The ordinal table's
+// entries are indices, so with no address table every one of them is out of
+// range; the file is claiming something it has no room for.
+void test_export_names_without_addresses() {
+    ExportLayout e;
+    e.addresses = {};
+    e.names = {{"Alpha", 0}};
+    const PeImage p = build_export_image(e);
+
+    check(!p.ok(), "export: names with no address table are refused");
+    check(p.error() == PeError::BadExportTable,
+          "export: reports a bad table");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("no address table") != std::string::npos,
+              "export: the message says why");
+    }
+}
+
+// A count large enough to be a denial of service rather than a table. Capped
+// and reported, for the import table's reason: a walk that stops at the cap
+// without saying so looks exactly like a table that ended.
+void test_export_count_is_capped() {
+    ExportLayout e;
+    e.addresses = {0x1100};
+    e.declared_functions = 100000;
+    const PeImage p = build_export_image(e);
+
+    check(!p.ok(), "export: an enormous address table is refused");
+    check(p.error() == PeError::BadExportTable,
+          "export: reports a bad table");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("65536") != std::string::npos,
+              "export: the message names the cap");
+    }
+
+    ExportLayout e2;
+    e2.addresses = {0x1100};
+    e2.names = {{"Alpha", 0}};
+    e2.declared_names = 100000;
+    const PeImage p2 = build_export_image(e2);
+    check(!p2.ok(), "export: an enormous name table is refused");
+    check(p2.error() == PeError::BadExportTable,
+          "export: reports a bad table for the name count too");
+
+    // The boundary itself: exactly the cap is walked, not refused. A cap
+    // applied at the wrong comparison turns a file with 65536 exports into a
+    // refusal, and nothing above this line would say so.
+    ExportLayout e3;
+    e3.addresses = {0x1100};
+    e3.names = {{"Alpha", 0}};
+    e3.declared_functions = 65536;
+    const PeImage p3 = build_export_image(e3);
+    check(p3.error() == PeError::BadExportTable,
+          "export: 65536 entries is walked and then fails on the file, not "
+          "on the cap");
+    if (!p3.error_detail().empty()) {
+        check(p3.error_detail().find("this reader walks") ==
+                  std::string::npos,
+              "export: the cap is not what stopped a 65536-entry table");
+    }
+    ExportLayout e4;
+    e4.addresses = {0x1100};
+    e4.names = {{"Alpha", 0}};
+    e4.declared_functions = 65537;
+    const PeImage p4 = build_export_image(e4);
+    check(!p4.ok(), "export: 65537 is over the cap");
+    if (!p4.error_detail().empty()) {
+        check(p4.error_detail().find("this reader walks") !=
+                  std::string::npos,
+              "export: 65537 is refused by the cap");
+    }
+}
+
+// A name that will not read. The walk stops there and keeps what it had:
+// the entries before it are real exports and dropping them would understate
+// the DLL, and the entries after it are equally real. This is the same rule
+// the import walk follows, for the same reason.
+void test_export_name_unterminated() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"Alpha", 0}, {"Beta", 1, true}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "unterminated export name: the file still parses");
+    check(p.exports().size() == 2,
+          "unterminated export name: the addresses are still reported");
+    if (p.exports().size() == 2) {
+        check(p.exports()[0].name == "Alpha",
+              "unterminated export name: the readable name is kept");
+        check(p.exports()[1].name.empty(),
+              "unterminated export name: the unreadable one is dropped");
+        check(p.exports()[1].rva == 0x1200,
+              "unterminated export name: its address survives");
+    }
+}
+
+// A forwarder whose string will not read. Unlike a name, this one is
+// refused: a DLL with a forwarder that cannot be read is a DLL whose
+// forwarder will fail later and less clearly, and the caller needs to know
+// now. The export keeps its name and address, so a reader that only wanted
+// the names still has them -- what is refused is the file.
+void test_export_forwarder_unterminated() {
+    ExportLayout e;
+    e.addresses = {0x1100};
+    e.names = {{"Alpha", 0}};
+    e.forwarders = {{0, "KERNEL32.Sleep", true}};
+    const PeImage p = build_export_image(e);
+
+    check(!p.ok(), "unterminated forwarder: refused");
+    check(p.error() == PeError::BadExportTable,
+          "unterminated forwarder: reports a bad table");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find("not a readable") != std::string::npos,
+              "unterminated forwarder: the message says the string did not "
+              "read");
+    }
+}
+
+// An image with no export directory at all. Not an error: most EXEs have
+// none, and a reader that refused them would refuse most of what Windows
+// runs.
+void test_export_absent() {
+    const Built b = build(base_spec());
+    const PeImage p = parse_image(b.bytes);
+
+    check(p.ok(), "no exports: parses");
+    check(p.error() == PeError::None, "no exports: no error");
+    check(p.exports().empty(), "no exports: the list is empty");
+    check(p.export_rva() == 0, "no exports: no directory rva");
+    check(p.export_size() == 0, "no exports: no size");
+    check(p.export_ordinal_base() == 0,
+          "no exports: a base of zero, which is also what an absent one "
+          "reads as");
+}
+
+// A directory declaring zero exports. A DLL that exports nothing is a legal
+// DLL -- an ordinal-only stub, a resource-only module, a shim -- and the
+// declaration is not a lie, it is an absence the file states.
+void test_export_directory_declares_nothing() {
+    ExportLayout e;
+    e.addresses = {};
+    e.names = {};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "empty export table: parses");
+    check(p.error() == PeError::None, "empty export table: no error");
+    check(p.exports().empty(), "empty export table: no exports");
+    check(p.export_ordinal_base() == 1,
+          "empty export table: the base is still reported");
+}
+
+// The independent counts, stated as a case. A DLL that exports five thousand
+// symbols by ordinal and names ten of them is ordinary, and a reader that
+// required the counts to match would refuse it. The other direction -- more
+// names than addresses -- is the case above, and it is refused, because an
+// index with nothing behind it is a claim the file cannot keep.
+void test_export_counts_are_independent() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200, 0x1300, 0x1400};
+    e.names = {{"Only", 0}};
+    const PeImage p = build_export_image(e);
+
+    check(p.ok(), "independent counts: parses");
+    check(p.exports().size() == 4, "independent counts: four addresses");
+    if (p.exports().size() == 4) {
+        check(p.exports()[0].name == "Only", "independent counts: one name");
+        check(p.exports()[1].name.empty(),
+              "independent counts: the rest are unnamed");
+        check(p.exports()[3].ordinal == 4,
+              "independent counts: the fourth ordinal is four");
+    }
+}
+
+// A file cut inside a section. Asserted here because it is a fact about the
+// order the checks run in, and every one of those orders is a decision: the
+// section table is validated before any directory is read, so a file whose
+// section data runs past its own end is refused there even when its export
+// directory would also have been refused, and a reader that reported the
+// export error would be reporting a complaint about a part of the file the
+// section error already covers.
+//
+// The cut is inside the section's raw data rather than at its end, so the
+// refusal is unambiguous: a file cut exactly at the section boundary would
+// have a whole section and would fail somewhere else.
+void test_export_truncated_file_fails_at_the_section_first() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"Alpha", 0}, {"Beta", 1}};
+    e.truncate_to = kExpDirFile + kExpDirSize + 2 * 4;
+    const PeImage p = build_export_image(e);
+
+    check(!p.ok(), "truncated file: refused");
+    check(p.error() == PeError::BadSectionTable,
+          "truncated file: the section check fires before the export check");
+    if (!p.error_detail().empty()) {
+        check(p.error_detail().find(".rdata") != std::string::npos,
+              "truncated file: the message names the section");
+    }
+}
+
+// The Name field is not read, and this is the case that says so. A file
+// whose export directory has a Name RVA of zero -- which is what a linker
+// that did not fill it in produces, and what a file that has been through
+// an editor produces -- is a file whose export table is perfectly walkable.
+// Windows loads it. A reader that checked the field would refuse it.
+void test_export_name_field_is_not_required() {
+    ExportLayout e;
+    e.addresses = {0x1100, 0x1200};
+    e.names = {{"Alpha", 0}, {"Beta", 1}};
+    Built b;
+    const PeImage p = build_export_image(e, &b);
+
+    // The builder already writes zero there. Asserted rather than assumed,
+    // so a builder that started filling it in would fail this test instead
+    // of quietly making it vacuous.
+    check(b.bytes[kExpDirFile + 12] == 0,
+          "export name field: the fixture leaves it zero");
+    check(p.ok(), "export name field: a zero Name is not a refusal");
+    check(p.exports().size() == 2, "export name field: both exports read");
+    if (p.exports().size() == 2) {
+        check(p.exports()[0].name == "Alpha",
+              "export name field: the names come from the name table");
+    }
+}
+
 // ------------------------------------------------------------ malformed input
 
 void test_not_pe() {
@@ -1397,6 +2505,35 @@ int main() {
     test_import_directory_out_of_file();
     test_import_directory_in_zero_fill();
     test_import_name_without_terminator();
+    test_export_table();
+    test_export_by_ordinal_only();
+    test_export_base_not_one();
+    test_export_base_zero();
+    test_export_empty_slot();
+    test_export_names_out_of_order();
+    test_export_unsorted_with_shuffled_ordinals();
+    test_export_two_names_one_entry();
+    test_export_forwarder_by_name();
+    test_export_forwarder_by_ordinal();
+    test_export_forwarder_module_with_a_dot();
+    test_export_forwarder_boundary_is_half_open();
+    test_export_forwarder_malformed();
+    test_export_forwarder_ordinal_forms();
+    test_export_directory_too_small();
+    test_export_directory_out_of_file();
+    test_export_directory_in_zero_fill();
+    test_export_table_out_of_file();
+    test_export_count_larger_than_the_file();
+    test_export_name_index_out_of_range();
+    test_export_names_without_addresses();
+    test_export_count_is_capped();
+    test_export_name_unterminated();
+    test_export_forwarder_unterminated();
+    test_export_absent();
+    test_export_directory_declares_nothing();
+    test_export_counts_are_independent();
+    test_export_name_field_is_not_required();
+    test_export_truncated_file_fails_at_the_section_first();
     test_not_pe();
     test_bad_header_offset();
     test_truncated_coff_and_optional();
