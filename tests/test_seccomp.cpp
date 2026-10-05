@@ -341,8 +341,26 @@ int main() {
     // syscall results are what prove the policy; the exit status is a
     // supporting claim that a sanitizer build cannot make, and dropping the
     // whole case would drop the real assertions with it.
-#if !defined(__SANITIZE_ADDRESS__) && !defined(OCC_TEST_ASAN) && \
-    !(defined(__has_feature) && __has_feature(address_sanitizer))
+    //
+    // Clang spells this __has_feature and makes it a keyword; GCC 14 and later
+    // accept it as an operator, and GCC 13 does not have it at all. The test
+    // is written the way test_container.cpp writes it because the obvious
+    // spelling does not compile on the oldest compiler in the matrix: naming
+    // it inside one condition as
+    //
+    //     !defined(A) && !(defined(__has_feature) && __has_feature(b))
+    //
+    // expands on GCC 13 to a call to an identifier that is not a macro, which
+    // is a syntax error rather than a false. The preprocessor does not short
+    // circuit, so the guarded call has to be a nested conditional instead.
+#if defined(__SANITIZE_ADDRESS__) || defined(OCC_TEST_ASAN)
+    // Sanitizer build: the exit status is not this build's to assert.
+#elif defined(__has_feature)
+#if !__has_feature(address_sanitizer)
+    check_true("the child exited with status zero",
+               WIFEXITED(status) == 1 && WEXITSTATUS(status) == 0);
+#endif
+#else
     check_true("the child exited with status zero",
                WIFEXITED(status) == 1 && WEXITSTATUS(status) == 0);
 #endif
