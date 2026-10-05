@@ -767,6 +767,174 @@ case written for it: removing `MAP_FIXED_NOREPLACE` (11 failures), removing
 the batch's rollback (1 failure, the case that exists for exactly that), and
 stripping modifiers instead of refusing them (6 failures).
 
+### Thread-local storage — `include/occ/runtime/loader.h`
+
+A module with a TLS directory owns a slot, every thread owns a block, and
+the two are joined by a DWORD the loader writes once and never writes again.
+That is the whole mechanism, and the reason it is worth its own section is
+that every one of those four steps has a way to be wrong that does not crash.
+
+Wine's implementation is `alloc_tls_slot`, `free_tls_slot` and
+`call_tls_callbacks` in `dlls/ntdll/loader.c`, and reading them settles three
+questions that a specification would leave open.
+
+**The directory is read from the mapping, not the file.** Wine calls
+`RtlImageDirectoryEntryToData(mod->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_TLS,
+&size)` — the mapped image, not the file. This is not a preference. The
+directory's four address fields are 32-bit virtual addresses, and they are
+**not in the base relocation table**: a file's copy and its mapped copy are
+byte-identical no matter where the image lands, because nothing rewrites
+them. A loader that read the file would produce the same answers as one that
+read the mapping on every image that has ever existed, which is why the case
+written for this had to be built out of a property no real image has.
+
+`.tls` here declares four bytes of raw data and a full page of virtual size,
+and the directory's RVA points 0x40 past the section's start — into the zero
+fill. The file has no offset for that RVA at all, so a file reader *must*
+refuse, and refusing is a different outcome from the one the test asserts. The
+mapped reader finds six zero DWORDs, concludes the module has no TLS, and the
+load succeeds. Reading the file cannot produce that outcome, and neither can a
+mirror of the loader's own arithmetic, because the property being tested is
+which memory the bytes came from.
+
+**A VA-encoded directory is stale the moment the image moves.** The fields
+are 32-bit; the image is not. A DLL linked at `0x7fa2a6e30000` writes
+addresses that are 32-bit numbers, and after an ASLR move every one of them
+points at nothing. Wine reads the field, believes it, and hands each thread a
+template full of pointers into whatever the process has mapped at the *linked*
+base — which for an ASLR image is nothing, and the first thread to touch its
+TLS faults somewhere with no relationship to TLS.
+
+This runtime accepts two encodings and says which it used. A field that falls
+inside the current image is a virtual address. A field that does not is read
+as an RVA from the image base. Both are in real use and neither is
+Wine-compatible, which is the point: Wine's reading is only correct for images
+based below 4 GiB, and this loader is explicit about the case rather than
+silently producing addresses into nothing. A VA-encoded image placed away from
+its linked base is refused, and the refusal names the address the loader
+*resolved* rather than the field it read — a reader needs the decision, not the
+file.
+
+**A freed slot is zeroed, not erased.** `free_tls_slot` `memset`s the entry.
+Erasing it would renumber every slot after it, and the slot numbers are
+already written into module memory as `AddressOfIndex` — the table would stop
+agreeing with the images that read it. The reuse search here is the same
+search over the same all-zero records, and a test frees the middle of three
+slots and asserts that the next load takes the hole, that the high-water mark
+does not move, and that the two live modules still read the slots they had.
+
+**What occ does not do, and why it is not a simplification.** Wine's
+`call_tls_callbacks` calls the addresses in the array inside `__TRY` and stops
+at the first exception. occ has no structured exception handling and cannot
+execute guest code, so it does not call the addresses at all: `TlsCallback` is
+an invoker supplied by the caller, returning `bool`, and the first `false`
+stops the walk. What is left is the part that is actually about the format —
+the walk, the terminator, the ordering, and the three inputs every callback
+receives (`reason`, `module`, `callback`) — and the part that would be a
+fiction is gone rather than stubbed.
+
+**The order of operations is load-bearing, twice.**
+
+The index DWORD is written after the final section protections are applied,
+not before. Every section is mapped `ReadWrite` while the image is being
+built, so a writability check made during `load_tls` is a check that cannot
+fail. The sequence is: read the directory, validate it, take a slot; apply the
+real protections; then `commit_tls_index`, which is the first point at which
+"is this DWORD writable?" is a question with two answers. A refusal there
+gives the slot back.
+
+And `build_tls_block` checks that the template is readable *before* it asks
+the kernel for a page. This one was a real defect, found by a test that was
+itself making the same mistake the code was. The original order was: allocate
+a block, then read the template out of the space. The kernel chooses the
+block's address, and it is free to choose the template's own. When it does,
+the new mapping covers the template, `find` reports it present, the copy
+succeeds — and what it copied is a page of zeroes out of the block that was
+just allocated. The call reports success. Every thread of that program then
+has a TLS template full of zeroes where the module's pointers should be, and
+nothing in any report says why.
+
+The version with the defect passed every other test in the file, including one
+that appears to cover exactly this ground. It was caught by a test that
+unmapped the template's section and expected a refusal; the refusal did not
+come, because the kernel had put the block back on top of what the test had
+just removed. The fix is the order, and the case that pins it down asserts
+that a `build_tls_block` whose template is not mapped is refused *and leaves
+no region behind* — the mapping it would have made is not made.
+
+**The suite's own address allocator, because a test that cannot be trusted
+cannot test anything.** Fifteen fixtures need a base that nothing is mapped
+at. A constant is an assumption about what else is in the process, and an
+ASan build invalidates it by putting 4 GiB to 1 TiB of shadow exactly where
+every 64-bit PE's preferred base lives — which is how this section's first
+version failed, in three different fixtures, on the sanitizer build only.
+Asking the kernel for a range and giving it straight back is the right answer
+and is not sufficient alone: the kernel's search is deterministic about where
+a mapping of a given size lands, so every caller asking the same size is
+handed the same address, and the second load fails with
+`STATUS_CONFLICTING_ADDRESSES` at an address the first one had certified as
+free.
+
+The stride that makes the answers distinct was the second version, and it was
+wrong in a way that only a different compiler exposed. The stride separates
+the claims from *each other*; it says nothing about the rest of the process.
+On the Clang build the kernel's first answer came back outside the
+shared-library range and every step after it was free by luck. On the GCC
+build the kernel answered *inside* that range — `0x7f44...`, which is where
+libc and libstdc++ live — and the same code stopped working. Each candidate
+is now probed at its own address with `MAP_FIXED_NOREPLACE`, which refuses an
+occupied address rather than replacing what is there, and the walk steps over
+it. The case that pins this down parks a mapping inside the walk and asserts
+that the claims on either side of it are neither that address nor a refusal.
+
+**The defect the fuzzer found, which no unit test did.** The loader records
+the image in the space before it walks the relocations, the IAT and the TLS
+directory, and each of those three can refuse. The rollback undid the kernel
+mapping and, when there was no mapper, nothing at all — so a refused
+`occ check` left the space describing an image whose bytes were never placed,
+which is a state a caller cannot tell from a successful load and which the
+loader's own contract says cannot happen.
+
+It survived every unit test in the file because every one of them that reaches
+a post-record refusal supplies a mapper, and a mapper's rollback worked. The
+path with no mapper is `occ check`, and it had no case of its own. What found
+it was the loader harness's invariant — a refused load leaves the space as it
+was — over a corpus seed whose optional header declares 0x60 bytes and whose
+file stops 0x120 bytes in, so the data directory array is claimed and absent.
+The parser handles that correctly: it reads only where the optional header
+reaches and clamps the count to what fits. The loader on the no-mapper path
+does not, because it goes to the file for the directory rather than to a
+mapping that does not exist, and the offset it computes from the fixed layout
+lands past the end.
+
+The comment that kept it there was right about its subject and wrong about
+its consequence. "A refusal with no mapper has nothing to roll back — nothing
+was mapped" is true of the kernel and false of the ledger. The undo is now a
+choice between two kinds rather than a guard on one of them, and the case
+that pins it down asserts on the ledger's own contents rather than on a
+count, because a rollback that forgot one section of four would satisfy a
+count.
+
+The harness's invariant was wrong too, and in the direction that matters: it
+compared the allocation count, which `AddressSpace::remove` deliberately does
+not move on a forget, because the count is a replay sequence number and a
+region that was allocated and then forgotten still consumed one. Comparing it
+demanded that an undone load lie about having happened. It is now `same_map`,
+which compares the regions and the high water — and the loosening was checked
+by re-tightening it and confirming the seeds still fail, so that a weaker
+assertion is not doing the work of a missing fix.
+
+**412 checks, 28 mutations, none surviving.** The 28 are the ones a
+plausible mistake would make, and the report is written to be worth what they
+were worth: four are rejected by the compiler and counted separately rather
+than as coverage, and two more are documented in the harness as
+reachable-but-untested rather than listed as caught or as dead. Two of the 28
+are paired edits, because this code has a *doubled* guard on the PE32
+callback field and each half alone is an equivalent change that no single-edit
+harness can distinguish from a no-op. One is in the test file rather than the
+runtime, and one is the rollback above — the two places where what is being
+checked is the suite's own honesty rather than the loader's behaviour.
+
 ### M2 — ntdll, memory and handles
 
 `NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtFreeVirtualMemory`,

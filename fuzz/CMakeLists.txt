@@ -141,7 +141,8 @@ set(OCC_PE_SEEDS
     mz_no_signature.bin
     pe_bad_entry_rva.bin
     pe_entry_not_executable.bin
-    pe_section_over_headers.bin)
+    pe_section_over_headers.bin
+    pe_short_data_directory.bin)
 
 set(OCC_PE_SEED_PATHS)
 foreach(_seed IN LISTS OCC_PE_SEEDS)

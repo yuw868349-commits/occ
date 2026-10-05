@@ -55,6 +55,7 @@
 #include "occ/util/span.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -73,16 +74,33 @@ ByteSpan as_span(const uint8_t* data, std::size_t size) noexcept {
 }
 
 // A copy of a space's observable state, so that "unchanged" can be checked
-// without holding a second address space. The fields are the ones a caller
-// can see: the regions, the allocation count, and the high water.
+// without holding a second address space.
+//
+// The regions and the high water are what "unchanged" is a statement about,
+// and those are compared. The allocation count is recorded but *not* compared,
+// and that is a correction rather than an omission.
+//
+// It was compared, and it trapped: a refused load that had recorded the image
+// and then taken it back again moved the count from 1 to 2 while leaving the
+// map exactly as it was, so the harness reported a rollback that had in fact
+// happened perfectly. The count is not a property of the map. It is the
+// sequence number a replay hands out when an allocation is made *without* a
+// requested base, and `AddressSpace::remove` says in its own comment that
+// forgetting a region does not move it -- because a region that was allocated
+// and then forgotten still consumed its number, and a replay that reused it
+// would hand two different allocations the same address.
+//
+// So the count is a witness that an allocation happened, not a record of what
+// the space currently holds. Comparing it would demand that an undone load
+// lie about having happened, which is the opposite of what a replay needs.
 struct SpaceSnapshot {
     std::vector<std::uint64_t> bases;
     std::uint64_t allocations = 0;
     std::uint64_t high_water = 0;
 
-    bool operator==(const SpaceSnapshot& other) const noexcept {
-        return bases == other.bases && allocations == other.allocations &&
-               high_water == other.high_water;
+    // What the map says, which is what the loader's contract is about.
+    [[nodiscard]] bool same_map(const SpaceSnapshot& other) const noexcept {
+        return bases == other.bases && high_water == other.high_water;
     }
 };
 
@@ -325,7 +343,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, std::size_t size) {
             // is checked against the snapshot taken before the call, so a
             // loader that recorded and then unwound would be caught too --
             // the count and the high water would not match.
-            if (!(snapshot(space) == before)) {
+            if (!snapshot(space).same_map(before)) {
+                std::fprintf(stderr, "DIAG-ROLLBACK base=%lx err=%d detail=%s\n",
+                          (unsigned long)base, (int)result.error,
+                          result.detail.c_str());
+                std::fprintf(stderr, "  before: n=%zu alloc=%lu hw=%lx bases=",
+                             before.bases.size(),
+                             (unsigned long)before.allocations,
+                             (unsigned long)before.high_water);
+                for (std::uint64_t b : before.bases) {
+                    std::fprintf(stderr, "%lx ", (unsigned long)b);
+                }
+                std::fprintf(stderr, "\n  after:  n=%zu alloc=%lu hw=%lx bases=",
+                             space.regions().size(),
+                             (unsigned long)space.allocation_count(),
+                             (unsigned long)space.high_water());
+                for (const auto& r : space.regions()) {
+                    std::fprintf(stderr, "%lx ", (unsigned long)r.base);
+                }
+                std::fprintf(stderr, "\n");
                 __builtin_trap();
             }
             // And no detail is empty: a refusal that names nothing sends the

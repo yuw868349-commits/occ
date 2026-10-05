@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace occ::runtime {
 
@@ -206,6 +207,42 @@ void store_u32(std::uint64_t va, std::uint32_t v) noexcept {
 void store_u64(std::uint64_t va, std::uint64_t v) noexcept {
     store_u32(va, static_cast<std::uint32_t>(v));
     store_u32(va + 4, static_cast<std::uint32_t>(v >> 32));
+}
+
+// A load at an address in mapped memory, with the answer the caller needs to
+// tell "the address held this" from "the address was not readable".
+//
+// The counterpart to the stores above, and it exists for the same reason they
+// do and with the same caveat: no bounds check, because the caller checked
+// the address against the space. The difference is that a store cannot
+// report -- writing to an unmapped address kills the process, which is a
+// perfectly clear way of finding out -- while a load can come back as
+// anything at all, and a caller that treats that as data produces an answer
+// from whatever the kernel left there.
+//
+// `space` is the authority rather than a size, because a TLS template is
+// read from an image that was placed rather than from the file, and "inside
+// the image" and "inside a region this process mapped" are different
+// questions: the first is a fact about the file's arithmetic and the second
+// is a fact about the process.
+[[nodiscard]] bool load_from(const AddressSpace& space, std::uint64_t va,
+                             void* dst, std::size_t bytes) noexcept {
+    const Region* r = space.find(va);
+    if (r == nullptr || r->end() < va + bytes) {
+        return false;
+    }
+    std::memcpy(dst, reinterpret_cast<const void*>(va), bytes);
+    return true;
+}
+
+[[nodiscard]] bool load_u32_from(const AddressSpace& space, std::uint64_t va,
+                                 std::uint32_t& out) noexcept {
+    return load_from(space, va, &out, sizeof out);
+}
+
+[[nodiscard]] bool load_u64_from(const AddressSpace& space, std::uint64_t va,
+                                 std::uint64_t& out) noexcept {
+    return load_from(space, va, &out, sizeof out);
 }
 
 // What went wrong when a relocation could not be written.
@@ -414,6 +451,103 @@ void rollback_placement(Mapper& m,
     }
 }
 
+// Undoes a placement that was only recorded: the ledger's copy of the image,
+// with no kernel mapping behind it.
+//
+// This is not rollback_placement with a null mapper. That would be a crash,
+// and the path that needs this is the one that has no mapper by design --
+// `occ check`, which reads a file and reports what it says without placing
+// anything. So the two cases are told apart by what the caller has, not by
+// whether it happens to be null today.
+//
+// The reason this exists at all is a bug the fuzzer found, and the bug was
+// not in the TLS code that introduced the path that reached it. It was here:
+// `record_batch` runs before the relocation walk, the IAT and the TLS
+// directory, and every one of those three can refuse. A refusal rolled back
+// the kernel mapping when there was one and rolled back *nothing* when there
+// was not, so a refused `occ check` left the space describing an image with
+// no bytes in it -- which is a state the comment at the record call says a
+// reader can recognise, and which a caller has no way to tell from a
+// successful load. The loader's own contract says a refused load leaves the
+// space unchanged. This is where that is kept.
+//
+// The allocation count does not go back, and that is `remove`'s rule rather
+// than a second decision: it counts allocations and hands out replay sequence
+// numbers, and a recorded-then-forgotten region consumed one. What has to go
+// back is the map, because the map is what "unchanged" is a statement about.
+void rollback_record(AddressSpace& space,
+                     const std::vector<AddressSpace::Candidate>& batch) noexcept {
+    for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+        (void)space.remove(it->base);
+    }
+}
+
+// Undoes a placement, whichever kind it was.
+void rollback(AddressSpace& space, Mapper* placement,
+              const std::vector<AddressSpace::Candidate>& batch) noexcept {
+    if (placement != nullptr) {
+        rollback_placement(*placement, batch);
+    } else {
+        rollback_record(space, batch);
+    }
+}
+
+TlsResult commit_tls_index(const TlsModule& m, AddressSpace& space,
+                           TlsTable& table) noexcept {
+    TlsResult out;
+    if (m.index_va == 0) {
+        // A directory with no `AddressOfIndex` is legal -- a module can
+        // declare a template and no way to find its slot -- and there is
+        // nothing to write. Not a refusal: the module's TLS is still built,
+        // and a caller that knows the module's base can still find the
+        // block. What it cannot do is look it up by index, which is what
+        // the absence of the field means.
+        out.ok = true;
+        return out;
+    }
+    // Every refusal below hands the slot back, and the reason is the same
+    // in both: a slot consumed by a load that then failed is a slot the
+    // reuse search will never offer again, because the entry is not zeroed
+    // and a non-zero entry looks occupied. A process that loaded and refused
+    // the same broken module in a loop would grow its table by one per
+    // attempt and never reuse a single one of them.
+    //
+    // The high-water mark goes back with it, and only when this module held
+    // the last slot. Lowering it unconditionally would renumber nothing --
+    // it is a bound, not a length -- but it would report a smaller bound than
+    // the table has, and the reuse search stops at the bound.
+    auto release = [&]() noexcept {
+        if (m.index < table.modules.size()) {
+            table.modules[m.index] = TlsModule{};
+        }
+        if (table.slots_allocated == m.index + 1) {
+            table.slots_allocated = m.index;
+        }
+    };
+
+    const Region* r = space.find(m.index_va);
+    if (r == nullptr) {
+        release();
+        out.error = TlsError::MalformedDirectory;
+        out.detail = "the TLS index at " + hex_of(m.index_va) +
+                     " is in no region this load made";
+        return out;
+    }
+    if ((protection_to_prot(r->protection) & PROT_WRITE) == 0) {
+        release();
+        out.error = TlsError::MalformedDirectory;
+        out.detail = "the TLS index at " + hex_of(m.index_va) +
+                     " is in " + (r->section.empty() ? "an unnamed section"
+                                                     : r->section) +
+                     ", which the file declared read-only, so no slot number "
+                     "can ever be written there";
+        return out;
+    }
+    store_u32(m.index_va, m.index);
+    out.ok = true;
+    return out;
+}
+
 } // namespace
 
 const char* load_error_name(LoadError e) noexcept {
@@ -429,6 +563,7 @@ const char* load_error_name(LoadError e) noexcept {
     case LoadError::AddressConflict: return "address_conflict";
     case LoadError::MappingRefused: return "mapping_refused";
     case LoadError::RelocationNotWritable: return "relocation_not_writable";
+    case LoadError::TlsRefused: return "tls_refused";
     }
     return "unknown";
 }
@@ -1457,43 +1592,66 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
     }
 
     // ----------------------------------------------------------------- TLS
-
+    //
+    // The directory is read here and the slot is handed out here, and the
+    // split between the two is Wine's and worth keeping: `alloc_tls_slot`
+    // runs at load time because the index has to be in the image before any
+    // thread can read it, and the per-thread copy happens at thread creation
+    // because a thread's block belongs to the thread. Doing either at the
+    // wrong time is a specific and confusing failure -- an image whose index
+    // is written when the first thread attaches is an image whose second
+    // thread reads a slot number that was never written.
+    //
+    // The read is a decision, so it happens whether or not a mapper was
+    // given, exactly like the import walk above. What a mapper adds is the
+    // one store: the index is written into the image, and there is nowhere
+    // to write it without memory.
+    // A table for the case where the caller supplied none. A load with no
+    // table still reads the directory and still reports it, and the slot it
+    // hands out is a slot in a table that goes out of scope -- which is the
+    // right outcome, because a slot number written into an image with no
+    // process behind it is a number nothing will ever resolve. The
+    // alternative, a file-scope table, would be a slot shared by every
+    // process in the address space, which is the bug Wine's global
+    // `tls_dirs` is.
+    //
+    // Declared out here rather than inside the block because the final
+    // protections below hand a slot back on a TLS refusal, and a slot can
+    // only be given back to the table it came from.
+    TlsTable detached;
+    TlsTable& table = context.tls != nullptr ? *context.tls : detached;
     {
-        std::size_t dirs_off = image.is_pe32_plus() ? kDirsOffset64
-                                                    : kDirsOffset32;
-        std::size_t tls_entry = dirs_off + 8 * static_cast<std::size_t>(kDirTls);
-        std::uint32_t lfanew = 0;
-        std::uint64_t opt_off = 0;
-        if (read_u32(bytes, 0x3C, lfanew)) {
-            opt_off = static_cast<std::uint64_t>(lfanew) + 4U + 20U;
+        TlsModule found;
+        TlsResult tls =
+            load_tls(image, bytes, base, space, context, table, &found);
+        if (!tls.ok) {
+            // A TLS directory this runtime cannot make sense of refuses the
+            // load rather than being ignored, and the refusal names the
+            // field. An image whose callbacks cannot be found is an image
+            // whose thread entry points at nothing; loading it and saying
+            // so later is worse than saying so here, where the file is still
+            // the thing being read.
+            //
+            // The rollback tells the two placements apart rather than
+            // guarding on the mapper, because "nothing was mapped" is not the
+            // same statement as "nothing was recorded". A load with no mapper
+            // still ran record_batch, so it still put the image in the
+            // ledger, and a refusal that undid only the kernel mapping would
+            // leave the space describing an image with no bytes in it. The
+            // fuzzer found this: its invariant is that a refused load leaves
+            // the space as it was, and the TLS directory was the first thing
+            // in the loader that could refuse *after* the record.
+            //
+            // A null mapper was never the reason to skip the undo, so nothing
+            // is dereferenced here that might be null.
+            out.error = LoadError::TlsRefused;
+            out.detail = std::move(tls.detail);
+            rollback(space, placement, batch);
+            return out;
         }
-        std::uint32_t tls_rva = 0;
-        if (opt_off != 0 &&
-            read_u32(bytes,
-                     static_cast<std::size_t>(opt_off + tls_entry), tls_rva) &&
-            tls_rva != 0) {
-            // The directory's first two fields are the start and end of the
-            // template that has to be copied into each thread's TLS block.
-            // Only the size is taken here; the copy happens at thread
-            // creation, which is a later milestone and a different layer.
-            std::uint64_t tls_off = 0;
-            std::uint32_t start = 0;
-            std::uint32_t end = 0;
-            if (image.to_file_offset(tls_rva, tls_off) &&
-                read_u32(bytes, static_cast<std::size_t>(tls_off), start) &&
-                read_u32(bytes, static_cast<std::size_t>(tls_off) + 4, end) &&
-                end >= start) {
-                module.tls_directory_va = base + tls_rva;
-                module.tls_template_size = end - start;
-                if (context.events != nullptr) {
-                    auto& e = context.events->begin(obs::EventKind::Note);
-                    e.add("text", std::string_view{"tls directory"});
-                    e.add_hex("directory", module.tls_directory_va);
-                    e.add_hex("template_size", module.tls_template_size);
-                    context.events->commit();
-                }
-            }
-        }
+        module.tls = found;
+        module.has_tls = found.template_va != 0 || found.zero_fill != 0 ||
+                         found.callbacks_va != 0;
     }
 
     // --------------------------------------------------- final protections
@@ -1546,6 +1704,21 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                 continue;
             }
             imp.iat_written = true;
+        }
+
+        // The TLS slot number goes in last, and it goes in here because this
+        // is the first moment the index field's writability is a fact rather
+        // than a temporary. See `commit_tls_index`.
+        if (module.has_tls) {
+            const TlsResult tls = commit_tls_index(module.tls, space, table);
+            if (!tls.ok) {
+                out.error = LoadError::TlsRefused;
+                out.detail = std::move(tls.detail);
+                // The placement is already protected, and the undo does not
+                // care about that: it is a munmap of what this call mapped.
+                rollback_placement(*placement, batch);
+                return out;
+            }
         }
     }
 
@@ -1771,6 +1944,753 @@ LoadResult load_image_retrying(const parser::PeImage& image, ByteSpan bytes,
 
         base = next;
     }
+}
+
+// ------------------------------------------------------------------- TLS
+//
+// The reference throughout is Wine's `alloc_tls_slot`,
+// `free_tls_slot` and `call_tls_callbacks` in `dlls/ntdll/loader.c`, read
+// rather than copied. The shape is the format's; what follows is where this
+// runtime differs and why.
+//
+// The one thing that has to be right -- and that a from-the-file
+// implementation gets wrong in a way every bounds check agrees with -- is
+// that the directory's four address fields are read out of the *mapped*
+// image. See the section on TLS in loader.h for the whole argument; the short
+// version is that they are pointers, the relocation pass has rewritten them,
+// and the file still holds the addresses the image was linked at.
+
+const char* tls_error_name(TlsError e) noexcept {
+    switch (e) {
+    case TlsError::None: return "none";
+    case TlsError::MalformedDirectory: return "malformed_directory";
+    case TlsError::TooLarge: return "too_large";
+    case TlsError::CallbackFailed: return "callback_failed";
+    case TlsError::OutOfMemory: return "out_of_memory";
+    }
+    return "unknown";
+}
+
+const char* tls_reason_name(TlsReason r) noexcept {
+    switch (r) {
+    case TlsReason::ProcessDetach: return "process_detach";
+    case TlsReason::ThreadAttach: return "thread_attach";
+    case TlsReason::ThreadDetach: return "thread_detach";
+    case TlsReason::ProcessAttach: return "process_attach";
+    }
+    return "unknown";
+}
+
+// The directory, as a structure.
+//
+// Nine DWORDs on PE32+, five on PE32. The difference is not cosmetic and the
+// shorter form is not a subset: the 32-bit structure has no
+// `AddressOfCallBacks` field at all, which is to say a PE32 module cannot
+// have TLS callbacks, and reading a field that is not there is how a 32-bit
+// image would end up with a callback list full of whatever followed it in
+// the structure.
+//
+// Returned as a plain value rather than filled in place, so that a
+// half-read directory is never the caller's to look at.
+struct RawTlsDirectory {
+    std::uint32_t start_raw = 0;
+    std::uint32_t end_raw = 0;
+    std::uint32_t index_va = 0;
+    std::uint32_t callbacks_va = 0;
+    std::uint32_t zero_fill = 0;
+    std::uint32_t characteristics = 0;
+    bool have_callbacks_field = false;
+};
+
+// Where the directory is, and whether the file carries one.
+//
+// The RVA comes from the optional header's data directory, which is an RVA
+// in every case and is not relocated -- the directory array is part of the
+// headers and describes the file, not the mapping. Only the directory's
+// *contents* are addresses that relocation touches.
+[[nodiscard]] TlsResult find_tls_directory(const parser::PeImage& image,
+                                           ByteSpan bytes,
+                                           std::uint32_t& rva_out) noexcept {
+    rva_out = 0;
+    std::uint32_t lfanew = 0;
+    if (!read_u32(bytes, 0x3C, lfanew)) {
+        // No e_lfanew means no optional header, so no directory array. That
+        // is a parse failure the caller has already refused the file for, and
+        // it is reported as a TLS refusal rather than a crash because this
+        // function is reachable from `occ check` on any file at all.
+        return TlsResult{false, TlsError::MalformedDirectory,
+                         "the file has no e_lfanew, so it has no TLS "
+                         "directory to read"};
+    }
+    const std::size_t dirs_off = image.is_pe32_plus() ? kDirsOffset64
+                                                      : kDirsOffset32;
+    const std::size_t dir_at =
+        static_cast<std::size_t>(lfanew) + 4U + 20U + dirs_off +
+        8 * static_cast<std::size_t>(kDirTls);
+    if (!read_u32(bytes, dir_at, rva_out)) {
+        return TlsResult{false, TlsError::MalformedDirectory,
+                         "the data directory array stops before the TLS "
+                         "entry at " + hex_of(dir_at)};
+    }
+    return TlsResult{true, TlsError::None, {}};
+}
+
+// Reads a directory out of the file, for the case where there is no mapping.
+//
+// This is the `occ check` path and the only one that reads the file, and it
+// is correct there for a reason that is worth stating because it is not
+// generally true: an image that was never mapped was never relocated, so the
+// file's addresses are the addresses the module has. The moment a module is
+// placed anywhere but its linked base, this function is the wrong one, which
+// is why `load_tls` prefers the space whenever there is one.
+[[nodiscard]] TlsResult read_tls_directory_from_file(const parser::PeImage& image,
+                                                     ByteSpan bytes,
+                                                     std::uint32_t rva,
+                                                     RawTlsDirectory& out) noexcept {
+    std::uint64_t off = 0;
+    if (!image.to_file_offset(rva, off)) {
+        return TlsResult{false, TlsError::MalformedDirectory,
+                         "the TLS directory at RVA " + hex_of(rva) +
+                             " is outside the file"};
+    }
+    const std::size_t at = static_cast<std::size_t>(off);
+    if (!read_u32(bytes, at, out.start_raw) ||
+        !read_u32(bytes, at + 4, out.end_raw) ||
+        !read_u32(bytes, at + 8, out.index_va) ||
+        !read_u32(bytes, at + 12, out.zero_fill)) {
+        return TlsResult{false, TlsError::MalformedDirectory,
+                         "the TLS directory at RVA " + hex_of(rva) +
+                             " is truncated in the file"};
+    }
+    // Characteristics is the fifth field on both forms and is read for the
+    // same reason Windows reads it: not to act on it, but so that a report
+    // can name the whole structure. It is deliberately not branched on -- the
+    // alignment bits are the loader's business rather than the program's,
+    // and a module that declares unusual ones still has a template that has
+    // to be copied.
+    (void)read_u32(bytes, at + 16, out.characteristics);
+
+    if (image.is_pe32_plus()) {
+        out.have_callbacks_field = true;
+        if (!read_u32(bytes, at + 20, out.callbacks_va)) {
+            return TlsResult{false, TlsError::MalformedDirectory,
+                             "the TLS directory at RVA " + hex_of(rva) +
+                                 " is truncated inside the callback field"};
+        }
+    }
+    return TlsResult{true, TlsError::None, {}};
+}
+
+// Reads a directory out of the mapped image.
+//
+// Two things are different from the file read and both matter. The values
+// are the *relocated* ones, which is the whole reason this function exists;
+// and each field is checked against the space as it is read, so a directory
+// pointing at an address no region covers is refused by name instead of
+// producing a template address that faults on first use.
+//
+// The width is 32 bits on both PE32 and PE32+ for a reason the format makes
+// unavoidable: these are the fields as the file stores them, and a PE32+
+// module's TLS template above 4 GiB is a module whose directory cannot
+// describe it. That is a property of the format, not a limit chosen here --
+// and it is worth knowing rather than assuming, because the *loaded* image
+// routinely lives above 4 GiB while the directory that describes it is a
+// 32-bit structure. Wine has the same constraint and the same consequence:
+// `RtlImageDirectoryEntryToData` hands out pointers into the mapping while
+// the directory's own fields stay 32-bit.
+[[nodiscard]] TlsResult read_tls_directory_from_space(
+    const AddressSpace& space, std::uint64_t dir_va, bool pe32_plus,
+    RawTlsDirectory& out) noexcept {
+    // Read by offset, spelled out, because "the four address fields" is the
+    // fact the whole structure exists to express and an expression that
+    // computed the offsets would hide which field is which.
+    std::uint32_t start_raw = 0;
+    std::uint32_t end_raw = 0;
+    std::uint32_t index_va = 0;
+    std::uint32_t zero_fill = 0;
+    std::uint32_t characteristics = 0;
+    std::uint32_t callbacks_va = 0;
+
+    if (!load_u32_from(space, dir_va + 0, start_raw) ||
+        !load_u32_from(space, dir_va + 4, end_raw) ||
+        !load_u32_from(space, dir_va + 8, index_va) ||
+        !load_u32_from(space, dir_va + 12, zero_fill) ||
+        !load_u32_from(space, dir_va + 16, characteristics)) {
+        return TlsResult{false, TlsError::MalformedDirectory,
+                         "the TLS directory at " + hex_of(dir_va) +
+                             " is not five readable DWORDs in memory this "
+                             "process mapped"};
+    }
+    if (pe32_plus) {
+        if (!load_u32_from(space, dir_va + 20, callbacks_va)) {
+            return TlsResult{false, TlsError::MalformedDirectory,
+                             "the TLS directory at " + hex_of(dir_va) +
+                                 " is truncated inside the callback field in "
+                                 "memory this process mapped"};
+        }
+    }
+
+    out.start_raw = start_raw;
+    out.end_raw = end_raw;
+    out.index_va = index_va;
+    out.zero_fill = zero_fill;
+    out.characteristics = characteristics;
+    out.callbacks_va = callbacks_va;
+    out.have_callbacks_field = pe32_plus;
+    return TlsResult{true, TlsError::None, {}};
+}
+
+// Picks the source and reads the directory.
+//
+// The rule in one place, because it is the rule everything else rests on:
+// mapped memory when there is a mapping, the file when there is not. A
+// directory read from the file while a mapping exists is not a fallback, it
+// is a wrong answer that passes every check.
+[[nodiscard]] TlsResult read_tls_directory(const parser::PeImage& image,
+                                           ByteSpan bytes,
+                                           const AddressSpace& space,
+                                           std::uint64_t base,
+                                           bool mapped, std::uint32_t rva,
+                                           RawTlsDirectory& out) noexcept {
+    if (!mapped) {
+        return read_tls_directory_from_file(image, bytes, rva, out);
+    }
+    return read_tls_directory_from_space(space, base + rva,
+                                         image.is_pe32_plus(), out);
+}
+
+// Whether a directory field, read as a virtual address, names something
+// inside the image.
+//
+// The window is half-open on the right because a field that names the first
+// byte past the end is not inside, and a template whose *start* is at the
+// end is caught by the size check that follows rather than by this one.
+[[nodiscard]] bool field_is_inside(std::uint64_t field, std::uint64_t base,
+                                   std::uint64_t image_rva_end) noexcept {
+    return field >= base && field - base < image_rva_end;
+}
+
+// Turns a directory field into the address it names.
+//
+// **The format has two answers for this and a loader has to accept both.**
+// The field is 32 bits. The image is not. So:
+//
+//   * Read as a virtual address, the field can only describe an image based
+//     below 4 GiB. This is what the specification says the field means and
+//     what a linker that targets a low base emits, and it is what Wine
+//     assumes without checking -- `alloc_tls_slot` memcpy's from
+//     `(void *)dir->StartAddressOfRawData` and never asks whether the value
+//     is an RVA. A module based at 0x7fa2a6e30000, which is where a
+//     64-bit Windows process puts a DLL, therefore has a TLS directory that
+//     Wine cannot use at all.
+//
+//   * Read as an RVA, the field works at any base -- and this is what
+//     modern linkers emit for 64-bit images, because it is the only
+//     encoding that survives ASLR. A file that used the VA form would have
+//     to be patched whenever it moved, and the relocation pass does not
+//     touch the TLS directory: those four fields are not in the relocation
+//     table, which is precisely why a VA-form directory is *stale* the
+//     moment the image moves and has to be re-read from the mapping.
+//
+// So: a field that lands inside the image is a VA, and a field that does not
+// is an RVA. The disambiguation is unambiguous in practice -- an RVA is
+// under `SizeOfImage`, which is a small number, and a VA is not, unless the
+// image is based low -- and the ambiguous case is resolved toward the VA
+// reading, which is the one the specification names.
+//
+// The consequence worth stating: reading the file's copy of a VA-form
+// directory is *always* wrong, because the file's copy holds the linked
+// address and the field is not relocated. Reading the mapped copy is right
+// in both forms. That is the whole argument for reading out of memory.
+[[nodiscard]] std::uint64_t resolve_tls_address(std::uint64_t field,
+                                                std::uint64_t base,
+                                                bool is_rva) noexcept {
+    return is_rva ? base + field : static_cast<std::uint64_t>(field);
+}
+
+// Writes a module's slot number into its image, after the protections are on.
+//
+// This is the second half of the store `load_tls` deliberately did not do,
+// and the reason it is a separate step is that it is the first moment the
+// question "is the index field in writable memory?" has an answer worth
+// asking. Before the final protections every region is `ReadWrite` -- a
+// relocation can name a read-only section and the IAT often is in one -- so a
+// check made there is a check of a temporary state.
+//
+// A file whose `AddressOfIndex` names a read-only section cannot have a
+// working TLS, because the program reads the slot number from there and
+// nothing will ever write it. Windows refuses such a module at load time
+// (`LdrpTlsSlotsUsed` walks the directory and the write in
+// `alloc_tls_slot` faults or is guarded), and so does this: the refusal
+// names the address, and the slot is given back so a later module can take
+// it.
+TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
+                   std::uint64_t base, AddressSpace& space,
+                   const LoadContext& context, TlsTable& table,
+                   TlsModule* module) noexcept {
+    TlsResult out;
+    if (module == nullptr) {
+        out.error = TlsError::MalformedDirectory;
+        out.detail = "no module to report the TLS of";
+        return out;
+    }
+    *module = TlsModule{};
+
+    std::uint32_t rva = 0;
+    {
+        const TlsResult found = find_tls_directory(image, bytes, rva);
+        if (!found.ok) {
+            return found;
+        }
+    }
+    if (rva == 0) {
+        // No directory. Not a failure, and not the same thing as a directory
+        // that is present and empty: a zero RVA is how a linker says "this
+        // module has no TLS", and a caller that had to tell the two apart
+        // would be asking a question with two useless answers.
+        out.ok = true;
+        return out;
+    }
+
+    // Whether the image is really in memory, which decides where the
+    // directory is read from.
+    //
+    // The test is the *mapper*, not the ledger. An earlier version asked
+    // `space.find(base) != nullptr`, on the reasoning that a region covering
+    // the base means the image is there. It is not: a load with no mapper
+    // still calls `record_batch`, so the ledger describes every section of
+    // the image and none of them is backed by anything. The loader then read
+    // the directory out of a recorded-but-unmapped address and the test suite
+    // died with SIGSEGV inside a memcpy.
+    //
+    // The distinction is the one the whole `LoadContext::placement` field is
+    // about: the ledger is a record of what the load *decided*, the mapping
+    // is what the kernel *did*, and only the second one can be read from.
+    // A ledger that said "mapped" for an unmapped address would make this
+    // function -- and the entry-point check, and every IAT store -- a
+    // segfault waiting for an image with no mapper.
+    const bool mapped = context.placement != nullptr;
+
+    RawTlsDirectory dir;
+    {
+        const TlsResult read =
+            read_tls_directory(image, bytes, space, base, mapped, rva, dir);
+        if (!read.ok) {
+            return read;
+        }
+    }
+
+    // The empty-directory check Wine makes, kept exactly as it is there: a
+    // directory whose template, zero fill and callback array are all absent
+    // describes nothing, and giving the module a slot would make its
+    // `AddressOfIndex` meaningful where the file says nothing about it.
+    //
+    // Wine's test is `!size && !SizeOfZeroFill && !AddressOfCallBacks` where
+    // `size` is `End - Start`. Written here with the same three terms, and
+    // the terms are compared as "the derived quantity is zero" rather than
+    // "both fields are zero" so that a directory declaring a zero-length
+    // template at a non-zero address is treated the same way Wine treats it:
+    // as no TLS.
+    const std::uint64_t template_size =
+        dir.end_raw >= dir.start_raw
+            ? static_cast<std::uint64_t>(dir.end_raw) - dir.start_raw
+            : 0;
+    if (dir.end_raw < dir.start_raw) {
+        out.error = TlsError::MalformedDirectory;
+        out.detail = "the TLS template ends at " + hex_of(dir.end_raw) +
+                     ", before it starts at " + hex_of(dir.start_raw);
+        return out;
+    }
+    if (template_size == 0 && dir.zero_fill == 0 && dir.callbacks_va == 0) {
+        out.ok = true;
+        return out;
+    }
+
+    // The template plus the zero fill is what every thread's block costs, and
+    // it is checked here rather than at thread creation for the same reason
+    // the placement plan is checked before anything is mapped: a size that
+    // cannot be allocated is a fact about the file, and finding it out once
+    // at load time is better than once per thread.
+    const std::uint64_t block = template_size + dir.zero_fill;
+    if (block > std::numeric_limits<std::uint32_t>::max()) {
+        // The two fields are 32-bit, so their sum is at most 2^33, and
+        // `TlsBlock::size` is 32-bit. Refusing here rather than truncating
+        // is the difference between a thread whose block is the size the file
+        // asked for and a thread whose block is the size the file asked for
+        // modulo four gigabytes.
+        out.error = TlsError::TooLarge;
+        out.detail = "a thread's TLS block would be " + hex_of(block) +
+                     " bytes, which does not fit in the 32-bit size this "
+                     "runtime reports it in";
+        return out;
+    }
+
+    TlsModule m;
+    m.directory_va = base + rva;
+    m.template_size = static_cast<std::uint32_t>(template_size);
+    m.zero_fill = dir.zero_fill;
+    m.callbacks_va = dir.have_callbacks_field ? dir.callbacks_va : 0;
+
+    // The image's extent, as an RVA window. Every address in the directory
+    // is checked against this and nothing else, because the directory's
+    // address fields are 32-bit and the image is not -- see
+    // resolve_tls_address, which is where that matters.
+    const std::uint64_t image_rva_end = image.image_size();
+    const std::uint64_t image_end = base + image_rva_end;
+
+    // How each address field was read out of the directory. Recorded because
+    // "the template is at 0x7fa2a6e31100" and "the template is at RVA 0x1100
+    // in an image based at 0x7fa2a6e30000" are the same fact said two ways,
+    // and a reader of a report needs to know which one produced it.
+    const bool template_is_rva =
+        !field_is_inside(dir.start_raw, base, image_rva_end);
+    const bool index_is_rva =
+        !field_is_inside(dir.index_va, base, image_rva_end);
+    const bool callbacks_is_rva =
+        m.callbacks_va != 0 &&
+        !field_is_inside(m.callbacks_va, base, image_rva_end);
+
+    m.template_va = resolve_tls_address(dir.start_raw, base, template_is_rva);
+    m.index_va = resolve_tls_address(dir.index_va, base, index_is_rva);
+    m.callbacks_va =
+        resolve_tls_address(m.callbacks_va, base, callbacks_is_rva);
+
+    // The template has to be inside the image, and "inside" is checked
+    // against the image rather than against the space. A TLS directory that
+    // points outside its own image is wrong whether or not the image happens
+    // to be in memory, and `occ check` has to reach the same verdict as a
+    // load -- a checker that accepted a directory a loader would refuse is a
+    // checker that says a broken file is fine.
+    //
+    // Written as a subtraction from `m.template_va - base` rather than as a
+    // comparison against `base` first, because the two are not the same
+    // check: a field that resolved *below* the base would have wrapped into
+    // a huge RVA that passes every `> image_size` test, and the wrap is what
+    // the explicit `template_va < base` line below turns into a refusal.
+    if (m.template_va < base ||
+        m.template_va - base + template_size > image_rva_end) {
+        out.error = TlsError::MalformedDirectory;
+        out.detail = "the TLS template at " + hex_of(m.template_va) +
+                     (m.template_va < base
+                          ? " is below the image base " + hex_of(base)
+                          : " leaves the image, which ends at " +
+                                hex_of(image_end));
+        return out;
+    }
+    if (m.callbacks_va != 0 &&
+        (m.callbacks_va < base || m.callbacks_va >= image_end)) {
+        out.error = TlsError::MalformedDirectory;
+        out.detail = "the TLS callback array at " + hex_of(m.callbacks_va) +
+                     " is outside the image, which ends at " +
+                     hex_of(image_end);
+        return out;
+    }
+    // The index is a DWORD, so the check is for four bytes ending inside --
+    // a field that starts one byte before the end of the image is a field
+    // whose three other bytes are in the next section, or past the mapping.
+    if (m.index_va != 0 &&
+        (m.index_va < base || m.index_va - base + 4 > image_rva_end)) {
+        out.error = TlsError::MalformedDirectory;
+        out.detail = "the TLS index field at " + hex_of(m.index_va) +
+                     " is outside the image, which ends at " +
+                     hex_of(image_end);
+        return out;
+    }
+
+    // The slot. Reuse of a free slot is Wine's behaviour and it is worth
+    // having: a process that loads and unloads the same DLL two hundred
+    // times in a loop would otherwise need two hundred slots, and the slot
+    // number is baked into code the DLL's own author compiled against an
+    // earlier load of itself.
+    //
+    // A free slot is one whose entry has been zeroed, which is exactly what
+    // `free_tls_block`'s counterpart does and exactly what Wine's
+    // `free_tls_slot` does -- it `memset`s the entry rather than compacting
+    // the array, because compacting would renumber the live modules, and a
+    // module's slot number is written into its own image where nothing
+    // rewrites it.
+    std::uint32_t slot = static_cast<std::uint32_t>(table.modules.size());
+    for (std::size_t i = 0; i < table.modules.size(); ++i) {
+        if (table.modules[i].template_va == 0 &&
+            table.modules[i].template_size == 0 &&
+            table.modules[i].zero_fill == 0 &&
+            table.modules[i].callbacks_va == 0) {
+            slot = static_cast<std::uint32_t>(i);
+            break;
+        }
+    }
+    m.index = slot;
+    if (static_cast<std::size_t>(slot) < table.modules.size()) {
+        table.modules[slot] = m;
+    } else {
+        table.modules.push_back(m);
+    }
+    if (slot + 1 > table.slots_allocated) {
+        table.slots_allocated = slot + 1;
+    }
+
+    // Nothing below can fail, and that is a property of the order rather
+    // than an accident of this snapshot. Every check that could refuse --
+    // the template's bounds, the callback array's, the index field's, the
+    // block's size -- ran *above*, before a slot was allocated, so a
+    // directory this runtime cannot build never reaches the table and there
+    // is nothing here to give back.
+    //
+    // The one check that happens later is the index field's writability, in
+    // `commit_tls_index`, which runs after the final protections because
+    // that is the first moment the question has an answer. That one does
+    // have to release, and does; see the `release` lambda there.
+    //
+    // Writing this down matters because the next person to add a check will
+    // add it here, below the allocation, and it will have to release -- and
+    // the failure mode of forgetting is a table that grows by one per
+    // refused load and reuses nothing.
+
+    // The one store, and it does not happen here.
+    //
+    // The slot number goes into the image at `index_va`, but not from this
+    // function, because at this point in the load every region is
+    // `ReadWrite` on purpose -- a relocation can name an address in a
+    // read-only section, and the IAT is often in one -- so a writability
+    // check here would be a check of a temporary state and would always
+    // pass. It is `commit_tls_index`, called after the final protections,
+    // that finds out whether the index field is in a section the file
+    // declared writable, and a file whose is not is refused there.
+    //
+    // Wine writes it from `alloc_tls_slot`, which also runs after the
+    // sections are protected, and for the same reason.
+
+    if (context.events != nullptr) {
+        auto& e = context.events->begin(obs::EventKind::Note);
+        e.add("text", std::string_view{"tls directory"});
+        e.add("source", std::string_view{mapped ? "memory" : "file"});
+        e.add_hex("directory", m.directory_va);
+        e.add_hex("template", m.template_va);
+        e.add("template_size", static_cast<std::uint64_t>(m.template_size));
+        e.add("zero_fill", static_cast<std::uint64_t>(m.zero_fill));
+        e.add("slot", static_cast<std::uint64_t>(slot));
+        e.add_hex("index", m.index_va);
+        if (m.callbacks_va != 0) {
+            e.add_hex("callbacks", m.callbacks_va);
+        }
+        context.events->commit();
+    }
+
+    *module = m;
+    out.ok = true;
+    return out;
+}
+
+TlsResult build_tls_block(const TlsTable& table, std::uint32_t slot,
+                          const AddressSpace& space, Mapper& mapper,
+                          TlsBlock* out) noexcept {
+    TlsResult result;
+    if (out == nullptr) {
+        result.error = TlsError::MalformedDirectory;
+        result.detail = "no block to report the thread's TLS in";
+        return result;
+    }
+    *out = TlsBlock{};
+
+    if (slot >= table.modules.size()) {
+        result.error = TlsError::MalformedDirectory;
+        result.detail = "slot " + std::to_string(slot) +
+                        " is not in a table of " +
+                        std::to_string(table.modules.size()) + " modules";
+        return result;
+    }
+    const TlsModule& m = table.modules[slot];
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(m.template_size) + m.zero_fill;
+
+    // Everything this function will read is checked *before* it maps
+    // anything, and the order is the whole point.
+    //
+    // The first version of this allocated the block first and read the
+    // template into it afterwards, on the reasonable grounds that a block is
+    // needed before anything can be copied into it. That order has a failure
+    // mode that is invisible until it happens: `mapper.map(0, ...)` asks the
+    // kernel where to put the block, and the kernel is free to answer with an
+    // address that is the template's own address. The mapping then *covers*
+    // the template, `space.find` finds the block, and the copy reads a page
+    // of zeros out of the block it just made and reports success. Every
+    // thread of that program then has a TLS template full of zeroes where
+    // the module's own pointers should be -- which is not a crash, and not a
+    // wrong answer this runtime can detect later, but a program whose
+    // thread-local variables are all zero for a reason nothing in the report
+    // will name.
+    //
+    // Checking first makes the allocation irrelevant to the answer. A
+    // template that is not in the space is refused by name, before there is
+    // a block that could be mistaken for one, and the refusal is the same
+    // whether or not the kernel would have overlapped them. It also means
+    // the block is only ever mapped when there is something to put in it, so
+    // the "map then possibly undo" window below shrinks to the copies
+    // themselves, which cannot fail.
+    if (m.template_size != 0) {
+        const Region* home = space.find(m.template_va);
+        if (home == nullptr || home->end() < m.template_va + m.template_size) {
+            result.error = TlsError::MalformedDirectory;
+            result.detail = "the TLS template at " + hex_of(m.template_va) +
+                            " is not in memory this process mapped";
+            return result;
+        }
+    }
+    if (m.callbacks_va != 0 && space.find(m.callbacks_va) == nullptr) {
+        result.error = TlsError::MalformedDirectory;
+        result.detail = "the TLS callback array at " + hex_of(m.callbacks_va) +
+                        " is not in memory this process mapped";
+        return result;
+    }
+
+    // The template is copied out of the *space*, and that is the whole
+    // reason this function takes a space and not a file. The template holds
+    // pointers into the image, and an image placed away from its linked base
+    // has had those pointers relocated; a copy taken from the file would hand
+    // every thread a block full of addresses that point at the image's
+    // preferred base, which is memory nothing is mapped at.
+    //
+    // Read through the space rather than through a raw pointer for the same
+    // reason the stores are: a TLS template can name an address the plan did
+    // not cover, and the space is the authority on what was covered.
+    if (total != 0) {
+        const Result<std::uint64_t> mapped =
+            mapper.map(0, total, PageProtection::ReadWrite,
+                       RegionKind::Private, ".tls");
+        if (!mapped.ok()) {
+            result.error = TlsError::OutOfMemory;
+            result.detail = "a thread's TLS block of " + hex_of(total) +
+                            " bytes could not be mapped";
+            return result;
+        }
+        out->address = mapped.value;
+        out->size = static_cast<std::uint32_t>(total);
+
+        // The two reads below cannot fail: the checks above established that
+        // both the template and the callback array are inside regions this
+        // space holds, and nothing between here and them removes one. They
+        // are still written to refuse rather than to assume, because the
+        // alternative is a load_from that returns a bool nobody looks at,
+        // and a check that cannot fail is either redundant or load-bearing
+        // depending on a fact three functions away.
+        auto refuse = [&](TlsError e, std::string detail) noexcept -> TlsResult {
+            (void)mapper.unmap(out->address);
+            *out = TlsBlock{};
+            result.ok = false;
+            result.error = e;
+            result.detail = std::move(detail);
+            return result;
+        };
+
+        if (m.template_size != 0) {
+            if (!load_from(space, m.template_va, reinterpret_cast<void*>(out->address),
+                           m.template_size)) {
+                return refuse(TlsError::MalformedDirectory,
+                              "the TLS template at " + hex_of(m.template_va) +
+                                  " stopped being readable between the check "
+                                  "and the copy");
+            }
+        }
+        // The zero fill. Written rather than left to the mapping, because a
+        // caller may reuse a block address it was given, and then the
+        // kernel's zeros are somebody else's leftovers.
+        //
+        // It is `m.template_size` bytes in, not `total` bytes in: the
+        // template is already there and writing zeros over it would destroy
+        // the very thing this function exists to copy.
+        if (m.zero_fill != 0) {
+            std::memset(reinterpret_cast<void*>(out->address + m.template_size),
+                        0, m.zero_fill);
+        }
+    }
+
+    // The callback array, read out of the space for the same reason the
+    // template is: the entries are addresses in the image, and an image
+    // placed elsewhere has had them relocated.
+    if (m.callbacks_va != 0) {
+        // Bounded by the region, not trusted. A file whose array has no
+        // terminator inside its own image would otherwise walk off the end
+        // of every mapping and read whatever the kernel had there, and the
+        // resulting "callback" would be called.
+        //
+        // The null check is not repeated from the one above, but the region
+        // is: `find` is a search and this needs the extent, and holding the
+        // region from the earlier check across an allocation would be holding
+        // a pointer into a vector that the allocation may have reallocated.
+        const Region* r = space.find(m.callbacks_va);
+        if (r == nullptr) {
+            result.error = TlsError::MalformedDirectory;
+            result.detail = "the TLS callback array at " +
+                            hex_of(m.callbacks_va) +
+                            " stopped being mapped between the check and the "
+                            "walk";
+            return result;
+        }
+        // The terminator has to fit too: a region that ends exactly at the
+        // last entry has no terminator in it, and the loop below would read
+        // one past. Bounded by `end() - 8` so the last read is a whole
+        // pointer that is inside the region.
+        const std::uint64_t region_end = r->end();
+        for (std::uint64_t at = m.callbacks_va; at + 8 <= region_end;
+             at += 8) {
+            std::uint64_t fn = 0;
+            if (!load_u64_from(space, at, fn)) {
+                break;
+            }
+            if (fn == 0) {
+                // The format's own terminator. Not an absence and not an
+                // error: an array whose first entry is null is a module
+                // with no callbacks, and a loader that reported an error
+                // would be reporting its own expectation as a fact.
+                break;
+            }
+            out->callbacks.push_back(fn);
+        }
+    }
+
+    result.ok = true;
+    return result;
+}
+
+void free_tls_block(Mapper& mapper, const TlsBlock& block) noexcept {
+    // No address is not an error. A module with neither template nor zero
+    // fill has no block, and a caller freeing every module's TLS on thread
+    // exit should not have to ask which modules those were.
+    if (block.address == 0) {
+        return;
+    }
+    // The result is dropped on purpose, and the reason is worth stating
+    // because it looks like an oversight: this function returns void, and a
+    // caller that cannot see a failure cannot act on one. What it can do is
+    // not carry on believing the block is there, which is why the block is
+    // zeroed below whatever the unmap did -- an unmap that failed leaves
+    // memory mapped, and a caller that goes on to use the address faults
+    // somewhere that has nothing to do with TLS.
+    (void)mapper.unmap(block.address);
+}
+
+TlsResult call_tls_callbacks(const TlsBlock& block, TlsCallback callback,
+                             void* state, std::uint64_t module,
+                             TlsReason reason) noexcept {
+    TlsResult out;
+    if (callback == nullptr) {
+        // Not a refusal of the module: a caller with no way to call into the
+        // image can still walk the list, and saying "failed" here would make
+        // an absence of an invoker indistinguishable from a callback that
+        // returned false. Nothing was called, which is what ok means.
+        out.ok = true;
+        return out;
+    }
+    for (std::uint64_t fn : block.callbacks) {
+        if (!callback(state, fn, module, reason)) {
+            out.error = TlsError::CallbackFailed;
+            out.detail = "the TLS callback at " + hex_of(fn) +
+                         " refused the " + tls_reason_name(reason);
+            return out;
+        }
+    }
+    out.ok = true;
+    return out;
 }
 
 } // namespace occ::runtime

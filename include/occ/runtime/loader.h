@@ -117,6 +117,17 @@ enum class LoadError : std::uint8_t {
     // map, and it is the same reason the entry point and the IAT slots are
     // checked where they are.
     RelocationNotWritable,
+    // The TLS directory is present and does not describe anything this
+    // runtime can build: the template's end is before its start, or one of
+    // its addresses is outside the image.
+    //
+    // Its own value rather than a reuse of BadRelocation, because the two
+    // are found at different times by different code and the reader needs to
+    // know which structure was wrong. A bad relocation is a good image with
+    // one bad entry; a bad TLS directory means the whole structure is
+    // unusable, and a caller who fixed the relocation would find the same
+    // refusal waiting.
+    TlsRefused,
 };
 
 [[nodiscard]] const char* load_error_name(LoadError e) noexcept;
@@ -150,6 +161,182 @@ struct ResolvedImport {
     bool iat_written = false;
 };
 
+// ------------------------------------------------------------------- TLS
+//
+// What a PE's TLS directory means, and what has to happen for it to work.
+//
+// The directory is nine four-byte fields (twenty-four on PE32), and three of
+// them describe a block of bytes the file carries and every thread needs its
+// own copy of:
+//
+//   StartAddressOfRawData   the template, as a virtual address
+//   EndAddressOfRawData     one past its last byte
+//   AddressOfIndex          a DWORD in the image the loader writes the
+//                           module's slot number into
+//   AddressOfCallBacks      a NULL-terminated array of function pointers
+//   SizeOfZeroFill          zero bytes appended after the template
+//
+// The indirection is the whole design. An image cannot contain a thread's TLS
+// block, because there are as many of those as there are threads and the
+// image is mapped once. So the image contains a *template*, and the runtime
+// copies it per thread; and because the copy has to be found by a variable
+// the program indexes, the image contains the *address of a slot number*
+// rather than the slot number, which is what lets a module loaded later still
+// find its block through code that was compiled against an earlier one.
+//
+// **Every one of those addresses is read out of memory, never out of the
+// file.** This is the one thing about TLS that has to be right and it is the
+// thing that is easy to get wrong, because reading the directory out of the
+// file looks like it works: the values are there, they are the right shape,
+// and every bounds check passes. They are also the addresses the image was
+// *linked* at. The four address fields are not in the relocation table --
+// which is exactly why a file's copy of them is stale the moment the image
+// moves -- so a module placed anywhere but its preferred base has a
+// directory that names memory nothing is mapped at.
+//
+// Wine gets the reading right and is the reference for it: `alloc_tls_slot`
+// in `dlls/ntdll/loader.c` calls `RtlImageDirectoryEntryToData(mod->DllBase,
+// ...)`, on the *mapped* image, and `call_tls_callbacks` re-reads the
+// directory from the module rather than from the copy it cached, for the
+// same reason. So does occ read the directory from the space whenever there
+// is one, and fall back to the file only when there is not -- which is the
+// `occ check` case, where the answer is about the file's shape and no
+// relocation will ever happen to it.
+//
+// **The fields are 32 bits and the image is not, and both encodings are in
+// the wild.** A field read as a virtual address can only describe an image
+// based below 4 GiB, which is what the specification means and what Wine
+// assumes without checking: a DLL based at 0x7fa2a6e30000, which is where
+// a real 64-bit process puts one, has a TLS directory Wine cannot use. A
+// field read as an RVA works at any base, and that is what modern linkers
+// emit for 64-bit images, because it is the only encoding that survives
+// ASLR. This runtime accepts both, disambiguated by which one lands inside
+// the image and resolved toward the VA reading when both could. Wine accepts
+// only the first, which is a real limitation rather than a simplification.
+//
+// Three further things are done differently from Wine, each a decision
+// rather than an accident:
+//
+//   * **A slot is a slot in a table the caller owns.** Wine keeps a global
+//     `tls_dirs` array and a `tls_module_count`, and a process with twenty
+//     DLLs has a twenty-four-slot array that grew by doubling and was never
+//     shrunk -- and a test harness in the same address space silently shares
+//     it. `TlsTable` is a value, so a caller can put two of them in two
+//     processes and cannot accidentally share one.
+//
+//   * **The index is written even when there are no threads yet.** A module
+//     loaded before the first thread still has to be findable by index from
+//     that thread, so the write happens at load time rather than at first
+//     thread creation.
+//
+//   * **A template of zero length with a zero fill is not "no TLS".** Wine
+//     returns FALSE for a directory whose template, zero fill and callback
+//     array are all empty, and that check is kept: a module with an all-zero
+//     directory is a module with no TLS, and giving it a slot would make
+//     `AddressOfIndex` meaningful where the file says nothing.
+// A module's TLS, as the loader recorded it.
+//
+// `index` is the slot. `template_va` and `template_size` describe the bytes
+// every thread copies; `zero_fill` is how many zeros follow them in each
+// block; `callbacks_va` is where the callback array is, or zero.
+//
+// `index_va` is where the slot number was *written*, which is a different
+// question from what the slot number is. It is kept because a reader
+// debugging "the program read a garbage index" needs the address to look at,
+// and because it is the one field a caller has to be able to check for
+// itself: a module with a slot and no writable index field has a slot number
+// that exists in the loader and not in the image, and every thread it starts
+// will read whatever was in those four bytes before.
+//
+// `directory_va` is kept because a report that cannot name the structure it
+// read is a report about a number.
+struct TlsModule {
+    std::uint32_t index = 0;
+    std::uint64_t directory_va = 0;
+    std::uint64_t template_va = 0;
+    std::uint64_t index_va = 0;
+    std::uint64_t callbacks_va = 0;
+    std::uint32_t template_size = 0;
+    std::uint32_t zero_fill = 0;
+};
+
+// The per-process table of modules with TLS.
+//
+// A value rather than a global, so that two processes in one address space --
+// which is what the observer and the fuzz harness both do -- do not share a
+// slot table, and so that a table's lifetime is the caller's to state.
+struct TlsTable {
+    // One entry per module, in the order slots were handed out. The order is
+    // the slot order: an entry's index in this vector *is* its slot number,
+    // which is what `AddressOfIndex` receives.
+    //
+    // A freed slot stays in this vector as a zeroed entry rather than being
+    // erased, because erasing one would renumber every module after it and a
+    // module's slot number is written into its own image where nothing
+    // rewrites it. Wine's `free_tls_slot` memsets the entry for the same
+    // reason.
+    std::vector<TlsModule> modules;
+
+    // The number of entries ever allocated, including ones freed. A freed
+    // slot is reused, and this is the high-water mark the search for a free
+    // slot stops at -- the same thing Wine's `tls_module_count` is, and named
+    // for the same reason: it is a bound, not a length.
+    std::uint32_t slots_allocated = 0;
+};
+
+// The three things a thread needs from TLS, gathered in one value.
+//
+// Gathered because the three are always wanted together and are always
+// derived from the same two structures -- the image's directory and the
+// process's slot table -- and deriving them separately is how a caller ends
+// up with a block for slot 2 and a callback list for slot 3.
+struct TlsBlock {
+    // The thread's copy of the template plus its zero fill, or zero when the
+    // module has neither. A module whose template and zero fill are both
+    // empty legitimately has no block, and this is zero rather than a
+    // one-byte allocation: an address the program never dereferences should
+    // not be a heap block it has to keep alive.
+    std::uint64_t address = 0;
+    std::uint32_t size = 0;
+
+    // The callbacks, in the order the array lists them. Empty when the
+    // module has no callback array, and also empty when the array's first
+    // entry is null -- which is the format's own terminator and not an
+    // absence.
+    std::vector<std::uint64_t> callbacks;
+};
+
+// Why a module's TLS could not be set up.
+//
+// Separate from LoadError rather than a value of it, and the separation is
+// the point: a load that failed because the *base* was taken can be retried
+// somewhere else, and a load that failed because the TLS directory is
+// nonsense cannot be retried anywhere. Folding the second into the first
+// would make the retry loop below try sixty-four bases against a file that
+// was never going to load.
+enum class TlsError : std::uint8_t {
+    None = 0,
+    // The directory is present but its fields do not describe anything: the
+    // template's end is before its start, or an address in it is outside the
+    // image. A file that says this is a file whose TLS nobody can build.
+    MalformedDirectory,
+    // The template plus its zero fill, or a callback array's entries, do not
+    // fit in what this runtime can map for one thread.
+    TooLarge,
+    // A callback returned false, so the load it belongs to failed.
+    CallbackFailed,
+    // The thread's block could not be mapped.
+    OutOfMemory,
+};
+
+[[nodiscard]] const char* tls_error_name(TlsError e) noexcept;
+
+struct TlsResult {
+    bool ok = false;
+    TlsError error = TlsError::None;
+    std::string detail;
+};
+
 // A loaded image.
 struct LoadedModule {
     std::string path;
@@ -171,10 +358,21 @@ struct LoadedModule {
     std::uint64_t relocations_applied = 0;
     std::uint32_t relocation_blocks = 0;
 
-    // The TLS directory's virtual address and the size of the template, or
-    // zero when the image has none.
-    std::uint64_t tls_directory_va = 0;
-    std::uint32_t tls_template_size = 0;
+    // The TLS directory as the loader read it, or a zeroed record when the
+    // image has none. A record rather than two scalars because the directory
+    // is a structure, and the useful question about it -- what will this
+    // module's thread blocks contain -- cannot be answered from a size and
+    // an address.
+    //
+    // Filled whether or not `LoadContext::tls` was set, because reading the
+    // directory is a decision and every load makes it. What the table adds
+    // is the slot, and a caller without a table has no slot to be given.
+    TlsModule tls{};
+
+    // Whether this image declares TLS at all, which is not the same as
+    // `tls.template_size` being non-zero: a module may declare a template
+    // with no zero fill, or a zero fill with no template, and both are TLS.
+    bool has_tls = false;
 };
 
 struct LoadResult {
@@ -256,7 +454,138 @@ struct LoadContext {
     // and got a different one has a bug the retry loop would hide.
     BaseChooser base_chooser = nullptr;
     void* base_chooser_state = nullptr;
+
+    // The per-process table of TLS modules, or nullptr to skip TLS
+    // allocation. Appended last, and see the section on TLS below for why it
+    // is a caller-owned table rather than something the loader keeps.
+    TlsTable* tls = nullptr;
 };
+
+
+// Reads an image's TLS directory and records it in `table`.
+//
+// Returns ok with a zero `module` for an image with no TLS, which is not a
+// failure: most images have none, and a caller that had to distinguish "no
+// TLS" from "TLS refused" would be asking a question with two useless
+// answers. `module->index` is the slot the image's `AddressOfIndex` was
+// given, and it is the index into `table->modules`.
+//
+// **The directory is read out of `space` when there is one.** The four
+// address fields in it are virtual addresses that the relocation pass has
+// already rewritten, so the file's copy of them is the image's *linked*
+// addresses and is wrong for every image that was placed anywhere else. The
+// file is read only when `space` has nothing -- that is, when
+// `context.placement` is null and no mapper was given, which is the
+// `occ check` case, where the question is about the file's shape and no
+// relocation is going to happen to it. See the section on TLS above.
+//
+// A mapper's absence is not a failure and the difference is not a special
+// case in the code: with a mapper the slot number is *written* into the
+// image's `AddressOfIndex`, and without one there is nowhere to write it.
+// The slot is allocated and reported either way, because deciding is most of
+// the work and a caller in the no-mapper path still wants to know what the
+// directory says.
+[[nodiscard]] TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
+                                 std::uint64_t base, AddressSpace& space,
+                                 const LoadContext& context, TlsTable& table,
+                                 TlsModule* module) noexcept;
+
+// Builds a thread's TLS block for one module: copies the template, appends
+// `zero_fill` zeros, and reads the callback array.
+//
+// The template is copied *out of the space* rather than out of the file, and
+// that is not an optimisation. The template holds pointers into the image,
+// and an image placed away from its linked base has had those pointers
+// relocated; copying from the file would give every thread a block full of
+// addresses that point at the image's preferred base, which is memory
+// nothing is mapped at. For the same reason the callback array is read from
+// the space: its entries are addresses in the image too.
+//
+// There is no `bytes` parameter, and the omission is the point stated as an
+// interface: a caller holding the file cannot use it to build a block,
+// because a block built from the file is wrong for every image that was
+// placed anywhere but its linked base. The only source that is always
+// correct is the mapped image.
+//
+// Returns a failure rather than a partial block, and unmaps whatever it had
+// mapped: a thread whose TLS is half-built is a thread that faults later,
+// somewhere else, and a caller that cannot tell a partial block from a whole
+// one will treat the address it got as usable.
+[[nodiscard]] TlsResult build_tls_block(const TlsTable& table,
+                                        std::uint32_t slot,
+                                        const AddressSpace& space,
+                                        Mapper& mapper, TlsBlock* out) noexcept;
+
+// Releases a thread's block for one module.
+//
+// Named rather than left to a destructor because the address came from a
+// mapper the caller owns and the caller has to say which: a block freed
+// through the wrong mapper is a block the ledger still describes, and the
+// space and the ledger then disagree about what is mapped. A block with no
+// address is a module with neither template nor zero fill, which is a real
+// case rather than a degenerate one, and freeing it is not an error.
+void free_tls_block(Mapper& mapper, const TlsBlock& block) noexcept;
+
+// The reason DLL_THREAD_ATTACH exists, as the four values a callback is
+// called with.
+//
+// Named here rather than as four integers because the values are a
+// contract: a callback that does not recognise its reason must return
+// immediately without initialising anything, because Windows will call it
+// again for every module in the load order and a callback that runs its
+// initialiser twice is a bug that shows up as a corrupted module rather
+// than as a rejected one.
+enum class TlsReason : std::uint32_t {
+    ProcessDetach = 0,
+    ThreadAttach = 1,
+    ThreadDetach = 2,
+    ProcessAttach = 3,
+};
+
+[[nodiscard]] const char* tls_reason_name(TlsReason r) noexcept;
+
+// How a callback is reached.
+//
+// A callback is an address in the image, and calling it means calling into
+// memory this runtime mapped for someone else's code -- which on a host that
+// does not execute the guest's instructions cannot be done by dereferencing
+// the address. So the address is handed to a caller-supplied invoker, which
+// is the same shape of dependency the import resolver has: the loader knows
+// *which* function to call and the layer above knows *how*.
+//
+// The bool is the callback's return: TRUE keeps the load going, FALSE fails
+// it. Wine treats a callback that returns FALSE as a failed load (see
+// `call_dll_entry_point` in its loader.c).
+//
+// `reserved` is passed through as null, as Wine passes it, and is named in
+// the signature because a callback that declares three parameters and is
+// called with four is a callback reading a register the caller happened to
+// leave set.
+using TlsCallback = bool (*)(void* state, std::uint64_t callback,
+                             std::uint64_t module, TlsReason reason) noexcept;
+
+// Calls one module's callbacks for `reason`, in the order the array lists
+// them, stopping at the first one that returns false.
+//
+// `block` carries the callback addresses and `module` is the base they are
+// relative to, which is a parameter rather than something read out of the
+// table because the table is a value the caller owns and a module's base is
+// a property of the mapping, not of the TLS slot.
+//
+// Stops at the first false, and says so in the result, rather than calling
+// the rest: a callback that returned false has told the loader the load
+// failed, and calling the remaining callbacks would run their initialisers
+// for a module that is not going to be loaded. Wine stops too, though it
+// stops by catching an exception rather than by reading a return value --
+// its `call_tls_callbacks` wraps each call in `__TRY` and returns on
+// `__EXCEPT_ALL`, which is a statement about structured exceptions rather
+// than about the return value, and this runtime has no SEH to catch. What is
+// kept is the shape: the first failure ends the walk, and the callbacks after
+// it are not called.
+[[nodiscard]] TlsResult call_tls_callbacks(const TlsBlock& block,
+                                           TlsCallback callback, void* state,
+                                           std::uint64_t module,
+                                           TlsReason reason) noexcept;
 
 // Loads a parsed image at `preferred_base`, or at the image's own base when
 // `preferred_base` is zero.

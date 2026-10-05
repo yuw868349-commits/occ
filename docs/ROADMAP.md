@@ -23,7 +23,7 @@ the observation layer is the product, and it is the deepest part.
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 2,361 assertions across seventeen binaries. The counts are what
+The test suite is 2,527 assertions across seventeen binaries. The counts are what
 the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
@@ -33,7 +33,7 @@ none to a grep:
 | `test_engine` | 437 |
 | `test_pe` | 466 |
 | `test_observer` | 263 |
-| `test_runtime_loader` | 247 |
+| `test_runtime_loader` | 412 |
 | `test_elf` | 150 |
 | `test_uprobe` | 108 |
 | `test_ntdll_probes` | 102 |
@@ -43,7 +43,7 @@ none to a grep:
 | `test_seccomp` | 49 |
 | `test_placer` | 46 |
 | `test_event` | 43 |
-| `test_seeds` | 40 |
+| `test_seeds` | 41 |
 | `test_probe_wiring` | 36 |
 | `test_gdb_interop` | 29 |
 | `test_container` | 25 |
@@ -142,7 +142,7 @@ reference: it tells a reader the question has been answered.
 `fuzz/` holds six of them -- the ELF reader, the zip reader, the PE reader,
 the PE loader, the GDB RSP codec and the seccomp-BPF emitter -- each a
 `LLVMFuzzerTestOneInput` over the parser it names, plus a `seeds/` directory of
-thirty-five seeds. `docs/BUILD.md` describes
+thirty-six seeds. `docs/BUILD.md` describes
 `-DOCC_ENABLE_FUZZ=ON`, which is what `add_subdirectory(fuzz)` is conditioned
 on, and `fuzz/README.md` records what each harness asserts. They are off by
 default because the sanitizer link flags they need are per-consumer, so an
@@ -153,6 +153,27 @@ thing a person runs rather than a thing that runs -- though a bounded run of
 each is a ctest, so an ordinary `ctest` in a fuzz build does reach them. What
 the accumulated corpus holds is not checked in: it is untracked, and a clean
 build throws it away.
+
+**They have already paid for themselves, which is the argument for keeping
+them.** The loader harness asserts one thing above all others: a refused load
+leaves the address space exactly as it was. A seed whose optional header
+declares 0x60 bytes in a file that stops 0x120 bytes in -- so the data
+directory array is claimed by the layout and absent from the file -- broke
+it, and the defect was real: the loader rolled back a refused load's kernel
+mapping and, with no mapper to unmap, rolled back nothing, leaving a ledger
+that described an image whose bytes were never placed. Every unit test missed
+it, because every unit test that reaches a refusal after the record supplies
+a mapper. The fix is in, the case is in, and the seed is
+`pe_short_data_directory.bin` so the fuzzer starts next to the boundary again.
+
+The harness's own invariant was wrong in the same run, in the direction that
+matters: it compared the allocation count, which `AddressSpace::remove`
+deliberately does not move when a region is forgotten, because the count is a
+replay sequence number. A harness that traps on correct behaviour is as much a
+finding as one that misses a defect, and fixing it is only honest if the fix
+is checked -- so `same_map` compares the regions and the high water instead,
+and the loosening was verified by re-tightening it and confirming the seeds
+still fail.
 
 **Nothing that needs a process is fuzzed.** The `run` path and everything
 under it needs a real namespace and a real kernel, and a fuzzer that forks per
@@ -246,7 +267,7 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 2,361 assertions and needs no network. Two of the seventeen
+The test suite is 2,527 assertions and needs no network. Two of the seventeen
 binaries need a target binary and a host that permits namespaces and seccomp,
 one needs a gdb on `PATH`, and one needs a `python3` to re-run the seed
 generator; those are skipped rather than failed where the host does not have

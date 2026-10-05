@@ -253,6 +253,38 @@ def _loader_regressions(pe):
     override_section(buf, 0, va=0x0, vsize=0x2000)
     results["pe_section_over_headers.bin"] = bytes(buf)
 
+    # (4) A data directory array that stops before the TLS entry. The
+    #     directory array is the last thing in the optional header and its
+    #     length is a count, not a size, so an image can declare eight
+    #     directories -- indexes 0 through 7, stopping one short of the TLS
+    #     entry at index 9 -- and still be a well-formed optional header.
+    #
+    #     This one is the only seed here that the fuzzer found rather than a
+    #     person, and it found it through a stage the other three cannot
+    #     reach. Every one of those is refused by a check that runs *before*
+    #     the image is recorded in the address space, so the refusal costs
+    #     nothing. The TLS directory is read after the record, and the
+    #     loader rolled that record back only when a mapper was supplied --
+    #     a load with no mapper left the space describing an image whose
+    #     bytes were never placed, which a caller cannot tell from a
+    #     successful load.
+    #
+    #     It needs two sections so that the array has room to be short
+    #     without shortening the file, and a TLS entry at an RVA inside the
+    #     second one so that the only thing wrong with it is the count.
+    buf = bytearray(pe)
+    override_entry(buf, 0x1000)
+    # NumberOfRvaAndSizes is at 108 in the PE32+ layout: 24 bytes of Windows
+    # fields and standard fields, then 8 for the three timestamp and symbol
+    # counts, plus 68 for the versions, then the two 4-byte size fields.
+    struct.pack_into("<I", buf, opt + 108, 8)
+    # And the TLS entry, which the short array no longer covers, still points
+    # at something inside the image -- so an implementation that read it
+    # anyway would find a directory rather than nothing, and the refusal
+    # would have to come from the count.
+    struct.pack_into("<II", buf, opt + 112 + 9 * 8, 0x2000, 0x28)
+    results["pe_short_data_directory.bin"] = bytes(buf)
+
     return results
 
 
