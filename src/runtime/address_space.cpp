@@ -152,13 +152,31 @@ const char* status_name(Status s) noexcept {
     case Status::InvalidParameter2: return "STATUS_INVALID_PARAMETER_2";
     case Status::InvalidParameter3: return "STATUS_INVALID_PARAMETER_3";
     case Status::InvalidParameter4: return "STATUS_INVALID_PARAMETER_4";
+    case Status::InvalidParameter5: return "STATUS_INVALID_PARAMETER_5";
+    case Status::InvalidParameter6: return "STATUS_INVALID_PARAMETER_6";
     case Status::ConflictingAddresses: return "STATUS_CONFLICTING_ADDRESSES";
     case Status::NotCommitted: return "STATUS_NOT_COMMITTED";
     case Status::InvalidAddress: return "STATUS_INVALID_ADDRESS";
     case Status::SectionProtection: return "STATUS_SECTION_PROTECTION";
     case Status::NoMemory: return "STATUS_NO_MEMORY";
+    // "COMMITMENT", not "COMMIT": the extra T is in Windows' own spelling
+    // and in Wine's ntstatus.h, and a log line that spells it differently
+    // from the header a reader is holding is a log line they have to check.
     case Status::CommitLimit: return "STATUS_COMMITMENT_LIMIT";
     case Status::NotImplemented: return "STATUS_NOT_IMPLEMENTED";
+    case Status::AccessViolation: return "STATUS_ACCESS_VIOLATION";
+    case Status::PartialCopy: return "STATUS_PARTIAL_COPY";
+    case Status::InvalidInfoClass: return "STATUS_INVALID_INFO_CLASS";
+    case Status::InfoLengthMismatch: return "STATUS_INFO_LENGTH_MISMATCH";
+    case Status::InvalidHandle: return "STATUS_INVALID_HANDLE";
+    case Status::AccessDenied: return "STATUS_ACCESS_DENIED";
+    case Status::UnableToFreeVm: return "STATUS_UNABLE_TO_FREE_VM";
+    case Status::FreeVmNotAtBase: return "STATUS_FREE_VM_NOT_AT_BASE";
+    case Status::MemoryNotAllocated: return "STATUS_MEMORY_NOT_ALLOCATED";
+    case Status::MappedAlignment: return "STATUS_MAPPED_ALIGNMENT";
+    case Status::NotSameDevice: return "STATUS_NOT_SAME_DEVICE";
+    case Status::SectionNotImage: return "STATUS_SECTION_NOT_IMAGE";
+    case Status::NotMappedData: return "STATUS_NOT_MAPPED_DATA";
     }
     return "STATUS_UNKNOWN";
 }

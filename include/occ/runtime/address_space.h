@@ -160,16 +160,27 @@ enum class Status : std::uint32_t {
     InvalidParameter2 = 0xC00000F0,
     InvalidParameter3 = 0xC00000F1,
     InvalidParameter4 = 0xC00000F2,
+    InvalidParameter5 = 0xC00000F3,
+    InvalidParameter6 = 0xC00000F4,
     // The requested range overlaps something already mapped.
     ConflictingAddresses = 0xC0000018,
     // The range is inside an existing region but was not itself allocated.
     // Windows can tell these apart and so can this, because the region map
     // is here rather than in a server that only stores the merged result.
-    NotCommitted = 0xC000002C,
+    //
+    // This was 0xC000002C and is 0xC000002D. A program that compares the
+    // status numerically -- which is what a program written against the
+    // realconstant does, and there are more of those than one would like --
+    // was told "not committed" when the runtime meant "invalid parameter",
+    // because 0xC000002C is `STATUS_INVALID_INFO_CLASS` and no Nt* path
+    // produces it. The value is read out of Wine's include/ntstatus.h
+    // rather than remembered, for the reason the whole enum is: a status
+    // code is an ABI, and an ABI written from memory is a guess.
+    NotCommitted = 0xC000002D,
     // The range was never mapped at all.
     InvalidAddress = 0xC0000141,
     // The region is mapped from a file and cannot be changed as asked.
-    SectionProtection = 0xC0000045,
+    SectionProtection = 0xC000004E,
     // The system is out of memory, or the request cannot be satisfied in
     // the address window it named.
     NoMemory = 0xC0000017,
@@ -177,12 +188,156 @@ enum class Status : std::uint32_t {
     // The operation is not one this runtime performs, and the caller
     // deserves to know the difference between "no" and "not implemented".
     NotImplemented = 0xC0000002,
+
+    // The rest of the codes the memory Nt* layer produces. Each value is
+    // read out of Wine's include/ntstatus.h rather than remembered, and
+    // that is not fastidiousness: three of the values this file carried
+    // before the ntdll layer existed were wrong, and a program that
+    // branches on a status numerically branches on the number, not on the
+    // name this project gave it.
+    //
+    // Two of them exist in Windows rather than for Windows' sake. Windows
+    // reuses 0xC0000045 for both `STATUS_IMAGE_ALREADY_LOADED` and
+    // `STATUS_SECTION_PROTECTION`, and a runtime that "fixed" the collision
+    // would answer SECTION_PROTECTION to a program asking about a loaded
+    // image. So the value is 0xC000004E -- SECTION_PROTECTION's real one --
+    // and the name says which of the two this is.
+
+    // A pointer argument was null where the call requires one. Wine returns
+    // this from NtProtectVirtualMemory, NtQuerySection and NtReadVirtualMemory,
+    // and *not* from NtWriteVirtualMemory, which says PARTIAL_COPY for the
+    // same kind of mistake. That asymmetry is Windows' and is preserved.
+    AccessViolation = 0xC0000005,
+    // A buffer the caller said was readable or writable is not. Used by
+    // NtReadVirtualMemory (the destination) and NtWriteVirtualMemory (the
+    // source) -- and the two use *different* codes, which is the single
+    // most surprising thing in this group and is therefore named in the
+    // header at the Nt* declarations as well as here.
+    PartialCopy = 0x8000000D,
+    // The `info_class` is not one this function answers.
+    InvalidInfoClass = 0xC0000003,
+    // The caller's buffer is smaller than the structure it asked about.
+    // The query functions distinguish this from a bad parameter because a
+    // program that allocated the wrong size has a bug a different program
+    // does not, and the two want different advice.
+    InfoLengthMismatch = 0xC0000004,
+    // A handle that names nothing, or names something this call may not use.
+    InvalidHandle = 0xC0000008,
+    // The operation needs a privilege or a permission the caller does not
+    // have. From NtLockVirtualMemory, where the kernel refused to pin.
+    AccessDenied = 0xC0000022,
+    // The release asked for more than the region has left. Distinct from
+    // "not allocated" and from "not at base" because a program that walks
+    // its own regions can hit all three and they need different responses.
+    UnableToFreeVm = 0xC000001A,
+    // The release named a size of zero at an address that is not the start
+    // of its region. Windows requires MEM_RELEASE at a region's base, and
+    // a program that frees an interior address is either confused or is
+    // releasing a sub-allocation this runtime does not track.
+    FreeVmNotAtBase = 0xC000009F,
+    // The range is inside the address window but nothing is mapped there.
+    // Distinct from InvalidAddress, which is about the address itself.
+    MemoryNotAllocated = 0xC00000A0,
+    // An offset or an address did not satisfy the alignment the section or
+    // the allocation requires. From NtMapViewOfSection.
+    MappedAlignment = 0xC0000220,
+    // Two views of two files are not views of the same file. From
+    // NtAreMappedFilesTheSame.
+    NotSameDevice = 0xC00000D4,
+    // SectionImageInformation was asked of something that is not an image.
+    SectionNotImage = 0xC0000049,
+    // The range is mapped but could not be flushed to its backing store.
+    // Not the same as InvalidAddress: the memory exists and the msync
+    // failed, which is a different problem with a different fix.
+    NotMappedData = 0xC0000088,
 };
 
+
 [[nodiscard]] const char* status_name(Status s) noexcept;
-[[nodiscard]] constexpr bool ok(Status s) noexcept {
-    return static_cast<std::int32_t>(s) >= 0;
+
+// Whether a status means the operation succeeded.
+//
+// The two bits at the top of an NTSTATUS are a severity, not a sign, and
+// treating them as a sign is a mistake this function made until the ntdll
+// layer forced the question. `STATUS_PARTIAL_COPY` is `0x8000000D`: the high
+// bit set, so read as a signed integer it is negative, but the severity in
+// bits 30-31 is 2 -- a *warning*. A program asking to read a buffer this
+// process cannot write has a bug, and Wine answers `STATUS_ACCESS_VIOLATION`
+// there; a program asking to *write* through a buffer it cannot read is
+// answered `STATUS_PARTIAL_COPY`, which Windows documents as a warning
+// because a partial write is possible in general.
+//
+// The two callers here are not Windows' callers, though: nothing here does a
+// partial write, so this runtime treats both as the failure they are. What it
+// must not do is decide that by looking at the sign, because the next status
+// added to this enum would then depend on whether somebody remembered which
+// values have a high bit -- which is not a property a reader can see.
+//
+// Severity 0 is the only success. The severity field is what NTSTATUS defines,
+// and using it makes "is this a warning or an error" a question the value can
+// answer about itself.
+[[nodiscard]] constexpr std::uint32_t status_severity(Status s) noexcept {
+    return (static_cast<std::uint32_t>(s) >> 30) & 0x3U;
 }
+
+[[nodiscard]] constexpr bool ok(Status s) noexcept {
+    return status_severity(s) == 0;
+}
+
+// Every status's severity must agree with what `ok()` claims.
+//
+// A status is added here when anNt* needs it, and the two ways to get it
+// wrong are both silent. A *wrong value* sends a program that branches
+// numerically down the wrong branch, which is why three of the values above
+// were corrected against Wine's `ntstatus.h` rather than from memory. A wrong
+// *severity* is worse, because `ok()` reads the top two bits and this enum
+// had been deciding them with `status >= 0` -- so `STATUS_PARTIAL_COPY`,
+// which is `0x8000000D` and therefore negative as an integer, would have
+// been counted as a failure by the sign and would have been missed by a
+// caller reading severity. Both are answered by the same rule, and the rule
+// is checkable at compile time for every value:
+//
+//   severity 0 -- success. Nothing else.
+//   severity 1 or 2 -- a failure this runtime reports.
+//
+// There is no third case, and this static assertion is what makes that a
+// constraint on the enum rather than a sentence in a comment. A value with
+// severity 3 -- `0xC0000000`'s neighbour, reserved by NTSTATUS for
+// "unknown" -- would be reported as success by a sign test and as failure
+// here, and the two must not both be live.
+namespace detail {
+constexpr bool a_status_is_mapped_correctly(Status s) noexcept {
+    return s == Status::Success || status_severity(s) != 0;
+}
+static_assert(a_status_is_mapped_correctly(Status::Success));
+static_assert(a_status_is_mapped_correctly(Status::InvalidParameter));
+static_assert(a_status_is_mapped_correctly(Status::InvalidParameter1));
+static_assert(a_status_is_mapped_correctly(Status::InvalidParameter2));
+static_assert(a_status_is_mapped_correctly(Status::InvalidParameter3));
+static_assert(a_status_is_mapped_correctly(Status::InvalidParameter4));
+static_assert(a_status_is_mapped_correctly(Status::InvalidParameter5));
+static_assert(a_status_is_mapped_correctly(Status::InvalidParameter6));
+static_assert(a_status_is_mapped_correctly(Status::ConflictingAddresses));
+static_assert(a_status_is_mapped_correctly(Status::NotCommitted));
+static_assert(a_status_is_mapped_correctly(Status::InvalidAddress));
+static_assert(a_status_is_mapped_correctly(Status::SectionProtection));
+static_assert(a_status_is_mapped_correctly(Status::NoMemory));
+static_assert(a_status_is_mapped_correctly(Status::CommitLimit));
+static_assert(a_status_is_mapped_correctly(Status::NotImplemented));
+static_assert(a_status_is_mapped_correctly(Status::AccessViolation));
+static_assert(a_status_is_mapped_correctly(Status::PartialCopy));
+static_assert(a_status_is_mapped_correctly(Status::InvalidInfoClass));
+static_assert(a_status_is_mapped_correctly(Status::InfoLengthMismatch));
+static_assert(a_status_is_mapped_correctly(Status::InvalidHandle));
+static_assert(a_status_is_mapped_correctly(Status::AccessDenied));
+static_assert(a_status_is_mapped_correctly(Status::UnableToFreeVm));
+static_assert(a_status_is_mapped_correctly(Status::FreeVmNotAtBase));
+static_assert(a_status_is_mapped_correctly(Status::MemoryNotAllocated));
+static_assert(a_status_is_mapped_correctly(Status::MappedAlignment));
+static_assert(a_status_is_mapped_correctly(Status::NotSameDevice));
+static_assert(a_status_is_mapped_correctly(Status::SectionNotImage));
+static_assert(a_status_is_mapped_correctly(Status::NotMappedData));
+} // namespace detail
 
 // The result of an operation that produces a value.
 //
