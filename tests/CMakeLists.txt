@@ -67,6 +67,7 @@ occ_add_test(occ_test_pe test_pe.cpp)
 occ_add_test(occ_test_runtime_loader test_runtime_loader.cpp)
 occ_add_test(occ_test_runtime_exports test_runtime_exports.cpp)
 occ_add_test(occ_test_mapper test_mapper.cpp)
+occ_add_test(occ_test_ntdll test_ntdll.cpp)
 occ_add_test(occ_test_placement test_placement.cpp)
 occ_add_test(occ_test_gdb_interop test_gdb_interop.cpp)
 

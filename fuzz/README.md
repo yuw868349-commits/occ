@@ -1,6 +1,6 @@
 # Fuzz harnesses
 
-Four libFuzzer targets over the places untrusted bytes enter occ. Each one is
+Six libFuzzer targets over the places untrusted bytes enter occ. Each one is
 an `LLVMFuzzerTestOneInput` over a parser, and each asserts the parser's own
 invariants rather than only surviving: a parser that does not crash but
 reports a mapping past the end of the file has still produced a lie, and a
@@ -34,6 +34,25 @@ only limit is libFuzzer's has no limit at all.
 For a longer run, point a harness at the corpus directly:
 
     ./build-fuzz/fuzz/occ_fuzz_pe build-fuzz/fuzz/corpus/pe fuzz/seeds
+
+**The two directories are different directories, and the order is the
+argument order.** libFuzzer treats its first argument as the corpus it *writes*
+and the rest as corpora it *reads*, so `occ_fuzz_corpus_dir fuzz/seeds` does
+what it looks like: it reads the seeds, and then adds an entry to
+`fuzz/seeds` for every input it reaches, named by the SHA-1 of its contents. A
+run of half a minute across six harnesses leaves about two thousand of them, and
+they are not seeds — a seed is an input somebody chose on purpose, and none of
+those were chosen. Pointing the corpus at the seed directory is the mistake
+this paragraph exists to prevent, because it is the mistake that makes the
+repository accumulate files nobody chose, and because it does not fail: the run
+passes, the tests pass, and the two thousand files are simply there afterwards.
+
+`fuzz/corpus/` is in `.gitignore` and `fuzz/seeds/` is not, and the two are
+told apart by where they are rather than by what they are called. Every seed is
+hand-written with a name that says what it is for — `pe_dll.bin`,
+`seccomp_two_rules.pol`, `rsp_g.gdb` — so a rule that recognised corpus entries
+by name would have to be loose enough to catch `pe_dll.bin` as well. A
+directory is the only distinction that survives a new seed.
 
 ## What each harness covers
 

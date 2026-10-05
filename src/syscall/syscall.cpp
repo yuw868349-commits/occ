@@ -232,6 +232,11 @@ Result mprotect(void* addr, std::size_t len, int prot) noexcept {
                          detail::arg(len), prot);
 }
 
+Result msync(void* addr, std::size_t length, int flags) noexcept {
+    return detail::call3(N(SYS_msync), detail::arg(addr),
+                         detail::arg(length), flags);
+}
+
 Result mremap(void* old_address, std::size_t old_size, std::size_t new_size,
               int flags, void* new_address) noexcept {
     return detail::call5(N(SYS_mremap), detail::arg(old_address),

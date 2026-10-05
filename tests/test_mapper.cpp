@@ -909,6 +909,42 @@ void test_the_counter_counts_syscalls() {
           "the ledger counted one allocation, not three operations");
 }
 
+// `sync` is the mapper's counted syscall for `NtFlushProcessWriteBuffers`, and
+// its whole reason for existing is that an `msync` on an anonymous mapping
+// succeeds whether or not it ran -- the return value reports a claim, the
+// counter records the act. The assertions below are about that difference.
+void test_sync_counts_and_reports() {
+    AddressSpace space;
+    Mapper m(space);
+
+    const Result<std::uint64_t> r =
+        m.map(0, 64 * 1024, PageProtection::ReadWrite, RegionKind::Private);
+    check(r.ok(), "sync: a region to flush exists");
+    const std::uint64_t before = m.syscalls_made();
+
+    const Result<std::uint64_t> s = m.sync(r.value, 64 * 1024);
+    check(s.ok() && s.value == 64 * 1024,
+          "sync: a flushed region reports the size it flushed");
+    check(m.syscalls_made() == before + 1,
+          "sync: and the counter moved, which is the record of the syscall "
+          "rather than of the return value -- on anonymous memory the msync "
+          "cannot fail, so the counter is the only evidence it happened");
+
+    // A misaligned range is a parameter error, not a flush refusal: the
+    // kernel's EINVAL for a misaligned msync would otherwise read as a
+    // statement about the memory.
+    const Result<std::uint64_t> bad = m.sync(r.value + 0x800, 64 * 1024);
+    check(!bad.ok() && bad.status == Status::InvalidParameter,
+          "sync: a range that is not page aligned is a parameter error, so a "
+          "caller reading the status does not conclude the kernel refused its "
+          "flush");
+
+    // The ledger is untouched by a flush. A flush changes no pages' mapping.
+    check(space.allocation_count() == 1,
+          "sync: and the ledger is unchanged, because a flush is not an "
+          "allocation");
+}
+
 } // namespace
 
 int main() {
@@ -921,6 +957,7 @@ int main() {
     test_map_batch_is_all_or_nothing();
     test_guard_is_refused_rather_than_ignored();
     test_the_counter_counts_syscalls();
+    test_sync_counts_and_reports();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

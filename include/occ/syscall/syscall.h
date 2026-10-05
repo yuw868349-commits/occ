@@ -222,6 +222,7 @@ Result mmap(void* addr, std::size_t length, int prot, int flags, int fd,
             long offset) noexcept;
 Result munmap(void* addr, std::size_t length) noexcept;
 Result mprotect(void* addr, std::size_t len, int prot) noexcept;
+Result msync(void* addr, std::size_t length, int flags) noexcept;
 Result mremap(void* old_address, std::size_t old_size, std::size_t new_size,
               int flags, void* new_address) noexcept;
 Result memfd_create(const char* name, unsigned int flags) noexcept;

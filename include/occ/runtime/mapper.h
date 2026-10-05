@@ -126,6 +126,26 @@ public:
                               std::string section = {},
                               std::uint32_t section_index = 0) noexcept;
 
+    // The same, with the caller naming the highest address the result may use.
+    //
+    // This is what NtAllocateVirtualMemory's `zero_bits` means and it is the
+    // one thing this layer cannot get from the kernel: `mmap` takes a `hint`,
+    // not a ceiling, and a process that asked for memory below 2^32 and got
+    // memory above it has a pointer it cannot use in a 32-bit address
+    // computation. Wine passes the limit to wineserver, which places the
+    // mapping with the whole address space in view; this runtime has no server
+    // and does the placement itself, descending from the ceiling in granularity
+    // steps and asking the kernel to confirm each candidate.
+    //
+    // A `ceiling` of zero means the default: `map()` with no ceiling. The two
+    // are not spelled as one function with a defaulted argument because the
+    // default would have to be "no ceiling" and a caller reading `map(0, n, p,
+    // k, {}, 0, 0)` cannot tell that from a ceiling of zero, which is a real
+    // address and the bottom of the user window.
+    Result<std::uint64_t> map_below(std::uint64_t ceiling, std::uint64_t size,
+                                    PageProtection protection,
+                                    RegionKind kind) noexcept;
+
     // Maps several regions as one operation: all of them mapped and recorded,
     // or none of either.
     //
@@ -179,6 +199,25 @@ public:
     // has a buffer overflow that does not fault.
     Result<std::uint32_t> protect(std::uint64_t base,
                                   PageProtection protection) noexcept;
+
+    // Flushes a mapped range to its backing store and counts the syscall.
+    //
+    // This is the mapper's side of `NtFlushProcessWriteBuffers`, and it is
+    // here rather than as a bare `::msync` in the ntdll layer for the same
+    // reason map and unmap are here: the mapper is where this runtime's
+    // syscalls happen and where the counter lives, and a flush that reached
+    // the kernel is a fact about the mapper's work. The counter is not
+    // decoration either -- `msync` on an anonymous mapping succeeds whether
+    // or not anything was flushed, and on this runtime's memory (which is
+    // anonymous) nothing observable distinguishes a flush that happened from
+    // one that was skipped. The count is the only answer to "did the call
+    // actually do it" short of a debugger, and Wine's stub has no answer at
+    // all.
+    //
+    // `base` and `size` must be page aligned, which is what `msync` itself
+    // requires (EINVAL otherwise); the ntdll layer above calls this per
+    // region, and the regions the ledger records are page aligned already.
+    Result<std::uint64_t> sync(std::uint64_t base, std::uint64_t size) noexcept;
 
     // The address the last failure named, and the errno behind it. Kept on
     // the mapper so that a caller that only wants the status does not have to

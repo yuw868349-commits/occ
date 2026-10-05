@@ -13,6 +13,31 @@ compile_commands.json
 __pycache__/
 *.pyc
 
+# Where a fuzz run writes the corpus it grows.
+#
+# libFuzzer adds an entry for every input it reaches, named by the SHA-1 of its
+# contents, and a run of half a minute across six harnesses produces about two
+# thousand of them. That is a name rather than a decision: nothing chose those
+# inputs, they are what one machine reached in one run, and the next run will
+# reach others. Committing them is how a repository comes to contain two
+# thousand files nobody chose.
+#
+# The pattern is a **directory**, not a filename shape, and that is the whole
+# point of it. The seeds the harnesses read live in `fuzz/seeds` and every one
+# of them is hand-written with a name that says what it is for -- `pe_dll.bin`,
+# `seccomp_two_rules.pol`, `rsp_g.gdb` -- so they belong in the repository, and
+# a corpus entry does not. The two are told apart by *where they are*, not by
+# what they are called, because the earlier attempt told them apart by name and
+# could not: a corpus entry is forty hex digits, so any rule loose enough to
+# catch one also catches `pe_dll.bin`, and any rule tight enough to spare that
+# is forty character classes on a single line, which is unreadable and gets
+# miscounted -- the first version of it had forty-four of them and silently
+# matched nothing while a shorter rule beneath it made the file look handled.
+# A rule that fails open and is believed to be working is worse than no rule.
+#
+# So the harnesses are pointed at `fuzz/seeds` to *read* and at `fuzz/corpus`
+# to *write*, and the run command in docs/RUNTIME.md says so.
+fuzz/corpus/
 # Local-only. This tree contains development aids that are not part of the
 # project: reference implementations used as oracles during development,
 # scratch targets, and the notes that go with them. They are excluded by

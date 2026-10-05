@@ -1098,19 +1098,297 @@ green build that lies. The trap covers `SIGINT` for the same reason: a harness
 interrupted halfway through nineteen mutants has one of them built, and whoever
 interrupted it left believing the tree was clean.
 
-### M2 — ntdll, memory and handles
+### The ntdll memory layer — `include/occ/runtime/ntdll.h`
 
-`NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtFreeVirtualMemory`,
-`NtReadVirtualMemory`, `NtWriteVirtualMemory`, `NtClose`, and the handle
-table they insert into.
+Eighteen exports, all of `dlls/ntdll/unix/virtual.c`, read rather than
+remembered. Wine's file is about 6,100 lines and the eighteen are the whole of
+its memory surface minus `NtCurrentTeb` and the two `NtWow*` shims; the rules
+below are transcribed from it, with the line numbers in the comments so a
+reader can check a claim without a checkout of Wine.
 
-The address space keeps a map of every region it handed out, so a
-protection change on a region it did not allocate is an error rather than
-a silent success. Wine cannot make that distinction cheaply; here it is a
-lookup in a map the runtime owns.
+**What `zero_bits` actually means.** It is the half of an allocation request
+that says *where* rather than *how much*, and the only thing surprising about
+it is that it is not a bound on the address the caller passed.
+`virtual.c:4618-4623`:
 
-Events: `memory_allocated`, `memory_protected`, `handle_created`,
-`handle_closed`, each carrying the syscall that was made and its result.
+```c
+if (!*ret) limit = get_zero_bits_limit( zero_bits );
+else        limit = 0;
+```
+
+A caller that names an address has said where, and `zero_bits` is ignored
+entirely. This runtime had a check that compared the two and refused — which
+meant every call passing an address with the default window failed, and passing
+an address with the default window is what a program that does not care does.
+`NtMapViewOfSection` *does* compare them (`virtual.c:5450-5455`), the two
+functions disagree in Wine, and the disagreement is transcribed rather than
+smoothed over: a program that works on Windows relies on each function's own
+rule, and harmonising them here would break one of the two.
+
+The comparison itself is a shift below 32 and a mask at or above it, and the
+mask is Wine's own `addr & ~zero_bits` — the mask is `zero_bits` *as a number*,
+not a run of that many low ones. That looks like a bug in Wine and may be one.
+It is copied because the job is to accept what Windows accepts, and a program
+that works there must work here. The two spellings agree at exactly one value,
+32, which is why a test of only 32 cannot tell them apart.
+
+**The `zero_bits` window has to be placed by this process.** Wine hands the
+limit to wineserver, which places the mapping with the whole address space in
+view. There is no server here, so `Mapper::map_below` does the search: descend
+from the ceiling in granularity steps, `MAP_FIXED_NOREPLACE` at each candidate,
+and let the kernel's refusal be the answer. The ledger lookup before each
+attempt is a cheap skip and *not* the safety check — only the kernel knows what
+anything has mapped, and a pre-check is the TOCTOU shape.
+
+**The 22-to-31 hole is copied, including the clause that cannot fire.**
+`virtual.c:4581-4582` refuses `zero_bits` between 22 and 31 and accepts 21 and
+32, and the second clause compares against a constant that makes it unreachable.
+Both stay. The hole looks like an off-by-one and "fixing" it refuses a value
+Windows accepts, in a program that was never wrong — the direction of divergence
+nobody tests for. The dead clause stays for the same reason: removing a clause
+that does nothing is safe today and wrong the day the constant's value changes.
+
+**`ROUND_SIZE` is not `round_up(size)`.** `virtual.c:189` adds the address's
+offset *within its page* to the size before rounding:
+
+```c
+#define ROUND_SIZE(addr,size) (((SIZE_T)(size) + ((UINT_PTR)(addr) & page_mask) + page_mask) & ~page_mask)
+```
+
+Two consequences, and both are places every reader's eye offers to fix. A size
+of **zero** at a page-aligned address rounds to **one page**, so
+`NtProtectVirtualMemory` with a zero size protects the page the address is in
+rather than refusing — and a suite that expected a refusal here was testing a
+rule Windows does not have. And the `+ page_mask` means a page-aligned request
+of exactly one page comes back as *two*: the extra page is Wine's, and removing
+it makes this runtime protect less than Windows does, in a call that succeeds
+either way, which is the worst kind of divergence.
+
+**Zero means opposite things in two functions.** `nt_free_virtual_memory`: zero
+is "the size must be at the base", which is what `MEM_RELEASE` requires.
+`nt_flush_virtual_memory`: zero is "the whole region" (`virtual.c:5793`). One
+is a constraint and the other is a default, and a helper that normalised them
+would break one caller each way.
+
+**The read and write paths disagree on purpose.** An unusable destination
+buffer is `STATUS_ACCESS_VIOLATION` in `NtReadVirtualMemory`
+(`virtual.c:5902`) and an unusable source buffer is `STATUS_PARTIAL_COPY` in
+`NtWriteVirtualMemory` (`virtual.c:5932`). The format is the reason: a write
+can genuinely be partial — some of the source readable, some not — so the status
+says so, while a read either copies all of a range or none of it and has no
+partial case. A runtime with one code for both sends a program that branches on
+it down a path Windows never takes. The two mutations of that pair are in
+`tools/mutate-ntdll.sh` as one mutant each, in opposite directions, because a
+suite that tested only one of the two would pass either.
+
+**Three situations get three different status codes, and the inconsistency is
+Wine's.** An address with nothing mapped is `MEMORY_NOT_ALLOCATED` from
+`NtFreeVirtualMemory` and `INVALID_PARAMETER` from `NtProtectVirtualMemory`. An
+unknown information class is `INVALID_INFO_CLASS` from `NtQueryVirtualMemory`,
+`NOT_IMPLEMENTED` from `NtQuerySection`, and `INVALID_PARAMETER_2` from
+`NtSetInformationVirtualMemory`. Harmonising any of them breaks a program that
+branches on which it got.
+
+### Where this goes past Wine
+
+Four things Wine stubs are implemented, and the first two are the ones worth
+naming because a stub that returns success is a bug the program cannot detect.
+
+**`NtCreatePagingFile` reserves and reports its size.** `virtual.c:6079` is
+`FIXME( "(%s %p %p %p) stub\n", ... ); return STATUS_SUCCESS;` — it returns
+success and never writes `*actual_size`. A program that sizes its working set
+from that answer reads whatever was in the variable, which on the first call is
+uninitialised stack memory, and gets a page file of an arbitrary size. This
+writes it.
+
+**`NtFlushProcessWriteBuffers` actually flushes.** `virtual.c:6069-6073` is a
+`FIXME` behind a `static int once` and returns success. Every writable region
+here goes through `msync(MS_SYNC)` and the first failure is reported. A program
+that calls this before telling the kernel its data is safe has a data-loss bug
+that no return value will ever report, which is the worst kind to have: it
+cannot be found by the program, only by the data it loses.
+
+**The handle table is per-table and self-identifying.** A handle is a
+per-table cookie in the high half and a slot index in the low half, with the
+low bit forced so a handle is never zero and never reads as a null pointer.
+An earlier version made a handle the *address* of its entry, on the reasoning
+that an address is unforgeable and an index has to be trusted. That reasoning
+was wrong three ways, and each is worth recording because the argument sounds
+strong:
+
+- the container had to become a `deque`, because `vector::push_back` moves every
+  element and the handle was only valid while its entry stayed put — so making
+  the handle unforgeable made it fragile;
+- with a deque the entries are not contiguous, so the range check that made it
+  safe could not be written as one;
+- and worst, an entry's address plus `sizeof(entry)` *is* the next entry's
+  address whenever the two are adjacent, so a forged interior pointer was
+  indistinguishable from a real handle. The test caught it by accident: the
+  forgery is only caught when the two entries are *not* adjacent, so the check
+  passed or failed according to how the allocator felt that run.
+
+An index has none of the three problems, and the cookie buys back what the
+address seemed to give — two tables in one address space, which is the normal
+case for the observer and the fuzz harness, cannot resolve each other's handles
+even at the same index.
+
+**Two information classes Wine cannot answer.** `MemoryRegionLedger`
+(`0x1000`) reports a region's `initial_protection` alongside its current one,
+plus how many times it changed, its kind, its section and whether it is
+executable. Wine's `MEMORY_BASIC_INFORMATION` has only the *current*
+protection, so "was this memory ever writable" has no answer there — and that
+is exactly the question a write-then-execute exploit asks.
+`MemoryRegionHistory` (`0x1001`) reports the allocation sequence number, the
+region count and the high-water mark; Wine's regions live in a wineserver that
+keeps no per-process counter, so a replay has nothing to align against.
+`MemoryUnixFunctions` and its Wow64 twin are `FIXME` in Wine — they fall
+through to a `default:` that returns `INVALID_INFO_CLASS` — and are answered
+here from a real handle table.
+
+**One class added where Wine says `NOT_IMPLEMENTED`.** `NtQuerySection` with
+`SectionSectionInformation` reports the section's own extents, which is a
+question about the object rather than about a view of it.
+
+### What the tests are actually asserting
+
+`tests/test_ntdll.cpp` is 208 assertions in thirteen functions, and the shape of
+it is that each one is named after a rule rather than after a function. Five of
+them exist because the first version asserted something Windows does not do, and
+in each case the runtime was right and the test was wrong:
+
+- `0x1001` bytes does **not** come back as `0x20000`. It comes back as
+  `0x10000`, because `0x1001` is one byte over a *page* and the granularity is
+  64 KiB. The test now asks for `0x10001` — one byte over the *granularity* —
+  which is the only size that distinguishes the two roundings.
+- a zero size in `NtProtectVirtualMemory` succeeds and protects one page.
+- the rounded size for a one-page request is *two* pages, and the extra one is
+  Wine's `+ page_mask`.
+- a failed protect leaves `*old_protect` and the address and size untouched,
+  which needs an address with *nothing* on it to be a failure at all — the
+  earlier version shared an address with the success case above it.
+- a forged handle is now three forgeries rather than one, because there are
+  three distinct mistakes: an index moved by a slot, an index with the low bit
+  clear, and an index from this table under another table's cookie.
+
+The other thing the tests assert is that the layer *refuses* rather than
+faulting, and that is where the two most valuable findings came from.
+
+**`memcpy` from address zero.** `nt_read_virtual_memory` had an `addr != 0`
+guard around its mapping check — written to mean "a null address names no
+region" — and address zero is exactly the address a program passes by accident,
+so the guard skipped the check and the copy went to a null pointer. The
+segfault is inside the runtime, so a program probing for a mapping by reading it
+crashes the emulator rather than getting a status. `nt_write_virtual_memory` had
+no destination check at all, and `nt_flush_instruction_cache` had the same
+`addr != 0` shape. All three now check the whole range, and the status follows
+Wine's far side rather than this layer's own: a `pread` on the target's
+`/proc/pid/mem` that comes back short sets `STATUS_ACCESS_VIOLATION`
+(`server/procfs.c:130-149`), so an unmapped source is an access violation on a
+read and a partial copy on a write.
+
+**Mapping the same range twice.** Three functions each made a probe mapping
+with `mmap(nullptr, ...)` to learn an address and then handed that address to
+`Mapper::map`, which mapped it *again* — and the second mapping always failed
+with `EEXIST`, because the first was still there. `NtMapViewOfSection` and
+`NtCreatePagingFile` therefore never succeeded at all, and
+`NtAllocateVirtualMemoryEx`'s top-down search reported "no memory" on a machine
+with terabytes of it. The detail string said "could not be recorded" and named
+an address that had been free a moment before, which is the shape of a bug that
+costs an afternoon.
+
+**A `std::string` in a `memcpy`'d structure.** `MemoryRegionLedger` had a
+`std::string` for the section name, and the whole struct is written into the
+caller's buffer with `memcpy` — because that is what a byte-array ABI wants and
+what the other info classes do. Under libc++ that works: the pointers come
+along, nothing reads them, and the copy is never destroyed. Under libstdc++ the
+caller's own variable *is* destroyed at the end of scope, its destructor calls
+`free()` on a pointer that was copied rather than allocated, and the process
+aborts. The name is a fixed 64-byte array with a reported length now, and the
+comment on the struct says why — a byte array with a `std::string` in it is a
+trap for the next person who adds a field and assumes the write is uniform.
+
+**A use-after-free that a plain run cannot see.** `nt_unmap_view_of_section`
+read `region->size` *after* the unmap that removed the region, and the ledger
+is a `std::vector<Region>` — so the pointer was into an allocation the removal
+had just freed or moved. AddressSanitizer found it; a plain run reports the
+right answer, because the freed bytes still hold the size they had. Two of the
+three similar cases in this layer are safe today and neither is safe *by
+construction*: `set_protection` rewrites a field without reallocating, and
+`erase` does not shrink capacity. That is now written down on
+`AddressSpace::find` rather than left as two coincidences, because the failure
+when it stops holding is a use-after-free that usually passes.
+
+**Two memory constants that were the same number.** `MEM_REPLACE_PLACEHOLDER`
+was `0x00080000`, which is `MEM_RESET` — the value written from memory, and the
+kind of value that is written from memory. Two names for one bit meant the
+`allocation_type_is_known_ex` mask had silently lost a bit it was meant to be
+enforcing, and the plain `NtAllocateVirtualMemory` accepted
+`MEM_RESERVE | MEM_REPLACE_PLACEHOLDER`, a request Windows refuses. The true
+values are `MEM_RESERVE_PLACEHOLDER 0x00040000` and
+`MEM_REPLACE_PLACEHOLDER 0x00004000` — not adjacent, with nine bits of gap
+between them, which is exactly why the guess landed on a neighbour. The test
+that caught it is a numeric assertion on the constants themselves, not a
+behavioural one, because a behavioural test can only catch the collision once
+some other bit happens to make the two distinguishable.
+
+**A ceiling checked once, where it needed checking every step.** `map_below`
+computed its candidate against the caller's ceiling and then looped *down*,
+which means the first candidate respected the ceiling by construction and every
+later one did too — for a loop that descends. The check was in the wrong place
+to be evidence of anything: `in_the_user_window` bounds the *process's* window,
+which is thousands of times larger than the `zero_bits` one, so nothing in the
+loop would have stopped a search that walked the other way from handing back an
+address above the window it was asked for. The comparison now runs every
+iteration, written as a difference (`ceiling - size`) for the reason
+`in_the_user_window` writes its own: `candidate + size` wraps near the top, and
+a wrapped sum compares as small enough to pass.
+
+**A flush that could not be observed, three times over.**
+`NtFlushProcessWriteBuffers` called `::msync` directly, and `msync` on an
+anonymous mapping succeeds whether or not it flushed anything — so a test could
+only check the *return value*, which a stub can fabricate. The first version
+recorded an event after the call, which the mutant matched by skipping the call
+and taking the same path; the second recorded the return value, which the
+mutant matched by reporting `0`. The version that works calls through
+`Mapper::sync` and asserts the syscall counter advanced: the counter records
+the *act*, and a fabricated return value cannot move it. This is now the
+general rule for the runtime — **an event that describes a decision instead of
+an action cannot tell a real flush from a stub, and an observability hook that
+cannot is worse than no hook at all, because it reports work that was never
+done.**
+
+**A check that silently duplicated another one, which hid it.**
+`HandleTable::find` verifies a handle in two steps: the cookie, then the low
+half. The low half check was written as `make_handle(index) != handle` — a
+round trip through the *whole* handle — and `make_handle` mixes **this table's**
+cookie into its high half. So the round trip re-ran the cookie comparison, and
+the two checks were indistinguishable: deleting the cookie check changed nothing
+observable, because the round trip refused every foreign handle anyway. The
+mutant survived several rounds of a harness that was otherwise catching
+everything else. The fix is the low half on its own —
+`(make_handle(index) & 0xFFFFFFFF) == parts.index` — after which each check
+answers for one half and neither can stand in for the other. Redundant
+validation is normally cheap; redundant validation that makes a check
+*unobservable* is not, because a suite that cannot detect a check being removed
+is not evidence the check was ever there.
+
+**208 checks, 28 mutations, none surviving.** Four of the 28 are rejected by
+the compiler and counted separately rather than as coverage. The harness runs
+every mutant under two builds and requires both to fail, and the second build
+is not redundancy: three of the findings above are memory faults that a plain
+run gets away with.
+
+**And the harness counts its own failures, which is the part worth copying.**
+An earlier version reported a mutant as un-caught when its anchor did not match
+the source — the mutant was never applied, so nothing had been measured at all,
+and the summary printed it in the same column as a genuine survivor. One such
+anchor had been pointing at `kMaxAttempts = 16384` while the source said `64`,
+so the run spent several rounds reporting a live survivor that was in fact a
+symptom of the production code carrying the very bug the mutant was written to
+detect: the placement search gave up after 4 MiB, and the mutant that would
+have caught it never ran. Anchor failures are now a separate list with a
+separate exit code, because a broken anchor is not a weaker result — it is not
+a result, and it invalidates the numbers printed beside it.
 
 ### M3 — mini-CRT and imports
 

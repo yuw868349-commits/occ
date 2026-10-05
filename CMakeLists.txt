@@ -551,6 +551,7 @@ add_library(occ_core STATIC
     src/runtime/mapper.cpp
     src/runtime/loader.cpp
     src/runtime/exports.cpp
+    src/runtime/ntdll.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

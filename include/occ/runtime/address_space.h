@@ -346,10 +346,38 @@ static_assert(a_status_is_mapped_correctly(Status::NotMappedData));
 // the hot path of every memory operation. The two-field form is what makes
 // that possible; std::expected's generality is not needed and its
 // constexpr machinery is not free.
+//
+// `detail` arrived with the ntdll layer and is a string rather than a
+// `const char*` on purpose. A status says what to do next; it does not say
+// which of five parameters was wrong, and a refusal that carries no
+// information beyond the code is a refusal a person reading a log cannot
+// act on. Wine's answer is a `TRACE` line, which is only visible under a
+// debug build and to a debugger attached to it.
+//
+// The field costs a string on the success path, which is why it is not
+// always there: it is empty on success and on every failure a caller that
+// has already decided what to do. An empty detail is a statement that the
+// status is the whole message, and the callers that leave it empty are the
+// ones whose caller does not need a sentence -- a size of zero, say, where
+// the status says everything.
 template <typename T>
 struct Result {
     T value{};
     Status status = Status::Success;
+
+    // A sentence about this failure, or empty. Not a substitute for the
+    // status and never to be branched on: a program branches on `status`,
+    // and a program that branched on this string would break the first time
+    // a sentence was reworded.
+    //
+    // `= {}` rather than left alone so that a `Result` built by aggregate
+    // initialisation (`Result<T>{value}`) says "no detail" explicitly instead
+    // of tripping the missing-field-initialiser warning on every success
+    // path. The warning is the right one to have and silencing it by writing
+    // the field is better than silencing it with a pragma: a reader of
+    // `Result<T>{base}` should not have to look up whether the struct has a
+    // third member.
+    std::string detail = {};
 
     [[nodiscard]] bool ok() const noexcept { return runtime::ok(status); }
 };
@@ -521,6 +549,26 @@ public:
                                           PageProtection protection) noexcept;
 
     // Finds the region containing an address, or nothing.
+    //
+    // **The returned pointer is only valid until the next call that adds or
+    // removes a region.** The regions are a `std::vector<Region>`, so a
+    // `record()` that grows the vector reallocates it and every pointer into it
+    // dangles -- including interior ones, and including one the caller was
+    // holding across an operation that happened to succeed.
+    //
+    // Two of the three are safe today and neither is safe by construction:
+    // `set_protection()` rewrites a field of an existing element and does not
+    // reallocate, so a pointer held across a protection change is fine; and
+    // `erase()` does not shrink capacity, so a pointer into a region that is
+    // merely *removed* still reads the bytes it had. A caller that relies on
+    // either fact is relying on an implementation detail of one container, and
+    // the failure when it stops holding is a use-after-free that a plain run
+    // usually gets away with -- the freed memory still has the right bytes in
+    // it. AddressSanitizer found exactly this in `nt_unmap_view_of_section`,
+    // which read `region->size` after the unmap that removed the region.
+    //
+    // So: read what you need out of a `Region*` before the next call that
+    // changes the set of regions, and do not hold one across a `map()`.
     [[nodiscard]] const Region* find(std::uint64_t addr) const noexcept;
 
     // Every region, in address order. Sorted rather than in insertion

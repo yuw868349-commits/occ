@@ -1,5 +1,7 @@
 #include "occ/runtime/mapper.h"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 
 #include "occ/syscall/syscall.h"
@@ -196,6 +198,149 @@ Result<std::uint64_t> Mapper::map(std::uint64_t base, std::uint64_t size,
 
     Result<std::uint64_t> out;
     out.value = at;
+    out.status = Status::Success;
+    return out;
+}
+
+Result<std::uint64_t> Mapper::map_below(std::uint64_t ceiling,
+                                        std::uint64_t size,
+                                        PageProtection protection,
+                                        RegionKind kind) noexcept {
+    if (size == 0) {
+        return fail<std::uint64_t>(Status::InvalidParameter, 0, 0);
+    }
+
+    // The highest address a region of this size could *end* at and still be
+    // inside the window: the ceiling less the size, rounded down to the
+    // granularity. Rounding down rather than up matters: a candidate that ends
+    // one byte past the ceiling is outside it, and a placement policy that
+    // admitted one would hand a program a region it cannot address.
+    //
+    // The subtraction is written as a difference against the window's low end
+    // rather than as `ceiling - size`, because a ceiling below the size
+    // underflows and a wrapped subtraction is enormous, which would produce a
+    // candidate near the top of the space -- the opposite of the constraint.
+    if (ceiling <= AddressSpace::kUserMin) {
+        return fail<std::uint64_t>(Status::NoMemory, 0, 0);
+    }
+    const std::uint64_t span = ceiling - AddressSpace::kUserMin;
+    if (size > span) {
+        return fail<std::uint64_t>(Status::NoMemory, 0, 0);
+    }
+    std::uint64_t candidate = AddressSpace::granularity_round_down(
+        ceiling - size);
+
+    // The search descends. Downward rather than upward because the interesting
+    // ceilings are low -- a program asking for memory below 2^32 wants the
+    // *lowest* address it can get that fits, and starting from the ceiling and
+    // walking down reaches the dense low part of the space first, where there
+    // is room, instead of the sparse high part where there is none.
+    //
+    // Each step is a real `MAP_FIXED_NOREPLACE` attempt rather than a ledger
+    // lookup, for the reason the flag exists at all: the ledger knows what
+    // *this process* has mapped and the kernel knows what anything has mapped,
+    // and only the kernel's answer is the one that decides whether the mapping
+    // can happen. A pre-check against the ledger would be the TOCTOU shape --
+    // two threads both find a hole, both map, one overwrites the other.
+    //
+    // The stride is the granularity rather than a page because the ledger
+    // rounds every allocation up to it, so a page-stride search would retry
+    // addresses that can never be free.
+    constexpr std::uint64_t kStride = AddressSpace::kGranularity;
+    const std::uint64_t floor_ = AddressSpace::kUserMin;
+    // The ceiling as a *bound on the region*, not on its base. Checked on every
+    // iteration rather than only where `candidate` is first computed, because
+    // that is the constraint the loop could otherwise break: the first
+    // candidate respects it by construction, and every later one is the
+    // previous one minus a stride, so it respects it too -- as long as the
+    // search descends. A loop that walked the other way would step straight
+    // past the ceiling and hand a program memory above the window it asked
+    // for, and the only place that says so is this comparison. `in_the_user_window`
+    // cannot catch it: it bounds the *process's* window, which is thousands of
+    // times larger than the `zero_bits` one.
+    //
+    // Written as a difference for the same reason `in_the_user_window` writes
+    // its own: `candidate + size` wraps when both are near the top, and a
+    // wrapped sum compares as small enough to pass.
+    const std::uint64_t ceiling_room = ceiling - size;
+    // The bound on attempts. A space with a hole in it has one within a few
+    // steps; a space without one does not, and the loop has to end rather than
+    // walk the whole 47-bit window one granule at a time -- which at 64 KiB a
+    // step is a hundred trillion iterations. The cap is generous enough that a
+    // real fragmentation pattern does not hit it: sixteen thousand granules is
+    // a gigabyte of descending search.
+    //
+    // The number is **16384 and not 64**, and it was 64 for a while, which is
+    // the loader's `still in the way after 64 bases` bug reproduced in a second
+    // place: sixty-four attempts at one granule each is 4 MiB of search, which
+    // on a fragmented address space is entirely inside the process's own
+    // mappings, and the failure mode is a refusal on a machine with terabytes
+    // free -- the one nobody debugs. It survived here for a specific and
+    // embarrassing reason: the mutation harness that exists to catch it
+    // anchored on this line *expecting* 16384, so the anchor did not match,
+    // the mutant was never applied, and the harness reported the name as if it
+    // had run. A suite that cannot report its own failures reporting success
+    // is worse than no suite, because it is trusted. The test that catches it
+    // is the one that fills two hundred granules and then demands a placement:
+    // 200 > 64, so the mutant refuses, and 200 < 16384, so the real value
+    // places.
+    constexpr std::uint64_t kMaxAttempts = 16384;
+    for (std::uint64_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (candidate < floor_ || candidate > ceiling_room ||
+            !in_the_user_window(candidate, size)) {
+            break;
+        }
+        const Result<std::uint64_t> at =
+            map(candidate, size, protection, kind);
+        if (at.ok()) {
+            return at;
+        }
+        // Only a conflict sends the search on. Anything else -- a protection
+        // this kernel refused, an address the ledger would not record -- is not
+        // going to be fixed by trying the next one, and reporting it is more
+        // useful than descending past it until the cap and reporting nothing.
+        if (at.status != Status::ConflictingAddresses) {
+            return at;
+        }
+        if (candidate < floor_ + kStride) {
+            break;
+        }
+        candidate -= kStride;
+    }
+    return fail<std::uint64_t>(Status::NoMemory, 0, 0);
+}
+
+Result<std::uint64_t> Mapper::sync(std::uint64_t base,
+                                   std::uint64_t size) noexcept {
+    // The alignment check, because `msync` answers a misaligned range with
+    // EINVAL and the caller above would read that as "the kernel refused the
+    // flush" -- a claim about the state of the memory rather than about the
+    // shape of the request, and the two need different statuses.
+    if (!AddressSpace::is_page_aligned(base) ||
+        !AddressSpace::is_page_aligned(size)) {
+        return fail<std::uint64_t>(Status::InvalidParameter, 0, base);
+    }
+
+    // The counter moves before the call and the call is on the next line,
+    // which is the same shape every counted syscall in this file has. The
+    // adjacency is the point: a flush that was skipped leaves this pair out,
+    // and the counter is the one record of the syscall that the *caller*
+    // cannot fake by mis-reading a return value -- an `msync` on an
+    // anonymous mapping succeeds whether or not it ran, so the return value
+    // alone is a report of what the code *claims*, and the counter is a
+    // report of what the code *did*. The first version of the
+    // flush-is-a-stub mutation survived a test that asserted on the event,
+    // because the event recorded the claim; it cannot survive the counter,
+    // which records the act.
+    ++syscalls_made_;
+    const sys::Result s =
+        sys::msync(reinterpret_cast<void*>(base),
+                   static_cast<std::size_t>(size), MS_SYNC);
+    if (s.failed()) {
+        return fail<std::uint64_t>(Status::NotMappedData, s.error, base);
+    }
+    Result<std::uint64_t> out;
+    out.value = size;
     out.status = Status::Success;
     return out;
 }
