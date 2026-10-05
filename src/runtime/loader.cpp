@@ -170,6 +170,250 @@ void emit_note(obs::Writer* w, std::string_view text) noexcept {
     return out;
 }
 
+// ------------------------------------------------------- writing the memory
+
+// Little-endian stores at an address in mapped memory.
+//
+// These have no bounds check, which is the thing a reader is most likely to
+// object to, so the reason is worth one paragraph. The address is derived
+// from an RVA that the placement plan already checked is inside the image,
+// and the image's regions are the only things this process can make, so the
+// store lands in one of them. A check here would be a second place where the
+// same question is answered, and it would answer it with less information:
+// the caller's check is against the map, which is the authority, while a
+// check here would be against the arithmetic.
+//
+// The value is written through a byte pointer rather than a reinterpret_cast
+// to a wider type because the address is only 4-byte or 8-byte aligned if
+// the relocation says so, and a store through a misaligned wide pointer is
+// undefined even on x86 where it works. The byte loop has no such
+// requirement and the cost is four or eight stores on a path that runs tens
+// of thousands of times per image.
+void store_u16(std::uint64_t va, std::uint16_t v) noexcept {
+    auto* p = reinterpret_cast<std::uint8_t*>(va);
+    p[0] = static_cast<std::uint8_t>(v);
+    p[1] = static_cast<std::uint8_t>(v >> 8);
+}
+
+void store_u32(std::uint64_t va, std::uint32_t v) noexcept {
+    auto* p = reinterpret_cast<std::uint8_t*>(va);
+    p[0] = static_cast<std::uint8_t>(v);
+    p[1] = static_cast<std::uint8_t>(v >> 8);
+    p[2] = static_cast<std::uint8_t>(v >> 16);
+    p[3] = static_cast<std::uint8_t>(v >> 24);
+}
+
+void store_u64(std::uint64_t va, std::uint64_t v) noexcept {
+    store_u32(va, static_cast<std::uint32_t>(v));
+    store_u32(va + 4, static_cast<std::uint32_t>(v >> 32));
+}
+
+// What went wrong when a relocation could not be written.
+struct RelocFailure {
+    bool failed = false;
+    std::uint64_t rva = 0;
+    const char* what = "";
+};
+
+// Reads a 16-bit field out of mapped memory.
+//
+// Byte at a time for the reason the loaders below do their arithmetic in a
+// wider type and store back narrow: the address is only guaranteed to be
+// aligned to whatever the linker emitted, and a narrow load at an odd address
+// is a fault on some architectures and undefined on all of them.
+[[nodiscard]] std::uint16_t load_u16_at(std::uint64_t va) noexcept {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(va);
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(static_cast<std::uint16_t>(p[0]) |
+                                   static_cast<std::uint16_t>(
+                                       static_cast<std::uint16_t>(p[1]) << 8)));
+}
+
+// Applies one relocation of the given type at `va`.
+//
+// The five types the format defines, each writing the form the linker emitted
+// rather than a normalized 64-bit form. A runtime that wrote all of them as
+// DIR64 would corrupt every 32-bit field in the image, and one that wrote them
+// all as 32-bit would truncate a real pointer; the type is the whole of what
+// distinguishes them.
+//
+// The 16-bit types -- HIGH, LOW and HIGHADJ -- are 16-bit types. They
+// relocate a *half* of an address, on the machines whose instructions could
+// not hold a 32-bit absolute address in one operand (MIPS, Alpha, IA64's
+// predecessors). Reading and writing 32 bits at those addresses corrupts the
+// neighbouring field, and the arithmetic below is the Windows Research
+// Kernel's, which is the authority: the format description in the PE
+// specification is a sentence long and does not say what the arithmetic is.
+//
+// `adjustment` carries HIGHADJ's second value, which lives in the *next
+// relocation entry* rather than in the image. The caller reads it and passes
+// it here because the entry walk is where the file is being read; see
+// HIGHADJ below for why it cannot come from the image.
+[[nodiscard]] RelocFailure apply_one(std::uint64_t va, std::uint16_t type,
+                                     std::uint64_t delta,
+                                     std::int16_t adjustment) noexcept {
+    RelocFailure f;
+    switch (type) {
+    case kRelBasedHigh: {
+        // The 16-bit field is the high half of a 32-bit address. The low half
+        // is not in this entry, so the arithmetic has to pretend the field is
+        // the whole address, shift the field up to where it belongs, add the
+        // delta, and shift back down -- which discards exactly the delta's
+        // low 16 bits and keeps the field's own low half out of the result.
+        //
+        // The shifts are on a signed 32-bit value because the sum is meant to
+        // be interpreted as one: a field of 0xFFFF shifted up is negative,
+        // and an unsigned shift would bring zeros into the top half and make
+        // the addition wrap differently. This is `LONG Temp` in the kernel's
+        // LdrProcessRelocationBlock.
+        std::int32_t temp = static_cast<std::int32_t>(
+                                static_cast<std::uint32_t>(load_u16_at(va))
+                                << 16);
+        temp += static_cast<std::int32_t>(static_cast<std::uint32_t>(delta));
+        store_u16(va, static_cast<std::uint16_t>(temp >> 16));
+        return f;
+    }
+    case kRelBasedLow: {
+        // The 16-bit field is the low half of an address. It moves by the
+        // whole delta and wraps within its own 16 bits, which is what the
+        // field's width means -- the machine reading it sign-extends, so the
+        // wrap is not an accident but the encoding.
+        //
+        // Wine skips this in 64-bit builds. That is a defensible reading of
+        // "no amd64 linker emits LOW", and this runtime does not emit relocs
+        // either -- but skipping it here would be a claim about what a file
+        // may contain rather than about what the type means, and a loader
+        // that refuses a file it could place is not more faithful than one
+        // that places it wrong. The kernel applies it unconditionally, and so
+        // does this.
+        const std::uint16_t field = load_u16_at(va);
+        store_u16(va, static_cast<std::uint16_t>(
+                           static_cast<std::uint32_t>(field) +
+                           static_cast<std::uint32_t>(delta)));
+        return f;
+    }
+    case kRelBasedHighLow: {
+        // A 32-bit field moves by the whole delta, with wraparound. The delta
+        // is truncated to 32 bits first because the field is 32 bits: adding a
+        // 64-bit delta to a 32-bit field would be a different operation, and
+        // a linker that emitted a HIGHLOW in a 64-bit image emitted it
+        // against an address it knew would stay in the low 4 GiB.
+        std::uint32_t v = 0;
+        const auto* p = reinterpret_cast<const std::uint8_t*>(va);
+        v = static_cast<std::uint32_t>(p[0]) |
+            (static_cast<std::uint32_t>(p[1]) << 8) |
+            (static_cast<std::uint32_t>(p[2]) << 16) |
+            (static_cast<std::uint32_t>(p[3]) << 24);
+        v += static_cast<std::uint32_t>(delta);
+        store_u32(va, v);
+        return f;
+    }
+    case kRelBasedHighAdj: {
+        // The one relocation that is not a relocation of the address it
+        // names, and the only one whose correctness depends on a value that
+        // is not in the image at all.
+        //
+        // A MIPS immediate is a signed 16-bit field, and an address assembled
+        // from two of them needs the high half adjusted when the low half is
+        // negative: 0x0000_7FFF plus a base is 0x0000_8000-ish, and the
+        // carry has to go somewhere. HIGHADJ is how the linker says where.
+        //
+        // The kernel's arithmetic, which is the whole of the specification
+        // that matters here:
+        //
+        //     Temp = field << 16;      // the 16-bit high half, as an address
+        //     Temp += adjustment;      // the carry the linker recorded
+        //     Temp += Diff;            // this load's delta
+        //     Temp += 0x8000;          // rounding
+        //     field = Temp >> 16;
+        //
+        // Three parts of that are load-bearing and none is decoration.
+        //
+        // The adjustment comes from the *next relocation entry*, not from the
+        // image. An entry is 16 bits of type and offset with no room for a
+        // value, so the adjustment is stored as a second entry whose own
+        // offset field is meaningless and whose 16 bits are the number. That
+        // is why this entry consumes two slots and why the caller has to
+        // read it -- and it is why an implementation that reads the
+        // adjustment out of the bytes *after* the field in the image is
+        // reading whatever that code happens to be: on the machines that emit
+        // HIGHADJ, the instruction at the relocated address is a pair of
+        // immediates, so the bytes after the high half are the low half --
+        // the wrong number entirely.
+        //
+        // The adjustment is signed. The linker emits the carry as a negative
+        // number when the low half was negative, and reading it as unsigned
+        // turns a subtraction of 8 into an addition of 65528.
+        //
+        // The 0x8000 is a rounding term and not an offset. The low half is
+        // signed, so adding it to the high half alone is ambiguous at the
+        // halfway point; the kernel adds half of the low half's range and
+        // then discards the low half by shifting, which rounds the total
+        // toward the value the assembler's sign extension would have
+        // produced. An implementation that omits it is off by one on every
+        // field whose low half is in [0x0000, 0x8000) -- a third of them --
+        // and only on those, which is the worst possible way to be wrong.
+        //
+        // There is no second-entry bookkeeping here and no "already applied"
+        // flag: the kernel checks a bit in the *offset* field
+        // (LDRP_RELOCATION_FINAL) because the Windows loader can be asked to
+        // relocate an image twice and the second pass would add the delta
+        // again. This loader relocates exactly once per load, from the file's
+        // bytes, and places the result at an address the caller was given --
+        // there is no second pass to defend against, and adding a bit to an
+        // entry would mutate the file's image for a caller that did not ask
+        // for that.
+        std::int32_t temp = static_cast<std::int32_t>(
+                                static_cast<std::uint32_t>(load_u16_at(va))
+                                << 16);
+        temp += static_cast<std::int32_t>(adjustment);
+        temp += static_cast<std::int32_t>(static_cast<std::uint32_t>(delta));
+        temp += 0x8000;
+        store_u16(va, static_cast<std::uint16_t>(temp >> 16));
+        return f;
+    }
+    case kRelBasedDir64: {
+        // The only type this runtime sees in practice on amd64, and the only
+        // one whose field is as wide as the address it holds.
+        std::uint64_t out = 0;
+        for (int i = 7; i >= 0; --i) {
+            out = (out << 8) |
+                  static_cast<std::uint64_t>(
+                      reinterpret_cast<const std::uint8_t*>(va)[i]);
+        }
+        out += delta;
+        store_u64(va, out);
+        return f;
+    }
+    default:
+        f.failed = true;
+        f.rva = va;
+        f.what = "a relocation type this runtime does not apply";
+        return f;
+    }
+}
+
+// Undoes a placement: unmaps every region the batch recorded.
+//
+// The undo is by base address, from the batch rather than from the space,
+// because the space may have been given more regions by a later step of a
+// load that is not this one. Reverse order, so that a partial undo leaves
+// the regions that were mapped first in the state that a reader would expect
+// to still be there -- and because for an image whose sections were adjacent,
+// the highest section is the one a reader looks at first.
+//
+// A failure here is not reported over the failure that caused it. A munmap
+// of an address this function just mapped cannot fail on a sane kernel, and
+// a caller that was told "the load failed" cannot act differently on the
+// second failure, so surfacing it would replace a message that names the
+// cause with one that names a consequence.
+void rollback_placement(Mapper& m,
+                        const std::vector<AddressSpace::Candidate>& batch) noexcept {
+    for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+        (void)m.unmap(it->base);
+    }
+}
+
 } // namespace
 
 const char* load_error_name(LoadError e) noexcept {
@@ -183,6 +427,8 @@ const char* load_error_name(LoadError e) noexcept {
     case LoadError::MissingImport: return "missing_import";
     case LoadError::UnimplementedImport: return "unimplemented_import";
     case LoadError::AddressConflict: return "address_conflict";
+    case LoadError::MappingRefused: return "mapping_refused";
+    case LoadError::RelocationNotWritable: return "relocation_not_writable";
     }
     return "unknown";
 }
@@ -516,6 +762,31 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                     out.detail = "a DIR64 relocation points outside the image";
                     return out;
                 }
+
+                // HIGHADJ's adjustment is the next entry, and this entry
+                // therefore covers two slots. Skip the second here so that
+                // the walk below counts one relocation rather than two -- and
+                // so that a block whose HIGHADJ is its last entry, with no
+                // adjustment slot after it, is refused here, before anything
+                // is mapped. That is the check this pass exists for; the
+                // adjustment's *value* is the write pass's business, and
+                // reading it here would mean holding a number this pass has
+                // no use for.
+                //
+                // The adjustment is the entry's own 16 bits, not its offset
+                // field: the linker spends a whole entry on a number that
+                // does not fit in an entry's 12-bit offset, and the type
+                // nibble of that second entry says nothing.
+                if (type == kRelBasedHighAdj) {
+                    if (i + 1 >= entries) {
+                        out.error = LoadError::BadRelocation;
+                        out.detail = "a HIGHADJ relocation is the last entry "
+                                     "in its block and has no adjustment slot";
+                        return out;
+                    }
+                    ++i;
+                }
+
                 switch (type) {
                 case kRelBasedDir64:
                     module.relocations_applied += 1;
@@ -524,11 +795,12 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                 case kRelBasedLow:
                 case kRelBasedHighLow:
                 case kRelBasedHighAdj:
-                    // The 32-bit forms. They exist in 64-bit images for
-                    // fields the linker knew would stay in the low 4 GiB,
-                    // and a runtime that ignored them would leave those
-                    // fields pointing at the old base. Counted and applied
-                    // by the mapping layer with the rest.
+                    // The 16- and 32-bit forms. They exist in 64-bit images
+                    // for fields the linker knew would stay in the low 4 GiB,
+                    // or -- for the 16-bit ones -- on the machines whose
+                    // instructions held half an address each. A runtime that
+                    // ignored them would leave those fields pointing at the
+                    // old base.
                     module.relocations_applied += 1;
                     break;
                 default:
@@ -595,6 +867,13 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
         // executable and writable gets the combined value rather than one
         // of the two. Reading them in the other order produces a
         // read-execute section from a read-write-execute one.
+        //
+        // The value is computed once and used twice below -- once for the
+        // recorded region and once for the final protection after the
+        // placement -- because a load that recorded one protection and
+        // applied another would be a map that lies about its own memory, and
+        // the whole point of computing it from the section's flags is that
+        // the two readings cannot disagree.
         const bool w = p.section->writable();
         const bool x = p.section->executable();
         if (w && x) {
@@ -610,16 +889,80 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
         batch.push_back(std::move(c));
     }
 
-    const auto rec = space.record_batch(batch);
-    if (!rec.ok()) {
-        // A conflict is a fact about the caller's space and not about the
-        // file, which is why it is a different error from the ones the plan
-        // above produces. The batch is all-or-nothing, so there is nothing
-        // to undo here.
-        out.error = LoadError::AddressConflict;
-        out.detail = "the image could not be recorded: " +
-                     std::string(status_name(rec.status));
-        return out;
+    // The two modes diverge here, and the divergence is one line wide.
+    //
+    // Without a mapper the call is record_batch and nothing else, which is
+    // the whole of what this function used to do. With one, the same
+    // candidates go through map_batch, which maps and records as one
+    // operation, and then the bytes are written.
+    //
+    // What is *not* different is that the plan above already ran. An image
+    // that would be refused by the window check, by the overlap check, by
+    // the relocation walk or by the entry-point check is refused before
+    // either call, so adding a mapper cannot turn a refusal into a
+    // placement. It can only add new failures of its own -- the kernel
+    // refusing an address the plan accepted, which is what MappingRefused is
+    // for.
+    Mapper* placement = context.placement;
+
+    if (placement == nullptr) {
+        const auto rec = space.record_batch(batch);
+        if (!rec.ok()) {
+            // A conflict is a fact about the caller's space and not about
+            // the file, which is why it is a different error from the ones
+            // the plan above produces. The batch is all-or-nothing, so there
+            // is nothing to undo here.
+            out.error = LoadError::AddressConflict;
+            out.detail = "the image could not be recorded: " +
+                         std::string(status_name(rec.status));
+            return out;
+        }
+    } else {
+        // The same batch, through the mapper.
+        //
+        // Every region goes in as read-write, whatever the section's flags
+        // say, and the flags are applied afterwards. The alternative --
+        // mapping each section with its final protection -- cannot work:
+        // a relocation routinely names an address in a read-only section,
+        // because a read-only section is full of pointers to the image's own
+        // functions and those pointers are exactly what a relocation
+        // rewrites. A loader that mapped the final protections first would
+        // fault on its own relocation pass, on a perfectly ordinary image.
+        //
+        // Windows avoids the problem by mapping the whole image committed
+        // and read-write, writing the relocations, and then protecting each
+        // section, and the order here is that order. The window in which a
+        // read-only section is writable is the same window Windows has, and
+        // it is why the final protect is a separate step that is checked
+        // rather than assumed: an image that is placed and whose protection
+        // was never applied is an image whose .text is writable, and a
+        // runtime that reports success there is reporting something false.
+        std::vector<Mapper::Candidate> to_map;
+        to_map.reserve(batch.size());
+        for (AddressSpace::Candidate& c : batch) {
+            to_map.push_back(Mapper::Candidate{c.base, c.size,
+                                                PageProtection::ReadWrite,
+                                                c.kind, c.section,
+                                                c.section_index});
+        }
+
+        const Result<std::uint64_t> mapped = placement->map_batch(to_map);
+        if (!mapped.ok()) {
+            // map_batch is all-or-nothing in both directions: it unmapped
+            // everything it had mapped before reporting this, so there is
+            // nothing to undo here and the space is as it was.
+            out.error = (mapped.status == Status::ConflictingAddresses)
+                            ? LoadError::AddressConflict
+                            : LoadError::MappingRefused;
+            out.detail = "the image could not be mapped: " +
+                         std::string(status_name(mapped.status));
+            if (placement->last_failure().error != 0) {
+                out.detail += " (errno " +
+                              std::to_string(placement->last_failure().error) +
+                              ")";
+            }
+            return out;
+        }
     }
 
     // The image is recorded in the space before the contents are placed, so
@@ -639,31 +982,235 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
         }
     }
 
-    if (needs_relocation) {
-        // The delta is base minus preferred base, as a byte offset.
+    // ------------------------------------------------------------- contents
+    //
+    // The file's bytes, into the memory. Below the record, above the
+    // relocations, and below the IAT -- the order the header of this file
+    // gives and the order the operations require: a relocation rewrites a
+    // value that has to be in memory, and the IAT holds addresses that have
+    // to be relocated too if the image moved.
+
+    if (placement != nullptr) {
+        // The headers.
         //
-        // It is computed in unsigned arithmetic and reinterpreted, not by
-        // casting each address to int64_t and subtracting. Both operands are
-        // uint64_t taken from a caller and from the file, and the file's
-        // preferred base can be any 64-bit value; the cast of such a value
-        // to int64_t is implementation-defined in the negative half, and the
-        // subtraction of the two is signed overflow -- undefined behaviour,
-        // which UBSan reported on the loader fuzz harness. Unsigned
-        // subtraction of two 64-bit values is total: it wraps modulo 2^64,
-        // and the two's-complement reinterpretation of that result is
-        // precisely the signed byte offset. No branch is needed and none is
-        // UB.
-        const std::uint64_t delta = base - image.image_base();
+        // Bounded by both the file and the region, because the region's size
+        // is the parsed header size and the file can be shorter -- the
+        // loader already handles that case for sections by dropping the
+        // uncovered tail, and the headers need the same treatment rather
+        // than a memcpy of a length the file may not have.
+        {
+            const Region* h = space.find(base);
+            if (h == nullptr) {
+                out.error = LoadError::AddressConflict;
+                out.detail = "the header region was not recorded";
+                rollback_placement(*placement, batch);
+                return out;
+            }
+            const std::uint64_t copy =
+                (headers_size < static_cast<std::uint64_t>(bytes.size()))
+                    ? headers_size
+                    : static_cast<std::uint64_t>(bytes.size());
+            std::memcpy(reinterpret_cast<void*>(base), bytes.data(),
+                        static_cast<std::size_t>(copy));
+            // The part of the header region the file does not cover. The
+            // mapping is anonymous and the kernel zeroes anonymous pages, so
+            // this is already zero and the memset is not needed -- which is
+            // worth stating because a reader looking for the zero fill will
+            // not find one here, and the reason it is safe is that this
+            // runtime maps anonymous memory and nothing else.
+        }
+
+        // The sections.
+        for (const Placement& p : placements) {
+            if (p.file_size != 0) {
+                // Bounded by construction: the plan clamped file_size to
+                // bytes.size() - raw_offset, so the read below is in range
+                // by arithmetic rather than by a check here. The subtraction
+                // is the reason the plan used that form.
+                if (p.file_off > static_cast<std::uint64_t>(bytes.size()) ||
+                    p.file_size >
+                        static_cast<std::uint64_t>(bytes.size()) - p.file_off) {
+                    out.error = LoadError::SectionOutOfRange;
+                    out.detail = "section " + p.section->name +
+                                 " names bytes outside the file";
+                    rollback_placement(*placement, batch);
+                    return out;
+                }
+                std::memcpy(reinterpret_cast<void*>(p.va),
+                            bytes.data() + static_cast<std::size_t>(p.file_off),
+                            static_cast<std::size_t>(p.file_size));
+            }
+            // The zero tail: a section whose virtual extent exceeds its raw
+            // size. The mapping is anonymous and zero, so again there is
+            // nothing to do, and the reason is the same one as above.
+        }
+    }
+
+    // The delta is base minus preferred base, as a byte offset.
+    //
+    // It is computed in unsigned arithmetic and reinterpreted, not by casting
+    // each address to int64_t and subtracting. Both operands are uint64_t
+    // taken from a caller and from the file, and the file's preferred base
+    // can be any 64-bit value; the cast of such a value to int64_t is
+    // implementation-defined in the negative half, and the subtraction of the
+    // two is signed overflow -- undefined behaviour, which UBSan reported on
+    // the loader fuzz harness. Unsigned subtraction of two 64-bit values is
+    // total: it wraps modulo 2^64, and the two's-complement reinterpretation
+    // of that result is precisely the signed byte offset. No branch is
+    // needed and none is UB.
+    const std::uint64_t delta = base - image.image_base();
+
+    if (needs_relocation && placement != nullptr) {
+        // The second walk over the relocations, which writes them.
+        //
+        // The walk above is the one that can refuse, and it runs before
+        // anything is mapped, so a file with a bad relocation never reaches
+        // this point. This one therefore does not validate the block
+        // structure -- every bound it would check was checked already, from
+        // the same bytes, moments ago -- and does only the work that needs
+        // memory to exist. Splitting it this way is what keeps the contract
+        // that a refused load leaves nothing behind: all of the refusals are
+        // in the first walk and none are in this one, so this walk cannot
+        // fail halfway and leave a half-relocated image mapped.
+        //
+        // The one thing it does check is that each entry's address is
+        // covered by a region, because the plan's check is against the
+        // image's size and the image's size is not the set of addresses that
+        // exist: a section's virtual extent is rounded up to a page, the
+        // gap between two sections is not mapped at all, and a relocation
+        // naming that gap is a file the plan accepted and this walk cannot
+        // satisfy. That is what RelocationNotWritable is for.
+        const std::uint64_t reloc_end = image.reloc_rva() + image.reloc_size();
+        std::uint64_t walk = image.reloc_rva();
+
+        while (walk + 8 <= reloc_end) {
+            std::uint64_t block_off = 0;
+            if (!image.to_file_offset(walk, block_off) ||
+                block_off + 8 > bytes.size()) {
+                // Unreachable given the walk above held on the same bytes.
+                // Bounded anyway, because "unreachable" is a claim about the
+                // past and this is a loop over a file.
+                out.error = LoadError::BadRelocation;
+                out.detail = "a relocation block header is outside the file";
+                rollback_placement(*placement, batch);
+                return out;
+            }
+            std::uint32_t page_rva = 0;
+            std::uint32_t block_size = 0;
+            (void)read_u32(bytes, static_cast<std::size_t>(block_off),
+                           page_rva);
+            (void)read_u32(bytes, static_cast<std::size_t>(block_off) + 4,
+                           block_size);
+            if (block_size < 8) {
+                out.error = LoadError::BadRelocation;
+                out.detail = "a relocation block declares a size smaller "
+                             "than its own header";
+                rollback_placement(*placement, batch);
+                return out;
+            }
+
+            const std::uint32_t entries = (block_size - 8) / 2;
+            for (std::uint32_t i = 0; i < entries; ++i) {
+                std::uint16_t entry = 0;
+                const std::uint64_t entry_rva = walk + 8 + 2ULL * i;
+                std::uint64_t entry_off = 0;
+                if (!image.to_file_offset(entry_rva, entry_off) ||
+                    !read_u16(bytes, static_cast<std::size_t>(entry_off),
+                              entry)) {
+                    out.error = LoadError::BadRelocation;
+                    out.detail = "a relocation entry is outside the file";
+                    rollback_placement(*placement, batch);
+                    return out;
+                }
+                const std::uint16_t type = entry >> 12;
+                const std::uint16_t offset = entry & 0x0FFFU;
+                if (type == kRelBasedAbsolute) {
+                    continue;
+                }
+
+                // The same two-slot walk as the pass above, and for the same
+                // reason: the adjustment is the next entry, and reading it
+                // here rather than in the plan would mean reading the file a
+                // second time for a value the plan already had in hand. The
+                // plan validated that the slot exists, so this cannot fail --
+                // and it is still written as a read that reports failure,
+                // because a loop over a file bounded by a claim about a past
+                // walk is the shape that turns a wrong claim into a fault.
+                std::int16_t adjustment = 0;
+                if (type == kRelBasedHighAdj) {
+                    std::uint64_t adj_off = 0;
+                    if (!image.to_file_offset(walk + 8 + 2ULL * (i + 1),
+                                             adj_off) ||
+                        !read_u16(bytes, static_cast<std::size_t>(adj_off),
+                                  entry)) {
+                        out.error = LoadError::BadRelocation;
+                        out.detail = "a HIGHADJ adjustment slot is outside "
+                                     "the file";
+                        rollback_placement(*placement, batch);
+                        return out;
+                    }
+                    adjustment = static_cast<std::int16_t>(entry);
+                    ++i;
+                }
+
+                const std::uint64_t rva = page_rva + offset;
+                const std::uint64_t va = base + rva;
+
+                // Coverage and writability, checked against the map rather
+                // than against the image's arithmetic.
+                //
+                // The region's own containment test is the authority, and a
+                // relocation into the gap between two sections is the case it
+                // exists for: the plan's check is against SizeOfImage, and
+                // the image's size includes gaps that were never mapped.
+                //
+                // The writability half cannot fail here -- every region went
+                // in as read-write and nothing has protected any of them yet
+                // -- and it is checked anyway, because the check costs one
+                // comparison and the thing it guards is a write to a page
+                // that would fault. A loader that arrived here with a
+                // read-only region in its own map has a placement bug, and
+                // it should report that rather than fault inside apply_one.
+                const Region* target = space.find(va);
+                if (target == nullptr) {
+                    out.error = LoadError::RelocationNotWritable;
+                    out.detail = "a relocation at RVA " + hex_of(rva) +
+                                 " names an address the image does not cover";
+                    rollback_placement(*placement, batch);
+                    return out;
+                }
+                if ((protection_to_prot(target->protection) & PROT_WRITE) ==
+                    0) {
+                    out.error = LoadError::RelocationNotWritable;
+                    out.detail = "a relocation at RVA " + hex_of(rva) +
+                                 " names read-only memory";
+                    rollback_placement(*placement, batch);
+                    return out;
+                }
+                const RelocFailure applied =
+                    apply_one(va, type, delta, adjustment);
+                if (applied.failed) {
+                    out.error = LoadError::BadRelocation;
+                    out.detail = applied.what;
+                    rollback_placement(*placement, batch);
+                    return out;
+                }
+            }
+            walk += block_size;
+        }
+    }
+
+    if (needs_relocation) {
         if (context.events != nullptr) {
             auto& e = context.events->begin(obs::EventKind::Note);
             e.add("text", std::string_view{"relocations applied"});
             e.add_hex("delta", delta);
             e.add("blocks", static_cast<std::uint64_t>(module.relocation_blocks));
             e.add("entries", module.relocations_applied);
+            e.add("written", placement != nullptr);
             context.events->commit();
         }
     }
-
     // ------------------------------------------------------ import lookup
 
     // The import directory.
@@ -843,6 +1390,54 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                     imp.resolved = imp.target_va != 0;
                 }
 
+                // The IAT store.
+                //
+                // Written after the relocations and not before, and the order
+                // is the whole reason this walk is where it is. The IAT of a
+                // relocated image holds RVAs until the relocation pass runs
+                // and absolute addresses after it, so an IAT written before
+                // the relocations would be rewritten by them into
+                // address+delta -- a value that is the address of an import
+                // plus a displacement, which points into the middle of
+                // whatever it names. The three stores therefore run in the
+                // order the header of this file gives: bytes, then
+                // relocations, then the IAT.
+                //
+                // Only when there was a resolver. Without one the slot keeps
+                // the RVA the file held, which is what `occ check` wants to
+                // see and what a caller that resolved nothing can act on: a
+                // program that reads an unresolved IAT reads a small
+                // number and faults, where a slot holding zero is a program
+                // that reads null and calls it -- which is a different
+                // failure with a different cause, and hiding it behind a
+                // resolved-looking zero is the thing this avoids.
+                if (placement != nullptr && imp.resolved) {
+                    // The slot was checked for coverage above, which is the
+                    // check that matters: this is a raw store at an address
+                    // computed from a file's RVA, and the coverage test is
+                    // what makes it safe. The test above walked placements
+                    // rather than the space, and the space now holds
+                    // exactly those regions plus the headers.
+                    const Region* slot = space.find(imp.iat_va);
+                    if (slot == nullptr) {
+                        out.error = LoadError::RelocationNotWritable;
+                        out.detail = "the IAT slot for " + dll + "!" +
+                                     imp.name +
+                                     " is not in a region this load made";
+                        rollback_placement(*placement, batch);
+                        return out;
+                    }
+                    if ((protection_to_prot(slot->protection) & PROT_WRITE) ==
+                        0) {
+                        out.error = LoadError::RelocationNotWritable;
+                        out.detail = "the IAT slot for " + dll + "!" +
+                                     imp.name + " is read-only";
+                        rollback_placement(*placement, batch);
+                        return out;
+                    }
+                    store_u64(imp.iat_va, imp.target_va);
+                }
+
                 if (context.events != nullptr) {
                     auto& e = context.events->begin(obs::EventKind::Import);
                     e.add("dll", dll);
@@ -901,17 +1496,61 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
         }
     }
 
+    // --------------------------------------------------- final protections
+    //
+    // The last step of a placement, and the one that makes the image what the
+    // file said it is.
+    //
+    // Everything above ran with every region writable, because a relocation
+    // can name an address in any section including a read-only one, and
+    // because the IAT is frequently in a section the linker marked
+    // read-only. This step is what takes that permission away, and it is
+    // separate rather than folded into the mapping for the reason stated at
+    // the mapping: a read-only section full of pointers into the image is
+    // ordinary, and a loader that applied the final protections first could
+    // not write its own relocations.
+    //
+    // Windows has the same window and closes it the same way. The window is
+    // why the result is checked rather than assumed: an image that is placed
+    // and never protected is an image whose .text is writable, and a loader
+    // that reported success there is reporting something false. The
+    // check is the only thing between "the placement finished" and "the
+    // image is loaded".
+    if (placement != nullptr) {
+        // Headers first, then the sections in the order they were placed.
+        // The order is the order a failure message names them in, and the
+        // headers are read-only in every image so this is the first place a
+        // refusal could occur.
+        for (const AddressSpace::Candidate& c : batch) {
+            const Result<std::uint32_t> applied =
+                placement->protect(c.base, c.protection);
+            if (!applied.ok()) {
+                out.error = LoadError::MappingRefused;
+                out.detail = "the protection of " + c.section + " at 0x" +
+                             hex_of(c.base) + " could not be set: " +
+                             std::string(status_name(applied.status));
+                rollback_placement(*placement, batch);
+                return out;
+            }
+            if (context.events != nullptr) {
+                const Region* r = space.find(c.base);
+                if (r != nullptr) {
+                    emit_mapping(context.events, *r);
+                }
+            }
+        }
+        // The counter the caller reads is now true of memory rather than of
+        // a plan: every entry was written.
+        for (ResolvedImport& imp : module.imports) {
+            if (!imp.resolved) {
+                continue;
+            }
+            imp.iat_written = true;
+        }
+    }
+
     // -------------------------------------------------------------- result
 
-    // What this function does not do, and why: it does not copy the section
-    // contents into memory and it does not write the resolved import
-    // addresses into the IAT. Both of those need writable mapped memory,
-    // which belongs to the layer that owns the host mapping rather than to
-    // the layer that decides what goes where. The division is what lets
-    // `occ check` load an image -- header parse, section placement,
-    // relocation count, import walk -- without mapping a byte, and it is
-    // why this function can report an image's shape without being able to
-    // run it.
     (void)sections;
 
     out.ok = true;

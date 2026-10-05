@@ -52,6 +52,7 @@
 #include "occ/observer/event.h"
 #include "occ/parser/pe.h"
 #include "occ/runtime/address_space.h"
+#include "occ/runtime/mapper.h"
 #include "occ/util/span.h"
 
 namespace occ::runtime {
@@ -96,6 +97,26 @@ enum class LoadError : std::uint8_t {
     // The address space refused to record a region: an overlap, or an
     // address outside the window.
     AddressConflict,
+    // The kernel refused a mapping the plan had already accepted: a
+    // placement at an address the plan covered and the kernel disagreed
+    // with, or no memory. It is a different value from AddressConflict
+    // because AddressConflict is a fact about the caller's space and this
+    // is a fact about the system the runtime is on -- a container with a
+    // low limit, a host out of memory, a hardened kernel that refused an
+    // executable mapping. A reader of the two learns which one happened.
+    MappingRefused,
+    // A relocation named an address the placement did not cover.
+    //
+    // The plan checks that every relocation's RVA is inside the image, and
+    // that is enough to place the image. It is not enough to write the
+    // relocation: the image's own size is not the set of addresses that are
+    // writable, because a relocation can name a read-only section and
+    // because a section's virtual extent is rounded up while its writable
+    // content is not. This is therefore discovered at the point of the
+    // write, which is the only place that holds both the address and the
+    // map, and it is the same reason the entry point and the IAT slots are
+    // checked where they are.
+    RelocationNotWritable,
 };
 
 [[nodiscard]] const char* load_error_name(LoadError e) noexcept;
@@ -118,6 +139,15 @@ struct ResolvedImport {
     // rendered as text, and this is true, so a reader can tell an export by
     // number from one by name.
     bool by_ordinal = false;
+    // True when this import's address was actually stored into the slot.
+    //
+    // Distinct from `resolved`, and the distinction is the useful one: an
+    // import can be resolved and not written, which is what a load that
+    // mapped no memory reports, and a caller asking "can this program call
+    // that function" needs the second answer rather than the first. A
+    // module whose imports are all resolved and none written is a shape, not
+    // a loaded image, and the field is what tells the two apart.
+    bool iat_written = false;
 };
 
 // A loaded image.
@@ -176,6 +206,34 @@ struct LoadContext {
 
     // The events to write to, or nullptr for a load that is not observed.
     obs::Writer* events = nullptr;
+
+    // Where the image is put, or nullptr to decide without putting it
+    // anywhere.
+    //
+    // This is the difference between the two things a caller can want from
+    // this function, and it is a pointer rather than a flag because the two
+    // are not a matter of degree. With a mapper, the image's bytes are
+    // copied into memory, its relocations are written, its IAT is filled
+    // and its sections are given their final protections, and the module
+    // returned describes memory a program can execute. Without one, every
+    // decision is still made and every refusal is still reported, and
+    // nothing is mapped: the module describes the shape of an image rather
+    // than a loaded one.
+    //
+    // `occ check` passes nullptr and is the reason this is optional. It
+    // answers questions about a file -- is it a PE, what does it import,
+    // would it load -- and answering them does not require an address space
+    // or a syscall, and a checker that mapped every file it looked at would
+    // be a runtime with a file browser attached.
+    //
+    // A mapper here changes what the function does, not whether it decides:
+    // the placement plan, the relocation walk and the entry-point check all
+    // run before anything is mapped, exactly as they do without one, so an
+    // image that would be refused is refused before a byte is placed. What a
+    // mapper adds is the part that can still fail afterwards -- the kernel
+    // refusing a mapping, and a write to an address the plan covered turning
+    // out to be possible or impossible.
+    Mapper* placement = nullptr;
 };
 
 // Loads a parsed image at `preferred_base`, or at the image's own base when
@@ -185,6 +243,19 @@ struct LoadContext {
 // leaves `space` unchanged, which is what lets the caller retry at another
 // base without unwinding a half-populated map. That property is worth the
 // cost of building the module in a local and moving it in at the end.
+//
+// The contract holds in both of the function's two modes, and holding it in
+// the placing one is the harder half: a mapping that succeeded has to be
+// unmapped before the function returns a failure, or the space is left
+// holding memory the map does not describe.
+//
+// With `context.placement` set, the image is placed: the headers and each
+// section are mapped, the file's bytes are copied in, the part of a section
+// the file does not cover is zeroed, the base relocations are written, the
+// IAT is filled with the resolved addresses, and each region is given its
+// final protection. Without it, all of the decisions are made and none of
+// the stores happen, and the returned module describes a shape rather than a
+// loaded image. See LoadContext::placement.
 [[nodiscard]] LoadResult load_image(const parser::PeImage& image,
                                     ByteSpan bytes, std::uint64_t preferred_base,
                                     AddressSpace& space,
