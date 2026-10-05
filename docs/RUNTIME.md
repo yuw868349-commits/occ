@@ -314,6 +314,72 @@ mapped address, which the optimizer is entitled to fold into reading its own
 answer. It did. The expectations now go through `volatile`, which says an
 expectation is a value and not an alias for the thing under test.
 
+**Measuring that, rather than assuming it.** The two fixes above arrived
+together, which means neither was ever shown to be the one that worked, and a
+fix nobody can attribute is a fix nobody can rely on. The mutation was HIGHADJ's
+adjustment read from the image instead of the second entry -- the runtime's
+own original code, and wrong here by a wide margin. Four runs, one variable at
+a time:
+
+| expectations | diagnostic in the loader | LTO | result |
+|---|---|---|---|
+| plain local | none | off | **passed all 74 checks** |
+| plain local | one `fprintf` | off | 2 failed |
+| `volatile` | none | off | **2 failed** |
+| `volatile` | none | on | (not run; not needed) |
+
+The first row is the finding: the suite was blind to a real bug in the code it
+was written for. The second row is why the natural first guess about the fix
+was wrong -- adding a print to the loader did stop the mutation, and it is
+tempting to conclude the print fixed the test. It did not. The print was the
+second and weaker half of the effect, and the third row separates them: with
+`volatile` and no print anywhere, the mutation is caught. The loader ships
+without a diagnostic in it.
+
+**Six mutations, and the sixth is why the file is shaped this way.** Each of
+these is a change that makes the loader wrong; none is a typo-shaped change
+that a reviewer would reject, because each is the mistake someone would ship.
+The runtime's own original code was three of them at once.
+
+| mutation | what a runtime that made it would do | caught |
+|---|---|---|
+| HIGHADJ does not consume its second slot | applies the delta to the adjustment's own type nibble | 1 failure |
+| HIGHADJ drops the `0x8000` | wrong on a third of fields, right on the rest | 1 failure |
+| HIGH writes a 32-bit field | overwrites the low half of the immediate pair | 2 failures |
+| LOW is a no-op | leaves the low half at the old base | 1 failure |
+| HIGHADJ zero-extends the adjustment | a sign error of one carry | 2 failures |
+| HIGHADJ takes the adjustment from the image | adds the low half instead of the carry | 2 failures |
+
+The fourth row caught the code that shipped, and the fifth caught a fixture
+that had been fixed for the sixth and left itself open to a fifth. That is
+worth stating plainly because it is the part that generalises: **one constant
+covers one failure mode, and a fixture fixed against a mutation is still
+unmeasured against every other one.** `-32768` was chosen because a 15-bit
+mask turns it into zero, whose sum with the rounding term is the same
+`0x8000` that the correct value produces -- the two agree on the high half
+and the mutation passes. The second HIGHADJ field, with an adjustment of
+`-1`, closes that: masked it becomes `0x7FFF`, half the range away, on the
+other side of the same boundary. Between the two fields the three wrong
+readings of the adjustment -- signed as unsigned, with the sign bit cleared,
+and taken from the image -- are each separated from the right answer, and the
+count assertion says the module saw five relocations in seven entries.
+
+The lesson generalises past this file, and the reason it does is structural
+rather than a matter of discipline. The fold needs an assertion that reads a
+field out of mapped memory and compares it against the same field re-derived
+from constants. In this repository the helpers that dereference an address --
+`load_u16`, `load_u32`, `load_u64` -- exist in exactly one file,
+`tests/test_placement.cpp`, so the shape that can be folded exists in exactly
+one file. `test_mapper.cpp` observes through a forked child and a pipe, and
+`test_observer.cpp` through a socketpair, which no optimizer can follow. The
+rest assert on parse results over a `std::vector` the test itself filled, where
+the expected value is a literal. A future test that adds an address-dereferencing
+read to one of those files is the first thing that would reintroduce the blind
+spot, and the rule for it is already written down at
+`tests/test_placement.cpp`'s `expected_field`: an expected value derived from
+the same arithmetic as the code under test is a *value*, and `volatile` is how
+it says so.
+
 ### The mapping layer — `include/occ/runtime/mapper.h`
 
 `AddressSpace` is a ledger. It was deliberately built as one: every rule

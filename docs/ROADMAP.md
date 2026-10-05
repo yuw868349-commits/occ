@@ -23,7 +23,7 @@ the observation layer is the product, and it is the deepest part.
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 
-The test suite is 2,054 assertions across seventeen binaries. The counts are what
+The test suite is 2,056 assertions across seventeen binaries. The counts are what
 the binaries print, not what the sources appear to contain — the two differ,
 because a check written across several lines is one assertion to a reader and
 none to a grep:
@@ -38,7 +38,7 @@ none to a grep:
 | `test_uprobe` | 108 |
 | `test_ntdll_probes` | 102 |
 | `test_mapper` | 87 |
-| `test_placement` | 74 |
+| `test_placement` | 76 |
 | `test_detect` | 65 |
 | `test_seccomp` | 49 |
 | `test_placer` | 46 |
@@ -246,7 +246,7 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 2,054 assertions and needs no network. Two of the seventeen
+The test suite is 2,056 assertions and needs no network. Two of the seventeen
 binaries need a target binary and a host that permits namespaces and seccomp,
 one needs a gdb on `PATH`, and one needs a `python3` to re-run the seed
 generator; those are skipped rather than failed where the host does not have
@@ -255,3 +255,27 @@ is the only test whose skip weakens a guarantee rather than a measurement,
 because nothing else would notice a seed drifting away from the generator
 that describes it. A claim in this file that can be checked should be checked
 that way before it is believed.
+
+**A sanitizer is a host like any other, and one test is worse under it.** Two
+assertions are conditional on the absence of AddressSanitizer, and both
+because the sanitizer replaces the thing being measured rather than because
+it found anything:
+
+- `test_container`'s signal-reporting case runs a child that provokes
+  SIGSEGV and inspects how the container reported it. ASan installs its own
+  SIGSEGV handler in that child and its handler does not return — it prints
+  and terminates — so the child dies of the sanitizer's abort rather than of
+  the signal the test raised. Passing `handle_segv=0` restores the signal and
+  also blinds the sanitizer to every real fault in the run, which is the worse
+  trade. The case is skipped under ASan and runs in the build without one.
+- `test_seccomp`'s "the child exited with status zero" is a supporting claim
+  about a child that has finished its syscalls and is on its way out. Under
+  ASan the exit path makes syscalls the filter has not been told about and
+  refuses, so the status is nonzero. Every syscall observation in that case
+  passes, and the check is made conditional rather than skipping the case,
+  because the observations are the real assertions.
+
+Neither skip hides a defect: the plain build reports `0 skipped` for
+`test_container` and the seccomp exit-status check passes there. What they
+establish is the rule this repository has been arguing for all along — a skip
+is a claim, and a claim gets written down and checked.

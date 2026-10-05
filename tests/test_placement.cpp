@@ -883,15 +883,36 @@ void test_every_relocation_type_is_written_in_its_own_form() {
     // instead of subtracting 32768 -- a sign error of 65536, which is one
     // whole carry, and lands two fields off rather than one.
     constexpr std::int16_t kAdjustment = -32768;
-    // The 16 bits immediately *after* HIGHADJ's field: the low half of the
-    // immediate pair, on the machines that emit this type.
+    // A second HIGHADJ, with an adjustment chosen against the *other* way to
+    // read one.
     //
-    // Given a value that carries nothing when 0x8000 is added, so that "read
+    // One constant cannot cover both mistakes, and -32768 covers only one of
+    // them. It was picked so that a zero-extended adjustment lands a whole
+    // field away: 0x8000 read as unsigned is +32768 rather than -32768, a sign
+    // error of 65536, which is exactly one carry. But masking the sign bit off
+    // instead -- `adj & 0x7FFF` -- turns -32768 into 0, and 0x7FFF's complement
+    // of the rounding term is the same 0x8000 the correct -32768 produces, so
+    // the two agree on the high half and the mutation passes. Measured, not
+    // argued: `static_cast<std::uint16_t>(adj) & 0x7FFF` escaped every
+    // assertion in this file when this was the only HIGHADJ.
+    //
+    // -1 is the value that separates them. Read correctly it subtracts one and
+    // the sum sits just below the rounding term; masked to 15 bits it becomes
+    // 0x7FFF, which is a difference of 32768 -- half the range, and here it
+    // straddles the boundary the first one straddles in the other direction.
+    // Together the two fields pin all three readings: the entry's bits as
+    // signed, as unsigned, and as unsigned with the sign bit cleared.
+    constexpr std::int16_t kAdjustment2 = -1;
+    // The 16 bits immediately *after* each HIGHADJ's field: the low half of
+    // the immediate pair, on the machines that emit this type.
+    //
+    // Given values that carry nothing when 0x8000 is added, so that "read
     // the adjustment from the image" and "read it from the second entry" reach
     // different high halves. See the note above on why this took a mutation to
     // find: with the bytes left at zero, and with an adjustment of -8, both
     // sources computed the same answer and the case could not tell them apart.
     constexpr std::uint16_t kLowHalf = 0x0100;
+    constexpr std::uint16_t kLowHalf2 = 0x0050;
 
     std::vector<std::uint8_t> text(0x200, 0);
     // Four fields the linker emitted, each starting at a value the arithmetic
@@ -903,6 +924,8 @@ void test_every_relocation_type_is_written_in_its_own_form() {
     put32(text, kOff + 0x08, 0x00001234u);    // HIGHLOW
     put16(text, kOff + 0x10, 0x5678u);        // HIGHADJ's field
     put16(text, kOff + 0x12, kLowHalf);       // the low half of the pair
+    put16(text, kOff + 0x1C, 0x9F3Du);        // the second HIGHADJ's field
+    put16(text, kOff + 0x1E, kLowHalf2);      // ... and its low half
     put16(text, kOff + 0x18, 0xFEDCu);        // LOW
     put16(text, kOff + 0x1A, 0xBEEFu);        // ... and the half after it
 
@@ -910,18 +933,21 @@ void test_every_relocation_type_is_written_in_its_own_form() {
     s.entry = 0x1000;
     s.sections = {{".text", 0x1000, 0x200, 0x200, kScnRead | kScnExecute}};
     s.section_content = {{0, text}};
-    // The block, in the order the assertions below read it. HIGHADJ is two
+    // The block, in the order the assertions below read it. Each HIGHADJ is two
     // entries: the first names the field, and the second carries the
-    // adjustment as a raw signed 16-bit value -- 0xFFF8 for -8, which is the
-    // encoding a linker emits and which cannot be expressed as a type and a
-    // twelve-bit offset. That second entry's type nibble is not to be
-    // interpreted and its offset is not to be relocated: it is a number.
+    // adjustment as a raw signed 16-bit value -- 0x8000 for -32768 and 0xFFFF
+    // for -1, which are the encodings a linker emits and which cannot be
+    // expressed as a type and a twelve-bit offset. That second entry's type
+    // nibble is not to be interpreted and its offset is not to be relocated:
+    // it is a number.
     const std::vector<std::uint8_t> block = reloc_block(
         0x1000, {{kOff + 0x00, kRelHigh},
                  {kOff + 0x08, kRelHighLow},
                  {kOff + 0x10, kRelHighAdj},
                  {0, 0, true, static_cast<std::uint16_t>(kAdjustment)},
-                 {kOff + 0x18, kRelLow}});
+                 {kOff + 0x18, kRelLow},
+                 {kOff + 0x1C, kRelHighAdj},
+                 {0, 0, true, static_cast<std::uint16_t>(kAdjustment2)}});
     {
         std::vector<std::uint8_t> content = text;
         content.resize(0x200, 0);
@@ -1084,6 +1110,23 @@ void test_every_relocation_type_is_written_in_its_own_form() {
               "types: HIGHADJ wrote 16 bits and left the next field alone");
     }
 
+    // The second HIGHADJ, whose adjustment is -1 rather than -32768. The two
+    // assertions are the same shape and they are not redundant: the first
+    // field's adjustment is the one value that a 15-bit mask cannot distinguish
+    // from the correct reading, and this field's is the one that a 15-bit mask
+    // moves by half the range. Between them the two fields fail every wrong
+    // reading of the adjustment that was measured -- as unsigned, as unsigned
+    // with the sign bit cleared, and as unsigned with the sign bit kept but the
+    // value taken from the image instead of the entry.
+    {
+        const std::uint16_t want =
+            expected_field(0x9F3Du, kAdjustment2, delta32, 0x8000);
+        check(load_u16(text_va + kOff + 0x1C) == want,
+              "types: a second HIGHADJ read its adjustment as signed");
+        check(load_u16(text_va + kOff + 0x1E) == kLowHalf2,
+              "types: the second HIGHADJ wrote 16 bits and stopped");
+    }
+
     // LOW: a 16-bit field moves by the whole delta and wraps inside its own
     // 16 bits.
     {
@@ -1096,19 +1139,15 @@ void test_every_relocation_type_is_written_in_its_own_form() {
               "types: LOW wrote 16 bits and left the next field alone");
     }
 
-    // And the module counted five relocations from six entries, because
-    // HIGHADJ's second entry is its adjustment rather than a relocation of
-    // its own. A loader that counted six applied the delta to the
-    // adjustment's own offset, which on a real image is a field of code.
-    // And the module counted four relocations from five entries, because
-    // HIGHADJ's second entry is its adjustment rather than a relocation of
-    // its own. A loader that counted five applied the delta to the
-    // adjustment's own type nibble -- which on this fixture is 0xF, an unknown
-    // relocation type, so the mistake would be refused rather than applied;
-    // with the type nibble clear it would be applied to whatever the low
-    // thirteen bits named, which on a real image is a field of code.
-    check(r.module.relocations_applied == 4,
-          "types: five entries were four relocations");
+    // And the module counted five relocations from seven entries, because each
+    // HIGHADJ's second entry is its adjustment rather than a relocation of its
+    // own. A loader that counted seven applied the delta to the adjustments'
+    // own type nibbles -- which on this fixture are 0xF, an unknown relocation
+    // type, so the mistake would be refused rather than applied; with the type
+    // nibbles clear it would be applied to whatever the low thirteen bits
+    // named, which on a real image is a field of code.
+    check(r.module.relocations_applied == 5,
+          "types: seven entries were five relocations");
 }
 
 // An import's address is written into its IAT slot, and the value is the one

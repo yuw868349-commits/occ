@@ -181,6 +181,39 @@ void test_exit_code_round_trip() {
 // A target killed by a signal is not an exit status. Conflating the two is
 // the classic way a crash is reported as a clean exit.
 void test_signal_reporting() {
+    // Not under a sanitizer, and the reason is that the property under test is
+    // a *signal*.
+    //
+    // This case works by running a child that provokes SIGSEGV and then
+    // inspecting how the container reported it. AddressSanitizer installs its
+    // own SIGSEGV handler in every process it is linked into, including that
+    // child, and its handler does not return: it prints a report and then
+    // terminates the process. So the child dies of the sanitizer's abort
+    // rather than of the signal the test raised, and the container correctly
+    // reports whatever actually happened -- which is not a signal, and is
+    // therefore not what this case is about.
+    //
+    // The alternative would be to pass ASAN_OPTIONS=handle_segv=0 or
+    // allow_user_segv_handler=1, and both were measured: the first lets the
+    // child's own null write fault without a report and does restore the
+    // signal, but it also disables the sanitizer's ability to see a real fault
+    // anywhere else in the run, which is a worse trade than skipping one case
+    // in one build. The second is what handle_segv=1 does anyway and does not
+    // restore the signal either.
+    //
+    // So the case is skipped, and the build without a sanitizer still runs
+    // it -- which is the build that has to prove this, because a signal is a
+    // property of the program and not of the instrumentation.
+#if defined(__SANITIZE_ADDRESS__) || defined(OCC_TEST_ASAN)
+    skip("signal reporting: a sanitizer replaces the child's SIGSEGV path");
+    return;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    skip("signal reporting: a sanitizer replaces the child's SIGSEGV path");
+    return;
+#endif
+#endif
+
     const auto linked = read_link("/proc/self/exe");
     if (!linked || linked->empty() || linked->front() != '/') {
         skip("signal reporting: the executable path is not readable");
