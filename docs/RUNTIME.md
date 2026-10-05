@@ -506,6 +506,156 @@ spot, and the rule for it is already written down at
 the same arithmetic as the code under test is a *value*, and `volatile` is how
 it says so.
 
+### Placing with retry
+
+A caller that names a base gets it or gets a refusal. `load_image` says so
+and does not pretend otherwise, because a caller which asked for an address
+and silently received a different one has a bug, and a retry loop wrapped
+around it would *hide* that bug rather than fix it — the failure mode, not
+the remedy. So the loop is a separate entry point, `load_image_retrying`,
+and the fact that it exists at all is the statement that a conflict and a
+refusal are different things.
+
+The loop retries exactly one error: `AddressConflict`. That is not the only
+error a placement can produce, and the distinction is the whole content of
+the policy. `AddressConflict` is a fact about the **caller's space** — this
+address is spoken for, and another address may not be. Everything else is a
+fact about the file or about this machine: a relocation naming a gap in the
+image is bad at every base, and an image this runtime does not execute is
+not going to be executed by moving it. Retrying those would replace a
+refusal that names the problem with one that names the wrong problem, and a
+reader of the second message would go looking for space that was never the
+problem. Wine's `LdrAllocateDllSlot` retries on a broader set of statuses
+and reports the last one, which is a defensible choice for a loader nobody
+is debugging; here the report is the product, so the two cases get two
+sentences.
+
+Four things end a search, and each says which one it was, because "it tried
+64 addresses" and "there was nowhere to put it" call for opposite responses
+from whoever reads the report:
+
+| End | `attempts` | The detail says |
+|---|---|---|
+| success | n | nothing; a success reports no reason |
+| a refusal | 1 | what the attempt said, verbatim |
+| the search ran out | n | "no base was free", followed by what the last attempt said |
+| the cap | 64 | "still in the way after 64 bases" |
+| a repeated base | n | which base, in hexadecimal, and that it had been tried |
+
+The last two exist because the policy is a function pointer and a function
+pointer can be wrong. A chooser that answered with the same address forever
+would spin until the cap and then report 64 attempts, which is a sentence
+about the policy wearing the loop's clothes.
+
+The default policy is a **deterministic downward scan**, and calling it that
+is a statement about what it is not. Windows picks a random base from a
+16 MB window with ASLR, which needs an entropy source (`SystemFunction036`)
+and a replay that hands back the same addresses — and this runtime has
+neither yet, so a random policy here would produce runs that differ from each
+other in a way nothing could reproduce. A scan that is verifiable beats a
+randomiser that is not, until the layer that can carry one exists. It steps
+*down* rather than up because a linker assumes the module is at its linked
+base, and scanning up walks into the base-competition region where every
+other image's preferred base already is.
+
+Three measured facts about the address space shaped this, and all three are
+the kind that are cheap to get wrong and expensive to debug:
+
+  * **`mmap` guarantees page alignment and nothing more.** Measured here, an
+    `mmap` of 192 KiB came back at `0x7febd0d407000`, which is `0x7000` past
+    a 64 KiB boundary. An early fixture asked for twice the size, took the
+    midpoint as one address and the whole as the other, and gave up whenever
+    the answer was not granularity-aligned — which is **15 times out of 16**.
+    Every case below it printed a `SKIP`, and the file still reported zero
+    failures. The fix is to ask for one granularity more than the two
+    addresses need and take the aligned pair out of the middle, so the
+    alignment is arithmetic rather than a hope. This is the project's
+    recurring failure mode in its sharpest form: **a test that measures
+    nothing prints like a test that passed**, because `SKIP` prints a line
+    and `PASS` prints nothing.
+
+  * **The window is 128 TiB, so "occupy the window" is not a test
+    operation.** From the `mmap` region at `0x7febd0d407000` down to a small
+    image's floor at `0x30000` is about 33 million steps of 64 KiB. A case
+    that wanted to watch a scan run out of room by reaching the floor would
+    need 33 million attempts, or a cap low enough to stop it first — and a
+    cap that low would stop every real search. So the floor cases name a low
+    address and *check it against the kernel with real mappings* before
+    relying on it. Naming an address is otherwise the thing these tests never
+    do; it is allowed here for one reason, which is that the floor is a fact
+    about the image and a base chosen without reference to it puts the bound
+    under test out of reach.
+
+  * **`space.find()` answers about interiors.** A region one granularity tall
+    contains every address inside it, so a check for "was anything placed
+    here" that looks *inside* an occupier answers yes whether or not the
+    retry did anything. An early version of the retry case checked one
+    address into the occupier and failed against a correct loader. The
+    addresses checked are one granularity *above* it.
+
+The floor itself is the window's floor and does not move with the image's
+size, which is worth stating because an earlier version had it as
+`kUserMin + round_up(size - 1, granularity)` — the image's own size added to
+the window's bottom. That put the floor at least one granularity too high
+for every image smaller than a granularity, and it did so silently, because a
+scan that stops one step early still returns a plausible-looking answer. The
+cost was a policy that reported *no base was free* about a space with a free
+base in it. What the size decides is not where the floor is but whether
+there is a base at all, and since PE32+ carries `SizeOfImage` in 32 bits
+while the window is 47, that check is unreachable — asserted as such rather
+than left as a branch nothing can enter.
+
+The `BaseChooser` seam is where a caller installs ASLR later, and it is
+documented as a seam rather than as a policy: a null chooser is the
+deterministic scan, not "no policy". The contract it has to honour is that
+it may answer with **any** legal base, and the test that enforces this uses
+a chooser whose answers are one *page* apart rather than one granularity
+apart — a case that only ever used granularity-spaced answers could not tell
+a loop that honoured the chooser's spacing from one that overrode it with a
+scan of its own.
+
+`tests/test_placement.cpp` grew from 76 assertions to 193 with this section,
+and the mutation harness in `tools/mutate-retry.sh` reports 12 of 12 caught.
+That number is worth less than what it cost to get there. Three of the
+mutants survived the first run, and each named a way the tests were lying:
+
+  * a mutant that rounded the image's size differently survived because the
+    test computed its expected floor with **the policy's own formula**. Every
+    assertion was stated relative to a number derived from the expression
+    under test. The test now finds the floor by asking what fits and what
+    does not, in arithmetic that never mentions the policy.
+  * a mutant that rewrote the underflow guard to inspect the result rather
+    than the base survived because the test only asserted *why the guard is
+    needed* — that the unguarded subtraction wraps — which is a statement
+    about subtraction. It never called the policy with a base **below** the
+    window, which is the only place the two forms disagree. That call is
+    there now.
+  * a mutant that made the syscall counter skip failed `mmap`s survived
+    because the test's bound was `>= one per attempt`, which is exactly what
+    a counter that skips failures produces when every attempt is refused on
+    its first candidate. The check that distinguishes them is now in the
+    retry case, where one attempt succeeds and the exact count of six is
+    accounted for: the refused `mmap`, two mappings, two protections.
+
+The counter itself was wrong before that, and finding out why is the more
+useful half. `syscalls_made()` moved only on a **successful** mapping, on
+the reasoning that a failure left nothing to be accountable for — which is
+true of the space and false of a counter, whose job is to say what the
+process asked the kernel for. A loop that spent three attempts discovering
+three conflicts reported that it had made no syscalls at all, and a reader
+checking that number against the attempt count had no way to tell a loop
+that never tried from one whose every try the kernel refused. The same
+comment in `record_batch`'s rollback path already said "the counter still
+moves, because a syscall was made", so the two paths disagreed about what
+the counter counted.
+
+The harness itself has one rule learned the hard way: it copies the pristine
+sources at **run time** into a temporary directory and verifies the restore
+with `cmp` at the end. An earlier version restored from a path written down
+when it was written, and the floor and upper-guard repairs — both made later
+in the same session — were silently discarded by the final restore. The
+suite still reported green, because it was measuring the older behaviour.
+
 ### The mapping layer — `include/occ/runtime/mapper.h`
 
 `AddressSpace` is a ledger. It was deliberately built as one: every rule

@@ -140,6 +140,20 @@ Result<std::uint64_t> Mapper::map(std::uint64_t base, std::uint64_t size,
 
     int error = 0;
     const std::uint64_t at = map_one(base, size, protection, error);
+    // The counter moves whether or not the mapping happened, because a
+    // syscall was made either way and that is what the counter is a count
+    // of. It used to move only on success, on the reasoning that a failed
+    // mapping left nothing behind to be accountable for -- which is true of
+    // the *space* and false of the counter, and the second is what the
+    // counter is for. A retry loop that spends three attempts discovering
+    // three conflicts reported that it had made no syscalls at all, and a
+    // reader checking that number against the attempt count had no way to
+    // tell a loop that never tried from a loop whose every try was refused
+    // by the kernel. (The retry case in tests/test_placement.cpp is what
+    // found it, by asserting that the attempts did something and being told
+    // they did nothing -- while in fact they had done exactly what they
+    // said they had.)
+    ++syscalls_made_;
     if (at == 0) {
         // The errno is translated rather than passed through, because the two
         // cases a caller of a memory API has to tell apart are "that address
@@ -158,7 +172,6 @@ Result<std::uint64_t> Mapper::map(std::uint64_t base, std::uint64_t size,
         }
         return fail<std::uint64_t>(Status::NoMemory, error, base);
     }
-    ++syscalls_made_;
 
     // The ledger's turn, and the reason this type exists. The region is now
     // mapped and the ledger does not know it, and a failure here has to undo
@@ -227,6 +240,12 @@ Result<std::uint64_t> Mapper::map_batch(
     for (const Candidate& c : batch) {
         int error = 0;
         const std::uint64_t at = map_one(c.base, c.size, c.protection, error);
+        // Counted before the branch, for the reason map() gives: the counter
+        // counts syscalls and this one was made whether or not it succeeded.
+        // A batch refused on its first candidate had still asked the kernel
+        // a question, and a reader comparing the counter against the number
+        // of candidates is entitled to that answer being in the number.
+        ++syscalls_made_;
         if (at == 0) {
             // Unwind, in reverse. Reverse because the mappings are the
             // caller's own regions in the caller's own order and the last one
@@ -243,7 +262,6 @@ Result<std::uint64_t> Mapper::map_batch(
                                             : Status::NoMemory;
             return fail<std::uint64_t>(status, error, c.base);
         }
-        ++syscalls_made_;
         done.push_back(Placed{at, AddressSpace::page_round_up(c.size)});
     }
 

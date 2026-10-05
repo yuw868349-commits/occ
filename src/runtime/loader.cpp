@@ -494,10 +494,10 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
     const bool has_relocations = image.reloc_size() != 0;
     if (needs_relocation && !has_relocations) {
         out.error = LoadError::NoRelocations;
-        out.detail = "the image asked for base 0x" +
-                     std::to_string(image.image_base()) +
+        out.detail = "the image asked for base " +
+                     hex_of(image.image_base()) +
                      " and has no relocation table, so it cannot be placed "
-                     "at 0x" + std::to_string(base);
+                     "at " + hex_of(base);
         return out;
     }
 
@@ -970,7 +970,7 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
     // that abandons the load between the two sees a map describing an image
     // with no bytes in it, which is a state a reader can recognise; the
     // alternative order leaves bytes at addresses the map does not mention.
-    emit_note(context.events, "image mapped at 0x" + std::to_string(base) +
+    emit_note(context.events, "image mapped at " + hex_of(base) +
                                   " with " +
                                   std::to_string(placements.size()) +
                                   " sections");
@@ -1557,6 +1557,220 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
     out.error = LoadError::None;
     out.module = std::move(module);
     return out;
+}
+
+// ------------------------------------------------------- placing with retry
+
+std::uint64_t choose_base_below(void*, const parser::PeImage& image,
+                                std::uint64_t failed_base,
+                                std::uint32_t) noexcept {
+    // The state and the attempt count are named in the header's declaration
+    // and left unnamed here: a deterministic scan carries none and has no
+    // use for either, since the only thing that stops it is the window.
+
+    // The lowest base this policy will offer.
+    //
+    // A base is legal when it is at or above the window's floor, and the
+    // lowest such base is the window's floor itself -- `kUserMin` already is
+    // a whole number of granularies. The image's size does not enter into it.
+    // The floor answers "how far down may I step", and the answer does not
+    // depend on how big the thing being stepped down towards is; what the
+    // size decides is whether the image fits *at all*, which is the second
+    // half of this check.
+    //
+    // This used to be `kUserMin + round_up(size - 1, kGranularity)`, on the
+    // reasoning that the floor is "the first base where base + size still
+    // fits". That formula is not that base. It adds the image's own size to
+    // the window floor, which puts the floor at least one granularity too
+    // high for every image smaller than a granularity -- and it did so
+    // silently, because a scan that stops one step early still returns a
+    // plausible-looking answer. The cost was a policy that reported "no base
+    // was free" about a space with a free base in it: the loop stepped down
+    // to kUserMin, was refused by this comparison, and told the caller there
+    // was nowhere left to try. A case in tests/test_placement.cpp found it,
+    // and found it by computing the floor itself rather than by asking this
+    // function -- the two disagreed by exactly one granularity.
+    const std::uint64_t size = image.image_size();
+    if (size == 0) {
+        return 0;
+    }
+    const std::uint64_t lowest =
+        AddressSpace::round_up(AddressSpace::kUserMin, AddressSpace::kGranularity);
+
+    // Whether the image fits at that base. It does not for an image larger
+    // than the window, and then there is nothing for this policy to offer at
+    // any base -- every answer would be a base the loader refuses. Saying so
+    // once here is cheaper than handing out sixty-four of them.
+    if (size > AddressSpace::kUserMax - lowest) {
+        return 0;
+    }
+
+    // The scan steps down by the granularity.
+    //
+    // Two bounds, and the second one is not decoration. `kUserMin` is the
+    // bottom of the window a base has to be in, and the subtraction below
+    // wraps: a base one granularity under it produces a number at the very
+    // top of the address space, and the loop would then walk *up* through
+    // the whole window handing out bases it had already tried. The guard is
+    // on the *base* rather than on the result, because the two forms agree
+    // everywhere except at the bottom -- `kUserMin` is exactly one
+    // granularity, so the unguarded step at the floor lands on zero, which
+    // is harmless, and only the step below it wraps.
+    //
+    // The upper guard is the other half of the same problem from the other
+    // direction, and it was missing until a case in tests/test_placement.cpp
+    // named a base below the window. A caller is entitled to name any
+    // address at all, including one this runtime would never have produced,
+    // and `failed_base` here is whatever the previous answer was. Once a
+    // single unguarded step produces a value above `kUserMax`, every
+    // subsequent step stays above it -- the subtraction makes the number
+    // smaller, but "smaller" is still astronomically large -- and the policy
+    // answered with 0xffffffffffc00000, a base the loader would then try to
+    // map and fail on, having spent an attempt to learn what one comparison
+    // could have said. A scan that cannot continue says so, whatever the
+    // reason.
+    if (failed_base < AddressSpace::kUserMin + AddressSpace::kGranularity ||
+        failed_base > AddressSpace::kUserMax) {
+        return 0;
+    }
+    const std::uint64_t next = failed_base - AddressSpace::kGranularity;
+
+    if (next < lowest) {
+        return 0;
+    }
+    return next;
+}
+
+LoadResult load_image_retrying(const parser::PeImage& image, ByteSpan bytes,
+                               std::uint64_t preferred_base,
+                               AddressSpace& space,
+                               const LoadContext& context,
+                               BaseRetry* report) noexcept {
+    LoadResult out;
+    BaseRetry local{};
+
+    // The attempt cap. It exists so that a caller with a pathological space
+    // gets an answer rather than a long wait, and 64 is far above any real
+    // process: an image whose preferred base is taken is placed within two
+    // or three tries, because the space above a base is not usually full.
+    // The number is a constant rather than a field because a caller that
+    // wants a different one wants a different policy, and `BaseChooser` is
+    // how a caller supplies one.
+    constexpr std::uint32_t kMaxAttempts = 64;
+
+    std::uint64_t base = preferred_base;
+    std::uint32_t attempts = 0;
+    const BaseChooser choose =
+        context.base_chooser != nullptr ? context.base_chooser
+                                        : ::occ::runtime::choose_base_below;
+
+    while (true) {
+        ++attempts;
+        const std::uint64_t tried_base =
+            base != 0 ? base : image.image_base();
+        local.tried.push_back(tried_base);
+
+        out = load_image(image, bytes, base, space, context);
+
+        if (out.ok) {
+            local.error = LoadError::None;
+            local.detail.clear();
+            local.attempts = attempts;
+            if (report != nullptr) {
+                *report = std::move(local);
+            }
+            return out;
+        }
+
+        // Only a placement conflict is retried. Everything else is a fact
+        // about the file or about this runtime, and no other base would
+        // change it -- a bad relocation is bad at every address, and an
+        // image this machine does not execute is not going to be executed by
+        // moving it. Retrying them would replace a refusal that names the
+        // problem with a refusal that names the wrong one.
+        if (out.error != LoadError::AddressConflict) {
+            local.error = out.error;
+            local.detail = std::move(out.detail);
+            local.attempts = attempts;
+            if (report != nullptr) {
+                *report = std::move(local);
+            }
+            return out;
+        }
+
+        if (attempts >= kMaxAttempts) {
+            // The cap is reached rather than the space being full, and the
+            // message says which, because "it tried 64 addresses" and "there
+            // was nowhere to put it" call for different responses from the
+            // person reading them.
+            local.error = out.error;
+            local.detail = "the image was still in the way after " +
+                           std::to_string(attempts) + " bases";
+            local.attempts = attempts;
+            if (report != nullptr) {
+                *report = std::move(local);
+            }
+            return out;
+        }
+
+        // The next base. A chooser that returns zero has run out, and that
+        // is a fact about the space rather than about the image, so the
+        // error stays AddressConflict and the detail says the search ended.
+        //
+        // It says so *in addition to* what the last attempt said, rather
+        // than instead of it. Substituting the attempt's own detail here --
+        // which is what an earlier version did, falling back to a sentence
+        // about the search only when the attempt had nothing to say -- is
+        // how a caller ends up reading "that address is taken" as the whole
+        // story when the truth is "I have nowhere left to try", and those
+        // two call for opposite responses: one looks for the module that
+        // took the address, the other for a bigger space. An earlier
+        // version of this file had the same defect in the form of four
+        // details that spelled an address in decimal after a "0x".
+        const std::uint64_t next =
+            choose(context.base_chooser_state, image, tried_base, attempts);
+        if (next == 0) {
+            local.error = out.error;
+            local.detail = "no base was free for the image";
+            if (!out.detail.empty()) {
+                local.detail += ": ";
+                local.detail += out.detail;
+            }
+            local.attempts = attempts;
+            if (report != nullptr) {
+                *report = std::move(local);
+            }
+            return out;
+        }
+
+        // A chooser that returns a base that was already tried would spin.
+        // The cap above would stop it, but the caller would get a report
+        // saying it tried 64 addresses when it tried two, and the report is
+        // the thing a person reads to decide what went wrong. Checked
+        // against the bases actually used, not against a count, because a
+        // chooser is free to skip and a count would refuse a legitimate
+        // scan.
+        bool already = false;
+        for (const std::uint64_t b : local.tried) {
+            if (b == next) {
+                already = true;
+                break;
+            }
+        }
+        if (already) {
+            local.error = out.error;
+            local.detail = "the base chooser returned " +
+                           hex_of(next) +
+                           ", which had already been tried";
+            local.attempts = attempts;
+            if (report != nullptr) {
+                *report = std::move(local);
+            }
+            return out;
+        }
+
+        base = next;
+    }
 }
 
 } // namespace occ::runtime

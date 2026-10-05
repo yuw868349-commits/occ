@@ -191,6 +191,16 @@ struct LoadResult {
 // and the loader is a lower layer than it. The loader asks "where is
 // kernel32!CreateFileW" and the answer comes from whoever knows, which is
 // the same shape of dependency the dynamic linker has.
+// How the next base is chosen, given the one that just failed.
+//
+// Returning zero means "no more", which ends the loop. The state pointer is
+// the chooser's own, so a caller can keep a count or a seed across
+// attempts; `attempts` is one-based and is the attempt that just failed.
+using BaseChooser = std::uint64_t (*)(void* state,
+                                      const parser::PeImage& image,
+                                      std::uint64_t failed_base,
+                                      std::uint32_t attempts) noexcept;
+
 struct LoadContext {
     // The handle to resolve an import against, or nullptr when the image's
     // imports should be recorded but not resolved. A nullptr here is what
@@ -234,6 +244,18 @@ struct LoadContext {
     // refusing a mapping, and a write to an address the plan covered turning
     // out to be possible or impossible.
     Mapper* placement = nullptr;
+
+    // How the next base is chosen when the one before it was taken, or
+    // nullptr for the deterministic downward scan. Appended rather than
+    // inserted, because callers construct this with a positional aggregate
+    // and reordering the fields would silently change what four of them
+    // mean.
+    //
+    // Only consulted by load_image_retrying. A plain load_image call names
+    // its base and does not consult it, because a caller that named a base
+    // and got a different one has a bug the retry loop would hide.
+    BaseChooser base_chooser = nullptr;
+    void* base_chooser_state = nullptr;
 };
 
 // Loads a parsed image at `preferred_base`, or at the image's own base when
@@ -260,5 +282,103 @@ struct LoadContext {
                                     ByteSpan bytes, std::uint64_t preferred_base,
                                     AddressSpace& space,
                                     const LoadContext& context) noexcept;
+
+// ------------------------------------------------------- placing with retry
+//
+// A load that fails because its base was taken is not a failure of the load.
+// It is a fact about the caller's address space at one moment, and the same
+// call one base over usually succeeds. This is the part that turns that fact
+// into an action.
+//
+// What it does, and what it deliberately does not do.
+//
+// It retries. The loader's contract already says a failed load leaves the
+// space unchanged, and `rollback_placement` already makes that true in the
+// placing mode -- a mapping that succeeded is unmapped before a failure is
+// reported, so the space is not left holding memory the map does not
+// describe. That contract is what makes a retry possible at all, and it is
+// why the retry loop below is this short: it does not undo anything, because
+// the call it is looping over has already undone everything.
+//
+// What it does not do is guess. Two limits bound the search and both are
+// reported in the returned error rather than left implicit:
+//
+//   * the granularity is 64 KiB, the allocation granularity of
+//     NtAllocateVirtualMemory, because a base that is not a multiple of it
+//     cannot be the base of a mapping a program will keep;
+//   * the window is the user's, and a base is only tried where the whole
+//     image fits inside it.
+//
+// A caller that wants Windows' random choice -- the `MiChooseImageBase`
+// behaviour, a random 64 KiB-aligned point within 16 MiB of the preferred
+// base -- supplies a different function; `BaseChooser` is a pointer, and
+// this one is the deterministic policy, not the only one. Randomness is not
+// provided here on purpose: it needs a source of entropy this runtime does
+// not own, and a replay needs the sequence to come back, so a random policy
+// belongs to the layer that has both. See LoadContext::base_chooser.
+struct BaseRetry {
+    // The error the first attempt produced, when the retry gave up. The
+    // last one is kept rather than the first because the last is the one
+    // that describes the space as it finally was, and a caller reading
+    // "it ran out of room" wants that rather than "the first guess was
+    // taken".
+    LoadError error = LoadError::AddressConflict;
+    std::string detail;
+
+    // How many bases were tried, including the first. One means the first
+    // attempt was the last one, which is the case where the image does not
+    // fit anywhere and retrying was never going to help.
+    std::uint32_t attempts = 0;
+
+    // The bases that were tried, in order. Recorded because a caller that
+    // cannot load an image needs to see where it looked: "it tried 200
+    // addresses" is a fact, and the addresses are how a person decides
+    // whether the space is too full or the image is too large.
+    std::vector<std::uint64_t> tried;
+};
+
+// The deterministic policy: scan down from the failed base by the
+// allocation granularity, to the bottom of the user's window.
+//
+// Down rather than up, and this is the one choice worth defending. The
+// image's preferred base is where its linker assumed it would live, and
+// everything in it that is not relocated is correct only there. Scanning
+// down moves away from other images that were linked to coexist above; the
+// addresses just above a taken base are the ones most likely to be the base
+// of something else, because that is where a linker put it. Scanning up
+// walks into the bases other images are competing for.
+//
+// It is also the direction that makes the scan terminate on the image's own
+// terms. Below the preferred base there is only the rest of the image's
+// reservation space and then the bottom of the window, so the loop ends
+// when the image no longer fits rather than when it runs out of addresses.
+//
+// The signature is the chooser's, and the state and attempt count are
+// ignored: a deterministic scan has no state to carry and no use for the
+// count, since the only thing that stops it is running out of window. They
+// are in the signature because the loop calls through a pointer and a
+// function that cannot answer those questions cannot be told apart from one
+// that is choosing badly.
+[[nodiscard]] std::uint64_t choose_base_below(
+    void* state, const parser::PeImage& image, std::uint64_t failed_base,
+    std::uint32_t attempts) noexcept;
+
+// Loads the image, retrying at another base when the address space says the
+// one it tried is taken.
+//
+// The loop stops at the first attempt that is not a placement conflict, and
+// the error from that attempt is what comes back. An image that is refused
+// for a reason no other base would fix -- a bad relocation, a machine this
+// runtime does not execute, an import that does not resolve -- fails once
+// and is reported, because trying it elsewhere would turn a refusal that
+// names the problem into a refusal that names the wrong problem.
+//
+// The space is unchanged unless the result is ok, and that holds across the
+// whole loop rather than per attempt: a caller that gets a failure from this
+// function has a space it can keep using, which is the property that makes
+// the retry safe to expose at all.
+[[nodiscard]] LoadResult load_image_retrying(
+    const parser::PeImage& image, ByteSpan bytes, std::uint64_t preferred_base,
+    AddressSpace& space, const LoadContext& context, BaseRetry* report = nullptr) noexcept;
 
 } // namespace occ::runtime
