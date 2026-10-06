@@ -234,6 +234,28 @@ in a build without a sanitizer, and it makes 91 assertions of which 37 install
 a real filter in a forked child.
 `fuzz/README.md` has the measurements.
 
+**`occ_test_seccomp` hangs under ASan, and that is structural rather than a
+defect in either.** The test installs real seccomp filters in forked children,
+and one of them denies `sigaltstack`. When something then goes wrong in such a
+child, ASan reports it by calling `sigaltstack` -- which that same filter
+denies -- so the reporting path fails, and ASan's own failure path calls
+`mmap`, which is denied too. What follows is `AsanDie` calling
+`internal_sched_yield` in a loop that never exits, and a process that spins at
+0% CPU and never returns. Observed under `build-asan`: every assertion reports
+PASS, and the binary then hangs indefinitely.
+
+The lesson is worth stating because the symptom is misleading. A hang with no
+output looks like a deadlock in the code under test, and the filters being
+installed at the time are this file's own, so the first suspicion falls on the
+seccomp emitter. The emitter is fine; the sanitizer is reporting a failure
+using the resource the test just took away. Any test that deliberately makes a
+syscall fail has this shape, and the fix is a property of the harness rather
+than of the code: either exclude the test from the sanitizer build, or have the
+child allow the small set of calls the sanitizer needs to die (`sigaltstack`,
+`mmap`, `exit_group`). It is listed here rather than left to be rediscovered
+because a timeout in `ctest` reads as a failure of whatever ran last, and the
+thing that ran last is not the thing that broke.
+
 ## Sanitizer build of the test suite
 
 ```

@@ -22,35 +22,63 @@ function(occ_add_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# Whether this build compiles the tests against a sanitizer runtime.
+#
+# Detected from the flags rather than from OCC_ENABLE_FUZZ, because the two are
+# independent and only the first one describes what the binaries are. A
+# developer who configures a sanitizer build by hand --
+#
+#   cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+#         -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -g"
+#
+#   -- which is the command docs/BUILD.md gives, and the one that produced
+#   every ASan run in this project's history -- leaves OCC_ENABLE_FUZZ off. A
+#   check written as "not a fuzz build" then concludes the tests are ordinary,
+#   builds them, registers them, and runs them. What it misses is that
+#   occ_core is instrumented, so the library the tests link needs the ASan
+#   runtime and the tests inherit the runtime's behaviour whether or not they
+#   were compiled with it. That is what the exclusion below is for, and
+#   inferring it from the wrong variable defeats it.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize" OR
+   CMAKE_CXX_FLAGS_DEBUG MATCHES "-fsanitize" OR
+   CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-fsanitize" OR
+   CMAKE_CXX_FLAGS_RELEASE MATCHES "-fsanitize")
+    set(OCC_SANITIZED_BUILD ON)
+else()
+    set(OCC_SANITIZED_BUILD OFF)
+endif()
+
 # Two of these install a mechanism in the child process that a sanitizer
 # runtime cannot survive, and neither failure is in this project's code.
 #
-# occ_test_seccomp installs a real seccomp filter. AddressSanitizer allocates
-# its shadow memory with mmap on the way out of fork(), and the filter denies
-# it -- the runtime's own CHECK fails and the child exits 1 before reaching
-# its _exit(0). The test then reports a child that died, which is true and
-# says nothing whatever about the filter. A policy that denies mmap would
-# break a real program the same way, which is worth knowing and worth
-# testing on its own terms rather than through a harness that cannot survive
-# it.
+# occ_test_seccomp installs a real seccomp filter, and one of its cases denies
+# sigaltstack. The filter also denies mmap. AddressSanitizer needs both of
+# those on the way out of fork(): it places its shadow memory with mmap, and
+# when that is refused it reports the failure through a path that calls
+# sigaltstack, which is refused too. The runtime then walks into its own
+# failure handler, calls mmap once more, and settles into AsanDie's
+# internal_sched_yield loop -- a spin at 0% CPU that never returns. The
+# visible result is a ctest timeout with every assertion already reported as
+# PASS, which is the most misleading shape a failure can take: it names
+# whatever ran last rather than whatever broke.
 #
 # occ_test_container ptrace-attaches to a child. ASan depends on its shadow
 # memory being where it put it; an attached tracer observes the mmap that
 # places it and the runtime faults at an address it never wrote. The target
 # dies of a SEGV that the tracer faithfully reports.
 #
-# Neither can be configured away -- the mmap denial is the behaviour under
-# test, and the attach is likewise -- so in a sanitized build these two are
-# not built. Skipping them is honest; linking the runtime anyway and watching
-# them fail would report this project's code as broken when it is the
-# combination that is. The ordinary build still runs all six, which is where
-# their assertions are about seccomp and namespaces rather than about a
+# Neither can be configured away -- the sigaltstack and mmap denials are the
+# behaviour under test, and the attach is likewise -- so in a sanitized build
+# these two are not built. Skipping them is honest; linking the runtime anyway
+# and watching them hang would report this project's code as broken when it is
+# the combination that is. The ordinary build still runs all six, which is
+# where their assertions are about seccomp and namespaces rather than about a
 # sanitizer's shadow memory.
 #
 # The other five are instrumented in a sanitized build and should stay that
 # way: they parse untrusted bytes and build events, which is the work a
 # sanitizer is for.
-if(NOT OCC_ENABLE_FUZZ)
+if(NOT OCC_SANITIZED_BUILD AND NOT OCC_ENABLE_FUZZ)
     occ_add_test(occ_test_seccomp test_seccomp.cpp)
     occ_add_test(occ_test_container test_container.cpp)
 endif()

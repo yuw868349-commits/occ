@@ -135,8 +135,24 @@ constexpr std::size_t kTlsArrayOffset = 0x1480;
 // program that computes a stack address from a TEB address, which is what
 // `RtlCaptureStackBackTrace` and every `_alloca` do, assumes they are in the
 // same neighbourhood and consistent.
-constexpr std::uint64_t kTebBaseHint = 0x7FFD0000;
-constexpr std::uint64_t kStackTopHint = 0x7FFE0000;
+//
+// **The hints are hints, and that is load-bearing rather than defensive.**
+// They were absolute addresses near the top of the user window -- `0x7FFD0000`
+// and `0x7FFE0000`, chosen because that is roughly where Windows puts them --
+// and a hard-wired absolute address is a claim about the address space that
+// the host can falsify. AddressSanitizer reserves a contiguous span from 4 GiB
+// to 128 TiB for its shadow memory, so the whole neighbourhood is occupied:
+// `map_above` walks up from the hint one 64 KiB granule at a time for at most
+// `kMaxAttempts` of them, all `kMaxAttempts` come back `EEXIST`, and the load
+// fails with STATUS_NO_MEMORY for a reason that has nothing to do with the
+// image. The plain build never saw it, which is exactly why a test that only
+// ever runs unsanitized is not a test.
+//
+// So each of the three regions is placed *above the one before it* -- image,
+// then TEB and PEB, then the stack -- with the floor rounded up to the next
+// granule, and none of them is named by an absolute address. A host with the
+// room gives the usual answer; a host without it gives an answer in the same
+// relative order, which is the part that is observable.
 
 // A stable, non-zero process id and thread id. Windows never issues zero
 // for either, and a program that uses one as a map key -- or as a sentinel
@@ -358,10 +374,19 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     // for the same reason: they are read together (every TEB has a PEB
     // pointer and the PEB has the process's heap list) and a single region
     // means a single protection change keeps them in step.
+    //
+    // Ordered *above the image*, not at a fixed address. See the note on
+    // `kTebBaseHint`: the relationship is what a program can observe, and the
+    // absolute numbers are not. Rounding the floor up to the next granule
+    // gives the alignment the mapper requires and leaves a gap between the
+    // image and the TEB, which is what Windows has.
+    const std::uint64_t teb_floor =
+        AddressSpace::round_up(loaded.module.base + loaded.module.size,
+                               AddressSpace::kGranularity);
     const std::uint64_t control_bytes =
         AddressSpace::round_up(kTebBytes + kPebBytes, AddressSpace::kPageSize);
     const Result<std::uint64_t> control = self->mapper_.map_above(
-        kTebBaseHint, control_bytes, PageProtection::ReadWrite,
+        teb_floor, control_bytes, PageProtection::ReadWrite,
         RegionKind::Control);
     if (!control.ok()) {
         return bail(error_for(control.status),
@@ -375,12 +400,18 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
 
     // --- 4. the stack ---------------------------------------------------
 
+    // Above the control region, for the same reason and with the same
+    // rounding. A program that walks from a TEB address to a stack address --
+    // which is what stack-backtrace and probe code does -- needs the two to
+    // be ordered, and it cannot know the numbers.
     const std::uint64_t stack_bytes =
         AddressSpace::round_up(std::max(options.stack_reserve,
                                         AddressSpace::kPageSize),
                                AddressSpace::kPageSize);
+    const std::uint64_t stack_floor =
+        AddressSpace::round_up(teb + control_bytes, AddressSpace::kGranularity);
     const Result<std::uint64_t> stack = self->mapper_.map_above(
-        kStackTopHint, stack_bytes, PageProtection::ReadWrite,
+        stack_floor, stack_bytes, PageProtection::ReadWrite,
         RegionKind::Stack);
     if (!stack.ok()) {
         return bail(error_for(stack.status),

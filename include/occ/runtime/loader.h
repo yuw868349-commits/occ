@@ -258,6 +258,17 @@ struct TlsModule {
     std::uint64_t callbacks_va = 0;
     std::uint32_t template_size = 0;
     std::uint32_t zero_fill = 0;
+    // The width of a pointer in this module's image: 8 for PE32+, 4 for PE32.
+    //
+    // Recorded because it is not a property of the *process*, and the places
+    // it matters are all downstream of the directory read. A PE32 module's
+    // TLS callback array is an array of 32-bit pointers, and walking it eight
+    // bytes at a time reads the second half of one entry as the first half of
+    // the next -- so a module with two callbacks is reported as having one,
+    // plus a callback whose address is the concatenation of two others. The
+    // template and the index field need no width (they are bytes and a DWORD),
+    // but the callback array is a pointer array and does.
+    std::uint32_t pointer_size = 8;
 };
 
 // The per-process table of modules with TLS.

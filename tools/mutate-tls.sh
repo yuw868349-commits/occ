@@ -27,30 +27,125 @@
 # proves it, because it is the change this whole layer exists to prevent.
 set -u
 
-BUILD=/workspace/Occ/build
+# Every path is derived from this script's own location rather than written
+# down. A hardcoded checkout path is a claim about where the tree lives, and
+# the failure it produces is silent and total: cmake is pointed at a
+# directory that does not exist, every build fails, and every mutant is
+# reported as "rejected by the compiler". That is a report about nothing --
+# it says 29 changes were all caught by the type system when in fact not one
+# of them was ever compiled. Deriving the root means the harness runs where
+# the tree actually is, and the preflight below turns a misconfigured tree
+# into a refusal instead of a false pass.
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+BUILD=${OCC_TLS_BUILD:-$ROOT/build}
 TEST="$BUILD/tests/occ_test_runtime_loader"
-LOADER=/workspace/Occ/src/runtime/loader.cpp
-HEADER=/workspace/Occ/include/occ/runtime/loader.h
-TESTFILE=/workspace/Occ/tests/test_runtime_loader.cpp
+LOADER="$ROOT/src/runtime/loader.cpp"
+HEADER="$ROOT/include/occ/runtime/loader.h"
+TESTFILE="$ROOT/tests/test_runtime_loader.cpp"
+
+# Preflight. The harness rewrites LOADER and TESTFILE in place, so a tree that
+# cannot build is a tree this script would corrupt 29 times over while
+# reporting success. Everything the run depends on is checked once, up front,
+# and the whole run is refused if any of it is missing -- a refusal costs one
+# message, a false report costs the suite's credibility.
+preflight() {
+    local missing=0 f
+    for f in "$BUILD" "$TEST" "$LOADER" "$HEADER" "$TESTFILE"; do
+        if [ ! -e "$f" ]; then
+            echo "refusing to run: $f does not exist" >&2
+            missing=1
+        fi
+    done
+    if [ "$missing" -ne 0 ]; then
+        echo "configure and build first, e.g." >&2
+        echo "  cmake -S '$ROOT' -B '$BUILD' && cmake --build '$BUILD' -j\"\$(nproc)\"" >&2
+        exit 2
+    fi
+    if [ ! -x "$TEST" ]; then
+        echo "refusing to run: $TEST is not executable" >&2
+        exit 2
+    fi
+    # Build the pristine tree before running it. This step is not redundant
+    # with the file-existence checks above, and skipping it is a trap that
+    # has already been sprung once: the binary sitting in the build directory
+    # is whatever the *previous* run last compiled, which -- because every
+    # mutant here edits the sources in place -- is that run's last mutant.
+    # An interrupted run therefore leaves a deliberately broken loader
+    # compiled into $TEST, and a preflight that only executes the binary
+    # reports the suite as failing when the sources are fine. The report then
+    # says the suite is broken, which sends the reader looking for a defect
+    # in code that has none.
+    #
+    # So the baseline is built, not assumed. If it does not build, that is a
+    # real fact about the tree and the run is refused.
+    if ! cmake --build "$BUILD" -j"$(nproc)" >"$WORK/preflight-build.log" 2>&1; then
+        echo "refusing to run: the pristine tree does not build" >&2
+        sed 's/^/  /' "$WORK/preflight-build.log" | head -20 >&2
+        exit 2
+    fi
+    # A baseline run, before anything is rewritten. Every result below is
+    # relative to this: a suite that already fails makes "caught" and
+    # "survived" both meaningless, because a mutant that fails for an
+    # unrelated reason is indistinguishable from one the suite is testing.
+    if ! "$TEST" >"$WORK/preflight.log" 2>&1; then
+        echo "refusing to run: the suite fails before any mutant is applied" >&2
+        grep FAIL "$WORK/preflight.log" | head -20 >&2
+        exit 2
+    fi
+}
 
 # Taken now, at run time, for the reason mutate-retry.sh's comment gives at
 # length: a fixed path is a claim about what the file contained, and this
 # script restores from it after every mutant.
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
 cp "$LOADER" "$WORK/loader.pristine"
 cp "$HEADER" "$WORK/loader.h.pristine"
 cp "$TESTFILE" "$WORK/test.pristine"
-
-caught=0
-survived=0
-failed_names=()
 
 restore() {
     cp "$WORK/loader.pristine" "$LOADER"
     cp "$WORK/loader.h.pristine" "$HEADER"
     cp "$WORK/test.pristine" "$TESTFILE"
 }
+
+# The exit trap restores the tree before it removes the copies, and it runs on
+# every path out of this script including SIGINT and SIGTERM. This is not
+# tidiness. The trap used to delete $WORK and nothing else, so a run that was
+# interrupted -- by a timeout, a Ctrl-C, or a kill -- left LOADER and TESTFILE
+# holding whichever mutant was in flight. The next build then compiled a
+# deliberately broken loader and the next run reported failures that had
+# nothing to do with any mutant, which is a worse outcome than no run at all:
+# it looks like a defect in the code under test. Restoring on the way out is
+# what makes an interrupted run leave the tree exactly as it found it.
+#
+# restore is defined before the trap so the handler cannot fire before the
+# function exists, and the handler tolerates a missing $WORK because it runs
+# after rm in the worst case.
+#
+# **The third `cp` in `restore` had its arguments the wrong way round.** It read
+# `cp "$TESTFILE" "$WORK/test.pristine"` -- the file under test *into* the
+# backup -- where every other line copies the backup back over the file. So the
+# first mutant applied replaced the pristine copy of the test file with the
+# mutated one, and from then on `restore` put the mutant back: the tree was
+# left holding whatever mutant the run was on, and the run's own report said
+# every later mutant was "caught" because the tree was already broken. The
+# mutation harness is the one tool in this repository that writes to the source
+# tree, so a restore that restores nothing is worse than no restore -- it looks
+# like the safety net working.
+cleanup() {
+    if [ -n "${WORK:-}" ] && [ -f "$WORK/loader.pristine" ]; then
+        restore
+    fi
+    rm -rf "${WORK:-/nonexistent}"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+caught=0
+survived=0
+broken=0
+failed_names=()
 
 # mutate NAME FILE OLD NEW [OLD NEW ...]
 #
@@ -96,8 +191,27 @@ PYEOF
         # change the type system rejects, which is a stronger guarantee than
         # any test. Counted separately so the report does not claim a
         # coverage it does not have.
-        echo "  [$name] rejected by the compiler"
-        caught=$((caught + 1))
+        #
+        # But "did not compile" and "the build never ran" are different facts
+        # and the report must not merge them. A cmake that fails because the
+        # build directory is missing, because a header moved, or because the
+        # disk is full has rejected nothing at all -- and counting it as caught
+        # is how a whole run of 29 mutants once reported "rejected by the
+        # compiler" while not one of them had been compiled. So the log is
+        # read rather than assumed: a build failure that contains no compiler
+        # diagnostic is a broken harness or a broken tree, and it is counted in
+        # neither column.
+        if grep -qE '(^|[ :])(error|Error):' "$WORK/build.log"; then
+            echo "  [$name] rejected by the compiler"
+            caught=$((caught + 1))
+        else
+            echo "  [$name] BUILD FAILED BEFORE COMPILING -- not counted as caught"
+            echo "      (the build failed without a compiler diagnostic; this is a"
+            echo "       harness or tree problem, not a fact about this mutant)"
+            sed 's/^/      /' "$WORK/build.log" | head -5
+            broken=$((broken + 1))
+            failed_names+=("$name")
+        fi
         restore
         return
     fi
@@ -115,6 +229,8 @@ PYEOF
     fi
     restore
 }
+
+preflight
 
 echo "TLS mutants"
 
@@ -146,15 +262,26 @@ mutate "template-from-file-not-space" "$LOADER" \
 # The callback array read from the file rather than the space. Same shape as
 # the template and caught by the same kind of assertion: the entries are
 # addresses, and the test compares them against the mapped ones.
+#
+# The anchor is the *whole* walk, including the stride and the width branch,
+# because the stride is now the module's pointer width and not a constant.
+# Anchoring on a fragment that named 8 would keep working while the code it
+# claimed to describe had stopped existing.
 mutate "callbacks-from-file-not-space" "$LOADER" \
-"        for (std::uint64_t at = m.callbacks_va; at + 8 <= region_end;
-             at += 8) {
+"        for (std::uint64_t at = m.callbacks_va; at + stride <= region_end;
+             at += stride) {
             std::uint64_t fn = 0;
-            if (!load_u64_from(space, at, fn)) {
+            if (stride == 4) {
+                std::uint32_t narrow = 0;
+                if (!load_u32_from(space, at, narrow)) {
+                    break;
+                }
+                fn = narrow;
+            } else if (!load_u64_from(space, at, fn)) {
                 break;
             }" \
-"        for (std::uint64_t at = m.callbacks_va; at + 8 <= region_end;
-             at += 8) {
+"        for (std::uint64_t at = m.callbacks_va; at + stride <= region_end;
+             at += stride) {
             std::uint64_t fn = 0;
             break;"
 
@@ -166,7 +293,7 @@ mutate "callbacks-from-file-not-space" "$LOADER" \
 # the RVA, giving an address one image above where it is -- refused by the
 # bounds check, and therefore caught by the load succeeding.
 mutate "rva-fallback-to-va-only" "$LOADER" \
-"    return is_rva ? base + field : static_cast<std::uint64_t>(field);" \
+"    return is_rva ? base + field : field;" \
 "    (void)is_rva; return static_cast<std::uint64_t>(field);"
 
 # The other direction: every field read as an RVA. A VA-encoded directory --
@@ -174,7 +301,7 @@ mutate "rva-fallback-to-va-only" "$LOADER" \
 # would resolve to `base + 0x40011000`, far outside, refused. Caught by the
 # low-base fixture, which is the only one that writes the VA form.
 mutate "va-fallback-to-rva-only" "$LOADER" \
-"    return is_rva ? base + field : static_cast<std::uint64_t>(field);" \
+"    return is_rva ? base + field : field;" \
 "    (void)is_rva; return base + field;"
 
 # The disambiguation inverted. An image based low whose VA-encoded field
@@ -385,64 +512,53 @@ mutate "zero-length-template-refused" "$LOADER" \
 "    if (dir.end_raw < dir.start_raw) {" \
 "    if (dir.end_raw <= dir.start_raw) {"
 
-# ----------------------------------------------------- the PE32 asymmetry
+# --------------------------------------------------------- the field width
+#
+# The mutants that used to live here assumed a PE32 directory was five DWORDs
+# with no callback field, and that PE32+ therefore needed a "does this form
+# have one" flag. Both halves of that belief were wrong, and the loader was
+# built on them: it read a real 64-bit module's directory at a four-byte
+# stride, saw `0x1` -- the high half of the start pointer -- as the end, and
+# refused every module mingw produces. The belief is gone; `tls_layout` now
+# states the width once and the two readers take it from there. See
+# `RawTlsDirectory`.
+#
+# So the mutants below are the ones the mistake can still make: change the
+# width, or ignore it.
 
-# A PE32 directory read as if it had a callback field. The sixth DWORD of a
-# five-DWORD structure is the next thing in the file, so the callback list
-# becomes full of whatever the linker put after it.
+# A PE32+ directory read at a four-byte stride, which is the mistake in its
+# original form. The template start comes out as the low half of the real
+# pointer and the end as the high half, so the directory is refused for
+# ending before it starts. Caught by test_loads_a_real_compiler_pe, which
+# loads a file a real linker produced -- no synthetic fixture has the field
+# values that make this visible, which is exactly why the real one exists.
 #
-# The mutation is on the *argument* that decides the form, and getting there
-# took three attempts that are worth recording, because each one failed for a
-# different reason and none of the failures was the test suite's.
-#
-#   * Changing `if (pe32_plus)` to `if (true)` inside
-#     read_tls_directory_from_space: an equivalent mutant. The read fills a
-#     local, and the local is discarded a few lines later by
-#     `m.callbacks_va = dir.have_callbacks_field ? dir.callbacks_va : 0;`,
-#     which is still governed by `out.have_callbacks_field = pe32_plus`. It
-#     read a DWORD, stored it, and had it overwritten by the very decision it
-#     was trying to remove. No test could ever have caught it, and a harness
-#     reporting it as a survivor would be reporting a falsehood.
-#
-#   * Changing that same line to `m.callbacks_va = dir.callbacks_va;`: a real
-#     behaviour change that the suite did *not* catch, and this is the more
-#     interesting failure. The guard is doubled -- the read is conditional
-#     *and* the use is conditional -- so removing the use-side guard alone
-#     changes nothing, because the field is still zero. It takes removing
-#     both to see a difference, which is what the second mutation below
-#     does.
-#
-# The lesson is the one this suite keeps re-learning: a redundant guard makes
-# a mutant survive, and the way to find out which guard is load-bearing is to
-# remove the one that looks obvious and watch the suite stay green.
-mutate "pe32-reads-a-callback-field" "$LOADER" \
-"    return read_tls_directory_from_space(space, base + rva,
-                                         image.is_pe32_plus(), out);" \
-"    return read_tls_directory_from_space(space, base + rva, true, out);"
+# The replacement is PE32's layout exactly, 24 bytes included. A short one
+# would be a different mistake (a truncated structure) rather than this one,
+# and a mutant that measures two things reports as neither.
+mutate "pe32-plus-read-at-four-bytes" "$LOADER" \
+"        return TlsDirectoryLayout{0, 8, 16, 24, 32, 36, 8, 40};" \
+"        return TlsDirectoryLayout{0, 4, 8, 12, 16, 20, 4, 24};"
 
-# The other end of the same guard, and this one has to remove *both* ends to
-# be a mutant at all. Each half on its own is an equivalent change: the read
-# is conditional on `pe32_plus` and the use is conditional on
-# `have_callbacks_field`, so deleting either guard alone leaves the field
-# zero either way and the suite green. Both were tried separately and both
-# were confirmed to change nothing.
-#
-# That redundancy is worth keeping rather than tidying away. Two guards that
-# each independently enforce the same rule is a real property of the code:
-# the reader cannot be reached in a form that would let it believe a PE32
-# image has a callback field, and neither can the consumer of what it read.
-# A single guard would be one edit away from the mistake; this is two, and
-# the two are in different functions.
-#
-# So the mutation below removes the pair, which is the smallest change that
-# actually alters behaviour, and the test does catch it.
-mutate "pe32-believes-the-sixth-dword" "$LOADER" \
-"    if (pe32_plus) {
-        if (!load_u32_from(space, dir_va + 20, callbacks_va)) {" \
-"    if (true) {
-        if (!load_u32_from(space, dir_va + 20, callbacks_va)) {" \
-"    m.callbacks_va = dir.have_callbacks_field ? dir.callbacks_va : 0;" \
-"    m.callbacks_va = dir.callbacks_va;"
+# A PE32 directory read at an eight-byte stride: the same mistake the other
+# way. `IMAGE_TLS_DIRECTORY32` is 24 bytes of 32-bit pointers, so reading it
+# at 8 takes the second half of `EndAddressOfRawData` as `AddressOfIndex`.
+# Caught by test_tls_pe32_fields_are_read_at_their_own_width, which asserts
+# the decoded index address against the one the fixture wrote.
+mutate "pe32-read-at-eight-bytes" "$LOADER" \
+"    return TlsDirectoryLayout{0, 4, 8, 12, 16, 20, 4, 24};" \
+"    return TlsDirectoryLayout{0, 8, 16, 24, 32, 36, 8, 40};"
+
+# The callback array walked at the process's width rather than the module's.
+# A PE32 module with two 32-bit callbacks is then reported as having one,
+# whose address is the concatenation of it and the next four bytes, and the
+# second initialiser never runs. Caught by
+# test_tls_pe32_reads_its_callback_field, which builds a two-entry array of
+# the 32-bit form and counts what comes back.
+mutate "callback-array-walked-at-eight-bytes" "$LOADER" \
+"        const std::uint64_t stride =
+            m.pointer_size == 4 ? 4u : 8u;" \
+"        const std::uint64_t stride = 8u;"
 
 # The block mapped before the template is checked, which is the order this
 # code had and had to stop having. The kernel chooses where a block goes, and
@@ -454,11 +570,19 @@ mutate "pe32-believes-the-sixth-dword" "$LOADER" \
 # This is the only mutant in this file that was a defect rather than a
 # plausible mistake, and it is here because the fix is an ordering, and an
 # ordering is exactly the thing a test suite stops noticing once it is right.
+# The anchor is the check itself, in the shape the code has now: a null lookup
+# or a short region, short-circuited so that `find` is not dereferenced when it
+# answered nothing. An earlier version of this file guarded the same condition
+# with a nested `if (m.template_size != 0)` and a `home` local, and the anchor
+# named those. A refactor that keeps the behaviour and changes the spelling
+# invalidates the mutant, and an anchor that no longer matches is the harness
+# reporting a fact about its own text rather than about the code -- which is
+# why "ANCHOR NOT UNIQUE" is counted separately from "survived" and is a
+# thing to fix rather than a coverage hole to accept.
 mutate "block-mapped-before-the-template-is-checked" "$LOADER" \
-"    if (m.template_size != 0) {
-        const Region* home = space.find(m.template_va);" \
-"    if (false) {
-        const Region* home = space.find(m.template_va);"
+"    if (space.find(m.template_va) == nullptr ||
+        space.find(m.template_va)->end() < m.template_va + m.template_size) {" \
+"    if (false) {"
 
 # ------------------------------------------- the refusal that costs a rollback
 
@@ -543,6 +667,16 @@ echo
 echo "----------------------------------------------------------------"
 echo "caught:   $caught"
 echo "survived: $survived"
+# A broken build is reported as its own column and fails the run, because the
+# alternative is a report that reads as coverage while measuring nothing.
+echo "unbuilt:  $broken"
+if [ "$broken" -gt 0 ]; then
+    echo "mutants that were never compiled (these are NOT results):"
+    for n in "${failed_names[@]}"; do
+        echo "  - $n"
+    done
+    exit 1
+fi
 if [ "$survived" -gt 0 ]; then
     echo "surviving mutants:"
     for n in "${failed_names[@]}"; do

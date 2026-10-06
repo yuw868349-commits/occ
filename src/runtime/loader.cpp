@@ -2089,24 +2089,61 @@ const char* tls_reason_name(TlsReason r) noexcept {
 
 // The directory, as a structure.
 //
-// Nine DWORDs on PE32+, five on PE32. The difference is not cosmetic and the
-// shorter form is not a subset: the 32-bit structure has no
-// `AddressOfCallBacks` field at all, which is to say a PE32 module cannot
-// have TLS callbacks, and reading a field that is not there is how a 32-bit
-// image would end up with a callback list full of whatever followed it in
-// the structure.
+// Six fields in both forms. The two forms differ in exactly one thing and
+// it is the thing that decides every offset below: the width of the four
+// pointer fields. PE32+ stores them as 64-bit -- the table is 40 bytes; PE32
+// stores them as 32-bit -- the table is 24. The two DWORD-only fields
+// (`SizeOfZeroFill`, `Characteristics`) sit after the pointers in both
+// forms, which is why the two forms cannot share one offset table and why
+// reading one at the other's layout is not a truncated read but a
+// misattributed one: at PE32+'s stride, the high half of
+// `EndAddressOfRawData` arrives wearing `AddressOfIndex`'s name.
+//
+// The pointer fields are widened to 64 bits on read. Zero extension is the
+// correct widening for PE32, and not a convention: the 32-bit form cannot
+// hold an address above 4 GiB, so the bits it does not have are the bits
+// that are zero.
 //
 // Returned as a plain value rather than filled in place, so that a
 // half-read directory is never the caller's to look at.
 struct RawTlsDirectory {
-    std::uint32_t start_raw = 0;
-    std::uint32_t end_raw = 0;
-    std::uint32_t index_va = 0;
-    std::uint32_t callbacks_va = 0;
+    std::uint64_t start_raw = 0;
+    std::uint64_t end_raw = 0;
+    std::uint64_t index_va = 0;
+    std::uint64_t callbacks_va = 0;
     std::uint32_t zero_fill = 0;
     std::uint32_t characteristics = 0;
-    bool have_callbacks_field = false;
 };
+
+// Where each field sits, per form, and how wide the pointer fields are.
+//
+// Written as a table rather than as arithmetic (`offset += 4` twice, then
+// `+= 8`) because the arithmetic is exactly what the bug was: a reader that
+// stepped 4 bytes at a time read PE32+'s 64-bit `StartAddressOfRawData` as
+// two 32-bit fields and handed the loader half of one field wearing the
+// next field's name. The table says, in one place, what the two forms are;
+// the readers below read through it and nowhere else.
+//
+// The sizes are the whole structures: 24 bytes on PE32, 40 on PE32+, which
+// is what `IMAGE_TLS_DIRECTORY32` and `IMAGE_TLS_DIRECTORY64` are in
+// winnt.h -- same six fields, same order, different pointer width.
+struct TlsDirectoryLayout {
+    std::size_t start;
+    std::size_t end;
+    std::size_t index;
+    std::size_t callbacks;
+    std::size_t zero_fill;
+    std::size_t characteristics;
+    std::size_t pointer_size;
+    std::size_t size;
+};
+
+[[nodiscard]] constexpr TlsDirectoryLayout tls_layout(bool pe32_plus) noexcept {
+    if (pe32_plus) {
+        return TlsDirectoryLayout{0, 8, 16, 24, 32, 36, 8, 40};
+    }
+    return TlsDirectoryLayout{0, 4, 8, 12, 16, 20, 4, 24};
+}
 
 // Where the directory is, and whether the file carries one.
 //
@@ -2159,30 +2196,40 @@ struct RawTlsDirectory {
                          "the TLS directory at RVA " + hex_of(rva) +
                              " is outside the file"};
     }
+    const TlsDirectoryLayout lay = tls_layout(image.is_pe32_plus());
     const std::size_t at = static_cast<std::size_t>(off);
-    if (!read_u32(bytes, at, out.start_raw) ||
-        !read_u32(bytes, at + 4, out.end_raw) ||
-        !read_u32(bytes, at + 8, out.index_va) ||
-        !read_u32(bytes, at + 12, out.zero_fill)) {
+
+    // The four pointer fields, each at the width its form gives it. A PE32
+    // field is widened by zero extension, which is correct and not a
+    // convention: the 32-bit form cannot hold an address above 4 GiB, so
+    // the bits it does not have are the bits that are zero.
+    const auto read_pointer = [&](std::size_t field_off,
+                                  std::uint64_t& dst) noexcept -> bool {
+        if (lay.pointer_size == 8) {
+            return read_u64(bytes, at + field_off, dst);
+        }
+        std::uint32_t narrow = 0;
+        if (!read_u32(bytes, at + field_off, narrow)) {
+            return false;
+        }
+        dst = narrow;
+        return true;
+    };
+
+    // Characteristics is read, and deliberately not branched on, for the
+    // same reason Windows reads it: the alignment bits are the loader's
+    // business rather than the program's, and a module that declares
+    // unusual ones still has a template that has to be copied. A report can
+    // name the whole structure either way.
+    if (!read_pointer(lay.start, out.start_raw) ||
+        !read_pointer(lay.end, out.end_raw) ||
+        !read_pointer(lay.index, out.index_va) ||
+        !read_pointer(lay.callbacks, out.callbacks_va) ||
+        !read_u32(bytes, at + lay.zero_fill, out.zero_fill) ||
+        !read_u32(bytes, at + lay.characteristics, out.characteristics)) {
         return TlsResult{false, TlsError::MalformedDirectory,
                          "the TLS directory at RVA " + hex_of(rva) +
                              " is truncated in the file"};
-    }
-    // Characteristics is the fifth field on both forms and is read for the
-    // same reason Windows reads it: not to act on it, but so that a report
-    // can name the whole structure. It is deliberately not branched on -- the
-    // alignment bits are the loader's business rather than the program's,
-    // and a module that declares unusual ones still has a template that has
-    // to be copied.
-    (void)read_u32(bytes, at + 16, out.characteristics);
-
-    if (image.is_pe32_plus()) {
-        out.have_callbacks_field = true;
-        if (!read_u32(bytes, at + 20, out.callbacks_va)) {
-            return TlsResult{false, TlsError::MalformedDirectory,
-                             "the TLS directory at RVA " + hex_of(rva) +
-                                 " is truncated inside the callback field"};
-        }
     }
     return TlsResult{true, TlsError::None, {}};
 }
@@ -2195,54 +2242,43 @@ struct RawTlsDirectory {
 // pointing at an address no region covers is refused by name instead of
 // producing a template address that faults on first use.
 //
-// The width is 32 bits on both PE32 and PE32+ for a reason the format makes
-// unavoidable: these are the fields as the file stores them, and a PE32+
-// module's TLS template above 4 GiB is a module whose directory cannot
-// describe it. That is a property of the format, not a limit chosen here --
-// and it is worth knowing rather than assuming, because the *loaded* image
-// routinely lives above 4 GiB while the directory that describes it is a
-// 32-bit structure. Wine has the same constraint and the same consequence:
-// `RtlImageDirectoryEntryToData` hands out pointers into the mapping while
-// the directory's own fields stay 32-bit.
+// The pointer fields are read at the width the image's own form gives them,
+// through the same layout table the file read uses. On PE32+ that is a
+// 64-bit read per pointer, and the mapping is where the mistake this table
+// exists to prevent is fatal: the mapped directory of a real image is the
+// relocated truth, and misreading it is not recoverable downstream.
 [[nodiscard]] TlsResult read_tls_directory_from_space(
     const AddressSpace& space, std::uint64_t dir_va, bool pe32_plus,
     RawTlsDirectory& out) noexcept {
-    // Read by offset, spelled out, because "the four address fields" is the
-    // fact the whole structure exists to express and an expression that
-    // computed the offsets would hide which field is which.
-    std::uint32_t start_raw = 0;
-    std::uint32_t end_raw = 0;
-    std::uint32_t index_va = 0;
-    std::uint32_t zero_fill = 0;
-    std::uint32_t characteristics = 0;
-    std::uint32_t callbacks_va = 0;
+    const TlsDirectoryLayout lay = tls_layout(pe32_plus);
 
-    if (!load_u32_from(space, dir_va + 0, start_raw) ||
-        !load_u32_from(space, dir_va + 4, end_raw) ||
-        !load_u32_from(space, dir_va + 8, index_va) ||
-        !load_u32_from(space, dir_va + 12, zero_fill) ||
-        !load_u32_from(space, dir_va + 16, characteristics)) {
+    // The four pointer fields, each at the width its form gives it, widened
+    // to 64 bits the same way the file read widens them.
+    const auto load_pointer = [&](std::size_t field_off,
+                                  std::uint64_t& dst) noexcept -> bool {
+        if (lay.pointer_size == 8) {
+            return load_u64_from(space, dir_va + field_off, dst);
+        }
+        std::uint32_t narrow = 0;
+        if (!load_u32_from(space, dir_va + field_off, narrow)) {
+            return false;
+        }
+        dst = narrow;
+        return true;
+    };
+
+    if (!load_pointer(lay.start, out.start_raw) ||
+        !load_pointer(lay.end, out.end_raw) ||
+        !load_pointer(lay.index, out.index_va) ||
+        !load_pointer(lay.callbacks, out.callbacks_va) ||
+        !load_u32_from(space, dir_va + lay.zero_fill, out.zero_fill) ||
+        !load_u32_from(space, dir_va + lay.characteristics,
+                       out.characteristics)) {
         return TlsResult{false, TlsError::MalformedDirectory,
                          "the TLS directory at " + hex_of(dir_va) +
-                             " is not five readable DWORDs in memory this "
-                             "process mapped"};
+                             " is not readable at its own widths in memory "
+                             "this process mapped"};
     }
-    if (pe32_plus) {
-        if (!load_u32_from(space, dir_va + 20, callbacks_va)) {
-            return TlsResult{false, TlsError::MalformedDirectory,
-                             "the TLS directory at " + hex_of(dir_va) +
-                                 " is truncated inside the callback field in "
-                                 "memory this process mapped"};
-        }
-    }
-
-    out.start_raw = start_raw;
-    out.end_raw = end_raw;
-    out.index_va = index_va;
-    out.zero_fill = zero_fill;
-    out.characteristics = characteristics;
-    out.callbacks_va = callbacks_va;
-    out.have_callbacks_field = pe32_plus;
     return TlsResult{true, TlsError::None, {}};
 }
 
@@ -2279,39 +2315,44 @@ struct RawTlsDirectory {
 // Turns a directory field into the address it names.
 //
 // **The format has two answers for this and a loader has to accept both.**
-// The field is 32 bits. The image is not. So:
+// The pointer fields hold either a virtual address or an RVA, and nothing
+// in the directory says which. Two facts decide it, one from the format and
+// one measured against a real image:
 //
-//   * Read as a virtual address, the field can only describe an image based
-//     below 4 GiB. This is what the specification says the field means and
-//     what a linker that targets a low base emits, and it is what Wine
-//     assumes without checking -- `alloc_tls_slot` memcpy's from
-//     `(void *)dir->StartAddressOfRawData` and never asks whether the value
-//     is an RVA. A module based at 0x7fa2a6e30000, which is where a
-//     64-bit Windows process puts a DLL, therefore has a TLS directory that
-//     Wine cannot use at all.
+//   * A VA-form field is one the relocation pass has already finished with.
+//     This is what the mingw-w64 linker actually emits, measured on the
+//     real image this suite loads: its directory sits at RVA 0x4040, and
+//     the image's own relocation table carries entries across exactly the
+//     bytes the linker wrote addresses into -- 0x4040 through 0x405f, DIR64
+//     on PE32+, one entry per non-zero pointer field. A field that is zero
+//     gets no entry, because relocating zero would leave it holding the
+//     image delta. After the pass a VA-form field already names the mapped
+//     address; adding the base again would double it. (An earlier note here
+//     claimed the relocation pass does not touch the TLS directory. Marks
+//     on the real image say otherwise.)
 //
-//   * Read as an RVA, the field works at any base -- and this is what
-//     modern linkers emit for 64-bit images, because it is the only
-//     encoding that survives ASLR. A file that used the VA form would have
-//     to be patched whenever it moved, and the relocation pass does not
-//     touch the TLS directory: those four fields are not in the relocation
-//     table, which is precisely why a VA-form directory is *stale* the
-//     moment the image moves and has to be re-read from the mapping.
+//   * An RVA-form field works at any base without ever being patched -- the
+//     encoding a linker picks when it wants the file to survive being
+//     mapped anywhere. A field under `SizeOfImage` cannot be a mapped
+//     address of an image placed above the 4 GiB mark, so it is an offset,
+//     and the base is what turns it into one.
 //
-// So: a field that lands inside the image is a VA, and a field that does not
-// is an RVA. The disambiguation is unambiguous in practice -- an RVA is
+// So: a field that lands inside the image is a VA the relocation pass has
+// already finalized, and a field that does not is an RVA that still needs
+// the base. The disambiguation is unambiguous in practice -- an RVA is
 // under `SizeOfImage`, which is a small number, and a VA is not, unless the
 // image is based low -- and the ambiguous case is resolved toward the VA
 // reading, which is the one the specification names.
 //
 // The consequence worth stating: reading the file's copy of a VA-form
-// directory is *always* wrong, because the file's copy holds the linked
-// address and the field is not relocated. Reading the mapped copy is right
-// in both forms. That is the whole argument for reading out of memory.
+// directory gives the linked address, which is the right answer only for an
+// image that was never mapped and therefore never moved. Reading the mapped
+// copy is right in both forms. That is the whole argument for reading out
+// of memory.
 [[nodiscard]] std::uint64_t resolve_tls_address(std::uint64_t field,
                                                 std::uint64_t base,
                                                 bool is_rva) noexcept {
-    return is_rva ? base + field : static_cast<std::uint64_t>(field);
+    return is_rva ? base + field : field;
 }
 
 // Writes a module's slot number into its image, after the protections are on.
@@ -2397,16 +2438,21 @@ TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
     // "both fields are zero" so that a directory declaring a zero-length
     // template at a non-zero address is treated the same way Wine treats it:
     // as no TLS.
-    const std::uint64_t template_size =
-        dir.end_raw >= dir.start_raw
-            ? static_cast<std::uint64_t>(dir.end_raw) - dir.start_raw
-            : 0;
+    // The template's size is the subtraction, and the subtraction is checked
+    // before it is made: `end < start` is refused by name here rather than
+    // being folded into a conditional that quietly reports a size of zero.
+    // A directory whose template ends before it begins is a directory that
+    // lies about what a thread's block will contain, and folding the check
+    // into the arithmetic would let the empty-directory test below accept
+    // it as "no TLS" -- a refusal and an acceptance agreeing on a wrong
+    // answer instead of one of them being right.
     if (dir.end_raw < dir.start_raw) {
         out.error = TlsError::MalformedDirectory;
         out.detail = "the TLS template ends at " + hex_of(dir.end_raw) +
                      ", before it starts at " + hex_of(dir.start_raw);
         return out;
     }
+    const std::uint64_t template_size = dir.end_raw - dir.start_raw;
     if (template_size == 0 && dir.zero_fill == 0 && dir.callbacks_va == 0) {
         out.ok = true;
         return out;
@@ -2417,9 +2463,10 @@ TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
     // the placement plan is checked before anything is mapped: a size that
     // cannot be allocated is a fact about the file, and finding it out once
     // at load time is better than once per thread.
+    constexpr std::uint64_t kMaxBlock =
+        std::numeric_limits<std::uint32_t>::max();
     const std::uint64_t block = template_size + dir.zero_fill;
-    if (block > std::numeric_limits<std::uint32_t>::max()) {
-        // The two fields are 32-bit, so their sum is at most 2^33, and
+    if (block > kMaxBlock) {
         // `TlsBlock::size` is 32-bit. Refusing here rather than truncating
         // is the difference between a thread whose block is the size the file
         // asked for and a thread whose block is the size the file asked for
@@ -2435,12 +2482,19 @@ TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
     m.directory_va = base + rva;
     m.template_size = static_cast<std::uint32_t>(template_size);
     m.zero_fill = dir.zero_fill;
-    m.callbacks_va = dir.have_callbacks_field ? dir.callbacks_va : 0;
+    // Both forms have a callback field; what differs is its width, which the
+    // readers have already accounted for. A PE32 directory that names no
+    // callbacks holds zero here exactly as a PE32+ one does, so no form
+    // branch survives to this level -- the layout table is the only place
+    // that knows the forms differ.
+    m.callbacks_va = dir.callbacks_va;
+    m.pointer_size = image.is_pe32_plus() ? 8u : 4u;
 
     // The image's extent, as an RVA window. Every address in the directory
-    // is checked against this and nothing else, because the directory's
-    // address fields are 32-bit and the image is not -- see
-    // resolve_tls_address, which is where that matters.
+    // is classified against this -- a field inside the image is a VA the
+    // relocations have already finalized, a field outside it is an RVA that
+    // still needs the base -- see resolve_tls_address, which is where that
+    // matters.
     const std::uint64_t image_rva_end = image.image_size();
     const std::uint64_t image_end = base + image_rva_end;
 
@@ -2734,13 +2788,27 @@ TlsResult build_tls_block(const TlsTable& table, std::uint32_t slot,
         }
         // The terminator has to fit too: a region that ends exactly at the
         // last entry has no terminator in it, and the loop below would read
-        // one past. Bounded by `end() - 8` so the last read is a whole
-        // pointer that is inside the region.
+        // one past. Bounded by the region end minus one stride, so the last
+        // read is a whole pointer that is inside the region.
+        //
+        // The stride is the module's own pointer width, and not a constant:
+        // a PE32 module's callback array is an array of 32-bit pointers, and
+        // walking it eight bytes at a time reads the second half of one
+        // entry as the first half of the next -- a half-garbage address
+        // standing in for every second callback.
         const std::uint64_t region_end = r->end();
-        for (std::uint64_t at = m.callbacks_va; at + 8 <= region_end;
-             at += 8) {
+        const std::uint64_t stride =
+            m.pointer_size == 4 ? 4u : 8u;
+        for (std::uint64_t at = m.callbacks_va; at + stride <= region_end;
+             at += stride) {
             std::uint64_t fn = 0;
-            if (!load_u64_from(space, at, fn)) {
+            if (stride == 4) {
+                std::uint32_t narrow = 0;
+                if (!load_u32_from(space, at, narrow)) {
+                    break;
+                }
+                fn = narrow;
+            } else if (!load_u64_from(space, at, fn)) {
                 break;
             }
             if (fn == 0) {

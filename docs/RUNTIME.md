@@ -816,12 +816,28 @@ questions that a specification would leave open.
 **The directory is read from the mapping, not the file.** Wine calls
 `RtlImageDirectoryEntryToData(mod->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_TLS,
 &size)` — the mapped image, not the file. This is not a preference. The
-directory's four address fields are 32-bit virtual addresses, and they are
-**not in the base relocation table**: a file's copy and its mapped copy are
-byte-identical no matter where the image lands, because nothing rewrites
-them. A loader that read the file would produce the same answers as one that
-read the mapping on every image that has ever existed, which is why the case
-written for this had to be built out of a property no real image has.
+directory's four pointer fields hold *virtual addresses*, and a file's copy
+holds the **linked** ones: `hello.exe` says `0x14000a000`, and once the image
+is placed anywhere else that number names nothing. A loader that read the file
+would hand every thread a template full of pointers into whatever the process
+has at the *linked* base — which for a relocated image is nothing, and the
+fault lands somewhere with no relationship to TLS. (An earlier version of this
+document claimed the fields are 32-bit and absent from the relocation table,
+so that reading either copy gives the same bytes. Both halves of that are
+wrong — the fields are 64-bit on PE32+, and the relocation table *does* cover
+them, `hello.exe` fixing up RVA 0x4040-0x405f — but the conclusion was right
+by luck and is now right by the argument above.)
+
+The directory's width matters as much as its source, and getting it wrong is
+not a misparse of one field: `IMAGE_TLS_DIRECTORY64` is 40 bytes with 64-bit
+pointers and `IMAGE_TLS_DIRECTORY32` is 24 with 32-bit ones. A reader that
+steps four bytes per field reads the low half of `StartAddressOfRawData` as
+the start and its **high half as the end**, so the template "ends before it
+starts" and every real 64-bit module is refused. That is what happened: the
+whole TLS suite passed, because the test builder wrote the four-DWORD layout
+the loader expected — a structure Windows does not define. See
+`tests/test_runtime_loader.cpp`'s real-compiler case, which exists to hold the
+door shut on that class of bug.
 
 `.tls` here declares four bytes of raw data and a full page of virtual size,
 and the directory's RVA points 0x40 past the section's start — into the zero
@@ -832,23 +848,22 @@ load succeeds. Reading the file cannot produce that outcome, and neither can a
 mirror of the loader's own arithmetic, because the property being tested is
 which memory the bytes came from.
 
-**A VA-encoded directory is stale the moment the image moves.** The fields
-are 32-bit; the image is not. A DLL linked at `0x7fa2a6e30000` writes
-addresses that are 32-bit numbers, and after an ASLR move every one of them
-points at nothing. Wine reads the field, believes it, and hands each thread a
-template full of pointers into whatever the process has mapped at the *linked*
-base — which for an ASLR image is nothing, and the first thread to touch its
-TLS faults somewhere with no relationship to TLS.
+**The pointer fields are relocated, and a null one is not.** The relocation
+table covers the directory, so a VA-encoded directory stays correct when the
+image moves — that is what a real linker emits, and mingw's `hello.exe` has
+all four fields as VAs with entries for each. A linker only emits an entry
+where it wrote an address, and a fixture that emits one for a null field gets
+a field holding the *delta* after relocation: an address inside the image that
+nothing meant to name, which the loader then walks as a callback array. That
+is a fixture trap rather than a loader bug, and the loader's answer to it --
+refusing a callback array outside the image -- is the correct one.
 
-This runtime accepts two encodings and says which it used. A field that falls
-inside the current image is a virtual address. A field that does not is read
-as an RVA from the image base. Both are in real use and neither is
-Wine-compatible, which is the point: Wine's reading is only correct for images
-based below 4 GiB, and this loader is explicit about the case rather than
-silently producing addresses into nothing. A VA-encoded image placed away from
-its linked base is refused, and the refusal names the address the loader
-*resolved* rather than the field it read — a reader needs the decision, not the
-file.
+**A VA-encoded directory is only meaningful where the image landed.** The two
+readings are both in real use. A field that falls inside the current image is
+a virtual address; a field that does not is read as an RVA from the image base.
+This is explicit rather than silent, which is the point: a reader of a
+refusal needs to know which reading was chosen and what it resolved to, not to
+be handed an address into nothing.
 
 **A freed slot is zeroed, not erased.** `free_tls_slot` `memset`s the entry.
 Erasing it would renumber every slot after it, and the slot numbers are
@@ -959,16 +974,39 @@ which compares the regions and the high water — and the loosening was checked
 by re-tightening it and confirming the seeds still fail, so that a weaker
 assertion is not doing the work of a missing fix.
 
-**382 checks, 28 mutations, none surviving.** The 28 are the ones a
-plausible mistake would make, and the report is written to be worth what they
-were worth: four are rejected by the compiler and counted separately rather
-than as coverage, and two more are documented in the harness as
-reachable-but-untested rather than listed as caught or as dead. Two of the 28
-are paired edits, because this code has a *doubled* guard on the PE32
-callback field and each half alone is an equivalent change that no single-edit
-harness can distinguish from a no-op. One is in the test file rather than the
-runtime, and one is the rollback above — the two places where what is being
-checked is the suite's own honesty rather than the loader's behaviour.
+**463 checks, 29 mutations.** The 29 are the ones a plausible mistake would
+make, and the report is written to be worth what they were worth: three are
+rejected by the compiler and counted separately rather than as coverage. One
+is in the test file rather than the runtime, and one is the rollback above —
+the two places where what is being checked is the suite's own honesty rather
+than the loader's behaviour.
+
+Two of them exist because of the width bug above, and neither could have been
+written before it: reading a PE32+ directory at four bytes per field, and
+reading a PE32 directory at eight. The first is caught by
+`test_loads_a_real_compiler_pe` and the second by
+`test_tls_pe32_fields_are_read_at_their_own_width`, so the pair is what keeps
+the two widths honest from both sides.
+
+**The harness restores the tree, and getting that right took a bug of its
+own.** `restore()` copies three pristine files back over the working tree, and
+its third line had the two paths the wrong way round — `cp "$TESTFILE"
+"$WORK/test.pristine"`, which copies the file *under test* onto the backup
+instead of the backup onto the file. The first mutant applied therefore
+replaced the pristine copy with the mutated one, `restore` put the mutant
+back, and every later mutant was reported "caught" because the tree was
+already broken. The symptom is a report that looks perfect and measures
+nothing, which is the failure mode this harness exists to detect — committed
+here because the same three lines are in every mutation script in this
+directory, and in three of the four the trap does not restore at all.
+
+**A refactor that changes spelling invalidates a mutant, and that is a fact
+about the harness rather than about the code.** One mutant's anchor named an
+`if (m.template_size != 0)` wrapper and a `home` local that a later cleanup
+folded into a short-circuited condition. The anchor matched nothing, the
+mutant was never applied, and the run reported it as *survived* — which reads
+as a hole in the suite and is nothing of the kind. The harness counts that
+case separately, and the fix is to re-point the anchor, not to add a test.
 
 ### Import resolution — `include/occ/runtime/exports.h`
 

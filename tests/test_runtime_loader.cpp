@@ -23,6 +23,7 @@
 #include "occ/runtime/pe_process.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -186,13 +187,12 @@ struct Spec {
     // a shape no linker emits and which is exactly what several of the
     // malformed cases need.
     struct TlsFields {
-        std::uint32_t start = 0;
-        std::uint32_t end = 0;
-        std::uint32_t index = 0;
+        std::uint64_t start = 0;
+        std::uint64_t end = 0;
+        std::uint64_t index = 0;
         std::uint32_t zero_fill = 0;
-        std::uint32_t callbacks = 0;
+        std::uint64_t callbacks = 0;
         std::uint32_t characteristics = 0;
-        bool have_callbacks_field = true;
     };
     std::optional<TlsFields> tls_fields;
     // The virtual address of the section the TLS template lives in, used to
@@ -381,8 +381,15 @@ Built build(const Spec& s) {
                 break;
             }
         }
+        // The structure's true size: 40 bytes on PE32+ and 24 on PE32. The 16
+        // extra bytes are the widening of the four pointer fields, not
+        // trailing padding, so a fixture that reserved the smaller size and
+        // then wrote 64-bit pointers would run off the end of the region it
+        // checked. The bound comes from the layout rather than from a
+        // constant that only fits one form.
+        const std::size_t dir_size = s.plus ? 40 : 24;
         if (host < s.sections.size() &&
-            host_file_at + 24 <= b.bytes.size()) {
+            host_file_at + dir_size <= b.bytes.size()) {
             // The template's bounds default to the first section, so the
             // common fixture -- "this image has TLS" -- is two fields rather
             // than six. A fixture that sets `tls_fields` says all of them,
@@ -397,53 +404,71 @@ Built build(const Spec& s) {
                                               : 0x1000;
                 // Encoded the way a linker would encode it for this base.
                 //
-                // The fields are 32 bits, so a base at or above 4 GiB cannot
-                // be written as a virtual address at all -- `base + tva`
-                // truncated to 32 bits is a number that means nothing. Every
-                // modern linker emits the RVA form for a 64-bit image, and
-                // it is the only form that survives the image moving. A base
-                // that fits in 32 bits gets the VA form, which is what the
-                // specification describes and what the low-base fixtures
-                // below exercise.
+                // On PE32+ the four pointers are 64 bits, so the virtual
+                // address form always fits, and it is the form real linkers
+                // emit: mingw's `hello.exe` declares `0x14000a000` for an
+                // image based at `0x140000000` and has relocations covering
+                // the directory, so the VA form is kept correct by the same
+                // relocation pass as everything else. Writing RVA-form
+                // pointers into a 64-bit fixture would test a shape no
+                // linker produces.
+                //
+                // On PE32 the pointers are 32 bits, so a base at or above
+                // 4 GiB cannot be named in the field at all -- `base + tva`
+                // truncated to 32 bits is a number that means nothing. The
+                // low-base PE32 fixtures use the VA form, which is what the
+                // specification describes; a PE32 fixture on a high base
+                // would have to use the RVA form, and the one that does is
+                // marked as such at the point that needs it.
                 //
                 // The choice is made here, in the fixture, rather than
                 // papered over in the loader: a fixture that wrote a
                 // truncated VA and expected the loader to guess would be
                 // testing the guess instead of the format.
                 const bool va_fits =
+                    s.plus ||
                     s.base + tva + s.tls_template_size <= 0xFFFFFFFFull;
                 const std::uint64_t enc = va_fits ? s.base : 0;
-                f.start = static_cast<std::uint32_t>(enc + tva);
-                f.end = static_cast<std::uint32_t>(
-                    enc + tva + s.tls_template_size);
-                f.index = static_cast<std::uint32_t>(enc + 0x2000);
+                f.start = enc + tva;
+                f.end = enc + tva + s.tls_template_size;
+                f.index = enc + 0x2000;
                 f.zero_fill = s.tls_template_size;
                 f.callbacks = 0;
             }
-            // The fields are written as 32-bit even on PE32+. That is not a
-            // simplification: the structure really is five DWORDs there, and
-            // a PE32 fixture that wrote eight-byte fields would have the
-            // loader read its own padding. The last four bytes of a PE32+
-            // directory are the callback field, and a PE32 image leaves them
-            // out of the structure entirely -- which the loader's
-            // `have_callbacks_field` records and one of the tests pins down.
-            put32(b.bytes, host_file_at + 0, f.start);
-            put32(b.bytes, host_file_at + 4, f.end);
-            put32(b.bytes, host_file_at + 8, f.index);
-            put32(b.bytes, host_file_at + 12, f.zero_fill);
-            put32(b.bytes, host_file_at + 16, f.characteristics);
-            // The sixth DWORD is written for a PE32 image too, and this is
-            // the whole point of writing it: those four bytes are *not* part
-            // of a PE32 directory, so whatever a linker happened to leave
-            // after the structure is sitting there in the file, and a loader
-            // that reads six DWORDs from a PE32 image will believe it. A
-            // fixture that left the bytes zero could not tell those two
-            // loaders apart -- which is exactly why this write is
-            // unconditional while the loader's read is not. A real PE32
-            // image has whatever follows the directory, and a fixture that
-            // does not put anything there is not describing one.
-            put32(b.bytes, host_file_at + 20, f.callbacks);
-
+            // The layout, written the way the loader reads it: the four
+            // pointers at 0/8/16/24 on PE32+ and 0/4/8/12 on PE32, then the
+            // two DWORDs, 40 bytes on PE32+ and 24 on PE32. Both forms carry
+            // all four pointers -- `IMAGE_TLS_DIRECTORY32` has
+            // `AddressOfCallBacks` exactly as the 64-bit form does. A fixture
+            // that wrote four DWORDs and stopped described a *different
+            // structure* than the one Windows defines, and it is precisely
+            // that mismatch that let a loader which read the wrong layout
+            // pass every test in this file while refusing every real 64-bit
+            // module. The writer now has to agree with the format, so a
+            // loader that does not is caught here rather than in the field.
+            if (s.plus) {
+                put64(b.bytes, host_file_at + 0, f.start);
+                put64(b.bytes, host_file_at + 8, f.end);
+                put64(b.bytes, host_file_at + 16, f.index);
+                put64(b.bytes, host_file_at + 24, f.callbacks);
+                put32(b.bytes, host_file_at + 32, f.zero_fill);
+                put32(b.bytes, host_file_at + 36, f.characteristics);
+            } else {
+                // PE32: the same six fields, with 32-bit pointers. A fixture
+                // that put one above 4 GiB here would be describing a
+                // structure the format cannot hold; the narrowing is
+                // deliberate and the PE32 fixtures set low addresses.
+                put32(b.bytes, host_file_at + 0,
+                      static_cast<std::uint32_t>(f.start));
+                put32(b.bytes, host_file_at + 4,
+                      static_cast<std::uint32_t>(f.end));
+                put32(b.bytes, host_file_at + 8,
+                      static_cast<std::uint32_t>(f.index));
+                put32(b.bytes, host_file_at + 12,
+                      static_cast<std::uint32_t>(f.callbacks));
+                put32(b.bytes, host_file_at + 16, f.zero_fill);
+                put32(b.bytes, host_file_at + 20, f.characteristics);
+            }
             // The callback array, when the fixture gave one. Written into
             // the file at the RVA the directory names, through the same
             // section lookup, because an array the loader cannot reach is an
@@ -517,6 +542,58 @@ std::vector<std::uint8_t> reloc_block(std::uint32_t page_rva,
         put16(out, 8 + i * 2, entries[i]);
     }
     return out;
+}
+
+// Relocation entries covering the pointer fields of a TLS directory that
+// actually hold an address.
+//
+// This exists because a real linker emits them, and a fixture that omits them
+// is not a stricter test -- it is a different file. Checked against mingw's
+// `hello.exe`: its table covers RVA 0x4040-0x405f, which is exactly the four
+// 8-byte pointers of the directory at 0x4040, and the directory holds the VA
+// `0x14000a000` for an image based at `0x140000000`. So a VA-form directory
+// and a relocation that fixes it up go together, and a fixture that writes the
+// first without the second describes an image whose directory goes stale the
+// moment it moves -- which is a file Windows would load at the wrong address,
+// not a stricter test of this loader.
+//
+// **A field that is zero gets no entry**, and that is the whole subtlety. A
+// relocation is an *addition*: the loader adds the placement delta to whatever
+// is in the field. So a relocation over a zero field does not leave it zero --
+// it leaves it holding the delta, which is an address inside the image that
+// nothing meant to name. A linker knows not to emit one, because it only
+// emits a relocation where it wrote an address; the four fields of a real
+// directory are all non-zero (`hello.exe` has a callback array, the CRT's, at
+// `0x140009038`), so a real table has all four entries.
+//
+// Entries are DIR64 (type 10) on PE32+ and HIGHLOW (type 3) on PE32, because
+// a 64-bit pointer needs the 64-bit form and a 32-bit one does not.
+std::vector<std::uint16_t> tls_dir_reloc_entries(std::uint32_t dir_rva,
+                                                 bool plus,
+                                                 const std::uint64_t* values,
+                                                 std::size_t count) {
+    const std::uint32_t page = dir_rva & ~0xFFFu;
+    const std::uint32_t at = dir_rva - page;
+    const std::uint16_t type = plus ? 10 : 3;
+    const std::uint32_t width = plus ? 8u : 4u;
+    std::vector<std::uint16_t> entries;
+    for (std::size_t field = 0; field < count && field < 4; ++field) {
+        if (values[field] == 0) {
+            continue;
+        }
+        const std::uint32_t off = at + static_cast<std::uint32_t>(field) * width;
+        // A pointer that would straddle the end of the page cannot be
+        // described by a page-relative offset, so it needs its own block in a
+        // real table. The TLS fixtures put the directory away from the page
+        // boundary; rather than silently produce a wrong table, this returns
+        // nothing and lets the caller's image stay un-relocated, which the
+        // caller can assert about.
+        if (off + width > 0x1000u) {
+            return {};
+        }
+        entries.push_back(static_cast<std::uint16_t>((type << 12) | off));
+    }
+    return entries;
 }
 
 // A spec whose relocation table is a real section.
@@ -2087,6 +2164,30 @@ bool read_file(const char* path, std::vector<std::uint8_t>& out) {
     return !out.empty();
 }
 
+// Reads a mapped DWORD. The only way these tests learn what the loader
+// wrote, and deliberately the only way: a helper that also knew the expected
+// value would be a helper the mutation harness could not point at the
+// difference between "wrote the slot" and "wrote something".
+std::uint32_t mapped_u32(const AddressSpace& sp, std::uint64_t va) {
+    // `sp` is taken and not used on purpose. The address is read raw because
+    // the test is asserting about the memory rather than about the ledger --
+    // but taking the space keeps the call sites honest, because a reader can
+    // then see that these addresses came out of a load rather than out of
+    // arithmetic, and an address that is not in the space would fault here
+    // rather than quietly reading something else.
+    (void)sp;
+    std::uint32_t v = 0;
+    std::memcpy(&v, reinterpret_cast<const void*>(va), sizeof v);
+    return v;
+}
+
+std::uint64_t mapped_u64(const AddressSpace& sp, std::uint64_t va) {
+    (void)sp;
+    std::uint64_t v = 0;
+    std::memcpy(&v, reinterpret_cast<const void*>(va), sizeof v);
+    return v;
+}
+
 void test_loads_the_handwritten_pe() {
     // The fixture is optional. It lives outside the repository because it is
     // a build product rather than a source, and a test that fails when a
@@ -2184,6 +2285,154 @@ void test_loads_the_handwritten_pe() {
               "handwritten: the entry point is executable");
         check(at_entry->section == ".text",
               "handwritten: the entry point is in .text");
+    }
+}
+
+// A PE built by a real compiler, loaded.
+//
+// Every other TLS case in this file is a fixture, and a fixture cannot catch
+// this class of bug. The bug this one exists for was in the *width* of the
+// TLS directory's fields: the loader stepped four bytes per field, so on a
+// PE32+ image it read the low half of `StartAddressOfRawData` as the start
+// and the high half as the end, and every real 64-bit module was refused with
+// a message about a template that ended before it started. The whole TLS
+// suite passed, because the builder here wrote the four-DWORD layout the
+// loader expected -- a structure Windows does not define.
+//
+// The lesson generalises past this field: a fixture describes what the author
+// believed the format to be, so it agrees with a wrong loader by
+// construction. A file produced by something outside this project cannot.
+//
+// The fixture is a mingw-w64 `hello.exe`, and it is optional in the same way
+// the hand-written one is: a build product that may be absent. When it is
+// present the assertions are about *properties* rather than addresses,
+// because this file's bytes are not a contract -- a different mingw build
+// gives a different .text and a different import list. What is checked is
+// that a real linker module survives a load at all, and that the TLS the file
+// declares comes out with the shape the format describes.
+void test_loads_a_real_compiler_pe() {
+    const char* candidates[] = {
+        "/tmp/pe/real/hello.exe",
+        "tests/fixtures/real/hello.exe",
+    };
+    std::vector<std::uint8_t> bytes;
+    const char* found = nullptr;
+    for (const char* path : candidates) {
+        if (read_file(path, bytes)) {
+            found = path;
+            break;
+        }
+    }
+    if (found == nullptr) {
+        std::fprintf(stderr,
+                     "SKIP real-compiler PE: no fixture at "
+                     "/tmp/pe/real/hello.exe\n");
+        return;
+    }
+
+    const PeImage p = parse_image(bytes);
+    check(p.ok(), "real: parses");
+    check(p.machine() == PeMachine::Amd64, "real: it is amd64");
+    // The property that makes this file worth loading: it *has* a TLS
+    // directory, which a `#include`-free C program compiled by mingw gets
+    // from the CRT. A fixture that omitted TLS would not have caught the bug
+    // this test exists for, so its absence would make the case misleading
+    // rather than merely weaker.
+    check(p.image_size() != 0, "real: the image has a size");
+    check(p.reloc_size() != 0,
+          "real: it has a relocation table, as a dynamically-linked 64-bit "
+          "image does");
+    check(!p.imports().empty(), "real: it imports something");
+
+    // The load itself. This is the assertion that fails when the TLS
+    // directory is read at the wrong width, and it is the reason the case
+    // exists: a real module was refused with "the TLS template ends at 0x1,
+    // before it starts at 0x4000a000", which names `0x1` because that is the
+    // high half of the real start pointer.
+    AddressSpace sp;
+    Mapper m(sp);
+    LoadContext ctx;
+    TlsTable table;
+    ctx.placement = &m;
+    ctx.tls = &table;
+    // The base comes from `claim_a_base` rather than from the image's linked
+    // base (`0x140000000` here). Asking for the linked base would be the more
+    // obvious thing and it is the weaker test: a load there has a delta of
+    // zero, so the relocation table is walked but nothing is added, and a
+    // loader that applied nothing would look correct. Asking for a claimed
+    // address makes the delta non-zero, so the table has to be *right*.
+    //
+    // It also has to be a claimed address rather than a constant, because this
+    // test is run under ASan, whose shadow region covers `0x140000000` -- the
+    // address a 64-bit PE is linked at by default. Loading there would be
+    // refused with an address conflict that says nothing about TLS.
+    const std::uint64_t base = claim_a_base(p.image_size());
+    check(base != 0, "real: a base address was available");
+    if (base == 0) {
+        return;
+    }
+    const LoadResult r = load_image(p, ByteSpan{bytes.data(), bytes.size()},
+                                    base, sp, ctx);
+    check(r.ok, "real: a real compiler's PE loads");
+    if (!r.ok) {
+        std::fprintf(stderr, "  load failed: %s (%s)\n",
+                     load_error_name(r.error), r.detail.c_str());
+        return;
+    }
+
+    check(r.module.entry_va != 0, "real: the entry point resolved");
+    // Non-zero, and the reason matters. The load above asked for a base that
+    // is not the linked one, so the delta is non-zero and a relocation table
+    // with entries in it has to produce a non-zero count. `== 0` would be the
+    // weaker assertion here: it would also pass on a build whose fixture was
+    // loaded where it was linked, which is exactly the case where the table is
+    // walked and nothing is added -- so it cannot tell a loader that applied
+    // the table from one that skipped it.
+    check(r.module.relocations_applied > 0,
+          "real: relocations were applied, because the image moved and the "
+          "table is not empty");
+    check(r.module.base == base,
+          "real: and the base it took is the one the test asked for");
+    check(r.module.has_tls,
+          "real: the CRT's TLS directory is recognised as TLS");
+
+    // The TLS itself, as the format describes it. A template is at least one
+    // byte and ends after it starts; the slot was written into the image; and
+    // the directory took a slot of its own. Each of these is a shape a real
+    // directory has, and none of them is checked against an address because
+    // this file's addresses are not a contract.
+    check(table.modules.size() == 1,
+          "real: exactly one module took a TLS slot");
+    if (table.modules.size() == 1) {
+        const TlsModule& tls = table.modules[0];
+        check(tls.template_size > 0,
+              "real: the template is not empty, and end is after start");
+        check(tls.template_va >= r.module.base &&
+                  tls.template_va - r.module.base < r.module.size,
+              "real: the template is inside the image that was mapped");
+        check(tls.template_va + tls.template_size <=
+                  r.module.base + r.module.size,
+              "real: the template ends inside the image too");
+        // mingw's CRT installs a TLS callback, so the field is non-zero in
+        // the file. Asserting it is non-zero pins down that a 32-bit-style
+        // "PE32 has no callback field" belief is not silently in force --
+        // though on a PE32+ image that belief would never have applied.
+        check(tls.callbacks_va != 0,
+              "real: the CRT's callback array was found");
+    }
+    // The slot number is in the image, which is the only way a program can
+    // find its own block.
+    check(table.modules.size() == 1 &&
+              mapped_u32(sp, table.modules[0].index_va) == 0,
+          "real: the first module's slot number was written into its image");
+
+    // And the entry point is executable, because a load that produced a
+    // non-executable entry would be useless however correct the rest was.
+    const Region* at_entry = sp.find(r.module.entry_va);
+    check(at_entry != nullptr, "real: the entry point is mapped");
+    if (at_entry != nullptr) {
+        check(at_entry->protection == PageProtection::ExecuteRead,
+              "real: the entry point is executable");
     }
 }
 
@@ -2550,10 +2799,9 @@ Spec a_va_encoded_spec(std::uint32_t template_size = 0x20) {
     s.tls_fields = [&] {
         Spec::TlsFields f;
         // Virtual addresses, because the base is below 4 GiB and they fit.
-        f.start = static_cast<std::uint32_t>(s.base + kTlsTemplateRva);
-        f.end = static_cast<std::uint32_t>(s.base + kTlsTemplateRva +
-                                           template_size);
-        f.index = static_cast<std::uint32_t>(s.base + kTlsIndexRva);
+        f.start = s.base + kTlsTemplateRva;
+        f.end = s.base + kTlsTemplateRva + template_size;
+        f.index = s.base + kTlsIndexRva;
         f.zero_fill = 0;
         f.callbacks = 0;
         return f;
@@ -2577,30 +2825,6 @@ void give_a_reloc_table(Spec& s, std::uint32_t page_rva,
     s.reloc_rva = 0x4000;
     s.reloc_size = static_cast<std::uint32_t>(table.size());
     s.image_size_override = 0x5000;
-}
-
-// Reads a mapped DWORD. The only way these tests learn what the loader
-// wrote, and deliberately the only way: a helper that also knew the
-// expected value would be a helper the mutation harness could not point at
-// the difference between "wrote the slot" and "wrote something".
-std::uint32_t mapped_u32(const AddressSpace& sp, std::uint64_t va) {
-    // `sp` is taken and not used on purpose. The address is read raw
-    // because the test is asserting about the memory rather than about the
-    // ledger -- but taking the space keeps the call sites honest, because a
-    // reader can then see that these addresses came out of a load rather
-    // than out of arithmetic, and an address that is not in the space would
-    // fault here rather than quietly reading something else.
-    (void)sp;
-    std::uint32_t v = 0;
-    std::memcpy(&v, reinterpret_cast<const void*>(va), sizeof v);
-    return v;
-}
-
-std::uint64_t mapped_u64(const AddressSpace& sp, std::uint64_t va) {
-    (void)sp;
-    std::uint64_t v = 0;
-    std::memcpy(&v, reinterpret_cast<const void*>(va), sizeof v);
-    return v;
 }
 
 std::vector<std::uint8_t> mapped_bytes(const AddressSpace& sp, std::uint64_t va,
@@ -2744,11 +2968,33 @@ void test_tls_template_is_copied_from_the_mapping() {
     s.image_size_override = kTlsImageSize;
     // The relocation table, for the reason test_tls_frees_and_reuses_a_slot
     // gives: this fixture places the image away from its linked base, and a
-    // loader that cannot rewrite pointers refuses to do that. One HIGHLOW
-    // at the template's first word, which is the word the block's contents
-    // are asserted on.
+    // loader that cannot rewrite pointers refuses to do that. Two blocks,
+    // because two pages hold something that needs rewriting:
+    //
+    //   * page 0x1000, a DIR64 at the template's first word, which is the
+    //     word the block's contents are asserted on. (0xA100 is type 10 --
+    //     DIR64 -- with offset 0x100, so RVA 0x1100.)
+    //   * page 0x3000, DIR64s over the directory's pointer fields that hold
+    //     addresses, because the image is about to move. Only the non-null
+    //     ones: this fixture declares no callbacks, and a relocation over a
+    //     null pointer would turn it into the relocation delta and invent an
+    //     array. `tls_dir_reloc_entries` takes the values so the zero ones
+    //     are left alone.
     {
-        const std::vector<std::uint8_t> table = reloc_block(0x1000, {0x3100});
+        std::vector<std::uint8_t> table =
+            reloc_block(0x1000, {0xA100});
+        const std::uint64_t dir_values[4] = {
+            s.base + kTlsTemplateRva, s.base + kTlsTemplateRva + kSize,
+            s.base + kTlsIndexRva, 0};
+        const std::vector<std::uint16_t> dir_entries =
+            tls_dir_reloc_entries(kTlsDirRva, s.plus, dir_values, 4);
+        check(!dir_entries.empty(),
+              "moved: the directory's relocations fit on one page");
+        if (!dir_entries.empty()) {
+            const std::vector<std::uint8_t> dir_block =
+                reloc_block(kTlsDirRva & ~0xFFFu, dir_entries);
+            table.insert(table.end(), dir_block.begin(), dir_block.end());
+        }
         s.sections.push_back({".reloc", 0x4000,
                               static_cast<std::uint32_t>(table.size()),
                               static_cast<std::int32_t>(table.size()),
@@ -2915,8 +3161,28 @@ void test_tls_frees_and_reuses_a_slot() {
         // plausible-looking relocation that points somewhere else is worse
         // than one with no relocation at all, because it looks like it is
         // testing the thing.
-        const std::vector<std::uint8_t> table =
-            reloc_block(0x1000, {0x3100});
+        std::vector<std::uint8_t> table = reloc_block(0x1000, {0x3100});
+        // Plus the directory's own four pointer fields, which a real linker
+        // relocates too -- mingw's `hello.exe` covers RVA 0x4040-0x405f for
+        // exactly this reason, and the three loads below all place the image
+        // away from its linked base. Without these the directory's VAs would
+        // still name the linked base after the move, and the loader would
+        // rightly refuse a template that is not inside the image it was
+        // handed. See `tls_dir_reloc_entries`.
+        {
+            const std::uint64_t dir_values[4] = {
+                s.base + kTlsTemplateRva, s.base + kTlsTemplateRva + 0x20,
+                s.base + kTlsIndexRva, 0};
+            const std::vector<std::uint16_t> dir_entries =
+                tls_dir_reloc_entries(kTlsDirRva, s.plus, dir_values, 4);
+            check(!dir_entries.empty(),
+                  "reuse: the directory's relocations fit on one page");
+            if (!dir_entries.empty()) {
+                const std::vector<std::uint8_t> dir_block =
+                    reloc_block(kTlsDirRva & ~0xFFFu, dir_entries);
+                table.insert(table.end(), dir_block.begin(), dir_block.end());
+            }
+        }
         s.sections.push_back({".reloc", 0x4000,
                               static_cast<std::uint32_t>(table.size()),
                               static_cast<std::int32_t>(table.size()),
@@ -2965,9 +3231,23 @@ void test_tls_frees_and_reuses_a_slot() {
         const LoadResult r = load_image(
             p, ByteSpan{b.bytes.data(), b.bytes.size()}, base, sp, ctx);
         check(r.ok, "reuse: each load succeeds");
+        if (!r.ok) {
+            // Stop here rather than carrying on. Everything below indexes
+            // `table.modules` by a slot number the failed load would not have
+            // taken, and a test that reads past the end of a vector because
+            // an earlier assertion failed is a crash that hides the failure
+            // that caused it -- the SEGV lands in a later line and names a
+            // later test. The count assertion below is the one that reports
+            // the real problem, so let the run reach it.
+            std::fprintf(stderr, "  load failed: %s (%s)\n",
+                         load_error_name(r.error), r.detail.c_str());
+        }
     }
     check(table.modules.size() == 3, "reuse: three slots were handed out");
     check(table.slots_allocated == 3, "reuse: the high-water mark is 3");
+    if (table.modules.size() != 3) {
+        return;
+    }
 
     // Free the middle one. The table has to be edited the way the loader
     // frees a slot, which is by zeroing the entry -- that is the contract
@@ -2997,21 +3277,34 @@ void test_tls_frees_and_reuses_a_slot() {
           "reuse: the third module still reads slot 2, not 1");
 }
 
-// A PE32 module has no callback field, and reading one anyway is how a
-// 32-bit image ends up calling whatever followed the structure.
+// A PE32 directory's four pointers are 32 bits wide, and reading them at a
+// 64-bit stride is how a 32-bit image is misparsed.
 //
-// The PE32 structure is five DWORDs. The loader's `have_callbacks_field` is
-// what stops the sixth DWORD from being read as a callback address, and the
-// way to observe that is to put a *recognisable* value at offset 20 -- the
-// slot a PE32+ directory would use -- and check that no callback appears.
-void test_tls_pe32_has_no_callback_field() {
-    Spec s = a_tls_spec(0x20);
+// An earlier version of this test asserted the opposite -- that PE32 has no
+// callback field at all -- and passed, because the loader it was testing had
+// the same wrong belief. The format disagrees: `IMAGE_TLS_DIRECTORY32` has
+// `AddressOfCallBacks` exactly as the 64-bit form does, and a loader that
+// reports `callbacks_va == 0` for a 32-bit module silently drops that
+// module's TLS callbacks. What is *actually* different between the forms is
+// the field width, so that is what this checks.
+//
+// The way to observe a width error is to give every field a value that would
+// decode to something else under the wrong stride. The template start is
+// `base + kTlsTemplateRva` and the end is `base + kTlsTemplateRva + kTemplate`
+// -- four bytes apart in the file, and four gigabytes apart if the high half
+// of a pointer were mistaken for the next field. A loader reading at width 8
+// sees a start of `0x2C001100` and an end of `0x2C001120`; one reading at
+// width 4 sees `0x2C001100` followed by whatever `kTlsIndexRva` looks like as
+// a pointer, and its `SizeOfZeroFill` comes out of `AddressOfIndex`.
+void test_tls_pe32_fields_are_read_at_their_own_width() {
+    constexpr std::uint32_t kTemplate = 0x20;
+    Spec s = a_tls_spec(kTemplate);
     s.plus = false;
-    // A PE32 image's base has to fit in 32 bits, because every address in
-    // the TLS directory is a 32-bit field. That is not a limit chosen here;
-    // see the note on read_tls_directory_from_space in loader.cpp. So this
-    // one fixture cannot use a 64-bit base, and it does not need to: nothing
-    // else in the TLS suite maps at a 32-bit address.
+    // A PE32 image's base has to fit in 32 bits, because every address in the
+    // TLS directory is a 32-bit field. That is not a limit chosen here: it is
+    // what a 32-bit field can hold. 0x2C000000 is low, free in this process,
+    // and distinct from the base the other low-base fixture uses so the two
+    // do not collide in a `Mapper` that never unmaps.
     s.base = 0x2C000000ull;
     s.image_size_override = kTlsImageSize;
     const Built b = build(s);
@@ -3029,8 +3322,25 @@ void test_tls_pe32_has_no_callback_field() {
         load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()}, 0, sp, ctx);
     check(r.ok, "pe32: the image loads");
     check(r.module.has_tls, "pe32: TLS is still TLS on a 32-bit image");
+
+    // The width is what is under test. The derived fixture writes the VA form
+    // because `0x2C000000 + 0x1100` fits in 32 bits, so the template the
+    // loader reports is the linked address of the bytes the fixture wrote --
+    // read back at four bytes per field, which is the form's own width.
+    check(r.module.tls.template_va == s.base + kTlsTemplateRva,
+          "pe32: the template start is the 32-bit field, read as a 32-bit "
+          "field");
+    check(r.module.tls.template_size == kTemplate,
+          "pe32: the template size is end minus start at the same width");
+    check(r.module.tls.index_va == s.base + kTlsIndexRva,
+          "pe32: the index field is the 32-bit field, and not the bytes a "
+          "wider stride would have read");
+    // And the callback field is present, at offset 12, zero because the
+    // fixture declared none -- the point being that the loader looked there
+    // and not at offset 24, which a PE32 directory does not have.
     check(r.module.tls.callbacks_va == 0,
-          "pe32: no callback field means no callback array");
+          "pe32: a directory with no callback array reports none, from the "
+          "field the 32-bit form actually has");
 }
 
 // A template that ends before it starts is refused, and the refusal names
@@ -3131,8 +3441,8 @@ void test_tls_refuses_a_template_outside_the_image() {
         Spec s = a_tls_spec(0x20);
         s.tls_fields = [&] {
             Spec::TlsFields f;
-            f.start = static_cast<std::uint32_t>(s.base + 0x3F00);
-            f.end = static_cast<std::uint32_t>(s.base + 0x4100);
+            f.start = s.base + 0x3F00;
+            f.end = s.base + 0x4100;
             f.index = kTlsIndexRva;
             f.zero_fill = 0;
             f.callbacks = 0;
@@ -4176,39 +4486,60 @@ void test_tls_a_failed_block_gives_its_mapping_back() {
 
 // A PE32 directory with a non-zero sixth DWORD.
 //
-// The fifth-and-shorter structure is the whole reason this case is separate
-// from the PE32+ one: a 32-bit module has no callback field, and the six
-// bytes after its fifth DWORD belong to something else in the file. A
-// fixture whose sixth DWORD is zero cannot tell the two readings apart --
-// which is why the first version of the PE32 test survived the mutant that
-// reads the field anyway.
+// A 32-bit module's callback field is real, and a loader that ignores it
+// drops TLS callbacks a program depends on.
 //
-// So the sixth DWORD here is a recognisable address, and the assertion is
-// that no callback appeared.
-void test_tls_pe32_ignores_the_word_after_its_directory() {
+// The predecessor of this test asserted the opposite -- that the DWORD at
+// offset 16 of a PE32 directory was not a callback field at all -- and it
+// passed against a loader that shared the mistake. The format says
+// `IMAGE_TLS_DIRECTORY32` carries `AddressOfCallBacks` at offset 12, and the
+// cost of not reading it is a 32-bit binary whose TLS callbacks never run:
+// the failure mode is silence, because a callback that is not called does
+// not report anything.
+//
+// So the fixture gives a PE32 directory a callback array with two entries
+// and checks that both come back, in order, from the field the 32-bit form
+// actually has. The array is placed in `.data` at `kTlsCallbacksRva` and
+// holds two addresses into `.text`, with the null terminator the format
+// requires.
+void test_tls_pe32_reads_its_callback_field() {
     Spec s = a_va_encoded_spec(0x20);
     s.plus = false;
     s.base = 0x2B000000ull;
     s.sections[1].characteristics = kScnRead | kScnWrite;
     s.image_size_override = 0x5000;
+
+    // Two callbacks and a terminator, as 32-bit addresses. The array lives in
+    // `.data` -- the same section the index field is in -- because the
+    // fixture's `.text` is not writable and an array in a read-only section
+    // is a different test.
+    const std::uint32_t cb0 = static_cast<std::uint32_t>(s.base + 0x1500);
+    const std::uint32_t cb1 = static_cast<std::uint32_t>(s.base + 0x1600);
+    std::vector<std::uint8_t> array;
+    for (std::uint32_t v : {cb0, cb1, 0u}) {
+        array.push_back(static_cast<std::uint8_t>(v & 0xFF));
+        array.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFF));
+        array.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFF));
+        array.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFF));
+    }
+
     s.tls_fields = [&] {
         Spec::TlsFields f;
-        f.start = static_cast<std::uint32_t>(s.base + kTlsTemplateRva);
-        f.end = static_cast<std::uint32_t>(s.base + kTlsTemplateRva + 0x20);
-        f.index = static_cast<std::uint32_t>(s.base + kTlsIndexRva);
+        f.start = s.base + kTlsTemplateRva;
+        f.end = s.base + kTlsTemplateRva + 0x20;
+        f.index = s.base + kTlsIndexRva;
         f.zero_fill = 0;
-        // The callback field, set on a PE32 image. A PE32 directory has no
-        // such field, so this DWORD is *not* part of the structure -- it is
-        // whatever the linker put after it. Setting it to a real address is
-        // what makes the fixture able to tell a loader that reads six DWORDs
-        // from one that reads five.
-        f.callbacks = static_cast<std::uint32_t>(s.base + 0x1500);
-        f.have_callbacks_field = false;
+        // The callback field, at offset 12, which is where the 32-bit form
+        // puts it. It is as much a field here as it is on PE32+.
+        f.callbacks = s.base + kTlsCallbacksRva;
         return f;
     }();
+    s.tls_callback_bytes = array;
+    s.tls_callbacks_rva = kTlsCallbacksRva;
+
     const Built b = build(s);
     const PeImage p = parse_image(b.bytes);
-    check(p.is_pe32_plus() == false, "pe32-word: the fixture is 32-bit");
+    check(p.is_pe32_plus() == false, "pe32-cb: the fixture is 32-bit");
 
     AddressSpace sp;
     Mapper m(sp);
@@ -4219,19 +4550,25 @@ void test_tls_pe32_ignores_the_word_after_its_directory() {
 
     const LoadResult r = load_image(
         p, ByteSpan{b.bytes.data(), b.bytes.size()}, 0, sp, ctx);
-    check(r.ok, "pe32-word: the image loads");
+    check(r.ok, "pe32-cb: the image loads");
     if (!r.ok) {
         return;
     }
-    check(r.module.tls.callbacks_va == 0,
-          "pe32-word: the word after a PE32 directory is not a callback "
-          "field, however plausible it looks");
+    check(r.module.tls.callbacks_va == s.base + kTlsCallbacksRva,
+          "pe32-cb: the callback field is read, from the offset the 32-bit "
+          "form gives it");
 
     TlsBlock block;
     const TlsResult t = build_tls_block(table, 0, sp, m, &block);
-    check(t.ok, "pe32-word: the block was built");
-    check(block.callbacks.empty(),
-          "pe32-word: and no callback came from the sixth DWORD");
+    check(t.ok, "pe32-cb: the block was built");
+    check(block.callbacks.size() == 2,
+          "pe32-cb: both callbacks were found, and the terminator ended the "
+          "array");
+    if (block.callbacks.size() == 2) {
+        check(block.callbacks[0] == cb0 && block.callbacks[1] == cb1,
+              "pe32-cb: the callbacks are the addresses the array named, in "
+              "order");
+    }
 }
 
 // The directory is read out of the mapping, and this is the test that can
@@ -4555,6 +4892,7 @@ int main() {
     test_loader_emits_events();
 
     test_loads_the_handwritten_pe();
+    test_loads_a_real_compiler_pe();
 
     test_tls_absent_directory_is_not_a_refusal();
     test_tls_all_zero_directory_is_no_tls();
@@ -4562,7 +4900,7 @@ int main() {
     test_tls_template_is_copied_from_the_mapping();
     test_tls_block_appends_zero_fill();
     test_tls_frees_and_reuses_a_slot();
-    test_tls_pe32_has_no_callback_field();
+    test_tls_pe32_fields_are_read_at_their_own_width();
     test_tls_refuses_a_reversed_template();
     test_tls_refuses_a_template_outside_the_image();
     test_tls_refuses_an_index_that_is_not_writable();
@@ -4575,7 +4913,7 @@ int main() {
     test_tls_va_encoded_directory_survives_only_where_it_is_true();
     test_tls_a_block_cannot_stand_in_for_the_template();
     test_tls_a_failed_block_gives_its_mapping_back();
-    test_tls_pe32_ignores_the_word_after_its_directory();
+    test_tls_pe32_reads_its_callback_field();
     test_tls_directory_is_read_from_the_mapping_not_the_file();
     test_a_pe_process_is_laid_out_like_a_windows_process();
     test_a_dll_is_not_started();
