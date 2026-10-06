@@ -11,6 +11,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "occ/runtime/address_space.h"
@@ -2089,6 +2090,670 @@ extern "C" __attribute__((ms_abi)) void* cr_localeconv() noexcept {
     return ::localeconv();
 }
 
+// --------------------------------------------------------------------------
+// The CRT's computational face
+// --------------------------------------------------------------------------
+//
+// The string, memory, conversion, sorting and random functions a C program
+// calls by name. Most are the host's own functions reached through the
+// same ms_abi translation every thunk uses. The ones the host spells
+// differently are written here: the `itoa` family the host has never had,
+// the strtol family clipped to the guest's 32-bit long, a `rand` that has
+// to produce the very sequence Windows produces rather than a sequence of
+// its own, the sort that hands a guest's comparison function back across
+// the ABI, and the 16-bit `wchar_t` family, whose step the host's 32-bit
+// spelling would get wrong.
+
+namespace {
+
+// Windows' `rand`, verbatim: one 32-bit seed, stepped by 214013 and
+// 2531011, the answer in bits 16 through 30. A guest that seeds and
+// expects the sequence Windows produces -- 41, 18467, 6334, ... from
+// srand(1) -- sees exactly that sequence, and the seed Windows starts
+// from without an srand call is 1.
+std::uint32_t g_rand_seed = 1;
+
+constexpr std::int64_t kMsLongMax = 2147483647;
+constexpr std::int64_t kMsLongMin = -2147483647 - 1;
+
+// The guest's `long` is 32 bits while the host's own strtol works in 64.
+// Windows clips an out-of-range conversion to LONG_MAX or LONG_MIN and
+// marks ERANGE; the clip below is that answer, not a silent truncation.
+std::int32_t clip_to_ms_long(std::int64_t value) noexcept {
+    if (value > kMsLongMax) {
+        errno = ERANGE;
+        return static_cast<std::int32_t>(kMsLongMax);
+    }
+    if (value < kMsLongMin) {
+        errno = ERANGE;
+        return static_cast<std::int32_t>(kMsLongMin);
+    }
+    return static_cast<std::int32_t>(value);
+}
+
+// Writes `magnitude` in `base`, digits and lower-case letters, which is
+// what the Windows spellings produce, into `out`, NUL terminated.
+void write_unsigned_radix(std::uint64_t magnitude, unsigned base,
+                          char* out) noexcept {
+    char digits[64];
+    std::size_t n = 0;
+    do {
+        const unsigned digit = static_cast<unsigned>(magnitude % base);
+        digits[n++] = digit < 10 ? static_cast<char>('0' + digit)
+                                 : static_cast<char>('a' + (digit - 10));
+        magnitude /= base;
+    } while (magnitude != 0);
+    char* p = out;
+    while (n > 0) {
+        *p++ = digits[--n];
+    }
+    *p = '\0';
+}
+
+// The signed spelling: base 10 carries a leading minus and the magnitude
+// of the value, negated in unsigned so the minimum negates safely. Any
+// other base is Windows' bit-pattern form -- _itoa(-1, 16) is "ffffffff",
+// the complement, not a sign and a half.
+void write_signed_radix(std::int64_t value, unsigned base,
+                        char* out) noexcept {
+    char* p = out;
+    std::uint64_t magnitude = static_cast<std::uint64_t>(value);
+    if (base == 10 && value < 0) {
+        *p++ = '-';
+        magnitude = ~magnitude + 1ULL;
+    }
+    write_unsigned_radix(magnitude, base, p);
+}
+
+// The 32-bit spellings: base 10 reads the value as the signed number it
+// is, and any other base reads the 32 bits themselves -- a 64-bit helper
+// would sign-extend "-1" into sixteen f's where Windows writes eight.
+char* write_itoa32(std::int32_t value, unsigned base, char* buffer) noexcept {
+    if (base == 10) {
+        write_signed_radix(value, base, buffer);
+    } else {
+        write_unsigned_radix(static_cast<std::uint32_t>(value), base, buffer);
+    }
+    return buffer;
+}
+
+// The guest comparison a sort or search calls back with is guest code,
+// which speaks the Microsoft ABI; the host's qsort speaks System V. The
+// bridge below is the System V side, and the context slot is the guest's
+// own function pointer.
+
+std::int32_t compare_bridge(const void* a, const void* b,
+                            void* context) noexcept {
+    return (*static_cast<GuestCompare*>(context))(a, b);
+}
+
+}  // namespace
+
+// --- strings and memory: the host's own functions ---
+
+extern "C" __attribute__((ms_abi)) char* cr_strcpy(
+    char* target, const char* source) noexcept {
+    return ::strcpy(target, source);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_strncpy(
+    char* target, const char* source, std::uint64_t n) noexcept {
+    return ::strncpy(target, source, static_cast<std::size_t>(n));
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_strcat(
+    char* target, const char* source) noexcept {
+    return ::strcat(target, source);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_strncat(
+    char* target, const char* source, std::uint64_t n) noexcept {
+    return ::strncat(target, source, static_cast<std::size_t>(n));
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_strcmp(
+    const char* a, const char* b) noexcept {
+    return ::strcmp(a, b);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_strchr(
+    const char* text, std::int32_t c) noexcept {
+    // The character sought is the guest's int folded to one byte, which
+    // is the fold the C definition itself prescribes.
+    return const_cast<char*>(::strchr(text, static_cast<char>(c)));
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_strrchr(
+    const char* text, std::int32_t c) noexcept {
+    return const_cast<char*>(::strrchr(text, static_cast<char>(c)));
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_strstr(
+    const char* haystack, const char* needle) noexcept {
+    return const_cast<char*>(::strstr(haystack, needle));
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strspn(
+    const char* text, const char* accept) noexcept {
+    return ::strspn(text, accept);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strcspn(
+    const char* text, const char* reject) noexcept {
+    return ::strcspn(text, reject);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_strpbrk(
+    const char* text, const char* accept) noexcept {
+    return const_cast<char*>(::strpbrk(text, accept));
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strnlen(
+    const char* text, std::uint64_t limit) noexcept {
+    return ::strnlen(text, static_cast<std::size_t>(limit));
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr__stricmp(
+    const char* a, const char* b) noexcept {
+    return ::strcasecmp(a, b);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr__strnicmp(
+    const char* a, const char* b, std::uint64_t n) noexcept {
+    return ::strncasecmp(a, b, static_cast<std::size_t>(n));
+}
+
+extern "C" __attribute__((ms_abi)) char* cr__strupr(char* text) noexcept {
+    for (char* p = text; *p != '\0'; ++p) {
+        *p = static_cast<char>(
+            ::toupper(static_cast<unsigned char>(*p)));
+    }
+    return text;
+}
+
+extern "C" __attribute__((ms_abi)) char* cr__strlwr(char* text) noexcept {
+    for (char* p = text; *p != '\0'; ++p) {
+        *p = static_cast<char>(
+            ::tolower(static_cast<unsigned char>(*p)));
+    }
+    return text;
+}
+
+extern "C" __attribute__((ms_abi)) void* cr_memmove(
+    void* target, const void* source, std::uint64_t bytes) noexcept {
+    return ::memmove(target, source, static_cast<std::size_t>(bytes));
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_memcmp(
+    const void* a, const void* b, std::uint64_t bytes) noexcept {
+    return ::memcmp(a, b, static_cast<std::size_t>(bytes));
+}
+
+// --- conversions ---
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_atoi(
+    const char* text) noexcept {
+    return ::atoi(text);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_atol(
+    const char* text) noexcept {
+    // The guest's long is 32 bits, so the answer is the low half of the
+    // host's -- identical wherever the answer is in range, and the
+    // overflow a C program cannot rely on either way.
+    return static_cast<std::int32_t>(::atol(text));
+}
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr__atoi64(
+    const char* text) noexcept {
+    return ::strtoll(text, nullptr, 10);
+}
+
+extern "C" __attribute__((ms_abi)) double cr_atof(
+    const char* text) noexcept {
+    return ::atof(text);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_strtol(
+    const char* text, char** end, std::int32_t base) noexcept {
+    errno = 0;
+    return clip_to_ms_long(::strtoll(text, end, base));
+}
+
+extern "C" __attribute__((ms_abi)) std::uint32_t cr_strtoul(
+    const char* text, char** end, std::int32_t base) noexcept {
+    errno = 0;
+    const std::int64_t value = ::strtoll(text, end, base);
+    // A leading minus is Windows' way to spell a complement: -1 reads as
+    // 0xffffffff without a range error, which is the magnitude negated in
+    // the *32-bit* domain, and the error starts only past what 32 bits
+    // can hold.
+    if (value < 0) {
+        const std::uint64_t magnitude =
+            ~static_cast<std::uint64_t>(value) + 1ULL;
+        if (magnitude > 0xFFFFFFFFULL) {
+            errno = ERANGE;
+            return 0xFFFFFFFFu;
+        }
+        return static_cast<std::uint32_t>(
+            0u - static_cast<std::uint32_t>(magnitude));
+    }
+    if (value > 0xFFFFFFFFLL) {
+        errno = ERANGE;
+        return 0xFFFFFFFFu;
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr_strtoll(
+    const char* text, char** end, std::int32_t base) noexcept {
+    return ::strtoll(text, end, base);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strtoull(
+    const char* text, char** end, std::int32_t base) noexcept {
+    return ::strtoull(text, end, base);
+}
+
+extern "C" __attribute__((ms_abi)) double cr_strtod(
+    const char* text, char** end) noexcept {
+    return ::strtod(text, end);
+}
+
+// The `itoa` family the host has never had. The base runs from 2 to 36;
+// base 10 spells the value signed, and any other base spells the value's
+// own bit pattern, which is why _itoa(-1, 16) is "ffffffff".
+extern "C" __attribute__((ms_abi)) char* cr_itoa(
+    std::int32_t value, char* buffer, std::int32_t base) noexcept {
+    return write_itoa32(value, static_cast<unsigned>(base), buffer);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr__itoa(
+    std::int32_t value, char* buffer, std::int32_t base) noexcept {
+    return write_itoa32(value, static_cast<unsigned>(base), buffer);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_ltoa(
+    std::int32_t value, char* buffer, std::int32_t base) noexcept {
+    // The guest's long is 32 bits, and the spelling is the same one.
+    return write_itoa32(value, static_cast<unsigned>(base), buffer);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr__ltoa(
+    std::int32_t value, char* buffer, std::int32_t base) noexcept {
+    return write_itoa32(value, static_cast<unsigned>(base), buffer);
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_ultoa(
+    std::uint32_t value, char* buffer, std::int32_t base) noexcept {
+    write_unsigned_radix(value, static_cast<unsigned>(base), buffer);
+    return buffer;
+}
+
+extern "C" __attribute__((ms_abi)) char* cr__ultoa(
+    std::uint32_t value, char* buffer, std::int32_t base) noexcept {
+    write_unsigned_radix(value, static_cast<unsigned>(base), buffer);
+    return buffer;
+}
+
+extern "C" __attribute__((ms_abi)) char* cr__i64toa(
+    std::int64_t value, char* buffer, std::int32_t base) noexcept {
+    write_signed_radix(value, static_cast<unsigned>(base), buffer);
+    return buffer;
+}
+
+extern "C" __attribute__((ms_abi)) char* cr__ui64toa(
+    std::uint64_t value, char* buffer, std::int32_t base) noexcept {
+    write_unsigned_radix(value, static_cast<unsigned>(base), buffer);
+    return buffer;
+}
+
+// --- character classification: the host's own tables ---
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isalpha(
+    std::int32_t c) noexcept {
+    return ::isalpha(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isalnum(
+    std::int32_t c) noexcept {
+    return ::isalnum(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isdigit(
+    std::int32_t c) noexcept {
+    return ::isdigit(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isxdigit(
+    std::int32_t c) noexcept {
+    return ::isxdigit(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isspace(
+    std::int32_t c) noexcept {
+    return ::isspace(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isupper(
+    std::int32_t c) noexcept {
+    return ::isupper(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_islower(
+    std::int32_t c) noexcept {
+    return ::islower(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ispunct(
+    std::int32_t c) noexcept {
+    return ::ispunct(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isprint(
+    std::int32_t c) noexcept {
+    return ::isprint(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isgraph(
+    std::int32_t c) noexcept {
+    return ::isgraph(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_iscntrl(
+    std::int32_t c) noexcept {
+    return ::iscntrl(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_tolower(
+    std::int32_t c) noexcept {
+    return ::tolower(c);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_toupper(
+    std::int32_t c) noexcept {
+    return ::toupper(c);
+}
+
+// --- sorting and searching ---
+
+extern "C" __attribute__((ms_abi)) void cr_qsort(
+    void* base, std::uint64_t count, std::uint64_t size,
+    GuestCompare compare) noexcept {
+    if (compare == nullptr) {
+        return;
+    }
+    // The guest's comparison function goes back across the ABI through
+    // the bridge, in the context slot qsort_r exists to carry.
+    ::qsort_r(base, static_cast<std::size_t>(count),
+              static_cast<std::size_t>(size), compare_bridge, &compare);
+}
+
+extern "C" __attribute__((ms_abi)) void* cr_bsearch(
+    const void* key, const void* base, std::uint64_t count,
+    std::uint64_t size, GuestCompare compare) noexcept {
+    // The host's bsearch has nowhere to carry the guest's own convention
+    // through, so the binary walk happens here, calling the guest
+    // function the same direct way the qsort bridge does.
+    const char* cursor = static_cast<const char*>(base);
+    while (count > 0) {
+        const std::uint64_t half = count / 2;
+        const void* element = cursor + half * size;
+        const std::int32_t order = compare(key, element);
+        if (order == 0) {
+            return const_cast<void*>(element);
+        }
+        if (order < 0) {
+            count = half;
+        } else {
+            cursor = static_cast<const char*>(element) + size;
+            count -= half + 1;
+        }
+    }
+    return nullptr;
+}
+
+// --- the random sequence Windows itself produces ---
+
+extern "C" __attribute__((ms_abi)) void cr_srand(
+    std::uint32_t seed) noexcept {
+    g_rand_seed = seed;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_rand() noexcept {
+    g_rand_seed = g_rand_seed * 214013u + 2531011u;
+    return static_cast<std::int32_t>((g_rand_seed >> 16) & 0x7FFFu);
+}
+
+// --- integer arithmetic ---
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_abs(
+    std::int32_t value) noexcept {
+    return ::abs(value);
+}
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr_labs(
+    std::int64_t value) noexcept {
+    // The guest hands a 32-bit long in the low half of the register and
+    // reads the low half back; the host's 64-bit answer narrows to the
+    // same bits wherever the answer is defined.
+    return ::labs(value);
+}
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr_llabs(
+    std::int64_t value) noexcept {
+    return ::llabs(value);
+}
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr__abs64(
+    std::int64_t value) noexcept {
+    return ::llabs(value);
+}
+
+// The quotient/remainder pairs. The host's own div_t is two ints -- 8
+// bytes, one register under the Microsoft ABI, the same layout the guest
+// spells -- so it answers through unchanged. ldiv_t is the same 8 bytes
+// with the guest's 32-bit longs, and lldiv_t is 16 bytes, which the
+// Microsoft ABI carries through a hidden pointer the compiler spells for
+// both sides of this call.
+extern "C" __attribute__((ms_abi)) div_t cr_div(
+    std::int32_t n, std::int32_t d) noexcept {
+    return ::div(n, d);
+}
+
+extern "C" __attribute__((ms_abi)) LdivPair cr_ldiv(
+    std::int32_t n, std::int32_t d) noexcept {
+    return {n / d, n % d};
+}
+
+extern "C" __attribute__((ms_abi)) LldivPair cr_lldiv(
+    std::int64_t n, std::int64_t d) noexcept {
+    return {n / d, n % d};
+}
+
+// --- the 16-bit wchar_t family ---
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcscpy(
+    char16_t* target, const char16_t* source) noexcept {
+    char16_t* p = target;
+    while ((*p++ = *source++) != u'\0') {}
+    return target;
+}
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsncpy(
+    char16_t* target, const char16_t* source, std::uint64_t n) noexcept {
+    char16_t* start = target;
+    for (; n > 0 && *source != u'\0'; --n) {
+        *target++ = *source++;
+    }
+    for (; n > 0; --n) {
+        *target++ = u'\0';
+    }
+    return start;
+}
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcscat(
+    char16_t* target, const char16_t* source) noexcept {
+    char16_t* p = target;
+    while (*p != u'\0') {
+        ++p;
+    }
+    while ((*p++ = *source++) != u'\0') {}
+    return target;
+}
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsncat(
+    char16_t* target, const char16_t* source, std::uint64_t n) noexcept {
+    char16_t* start = target;
+    while (*target != u'\0') {
+        ++target;
+    }
+    for (; n > 0 && *source != u'\0'; --n) {
+        *target++ = *source++;
+    }
+    *target = u'\0';
+    return start;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wcscmp(
+    const char16_t* a, const char16_t* b) noexcept {
+    // The guest's wchar_t is unsigned, and the answer is the difference
+    // of the two units, which is what the Windows CRT answers.
+    while (*a != u'\0' && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return static_cast<std::int32_t>(*a) - static_cast<std::int32_t>(*b);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wcsncmp(
+    const char16_t* a, const char16_t* b, std::uint64_t n) noexcept {
+    while (n > 0 && *a != u'\0' && *a == *b) {
+        ++a;
+        ++b;
+        --n;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    return static_cast<std::int32_t>(*a) - static_cast<std::int32_t>(*b);
+}
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcschr(
+    const char16_t* text, std::uint32_t c) noexcept {
+    // The character the guest seeks is the low 16 bits of its own value,
+    // the fold from its 32-bit int to its 16-bit wchar_t.
+    const auto needle = static_cast<char16_t>(c);
+    for (; *text != u'\0'; ++text) {
+        if (*text == needle) {
+            return const_cast<char16_t*>(text);
+        }
+    }
+    return needle == u'\0' ? const_cast<char16_t*>(text) : nullptr;
+}
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsrchr(
+    const char16_t* text, std::uint32_t c) noexcept {
+    const auto needle = static_cast<char16_t>(c);
+    const char16_t* last = nullptr;
+    const char16_t* p = text;
+    for (; *p != u'\0'; ++p) {
+        if (*p == needle) {
+            last = p;
+        }
+    }
+    if (needle == u'\0') {
+        return const_cast<char16_t*>(p);
+    }
+    return const_cast<char16_t*>(last);
+}
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsstr(
+    const char16_t* haystack, const char16_t* needle) noexcept {
+    if (*needle == u'\0') {
+        return const_cast<char16_t*>(haystack);
+    }
+    for (; *haystack != u'\0'; ++haystack) {
+        const char16_t* h = haystack;
+        const char16_t* p = needle;
+        while (*p != u'\0' && *h == *p) {
+            ++h;
+            ++p;
+        }
+        if (*p == u'\0') {
+            return const_cast<char16_t*>(haystack);
+        }
+    }
+    return nullptr;
+}
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsdup(
+    const char16_t* text) noexcept {
+    std::size_t units = 0;
+    while (text[units] != u'\0') {
+        ++units;
+    }
+    auto* copy = static_cast<char16_t*>(
+        ::malloc((units + 1) * sizeof(char16_t)));
+    if (copy == nullptr) {
+        return nullptr;
+    }
+    ::memcpy(copy, text, (units + 1) * sizeof(char16_t));
+    return copy;
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_wcsnlen(
+    const char16_t* text, std::uint64_t limit) noexcept {
+    std::uint64_t n = 0;
+    while (n < limit && text[n] != u'\0') {
+        ++n;
+    }
+    return n;
+}
+
+// The multibyte bridge. The guest's narrow bytes are this runtime's
+// UTF-8 -- the same text its file system paths arrive in -- and its
+// wchar_t is 16-bit UTF-16, so the conversion is the one the utf helpers
+// already carry.
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_mbstowcs(
+    char16_t* target, const char* source, std::uint64_t units) noexcept {
+    std::u16string wide;
+    if (!utf8_to_utf16(std::string_view(source), wide)) {
+        return static_cast<std::uint64_t>(-1);  // an invalid byte is EILSEQ
+    }
+    if (target == nullptr) {
+        return wide.size();  // the room the text needs, terminator excluded
+    }
+    const std::uint64_t stored = wide.size() < units ? wide.size() : units;
+    if (stored > 0) {
+        ::memcpy(target, wide.data(),
+                 static_cast<std::size_t>(stored) * sizeof(char16_t));
+    }
+    if (stored < units) {
+        target[stored] = u'\0';
+    }
+    return stored;
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_wcstombs(
+    char* target, const char16_t* source, std::uint64_t bytes) noexcept {
+    std::string narrow;
+    if (!utf16_to_utf8(std::u16string_view(source), narrow)) {
+        return static_cast<std::uint64_t>(-1);
+    }
+    if (target == nullptr) {
+        return narrow.size();
+    }
+    const std::uint64_t stored = narrow.size() < bytes ? narrow.size() : bytes;
+    if (stored > 0) {
+        ::memcpy(target, narrow.data(), static_cast<std::size_t>(stored));
+    }
+    if (stored < bytes) {
+        target[stored] = '\0';
+    }
+    return stored;
+}
+
 // ---- time ---------------------------------------------------------------
 
 extern "C" __attribute__((ms_abi)) void k32_GetSystemTimeAsFileTime(
@@ -2244,34 +2909,101 @@ void add_msvcrt(ExportModule& module) {
         e("___mb_cur_max_func",
           reinterpret_cast<void*>(&cr___mb_cur_max_func)),
         e("_amsg_exit", reinterpret_cast<void*>(&cr__amsg_exit)),
+        e("_abs64", reinterpret_cast<void*>(&cr__abs64)),
+        e("_atoi64", reinterpret_cast<void*>(&cr__atoi64)),
         e("_cexit", reinterpret_cast<void*>(&cr__cexit)),
         d("_commode", &g_commode),
         e("_errno", reinterpret_cast<void*>(&cr__errno)),
-        d("_fmode", &g_fmode),
+        e("_fmode", &g_fmode),
+        e("_i64toa", reinterpret_cast<void*>(&cr__i64toa)),
         e("_initterm", reinterpret_cast<void*>(&cr__initterm)),
+        e("_itoa", reinterpret_cast<void*>(&cr__itoa)),
         e("_lock", reinterpret_cast<void*>(&cr__lock)),
+        e("_ltoa", reinterpret_cast<void*>(&cr__ltoa)),
         e("_onexit", reinterpret_cast<void*>(&cr__onexit)),
+        e("_stricmp", reinterpret_cast<void*>(&cr__stricmp)),
+        e("_strlwr", reinterpret_cast<void*>(&cr__strlwr)),
+        e("_strnicmp", reinterpret_cast<void*>(&cr__strnicmp)),
+        e("_strupr", reinterpret_cast<void*>(&cr__strupr)),
+        e("_ui64toa", reinterpret_cast<void*>(&cr__ui64toa)),
+        e("_ultoa", reinterpret_cast<void*>(&cr__ultoa)),
         e("_unlock", reinterpret_cast<void*>(&cr__unlock)),
+        e("abs", reinterpret_cast<void*>(&cr_abs)),
         e("atexit", reinterpret_cast<void*>(&cr_atexit)),
+        e("atof", reinterpret_cast<void*>(&cr_atof)),
+        e("atoi", reinterpret_cast<void*>(&cr_atoi)),
+        e("atol", reinterpret_cast<void*>(&cr_atol)),
         e("abort", reinterpret_cast<void*>(&cr_abort)),
+        e("bsearch", reinterpret_cast<void*>(&cr_bsearch)),
         e("calloc", reinterpret_cast<void*>(&cr_calloc)),
+        e("div", reinterpret_cast<void*>(&cr_div)),
         e("exit", reinterpret_cast<void*>(&cr_exit)),
         e("fprintf", reinterpret_cast<void*>(&cr_fprintf)),
         e("fputc", reinterpret_cast<void*>(&cr_fputc)),
         e("fputs", reinterpret_cast<void*>(&cr_fputs)),
         e("free", reinterpret_cast<void*>(&cr_free)),
         e("fwrite", reinterpret_cast<void*>(&cr_fwrite)),
+        e("isalnum", reinterpret_cast<void*>(&cr_isalnum)),
+        e("isalpha", reinterpret_cast<void*>(&cr_isalpha)),
+        e("iscntrl", reinterpret_cast<void*>(&cr_iscntrl)),
+        e("isdigit", reinterpret_cast<void*>(&cr_isdigit)),
+        e("isgraph", reinterpret_cast<void*>(&cr_isgraph)),
+        e("islower", reinterpret_cast<void*>(&cr_islower)),
+        e("isprint", reinterpret_cast<void*>(&cr_isprint)),
+        e("ispunct", reinterpret_cast<void*>(&cr_ispunct)),
+        e("isspace", reinterpret_cast<void*>(&cr_isspace)),
+        e("isupper", reinterpret_cast<void*>(&cr_isupper)),
+        e("isxdigit", reinterpret_cast<void*>(&cr_isxdigit)),
+        e("itoa", reinterpret_cast<void*>(&cr_itoa)),
+        e("labs", reinterpret_cast<void*>(&cr_labs)),
+        e("ldiv", reinterpret_cast<void*>(&cr_ldiv)),
+        e("lldiv", reinterpret_cast<void*>(&cr_lldiv)),
         e("localeconv", reinterpret_cast<void*>(&cr_localeconv)),
         e("malloc", reinterpret_cast<void*>(&cr_malloc)),
+        e("mbstowcs", reinterpret_cast<void*>(&cr_mbstowcs)),
+        e("memcmp", reinterpret_cast<void*>(&cr_memcmp)),
         e("memcpy", reinterpret_cast<void*>(&cr_memcpy)),
+        e("memmove", reinterpret_cast<void*>(&cr_memmove)),
         e("memset", reinterpret_cast<void*>(&cr_memset)),
         e("puts", reinterpret_cast<void*>(&cr_puts)),
+        e("qsort", reinterpret_cast<void*>(&cr_qsort)),
+        e("rand", reinterpret_cast<void*>(&cr_rand)),
+        e("srand", reinterpret_cast<void*>(&cr_srand)),
         e("signal", reinterpret_cast<void*>(&cr_signal)),
+        e("strcat", reinterpret_cast<void*>(&cr_strcat)),
+        e("strchr", reinterpret_cast<void*>(&cr_strchr)),
+        e("strcmp", reinterpret_cast<void*>(&cr_strcmp)),
+        e("strcspn", reinterpret_cast<void*>(&cr_strcspn)),
         e("strerror", reinterpret_cast<void*>(&cr_strerror)),
         e("strlen", reinterpret_cast<void*>(&cr_strlen)),
+        e("strncat", reinterpret_cast<void*>(&cr_strncat)),
         e("strncmp", reinterpret_cast<void*>(&cr_strncmp)),
+        e("strncpy", reinterpret_cast<void*>(&cr_strncpy)),
+        e("strnlen", reinterpret_cast<void*>(&cr_strnlen)),
+        e("strpbrk", reinterpret_cast<void*>(&cr_strpbrk)),
+        e("strrchr", reinterpret_cast<void*>(&cr_strrchr)),
+        e("strspn", reinterpret_cast<void*>(&cr_strspn)),
+        e("strstr", reinterpret_cast<void*>(&cr_strstr)),
+        e("strtod", reinterpret_cast<void*>(&cr_strtod)),
+        e("strtol", reinterpret_cast<void*>(&cr_strtol)),
+        e("strtoll", reinterpret_cast<void*>(&cr_strtoll)),
+        e("strtoul", reinterpret_cast<void*>(&cr_strtoul)),
+        e("strtoull", reinterpret_cast<void*>(&cr_strtoull)),
+        e("tolower", reinterpret_cast<void*>(&cr_tolower)),
+        e("toupper", reinterpret_cast<void*>(&cr_toupper)),
         e("vfprintf", reinterpret_cast<void*>(&cr_vfprintf)),
+        e("wcschr", reinterpret_cast<void*>(&cr_wcschr)),
+        e("wcscmp", reinterpret_cast<void*>(&cr_wcscmp)),
+        e("wcscpy", reinterpret_cast<void*>(&cr_wcscpy)),
+        e("wcsdup", reinterpret_cast<void*>(&cr_wcsdup)),
         e("wcslen", reinterpret_cast<void*>(&cr_wcslen)),
+        e("wcsncat", reinterpret_cast<void*>(&cr_wcsncat)),
+        e("wcsncmp", reinterpret_cast<void*>(&cr_wcsncmp)),
+        e("wcsncpy", reinterpret_cast<void*>(&cr_wcsncpy)),
+        e("wcsnlen", reinterpret_cast<void*>(&cr_wcsnlen)),
+        e("wcsrchr", reinterpret_cast<void*>(&cr_wcsrchr)),
+        e("wcsstr", reinterpret_cast<void*>(&cr_wcsstr)),
+        e("wcstombs", reinterpret_cast<void*>(&cr_wcstombs)),
     };
 }
 

@@ -548,6 +548,230 @@ void test_translate_stream() {
           "a null stream translates to null");
 }
 
+// ------------------------------------------------- the CRT's computations
+
+// The comparison functions the sort and search hand back to the guest are
+// guest code, which means Microsoft ABI code; the host compiled these, so
+// their addresses are exactly what a guest would pass.
+extern "C" std::int32_t __attribute__((ms_abi)) compare_int_asc(
+    const void* a, const void* b) noexcept {
+    const int left = *static_cast<const int*>(a);
+    const int right = *static_cast<const int*>(b);
+    return left < right ? -1 : (left > right ? 1 : 0);
+}
+
+extern "C" std::int32_t __attribute__((ms_abi)) compare_int_desc(
+    const void* a, const void* b) noexcept {
+    return -compare_int_asc(a, b);
+}
+
+void test_crt_computational() {
+    // The conversions. The guest's long is 32 bits, so an answer past it
+    // is Windows' clamp-and-ERANGE, not the host's 64-bit value; and a
+    // leading minus on an unsigned conversion is a complement, not an
+    // error, until the magnitude passes what 32 bits hold.
+    char* end = nullptr;
+    check(winabi::cr_strtol("  -42abc", &end, 10) == -42 && end != nullptr &&
+              std::string(end) == "abc",
+          "strtol skips whitespace, reads the sign, and reports the stop");
+    errno = 0;
+    check(winabi::cr_strtol("5000000000", nullptr, 10) == 2147483647 &&
+              errno == ERANGE,
+          "strtol clamps past the 32-bit long and marks ERANGE");
+    errno = 0;
+    check(winabi::cr_strtol("-5000000000", nullptr, 10) == -2147483648 &&
+              errno == ERANGE,
+          "strtol clamps below the 32-bit long the same way");
+    errno = 0;
+    check(winabi::cr_strtol("0x1F", &end, 16) == 31,
+          "strtol reads the base it is given");
+    errno = 0;
+    check(winabi::cr_strtoul("-1", nullptr, 10) == 4294967295u &&
+              errno == 0,
+          "strtoul spells a minus as the complement, without an error");
+    errno = 0;
+    check(winabi::cr_strtoul("5000000000", nullptr, 10) == 4294967295u &&
+              errno == ERANGE,
+          "strtoul clamps past the 32-bit unsigned long");
+    check(winabi::cr_strtoll("12345678901", nullptr, 10) == 12345678901LL,
+          "strtoll is 64 bits");
+    check(winabi::cr_atoi("  +7rest") == 7, "atoi reads what it reads");
+    check(winabi::cr_atol("2147483647") == 2147483647,
+          "atol answers the 32-bit long");
+
+    // The itoa family the host has never had. Base 10 spells the value
+    // signed; any other base spells the value's own bit pattern, which is
+    // why -1 in hexadecimal is the full complement and not "-1".
+    char buf[72];
+    check(winabi::cr_itoa(-42, buf, 10) == buf && std::string(buf) == "-42",
+          "itoa in base 10 spells the sign");
+    check(winabi::cr_itoa(-1, buf, 16) != nullptr &&
+              std::string(buf) == "ffffffff",
+          "itoa in base 16 spells the bit pattern");
+    check(winabi::cr__itoa(-2147483648, buf, 10) != nullptr &&
+              std::string(buf) == "-2147483648",
+          "itoa negates the minimum safely in unsigned");
+    check(winabi::cr__itoa(0, buf, 2) != nullptr && std::string(buf) == "0",
+          "itoa spells zero as a digit, not nothing");
+    check(winabi::cr__i64toa(-1, buf, 10) != nullptr &&
+              std::string(buf) == "-1",
+          "i64toa in base 10 is signed");
+    check(winabi::cr__i64toa(-1, buf, 16) != nullptr &&
+              std::string(buf) == "ffffffffffffffff",
+          "i64toa in base 16 is the 64-bit complement");
+    check(winabi::cr__ui64toa(18446744073709551615ULL, buf, 16) != nullptr &&
+              std::string(buf) == "ffffffffffffffff",
+          "ui64toa spells the full unsigned range");
+    check(winabi::cr__itoa(255, buf, 36) != nullptr && std::string(buf) == "73",
+          "itoa reaches base 36 with lower-case digits");
+
+    // The random sequence. Windows' rand is a fixed recurrence with a
+    // fixed start, so a guest that seeds 1 sees the values Windows -- and
+    // wine -- produce, not whatever the host's own generator says.
+    winabi::cr_srand(1);
+    check(winabi::cr_rand() == 41, "srand(1) starts where Windows starts");
+    check(winabi::cr_rand() == 18467,
+          "the sequence continues the Windows recurrence");
+    check(winabi::cr_rand() == 6334,
+          "the recurrence steps by 214013 and 2531011");
+    winabi::cr_srand(1);
+    check(winabi::cr_rand() == 41, "reseeding restarts the sequence");
+
+    // Sorting and searching across the ABI. The comparison function the
+    // host calls back into is guest code -- here, host code compiled with
+    // the guest's convention, which is the same bridge either way.
+    int values[] = {5, 3, 9, 1, 7};
+    winabi::cr_qsort(values, 5, sizeof(int), compare_int_asc);
+    check(values[0] == 1 && values[1] == 3 && values[2] == 5 &&
+              values[3] == 7 && values[4] == 9,
+          "qsort orders through the guest's comparison function");
+    winabi::cr_qsort(values, 5, sizeof(int), compare_int_desc);
+    check(values[0] == 9 && values[4] == 1,
+          "the same bridge answers a different comparison");
+    const int key = 7;
+    const int* found = static_cast<const int*>(winabi::cr_bsearch(
+        &key, values, 5, sizeof(int), compare_int_desc));
+    check(found != nullptr && *found == 7,
+          "bsearch walks its own binary half-steps");
+    const int absent = 4;
+    check(winabi::cr_bsearch(&absent, values, 5, sizeof(int),
+                          compare_int_desc) == nullptr,
+          "a value the table does not hold comes back null");
+
+    // The quotient/remainder pairs. The layouts are the guest's: two
+    // 32-bit halves for div and ldiv, two 64-bit halves for lldiv.
+    const div_t d = winabi::cr_div(7, 2);
+    check(d.quot == 3 && d.rem == 1, "div answers its own pair");
+    const div_t negative = winabi::cr_div(-7, 2);
+    check(negative.quot == -3 && negative.rem == -1,
+          "div truncates toward zero, the way C divides");
+    const auto ld = winabi::cr_ldiv(-7, 2);
+    check(ld.quot == -3 && ld.rem == -1,
+          "ldiv is the 32-bit pair the guest's long spells");
+    const auto lld = winabi::cr_lldiv(-7, 2);
+    check(lld.quot == -3 && lld.rem == -1,
+          "lldiv is the 64-bit pair");
+
+    // The string family the host already has, plus the case spellings it
+    // names differently.
+    char text[32];
+    std::memcpy(text, "Hello", 6);
+    check(winabi::cr_strcmp(text, "Hello") == 0, "strcmp answers equality");
+    check(winabi::cr_strchr(text, 'l') == text + 2 &&
+              winabi::cr_strrchr(text, 'l') == text + 3,
+          "strchr and strrchr find from opposite ends");
+    check(winabi::cr_strstr("haystack", "stack") != nullptr,
+          "strstr finds the needle");
+    check(winabi::cr_strspn("abcXY", "cba") == 3 &&
+              winabi::cr_strcspn("abcXY", "XY") == 3,
+          "strspn and strcspn count complementary sets");
+    check(winabi::cr_strnlen("abcdef", 4) == 4,
+          "strnlen stops at the limit it is given");
+    winabi::cr__strupr(text);
+    check(std::string(text) == "HELLO", "_strupr folds in place");
+    winabi::cr__strlwr(text);
+    check(std::string(text) == "hello", "_strlwr folds back");
+    check(winabi::cr__stricmp("HeLLo", "hello") == 0,
+          "_stricmp compares without case");
+    char overlap[11];
+    std::memcpy(overlap, "1234567890", 11);
+    winabi::cr_memmove(overlap + 2, overlap, 8);
+    check(std::string(overlap) == "1212345678",
+          "memmove moves through the overlap like memmove does");
+    check(winabi::cr_memcmp("abc", "abd", 2) == 0 &&
+              winabi::cr_memcmp("abc", "abd", 3) < 0,
+          "memcmp compares only the bytes it is given");
+    winabi::cr_strcat(text, "-world");
+    check(std::string(text) == "hello-world", "strcat appends");
+    winabi::cr_strncpy(text, "XYZ", 2);
+    check(std::string(text) == "XYllo-world",
+          "strncpy copies its count, no more");
+
+    // Character classification: a spot check per table the guest reads.
+    check(winabi::cr_isdigit('7') != 0 && winabi::cr_isdigit('x') == 0,
+          "isdigit answers the digit table");
+    check(winabi::cr_isxdigit('f') != 0 && winabi::cr_ispunct('!') != 0 &&
+              winabi::cr_isspace(' ') != 0 && winabi::cr_isalpha('Q') != 0,
+          "the classification tables answer through");
+    check(winabi::cr_tolower('A') == 'a' && winabi::cr_toupper('b') == 'B',
+          "case conversion answers the folded byte");
+
+    // The 16-bit wchar_t family. The guest's wchar_t is two bytes and
+    // unsigned, and the comparison answers the difference of units.
+    char16_t wide[32];
+    check(winabi::cr_wcscpy(wide, u"wide") == wide &&
+              winabi::cr_wcslen(wide) == 4,
+          "wcscpy copies unit by unit");
+    check(winabi::cr_wcscmp(u"abc", u"abd") == -1,
+          "wcscmp answers the unsigned difference");
+    check(winabi::cr_wcscmp(u"abc", u"abc") == 0,
+          "wcscmp answers equality");
+    check(winabi::cr_wcsncmp(u"abc", u"abd", 2) == 0,
+          "wcsncmp compares only its count");
+    check(winabi::cr_wcschr(wide, 'd') == wide + 2,
+          "wcschr folds its character to 16 bits");
+    // A surrogate half is one 16-bit unit like any other: the guest seeks
+    // the low half of an emoji and finds it inside the pair.
+    check(winabi::cr_wcschr(u"\U0001F600", 0xDE00) != nullptr,
+          "a surrogate half the guest seeks is a unit like any other");
+    check(winabi::cr_wcsstr(u"haystack", u"stack") != nullptr,
+          "wcsstr finds the needle in 16-bit text");
+    winabi::cr_wcscat(wide, u"-text");
+    check(winabi::cr_wcslen(wide) == 9, "wcscat appends units");
+    char16_t padded[8];
+    check(winabi::cr_wcsncpy(padded, u"ab", 6) == padded &&
+              padded[0] == u'a' && padded[2] == u'\0' && padded[5] == u'\0',
+          "wcsncpy pads the rest of its count with terminators");
+    check(winabi::cr_wcsnlen(u"abcdef", 3) == 3,
+          "wcsnlen stops at the limit it is given");
+    const char16_t* dup = winabi::cr_wcsdup(u"kept");
+    check(dup != nullptr && winabi::cr_wcslen(dup) == 4 &&
+              winabi::cr_wcscmp(dup, u"kept") == 0,
+          "wcsdup answers a copy the guest can free");
+    ::free(const_cast<char16_t*>(dup));
+
+    // The multibyte bridge. The guest's narrow bytes are this runtime's
+    // UTF-8, its wide units are UTF-16, and a null destination asks only
+    // for the room the text needs.
+    check(winabi::cr_mbstowcs(nullptr, "hello", 0) == 5,
+          "mbstowcs counts the units a text needs");
+    char16_t round[16];
+    check(winabi::cr_mbstowcs(round, "h\xc3\xa9llo", 16) == 5 &&
+              round[1] == 0xE9 && round[5] == u'\0',
+          "mbstowcs turns the two-byte spelling into one wide unit");
+    check(winabi::cr_mbstowcs(round, "h\xc3\xa9llo", 3) == 3,
+          "mbstowcs stores only what its count holds");
+    check(winabi::cr_mbstowcs(round, "\xff", 16) ==
+              static_cast<std::uint64_t>(-1),
+          "mbstowcs refuses an invalid byte, it does not rewrite it");
+    check(winabi::cr_wcstombs(nullptr, u"wide", 0) == 4,
+          "wcstombs counts the bytes a text needs");
+    char narrow[16];
+    check(winabi::cr_wcstombs(narrow, u"h\xE9llo", 16) == 6 &&
+              std::string(narrow) == "h\xc3\xa9llo",
+          "wcstombs turns one wide unit into its UTF-8 spelling");
+}
+
 // --------------------------------------------------------------- registry
 
 void test_every_fixture_import_resolves() {
@@ -571,17 +795,46 @@ void test_every_fixture_import_resolves() {
         "__set_app_type",       "__setusermatherr",
         "_amsg_exit",           "_cexit",
         "_commode",             "_errno",
-        "_fmode",               "_initterm",
-        "_lock",                "_onexit",
-        "_unlock",              "abort",
-        "calloc",               "exit",
-        "fprintf",              "fputc",
-        "free",                 "fwrite",
-        "localeconv",           "malloc",
-        "memcpy",               "memset",
-        "signal",               "strerror",
-        "strlen",               "strncmp",
-        "vfprintf",             "wcslen",
+        "_fmode",               "_i64toa",
+        "_initterm",            "_itoa",
+        "_lock",                "_ltoa",
+        "_onexit",              "_stricmp",
+        "_strlwr",              "_strnicmp",
+        "_strupr",              "_ui64toa",
+        "_ultoa",               "_unlock",
+        "abs",                  "abort",
+        "atof",                 "atoi",
+        "atol",                 "bsearch",
+        "calloc",               "div",
+        "exit",                 "fprintf",
+        "fputc",                "free",
+        "fwrite",               "isalpha",
+        "isdigit",              "isspace",
+        "isupper",              "itoa",
+        "labs",                 "ldiv",
+        "lldiv",                "localeconv",
+        "malloc",               "mbstowcs",
+        "memcmp",               "memcpy",
+        "memmove",              "memset",
+        "qsort",                "rand",
+        "srand",                "signal",
+        "strcat",               "strchr",
+        "strcmp",               "strcspn",
+        "strerror",             "strlen",
+        "strncat",              "strncmp",
+        "strncpy",              "strnlen",
+        "strpbrk",              "strrchr",
+        "strspn",               "strstr",
+        "strtod",               "strtol",
+        "strtoll",              "strtoul",
+        "strtoull",             "tolower",
+        "toupper",              "vfprintf",
+        "wcschr",               "wcscmp",
+        "wcscpy",               "wcsdup",
+        "wcslen",               "wcsncmp",
+        "wcsncpy",              "wcsnlen",
+        "wcsrchr",              "wcsstr",
+        "wcstombs",
     };
 
     ExportRegistry registry;
@@ -637,6 +890,7 @@ int main() {
     test_vfprintf_conversions();
     test_heap_semantics();
     test_translate_stream();
+    test_crt_computational();
     test_every_fixture_import_resolves();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);

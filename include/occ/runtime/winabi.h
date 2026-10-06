@@ -42,6 +42,7 @@
 // trusted.
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -234,6 +235,194 @@ int host_vfprintf(std::FILE* stream, const char* fmt,
 // table is already a host pointer and goes through unchanged.
 [[nodiscard]] std::FILE* translate_stream(const GuestState& state,
                                           std::uint64_t stream) noexcept;
+
+// --------------------------------------------------------------------------
+// The CRT's computational face
+// --------------------------------------------------------------------------
+//
+// The string, conversion, sorting and random functions the guest calls by
+// name. These are the thunks themselves: Microsoft ABI entry points, the
+// same addresses the registry hands a guest's import. A host caller --
+// a test, or a tool that trusts the same answers the guest gets -- reaches
+// them directly, and the compiler bridges the convention on the way in,
+// which is exactly what a guest's `call [iat]` does.
+
+// The comparison a sort or search calls back with is guest code: a
+// Microsoft ABI function pointer, which the host's own qsort cannot
+// spell. The sort walks through a bridge; the search calls it directly.
+using GuestCompare = std::int32_t (__attribute__((ms_abi))*)(
+    const void*, const void*) noexcept;
+
+// The quotient/remainder pairs the guest spells. The 8-byte pair rides
+// one register under the Microsoft ABI, the 16-byte pair goes through a
+// hidden pointer, and the compiler spells both on each side of a call.
+struct LdivPair {
+    std::int32_t quot;
+    std::int32_t rem;
+};
+struct LldivPair {
+    std::int64_t quot;
+    std::int64_t rem;
+};
+
+extern "C" __attribute__((ms_abi)) char* cr_strcpy(char* target,
+                                                   const char* source) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_strncpy(
+    char* target, const char* source, std::uint64_t n) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_strcat(char* target,
+                                                   const char* source) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_strncat(
+    char* target, const char* source, std::uint64_t n) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_strcmp(
+    const char* a, const char* b) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_strchr(const char* text,
+                                                   std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_strrchr(const char* text,
+                                                    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_strstr(
+    const char* haystack, const char* needle) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strspn(
+    const char* text, const char* accept) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strcspn(
+    const char* text, const char* reject) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_strpbrk(
+    const char* text, const char* accept) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strnlen(
+    const char* text, std::uint64_t limit) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr__stricmp(
+    const char* a, const char* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr__strnicmp(
+    const char* a, const char* b, std::uint64_t n) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__strupr(char* text) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__strlwr(char* text) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_memmove(void* target,
+                                                    const void* source,
+                                                    std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_memcmp(
+    const void* a, const void* b, std::uint64_t bytes) noexcept;
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_atoi(
+    const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_atol(
+    const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr__atoi64(
+    const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) double cr_atof(const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_strtol(
+    const char* text, char** end, std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t cr_strtoul(
+    const char* text, char** end, std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr_strtoll(
+    const char* text, char** end, std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strtoull(
+    const char* text, char** end, std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) double cr_strtod(const char* text,
+                                                    char** end) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_itoa(std::int32_t value,
+                                                 char* buffer,
+                                                 std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__itoa(std::int32_t value,
+                                                  char* buffer,
+                                                  std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_ltoa(std::int32_t value,
+                                                 char* buffer,
+                                                 std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__ltoa(std::int32_t value,
+                                                  char* buffer,
+                                                  std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_ultoa(std::uint32_t value,
+                                                  char* buffer,
+                                                  std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__ultoa(std::uint32_t value,
+                                                   char* buffer,
+                                                   std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__i64toa(std::int64_t value,
+                                                    char* buffer,
+                                                    std::int32_t base) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__ui64toa(std::uint64_t value,
+                                                     char* buffer,
+                                                     std::int32_t base) noexcept;
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isalpha(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isalnum(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isdigit(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isxdigit(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isspace(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isupper(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_islower(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ispunct(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isprint(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_isgraph(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_iscntrl(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_tolower(
+    std::int32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_toupper(
+    std::int32_t c) noexcept;
+
+extern "C" __attribute__((ms_abi)) void cr_qsort(
+    void* base, std::uint64_t count, std::uint64_t size,
+    GuestCompare compare) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_bsearch(
+    const void* key, const void* base, std::uint64_t count,
+    std::uint64_t size, GuestCompare compare) noexcept;
+
+extern "C" __attribute__((ms_abi)) void cr_srand(std::uint32_t seed) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_rand() noexcept;
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_abs(
+    std::int32_t value) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr_labs(
+    std::int64_t value) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr_llabs(
+    std::int64_t value) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr__abs64(
+    std::int64_t value) noexcept;
+extern "C" __attribute__((ms_abi)) div_t cr_div(std::int32_t n,
+                                                std::int32_t d) noexcept;
+extern "C" __attribute__((ms_abi)) LdivPair cr_ldiv(std::int32_t n,
+                                                    std::int32_t d) noexcept;
+extern "C" __attribute__((ms_abi)) LldivPair cr_lldiv(
+    std::int64_t n, std::int64_t d) noexcept;
+
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcscpy(
+    char16_t* target, const char16_t* source) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsncpy(
+    char16_t* target, const char16_t* source, std::uint64_t n) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcscat(
+    char16_t* target, const char16_t* source) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsncat(
+    char16_t* target, const char16_t* source, std::uint64_t n) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wcscmp(
+    const char16_t* a, const char16_t* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wcsncmp(
+    const char16_t* a, const char16_t* b, std::uint64_t n) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcschr(
+    const char16_t* text, std::uint32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsrchr(
+    const char16_t* text, std::uint32_t c) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsstr(
+    const char16_t* haystack, const char16_t* needle) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* cr_wcsdup(
+    const char16_t* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_wcslen(
+    const char16_t* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_wcsnlen(
+    const char16_t* text, std::uint64_t limit) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_mbstowcs(
+    char16_t* target, const char* source, std::uint64_t units) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_wcstombs(
+    char* target, const char16_t* source, std::uint64_t bytes) noexcept;
 
 // --------------------------------------------------------------------------
 // The heap
