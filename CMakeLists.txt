@@ -552,6 +552,7 @@ add_library(occ_core STATIC
     src/runtime/loader.cpp
     src/runtime/exports.cpp
     src/runtime/ntdll.cpp
+    src/runtime/pe_process.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

@@ -20,11 +20,13 @@
 #include "occ/parser/pe.h"
 #include "occ/runtime/address_space.h"
 #include "occ/runtime/loader.h"
+#include "occ/runtime/pe_process.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unistd.h>
@@ -101,15 +103,17 @@ struct Spec {
     std::uint16_t machine = 0x8664; // AMD64
     std::uint16_t subsystem = 3;
     std::uint32_t entry = 0x1000;
-    // A constant, and deliberately so. Only the fixtures that *really* map --
-    // the TLS ones, which hand a `Mapper` to `load_image` -- may not name a
-    // fixed address, because AddressSanitizer reserves 4 GiB through 128 TiB
-    // and that is every address a 64-bit PE can be based in below kUserMax.
-    // Those ask the kernel instead; see claim_a_base. The fixtures that pass
-    // an empty LoadContext make no mapping at all, so for them a fixed base
-    // costs nothing and says something: a test that only reads a ledger does
-    // not care where the image would have gone, and one that varies the base
-    // per fixture would be varying something it does not observe.
+    // A constant, and deliberately so. A fixture that *really* maps -- any
+    // one that puts a `Mapper` in its `LoadContext` -- may not name a fixed
+    // address, because AddressSanitizer reserves 4 GiB through 128 TiB and
+    // that is every address a 64-bit PE can be based in below kUserMax. Those
+    // ask the kernel instead; see `claim_a_base`, and the fixtures that need
+    // it set `base` themselves or pick a 32-bit address outside the
+    // reservation. The fixtures that pass an empty `LoadContext` make no
+    // mapping at all, so for them a fixed base costs nothing and says
+    // something: a test that only reads a ledger does not care where the
+    // image would have gone, and one that varies the base per fixture would
+    // be varying something it does not observe.
     std::uint64_t base = 0x0000000140000000ull;
     // Overrides SizeOfImage after the builder has computed one. -1 means
     // "no override", and it is -1 rather than 0 because 0 is a value a
@@ -1588,6 +1592,13 @@ void test_loader_refuses_an_iat_slot_that_overruns_its_region() {
     put32(tail, desc_at + 16, iat_rva);              // FirstThunk, into .data
 
     Spec s;
+    // A base the kernel has certified free, because the second load below
+    // hands a `Mapper` to `load_image` and a `Mapper` really maps. The
+    // default base is a constant and is fine for a fixture that only reads
+    // the ledger; this one does not, and a constant in the 0x140000000
+    // neighbourhood is inside AddressSanitizer's shadow reservation. See
+    // `claim_a_base`.
+    s.base = claim_a_base(0x10000);
     s.sections.push_back({".text", 0x1000, 0x1000, 0x200,
                           kScnExecute | kScnRead});
     // A writable section, so the write is not refused as read-only before the
@@ -4321,6 +4332,152 @@ void test_tls_directory_is_read_from_the_mapping_not_the_file() {
           "src: and the high-water mark never moved");
 }
 
+// A PE built into a runnable process, by this runtime.
+//
+// The loader above maps an image. This is the step past it: the image, plus
+// a stack, plus the TEB and the PEB, in the arrangement a program that
+// starts running expects to find. Everything it asserts is about the
+// *layout* rather than about execution, because execution is the next test
+// section -- and a layout that is wrong is a program that faults in its
+// startup code, which is a debug session nobody enjoys.
+void test_a_pe_process_is_laid_out_like_a_windows_process() {
+    Spec s;
+    s.base = claim_a_base(0x10000);
+    s.sections.push_back({".text", 0x1000, 0x1000, 0x200,
+                          kScnExecute | kScnRead});
+    const Built b = build(s);
+    const PeImage p = parse_image(b.bytes);
+    check(p.ok(), "process: the fixture parses");
+
+    ProcessOptions opts;
+    opts.command_line = "C:\\app.exe alpha beta";
+    opts.image_path = "C:\\app.exe";
+
+    ProcessImage failure;
+    std::unique_ptr<PeProcess> proc = PeProcess::build(
+        p, ByteSpan{b.bytes.data(), b.bytes.size()}, opts, &failure);
+    check(proc != nullptr,
+          "process: a well-formed executable builds into a process");
+    if (proc == nullptr) {
+        std::fprintf(stderr, "SKIP: build refused: %s\n",
+                     failure.detail.c_str());
+        return;
+    }
+
+    const ProcessImage& pi = proc->image();
+    check(pi.ok, "process: and the record says so");
+    check(pi.error == ProcessError::None, "process: with no error");
+    check(pi.module.base == s.base, "process: the image is at its base");
+    check(pi.entry_point == pi.module.entry_va,
+          "process: the entry point is the image's own");
+
+    // The TEB and the PEB are two regions of one mapping, the TEB first,
+    // and the PEB is the TEB's `Peb` field. A runtime that put the PEB
+    // somewhere else would still work by accident -- a program takes the
+    // address from the TEB -- but the region record would lie about the
+    // pairing, and the region record is what this suite reads.
+    check(pi.teb != 0 && pi.peb != 0, "process: the TEB and PEB have addresses");
+    check(pi.peb > pi.teb, "process: the PEB is above the TEB in the mapping");
+
+    const Region* control = proc->space().find(pi.teb);
+    check(control != nullptr && control->kind == RegionKind::Control,
+          "process: the TEB lives in a control region");
+    check(control != nullptr && control->contains(pi.peb),
+          "process: and the PEB is in the same region");
+
+    const Region* stack = proc->space().find(pi.initial_stack_pointer - 1);
+    check(stack != nullptr && stack->kind == RegionKind::Stack,
+          "process: the initial stack pointer is inside the stack region");
+    check(stack != nullptr && pi.initial_stack_pointer <= stack->end(),
+          "process: and at or below its top");
+
+    // The 16-byte alignment the x64 ABI requires at a call. A stack that
+    // arrives misaligned makes every aligned SSE spill in the target an
+    // exception, which is a fault with no relation to the mistake.
+    check((pi.initial_stack_pointer & 0xF) == 0,
+          "process: the initial stack pointer is 16-byte aligned");
+
+    // The TEB's own fields, read back through the mapping this process
+    // owns. These are the values a program reads in its first hundred
+    // instructions.
+    const std::uint64_t teb = pi.teb;
+    std::uint64_t v = 0;
+    std::memcpy(&v, reinterpret_cast<const void*>(teb + 0x30), 8);
+    check(v == teb, "process: TEB.Self points at the TEB");
+    std::memcpy(&v, reinterpret_cast<const void*>(teb + 0x60), 8);
+    check(v == pi.peb, "process: TEB.Peb points at the PEB");
+    std::memcpy(&v, reinterpret_cast<const void*>(teb + 0x08), 8);
+    check(v == stack->end(), "process: TEB.StackBase is the stack's top");
+    std::memcpy(&v, reinterpret_cast<const void*>(teb + 0x58), 8);
+    check(v > teb && v < teb + 0x2000,
+          "process: TEB.TlsPointer is inside the TEB's own region");
+
+    // The PEB's image base, which is how a program finds itself.
+    std::memcpy(&v, reinterpret_cast<const void*>(pi.peb + 0x10), 8);
+    check(v == pi.module.base, "process: PEB.ImageBaseAddress is the image");
+    std::memcpy(&v, reinterpret_cast<const void*>(pi.peb + 0x18), 8);
+    check(v != 0, "process: PEB.Ldr points at a loader data block");
+    std::memcpy(&v, reinterpret_cast<const void*>(pi.peb + 0x20), 8);
+    check(v != 0, "process: PEB.ProcessParameters points at a block");
+
+    // The command line, as the counted string Windows uses. The length is
+    // in bytes and excludes the terminator, and a reader that took it for a
+    // character count would read half the string.
+    std::uint64_t params = 0;
+    std::memcpy(&params, reinterpret_cast<const void*>(pi.peb + 0x20), 8);
+    std::uint16_t len = 0;
+    std::memcpy(&len, reinterpret_cast<const void*>(params + 0x70), 2);
+    check(len == opts.command_line.size() * 2,
+          "process: the command line's length is in bytes and excludes the "
+          "terminator");
+
+    // Every region is recorded, and the record covers the image, the
+    // control block and the stack. A count of three is the smallest a
+    // process can have; a runtime that forgot to record one would still
+    // run and the record would be short.
+    std::size_t kinds = 0;
+    bool saw_image = false, saw_control = false, saw_stack = false;
+    for (const ProcessImage::RegionRecord& rec : pi.regions) {
+        if (rec.kind == RegionKind::Image) { saw_image = true; }
+        if (rec.kind == RegionKind::Control) { saw_control = true; }
+        if (rec.kind == RegionKind::Stack) { saw_stack = true; }
+        ++kinds;
+    }
+    check(kinds >= 3, "process: the record lists every region");
+    check(saw_image, "process: including the image");
+    check(saw_control, "process: including the TEB and PEB");
+    check(saw_stack, "process: including the stack");
+}
+
+// A DLL is not a process, and the refusal says which.
+//
+// Checked before the loader runs, and the reason is the address space: a
+// loader that mapped the DLL first and refused afterwards would leave a
+// half-built process behind, and a caller that retried would find the base
+// taken by the wreckage of the first attempt.
+void test_a_dll_is_not_started() {
+    Spec s;
+    s.dll = true;
+    s.base = claim_a_base(0x10000);
+    s.sections.push_back({".text", 0x1000, 0x1000, 0x200,
+                          kScnExecute | kScnRead});
+    const Built b = build(s);
+
+    const PeImage p = parse_image(b.bytes);
+    check(p.ok(), "dll: the fixture parses");
+    check(p.is_dll(), "dll: and the parser knows it is a DLL");
+
+    ProcessOptions opts;
+    ProcessImage failure;
+    std::unique_ptr<PeProcess> proc = PeProcess::build(
+        p, ByteSpan{b.bytes.data(), b.bytes.size()}, opts, &failure);
+    check(proc == nullptr, "dll: a DLL does not build into a process");
+    check(failure.error == ProcessError::NotAnExecutable,
+          "dll: and the refusal names the reason");
+    check(failure.detail.find("DLL") != std::string::npos,
+          "dll: and the detail says which");
+}
+
 // The names in the enums are the names in the reports.
 //
 // Small, and easy to skip, and it is the kind of thing that rots: a value
@@ -4420,6 +4577,8 @@ int main() {
     test_tls_a_failed_block_gives_its_mapping_back();
     test_tls_pe32_ignores_the_word_after_its_directory();
     test_tls_directory_is_read_from_the_mapping_not_the_file();
+    test_a_pe_process_is_laid_out_like_a_windows_process();
+    test_a_dll_is_not_started();
     test_tls_error_names_cover_their_enums();
     test_a_claim_steps_over_an_address_something_else_took();
 
