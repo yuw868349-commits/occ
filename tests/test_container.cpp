@@ -25,10 +25,12 @@
 #include "occ/util/fs.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -148,6 +150,162 @@ void test_overlay_needs_dirs() {
           "the overlay failure is reported at root assembly or earlier");
 }
 
+// container_spawn must not report success for a container that failed to come
+// up. This is the property the report pipe exists to provide, and it is the
+// one the old protocol got wrong: the child's readiness byte and its failure
+// report went into one pipe, so a report that reached the parent before the
+// readiness read was consumed byte by byte in the wrong order and the verdict
+// was read out of the middle of a failure message.
+//
+// The case is built to fail inside the child rather than in the parent, which
+// is what puts a report on the pipe at all. A missing upper directory is
+// refused by assemble_root, which runs after the gate is released, so the
+// child is the one that discovers the failure and the parent is the one that
+// has to read it.
+//
+// container_spawn is called directly rather than run_container, because the
+// property under test is the return value of the spawn itself. run_container
+// would also report the failure, but through container_reap and the exit
+// status, which is the fallback path and not the one being asserted.
+//
+// It runs twice, with and without a user namespace, and the second run is the
+// one that catches the old defect. With a user namespace the parent had a
+// reason to read the pipe before releasing the child -- it had to write the
+// uid map first -- and that read happened to consume the byte that was in
+// front, which masked the misordering. With no user namespace there is
+// nothing to wait for, so the parent's first and only read was the failure
+// report with the readiness byte still sitting in front of it, and the
+// readiness byte was read as the verdict. That is not a rarer schedule of the
+// same bug; it is the bug, with nothing to hide it.
+void spawn_reports_child_failure(bool with_user_namespace) {
+    ContainerConfig config;
+    config.root_kind = RootKind::Overlay;
+    config.root_dir = "/nonexistent-lower";
+    config.upper_dir.clear();
+    config.work_dir.clear();
+    config.namespaces.cgroup = false;
+    config.namespaces.net = false;
+    config.namespaces.user = with_user_namespace;
+
+    const SpawnResult spawned =
+        container_spawn(config, "/bin/true", {"/bin/true"}, {});
+
+    if (spawned.error.ok()) {
+        // The container came up on a host that accepted an overlay with no
+        // writable layer, which cannot happen. The test's premise failed, not
+        // the code.
+        if (spawned.pid > 0) {
+            (void)container_reap(spawned.pid);
+        }
+        check(false, with_user_namespace
+                        ? "a spawn with no writable overlay layer reported ok"
+                        : "a spawn without a user namespace reported ok for a "
+                          "container that failed");
+        (void)container_cleanup(config);
+        return;
+    }
+
+    check(spawned.error.error != 0,
+          "a spawn whose child failed carries an errno");
+    // The stage is the child's, not a default. A spawn that fails with
+    // neither of these would mean the parent gave up before the child said
+    // anything, which is a different defect from the one being asserted -- and
+    // the stage the child named is RootAssembly, because that is where the
+    // missing upper directory is refused.
+    check(spawned.error.stage == Stage::RootAssembly ||
+              spawned.error.stage == Stage::Clone,
+          "the child's failure is reported at the stage the child named");
+
+    // A spawn that reports a failure must not leave the child behind. The
+    // child exits on its own after writing the report, so this reaps it; a
+    // failure here means the child is unreaped, which is a leak a caller
+    // cannot see.
+    if (spawned.pid > 0) {
+        const ContainerResult reaped = container_reap(spawned.pid);
+        check(!reaped.error.ok() || reaped.exit_code != 0,
+              "a child that reported a failure did not exit successfully");
+    }
+    (void)container_cleanup(config);
+}
+
+void test_spawn_reports_child_failure() {
+    spawn_reports_child_failure(true);
+    spawn_reports_child_failure(false);
+}
+
+// The pid namespace has to be one the target can see. A container that asked
+// for a pid namespace and got a process carrying a host pid has created the
+// namespace and not used it: /proc inside the container shows the host's
+// process list, and a target that inspects its own pid sees a number that
+// means something outside.
+//
+// This is why the assertion is on the pid the target observes rather than on
+// anything occ can see from outside: from outside, a container whose pid
+// namespace was never entered looks exactly like one that was, because the
+// process is a direct child either way and its pid is the same number either
+// way. The difference is only visible from inside.
+//
+// The helper re-executes this binary, reads its own pid, and writes it to a
+// descriptor the test passed down. A descriptor rather than a path, because a
+// container with a read-only root cannot create a file: the root is sealed
+// before the target runs, so a helper asked to write to /tmp fails for a
+// reason that has nothing to do with the pid it was asked to report.
+void test_target_is_pid_one() {
+    const auto linked = read_link("/proc/self/exe");
+    if (!linked || linked->empty() || linked->front() != '/') {
+        skip("pid namespace: the executable path is not readable");
+        return;
+    }
+    const std::string self = *linked;
+
+    const std::string path =
+        "/tmp/occ-test-pidns-" +
+        std::to_string(static_cast<long>(::getpid())) + ".txt";
+
+    // No O_CLOEXEC: the descriptor has to survive the exec, which is the only
+    // way the target can hand a number back to a root it cannot write to.
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        skip("pid namespace: no writable temporary file");
+        return;
+    }
+
+    ContainerConfig config;
+    config.root_dir = "/";
+    config.root_kind = RootKind::ReadOnlyBind;
+    config.namespaces.cgroup = false;
+    config.namespaces.net = false;
+
+    const std::string marker = "--fd-helper";
+    const std::string fd_arg = std::to_string(fd);
+    const ContainerResult r =
+        run_container(config, self, {self, marker, fd_arg}, {});
+
+    (void)::close(fd);
+
+    // The file is read whatever the run reported. A run that failed still
+    // produced a number if the target got far enough to write one, and that
+    // is information the test wants rather than a reason to skip.
+    std::string content;
+    if (auto text = occ::fs::read_file(path)) {
+        content = *text;
+    }
+    (void)::unlink(path.c_str());
+
+    if (r.error.ok() && !content.empty()) {
+        const long observed = std::strtol(content.c_str(), nullptr, 10);
+        check(observed == 1,
+              "the target runs as pid 1 inside its pid namespace");
+    } else if (r.error.ok()) {
+        // The run succeeded but nothing was written, which means the helper
+        // did not get to write. Reported rather than skipped: the target ran,
+        // so this is not a host that refuses containers.
+        check(false, "the target did not report its pid");
+    } else {
+        skip("pid namespace: this host refuses a container");
+    }
+}
+
 // The target's exit status has to survive. This is the one end-to-end
 // property that matters to every caller.
 void test_exit_code_round_trip() {
@@ -247,10 +405,26 @@ void test_signal_reporting() {
 
 } // namespace
 
-// The helper entry point used by the signal test. It lives outside the
-// anonymous namespace so that main can find it.
+// The helper entry points used by the tests that need a target to do
+// something. They live outside the anonymous namespace so that main can find
+// them.
 namespace occ_test {
 [[noreturn]] void raise_segv();
+}
+
+// Writes this process's pid to the descriptor whose number is the second
+// argument.
+//
+// The write is through a descriptor rather than stdout because the
+// container's stdout is the test's stdout: a line on it would be
+// indistinguishable from the test's own output, and interleaving the two is
+// exactly the sort of thing that makes a passing test unreadable.
+void write_own_pid(const char* fd_arg) {
+    const int fd = static_cast<int>(std::strtol(fd_arg, nullptr, 10));
+    const std::string line = std::to_string(::getpid()) + "\n";
+    const ssize_t written = ::write(fd, line.data(), line.size());
+    const int rc = written == static_cast<ssize_t>(line.size()) ? 0 : 1;
+    _exit(rc);
 }
 
 int main(int argc, char** argv) {
@@ -268,8 +442,14 @@ int main(int argc, char** argv) {
         _exit(0);
     }
 
+    if (argc > 2 && std::strcmp(argv[1], "--fd-helper") == 0) {
+        write_own_pid(argv[2]);
+    }
+
     test_namespace_flags();
     test_overlay_needs_dirs();
+    test_spawn_reports_child_failure();
+    test_target_is_pid_one();
     test_exit_code_round_trip();
     test_signal_reporting();
 
