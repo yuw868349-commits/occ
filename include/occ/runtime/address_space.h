@@ -119,6 +119,21 @@ struct Region {
 
     RegionKind kind = RegionKind::Private;
 
+    // Whether the pages are committed, as opposed to merely reserved.
+    //
+    // Windows has three states for a page -- free, reserved and committed --
+    // and only the first two are address-space facts: a reserved range holds
+    // the addresses and nothing else, and `MEM_DECOMMIT` moves a committed
+    // range back to reserved without giving the addresses up. The ledger used
+    // to have only "a region exists" and "it does not", which made DECOMMIT
+    // indistinguishable from RELEASE and cost a program its reservations.
+    //
+    // A reserved region still occupies its addresses -- `find()` returns it,
+    // no other `record()` may overlap it, and `NtAllocateVirtualMemory` with
+    // `MEM_COMMIT` can commit it again -- but touching it faults, and that is
+    // the whole of what the flag changes here.
+    bool committed = true;
+
     // Which section of which image, for an image region. Empty otherwise.
     // The section name is advisory in the format and load-bearing here: it
     // is what a person reading about a fault at an address wants to see.
@@ -547,6 +562,34 @@ public:
     // region starts at `base`.
     Result<std::uint32_t> set_protection(std::uint64_t base,
                                           PageProtection protection) noexcept;
+
+    // Marks a range reserved and cleared of its commit, splitting the region
+    // it lies in if the range does not cover it whole.
+    //
+    // This is `MEM_DECOMMIT`, and it is the one operation of the memory API
+    // that changes what a range *is* without changing which addresses it
+    // occupies. The range may start anywhere inside a region and may end
+    // anywhere inside it -- Windows allows a decommit of the middle and is the
+    // reason the operation cannot be an `unmap()` -- so the region is cut into
+    // up to three parts and only the middle one loses its commit.
+    //
+    // Returns the number of bytes decommitted, or a status. The cut is
+    // page-aligned outward: a range that starts or ends inside a page takes the
+    // whole page, because a page is the unit the kernel commits and a
+    // half-page reservation cannot exist.
+    //
+    // Refuses, rather than answering success, when the range reaches outside
+    // the region that contains it, or when the region is not private memory.
+    Result<std::uint64_t> decommit(std::uint64_t base, std::uint64_t size) noexcept;
+
+    // Marks a region committed again after a decommit.
+    //
+    // This is `MEM_COMMIT` into a reservation that a `MEM_DECOMMIT` had
+    // cleared, and it is the other half of the three-state model: the addresses
+    // never moved, so nothing is cut here and the region is flipped back in
+    // place. Returns the region's size, or InvalidAddress when no region starts
+    // at `base`.
+    Result<std::uint64_t> commit(std::uint64_t base) noexcept;
 
     // Finds the region containing an address, or nothing.
     //

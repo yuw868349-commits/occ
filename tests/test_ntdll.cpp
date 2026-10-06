@@ -254,31 +254,34 @@ void test_allocation_validates_before_it_places() {
           "matching that is the whole point of copying the arithmetic");
     check(zero_bits_limit(31) == 0x1ULL,
           "zero_bits: 31 is below 2, so it leaves exactly one representable "
-          "address -- the last value before the 16/8/4/2/1 split takes over");
-    // At 32 the split begins, and the answer stops being a plain shift. It is
-    // also the one value where Wine's `addr & ~zero_bits` and the "run of low
-    // ones" reading agree, which is why 32 alone cannot tell them apart.
-    check(zero_bits_limit(32) == 0x3FULL,
-          "zero_bits: 32 is where the split takes over: 63 minus 32 is 31, and "
-          "31 minus the 1-bit remainder is 30, so the limit is 2^6-1 rather "
-          "than the 2^32-1 a 'below 2^32' reading would give -- the value is "
-          "handled by five different shifts and one of them has to be wrong "
-          "for the answer to be anything at all");
-    check(zero_bits_limit(33) == 0x3FULL,
-          "zero_bits: 33 gives the same limit as 32, because the extra bit is "
-          "one the shift below 32 would have removed anyway -- two values one "
-          "answer, which is a boundary and not a bug");
-    // **And `zero_bits_accepts`, the other half of the rules.** The limit is
+          "address -- the last value before the parameter changes kind at 32 "
+          "and the arithmetic changes with it");
+    // At 32 the parameter changes kind, and so does the arithmetic. The
+    // documentation says it in the parameter's own description -- below 32 the
+    // value is a *count* of high-order bits that must be zero, and at or above
+    // 32 "the value is a bitmask" -- and the ceiling follows the mask reading:
+    // the largest address `zero_bits_accepts` admits is the mask itself, so the
+    // exclusive ceiling is one past it.
+    check(zero_bits_limit(32) == 0x21ULL,
+          "zero_bits: 32 is where the value becomes a bitmask, and the ceiling "
+          "is the mask itself plus one -- a caller asking for memory below "
+          "4 GiB gets a window 4 GiB wide, not the 64 bytes a shift reading "
+          "would give it");
+    check(zero_bits_limit(33) == 0x22ULL,
+          "zero_bits: and 33 -- whose mask 0x21 admits bits 0 and 5 rather "
+          "than 32's bit 5 alone, so the last address a search may reach is "
+          "0x21 and the ceiling is one past it");
+    // **And `zero_bits_accepts`, the other half of the rules.** The ceiling is
     // what a *placement* uses when no address was given; `zero_bits_accepts`
     // is what NtMapViewOfSection uses when one was, and its two branches are
     // two different tests in Wine (`virtual.c:5450-5455`): a shift below 32
     // and a mask at or above it. The mask branch is the one that reads wrong
     // at first -- `addr & ~zero_bits` uses `zero_bits` *as a number* rather
-    // than as "a run of low ones", so a 32 means "below 64" and not "below
-    // 2^32". An earlier version wrote the mathematically prettier run-of-ones
-    // form, which agrees with Wine's only at exactly 32 and disagrees
-    // everywhere else; it survived a whole round of mutations because nothing
-    // called it with a value that separates the two. These numbers do.
+    // than as "a run of low ones", so a 32 means "bits 0 and 5 allowed" and not
+    // "below 2^32". An earlier version wrote the mathematically prettier
+    // run-of-ones form, which agrees with Wine's only at exactly 32 and
+    // disagrees everywhere else; it survived a whole round of mutations because
+    // nothing called it with a value that separates the two. These numbers do.
     check(zero_bits_accepts(0, 0xFFFFFFFFFFFFFFFFULL),
           "zero_bits_accepts: a zero window constrains nothing at all, not "
           "even the top of the space");
@@ -290,9 +293,9 @@ void test_allocation_validates_before_it_places() {
     check(zero_bits_accepts(32, 0x20ULL) &&
               !zero_bits_accepts(32, 0x40ULL),
           "zero_bits_accepts: 32 is where the mask branch begins and the "
-          "boundary case -- Wine's form makes it 'below 64', the run-of-ones "
-          "mis-reading makes it 'below 2^32', and 0x20 against 0x40 is the "
-          "pair that separates them");
+          "boundary case -- Wine's form makes it 'bit 0 or bit 5', the "
+          "run-of-ones mis-reading makes it 'below 2^32', and 0x20 against "
+          "0x40 is the pair that separates them");
     check(!zero_bits_accepts(32, 0x100000000ULL),
           "zero_bits_accepts: 2^32 against a window of 32 is refused by "
           "Wine's mask -- the mis-reading would accept it, which is exactly "
@@ -300,15 +303,36 @@ void test_allocation_validates_before_it_places() {
     check(zero_bits_accepts(33, 0x20ULL) &&
               !zero_bits_accepts(33, 0x10000000000ULL),
           "zero_bits_accepts: and 33 -- where Wine's mask is ~33, so the only "
-          "allowed bits are 0 and 5, 0x20 survives and 2^40 does not");
+          "allowed bits are 1 and 5, 0x20 survives and 2^40 does not");
 
-    check(zero_bits_limit(64) == 0x7FULL,
-          "zero_bits: and 64 -- where the shift reaches 57 and the limit is the "
-          "low 128 bytes -- is nowhere near the whole space, so a caller "
-          "passing a large value gets a *tighter* window rather than a looser "
-          "one. That is Wine's arithmetic and not this runtime's judgement; "
-          "the alternative would be to clamp, which answers differently for "
-          "every value above 2^32");
+    // **The two halves agree, which is the property rather than either
+    // number.** A ceiling and an accept test describe one window from two
+    // sides, and a window whose search can find an address its own accept test
+    // refuses is not a window. This walks the boundary of every mask branch
+    // value the tests above name, on both sides, and fails if the last place a
+    // search may reach is not the last address the accept test admits.
+    for (std::uint32_t zb : {32u, 33u, 40u, 64u}) {
+        const std::uint64_t limit = zero_bits_limit(zb);
+        check(limit > 0, "zero_bits: a mask window is never empty");
+        // The ceiling is exclusive: the last place a search may put a base is
+        // one below it, and that address is admitted...
+        check(zero_bits_accepts(zb, limit - 1),
+              "zero_bits: the last address a window's own ceiling admits is "
+              "accepted by the same window's accept test -- a ceiling that "
+              "promised an address the accept test then refused would make "
+              "every allocation in the window fail");
+        // ...and one past it must not be, or the ceiling was too tight.
+        check(!zero_bits_accepts(zb, limit + 1),
+              "zero_bits: and the first address past the ceiling is refused, "
+              "so the ceiling is not merely consistent but tight");
+    }
+
+    check(zero_bits_limit(64) == 0x41ULL,
+          "zero_bits: and 64 -- whose mask is 0x40, so the only place a search "
+          "may put a region is 0x40 itself and the ceiling is one past it. The "
+          "window is a single address rather than a 128-byte run, which is what "
+          "a reader who took the at-or-above-32 value for a shift would expect "
+          "and the mask reading does not give");
 
     // **And the search that honours the window goes *down*, and stops at it.**
     //
@@ -764,6 +788,226 @@ void test_free_refuses_three_different_problems() {
 }
 
 // ------------------------------------------------------------------------
+// Decommit and recommit
+// ------------------------------------------------------------------------
+
+// `MEM_DECOMMIT` is *not* a release, and this is the case that says so.
+//
+// The defect this covers was quiet: every accepted free type fell through to
+// one `unmap()`, so a program that decommitted the middle of a reservation had
+// the whole thing taken away and was told the call succeeded. Three things went
+// wrong at once and none of them announced itself -- the addresses went back to
+// the system, a later commit into the same range failed with
+// MEMORY_NOT_ALLOCATED, and a pointer the program had kept into the reservation
+// dangled. A test that only asserted "the call returned success" would have
+// passed against the bug, which is why every assertion below is about the
+// *state* the call left rather than about its return.
+void test_decommit_keeps_the_reservation() {
+    Fixture f;
+    const std::uint64_t base = allocate(f, 0x30000);
+    if (base == 0) {
+        return;
+    }
+
+    // Decommit the middle 64 KiB of a 192 KiB reservation, so both a head and
+    // a tail survive and the cut is the interesting three-way one.
+    const std::uint64_t middle = base + 0x10000;
+    std::uint64_t addr = middle;
+    std::uint64_t size = 0x10000;
+    const auto r =
+        nt_free_virtual_memory(f.ctx, &addr, &size, mem::kDecommit);
+    check(r.ok(),
+          "decommit: MEM_DECOMMIT of a range inside a reservation succeeds");
+    check(size == 0x10000,
+          "decommit: and reports the range that actually lost its commit, "
+          "rounded to whole pages");
+
+    // **The reservation is still there, and it is still the whole 192 KiB.**
+    // The ledger now holds three regions where there was one, and the sum of
+    // their sizes is the size the reservation started with. That sum is the
+    // whole of the "the addresses were not given up" claim.
+    const Region* head = f.space.find(base);
+    const Region* mid = f.space.find(middle);
+    const Region* tail = f.space.find(base + 0x20000);
+    check(head != nullptr && mid != nullptr && tail != nullptr,
+          "decommit: the range is still backgrounded by regions -- a decommit "
+          "does not remove a region from the ledger, which is the difference "
+          "between it and a release");
+    if (head != nullptr && mid != nullptr && tail != nullptr) {
+        check(head->base == base && head->size == 0x10000,
+              "decommit: the region before the range is unchanged and still "
+              "committed");
+        check(mid->base == middle && mid->size == 0x10000,
+              "decommit: the range itself is a region of its own now");
+        check(tail->base == base + 0x20000 && tail->size == 0x10000,
+              "decommit: and the region after it is unchanged, so a range in "
+              "the middle of a reservation cuts it into three pieces and "
+              "neither end is disturbed");
+        check(head->committed && !mid->committed && tail->committed,
+              "decommit: only the middle piece lost its commit -- marking all "
+              "three would decommit the head and tail the caller did not name");
+        check(mid->kind == RegionKind::Private,
+              "decommit: and the reserved piece keeps the kind of the "
+              "reservation, because a recommit has to find it again");
+    }
+
+    // The kernel agrees: the decommitted pages no longer hold their contents.
+    // A release would have made the whole range unreadable; a decommit makes
+    // only the named pages fault, and the head and tail must still be
+    // writable. Asserting this against the *ledger* alone would pass for an
+    // implementation that never touched the kernel at all.
+    volatile char* writable_head =
+        reinterpret_cast<volatile char*>(static_cast<std::uintptr_t>(base));
+    volatile char* writable_tail = reinterpret_cast<volatile char*>(
+        static_cast<std::uintptr_t>(base + 0x20000));
+    writable_head[0] = 1;
+    writable_tail[0] = 1;
+    check(writable_head[0] == 1 && writable_tail[0] == 1,
+          "decommit: the committed head and tail are still readable and "
+          "writable after a decommit of the range between them");
+
+    // **A protection change on the reserved range does not commit it.** This is
+    // the case the ledger's two fields have to stay independent for: a
+    // protection is not a commit, and a caller that decommits a range and then
+    // changes its protection has not asked for the memory back. `set_protection`
+    // rebuilds the region through `make_region`, which constructs a committed
+    // one, so the flag has to be copied across -- and dropping that copy is
+    // invisible until a program touches memory it believes is still reserved.
+    {
+        std::uint64_t p_addr = middle;
+        std::uint64_t p_size = 0x10000;
+        std::uint32_t p_old = 0;
+        const auto pr = nt_protect_virtual_memory(f.ctx, &p_addr, &p_size, 0x02,
+                                                  &p_old);
+        if (pr.ok()) {
+            const Region* after = f.space.find(middle);
+            check(after != nullptr && !after->committed,
+                  "decommit: a protection change on a decommitted range leaves "
+                  "it decommitted -- a protection is not a commit, and a "
+                  "runtime that recommitted on a protect would hand a program "
+                  "memory it had just returned");
+        }
+    }
+
+    // **And the range can be committed again, at the same addresses.** This is
+    // the half of the three-state model that the old code could not express:
+    // the address is a pointer the program kept, so a recommit that placed the
+    // memory somewhere else would be a recommit the program cannot use.
+    std::uint64_t commit_addr = middle;
+    std::uint64_t commit_size = 0x10000;
+    const auto rec = nt_allocate_virtual_memory(f.ctx, &commit_addr,
+                                               &commit_size, 0,
+                                               mem::kCommit, 0x04);
+    check(rec.ok(),
+          "decommit: MEM_COMMIT into the decommitted range succeeds -- the "
+          "reservation was never given up, so there is something to commit");
+    check(commit_addr == middle,
+          "decommit: and the memory is committed at the same address it was "
+          "decommitted at, which is the entire point of keeping the "
+          "reservation");
+    const Region* recommitted = f.space.find(middle);
+    check(recommitted != nullptr && recommitted->committed,
+          "decommit: and the ledger records the range as committed again");
+
+    std::uint64_t free_addr = base;
+    std::uint64_t free_size = 0;
+    (void)nt_free_virtual_memory(f.ctx, &free_addr, &free_size, mem::kRelease);
+}
+
+// The refusals, which are the other half of the contract and are what a caller
+// branches on. Each of these names a *different* mistake, and a runtime that
+// answered one status for all of them would send a program looking in the
+// wrong place.
+void test_decommit_refuses_what_it_cannot_do() {
+    Fixture f;
+    const std::uint64_t base = allocate(f, 0x20000);
+    if (base == 0) {
+        return;
+    }
+
+    // A zero size. `MEM_DECOMMIT` with nothing to decommit names no range, and
+    // the zero that means "the whole region" belongs to `MEM_RELEASE` alone --
+    // this is the use-after-free the header warns about, so it is refused
+    // rather than read as its opposite.
+    {
+        std::uint64_t addr = base;
+        std::uint64_t size = 0;
+        const auto r =
+            nt_free_virtual_memory(f.ctx, &addr, &size, mem::kDecommit);
+        check(!r.ok() && r.status == Status::InvalidParameter,
+              "decommit: a zero size is refused, because the zero that means "
+              "'the whole region' is MEM_RELEASE's and reading it as such here "
+              "would decommit a whole reservation a caller named one byte of");
+    }
+
+    // A range that starts inside the region and ends past it. The ledger holds
+    // one region here, so a range that reaches beyond its end names memory
+    // that belongs to nobody -- and refusing is right rather than clamping,
+    // because a clamped decommit would release pages the caller did not name.
+    {
+        std::uint64_t addr = base + 0x10000;
+        std::uint64_t size = 0x30000;
+        const auto r =
+            nt_free_virtual_memory(f.ctx, &addr, &size, mem::kDecommit);
+        check(!r.ok(),
+              "decommit: a range that reaches past the end of the region is "
+              "refused rather than clamped");
+    }
+
+    // An address with nothing mapped at all: MEMORY_NOT_ALLOCATED, the same
+    // status a release gets for the same situation, because the two calls agree
+    // about what "there is nothing there" means.
+    {
+        const std::uint64_t nowhere = a_free_base(0x1000);
+        if (nowhere != 0) {
+            std::uint64_t addr = nowhere;
+            std::uint64_t size = 0x1000;
+            const auto r =
+                nt_free_virtual_memory(f.ctx, &addr, &size, mem::kDecommit);
+            check(!r.ok() && r.status == Status::MemoryNotAllocated,
+                  "decommit: an address with nothing mapped is "
+                  "MEMORY_NOT_ALLOCATED, just as a release of one is");
+        }
+    }
+
+    // The region survived every refusal, and a later valid decommit still
+    // works -- a refused call that left the ledger half-cut would show up here
+    // as a region that no longer covers its own base.
+    check(f.space.find(base) != nullptr,
+          "decommit: and every refusal left the reservation as it was");
+    {
+        std::uint64_t addr = base;
+        std::uint64_t size = 0x10000;
+        const auto r =
+            nt_free_virtual_memory(f.ctx, &addr, &size, mem::kDecommit);
+        check(r.ok(),
+              "decommit: and a valid decommit after the refusals still "
+              "succeeds, so no refusal left state behind");
+    }
+
+    // **A decommit that rounds away to nothing succeeds, having done
+    // nothing.** Wine guards its own mapping with `host_start < host_end` and
+    // returns SUCCESS either way, so a range that lies entirely inside one page
+    // -- which cannot happen through `nt_free_virtual_memory`'s own rounding,
+    // but can through a direct `AddressSpace` call -- is a success with a
+    // reported size of zero rather than a refusal. Refusing would make this
+    // runtime reject a call Windows accepts.
+    {
+        auto empty = f.space.decommit(base + 0x10, 0x10);
+        check(empty.ok() && empty.value == 0,
+              "decommit: a range with no whole page in it reports zero bytes "
+              "decommitted and succeeds -- Wine answers SUCCESS having done "
+              "nothing, and a refusal is the divergence nobody tests for");
+        check(f.space.find(base) != nullptr,
+              "decommit: and leaves the region it touched alone");
+    }
+
+    std::uint64_t free_addr = base;
+    std::uint64_t free_size = 0;
+    (void)nt_free_virtual_memory(f.ctx, &free_addr, &free_size, mem::kRelease);
+}
+
+// ------------------------------------------------------------------------
 // Protect
 // ------------------------------------------------------------------------
 
@@ -785,7 +1029,7 @@ void test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure() {
         check(r.ok(), "protect: a change to read-write succeeds");
         check(old == 0x02, "protect: and reports the protection that was there");
         check(addr == base, "protect: writing back the page-rounded address");
-        // **0x2000 for a request of 0x1000, and the extra page is Wine's.**
+        // **0x1000 for a request of 0x1000, and the `page_mask` is why.**
         //
         // The macro, from `virtual.c:189`, written on one line because a
         // trailing backslash in a comment is a line continuation and GCC says
@@ -793,20 +1037,23 @@ void test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure() {
         //
         //     ROUND_SIZE(addr,size) = (size + (addr & page_mask) + page_mask) & ~page_mask
         //
-        // The `+ page_mask` before the mask is what adds a page: the macro
-        // rounds the size *plus the address's in-page offset* up, so a
-        // page-aligned address always costs one page more than it asked for. It
-        // looks like an off-by-one and every instinct says to fix it -- and
-        // fixing it would make this runtime protect one page less than Windows
-        // does, in a call that succeeds either way, which is the worst kind of
-        // divergence: the program carries on and the bug shows up later as a
-        // page that was not protected.
-        check(size == 0x2000,
-              "protect: and the rounded size, which is one page more than "
-              "asked for because ROUND_SIZE adds the address's in-page offset "
-              "to the size and rounds the sum -- a runtime that 'fixed' that "
-              "would protect less than Windows and the program would not "
-              "find out until something wrote through the unprotected page");
+        // The term added before the mask is `page_mask`, which is one *less*
+        // than a page -- and that single bit is the difference between a size
+        // that grows when it should not and one that does not. With the mask,
+        // an already-aligned size goes through untouched: `aligned + mask`
+        // rounds back down to `aligned`. An earlier version of this function
+        // added a whole `page_size` instead, which made every aligned request
+        // cover one page more than the caller named -- and every request from a
+        // program that had read the alignment rules is aligned, so the extra
+        // page was the ordinary case rather than the corner. It survived
+        // because the assertions here had been written to match it, with this
+        // comment's own formula spelling the correct one two lines above.
+        check(size == 0x1000,
+              "protect: and the rounded size, which for an aligned address is "
+              "exactly what was asked for -- the mask term in ROUND_SIZE adds "
+              "a page only when the address carries an in-page offset, and a "
+              "runtime that added a page unconditionally would protect memory "
+              "the caller never named");
 
         const Region* region = f.space.find(base);
         check(region != nullptr && region->protection == PageProtection::ReadWrite,
@@ -820,20 +1067,21 @@ void test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure() {
               "protect: and the change is counted");
     }
 
-    // **A size of zero still protects one page.** This is the `ROUND_SIZE`
-    // rule from `virtual.c:189` and it is the second place in this layer where
-    // "zero" means something other than "nothing":
+    // **A size of zero protects the one page the address is in.** This is not
+    // a consequence of `ROUND_SIZE` -- Wine computes the macro, gets zero, and
+    // asks the kernel to protect nothing, which is a success that changed
+    // nothing -- it is a clause of its own, and it is what Windows does. A
+    // program passing zero is asking for "the page this address is in", and
+    // that is the page its next write is going to land on.
     //
     //     ROUND_SIZE(addr,size) = (size + (addr & page_mask) + page_mask) & ~page_mask
     //
-    // It adds the address's offset *within its page* to the size and rounds the
-    // sum up. A size of zero at a page-aligned address therefore rounds to one
-    // page, not to zero, and the call succeeds on a region that is there. An
-    // earlier version of this test expected it to fail -- on the reasoning that
-    // zero means nothing to protect -- and was wrong in a way worth recording:
-    // a program calling this with zero and a valid address is asking for "the
-    // page this address is in", and a runtime that refused would refuse a call
-    // Windows accepts.
+    // The macro cannot express the rule: its job is to widen a size to cover
+    // the pages a *range* touches, and a range of length zero touches none. An
+    // earlier version of this test expected the call to fail -- on the
+    // reasoning that zero means nothing to protect -- and was wrong in a way
+    // worth recording: a runtime that refused would refuse a call Windows
+    // accepts.
     {
         std::uint64_t addr = base;
         std::uint64_t size = 0;
@@ -842,16 +1090,17 @@ void test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure() {
             nt_protect_virtual_memory(f.ctx, &addr, &size, 0x02, &old);
         check(r.ok(),
               "protect: a zero size at a page-aligned address protects the one "
-              "page the address is in, because ROUND_SIZE adds the address's "
-              "in-page offset to the size before rounding -- zero is not "
-              "\"nothing to protect\" here");
+              "page the address is in, because that is what a caller passing "
+              "zero is asking about -- zero is not \"nothing to protect\" "
+              "here");
         check(old == 0x04,
               "protect: and it reports the protection that was there, which is "
               "the read-write the previous case left behind");
         check(size == 0x1000,
-              "protect: while a runtime that treated zero as zero would report "
-              "a size of zero and a program would have no idea how much it "
-              "just changed");
+              "protect: while reporting the one page it protected -- a runtime "
+              "that treated zero as zero would report success having changed "
+              "nothing, and the program would write through a page it believed "
+              "it had just made writable");
     }
 
     // **A failed change leaves `*old_protect` alone.** This is why the null
@@ -919,6 +1168,44 @@ void test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure() {
         check(!r.ok() && r.status == Status::InvalidParameter,
               "protect: PAGE_GUARD is refused rather than applied as its base "
               "protection");
+    }
+
+    // **`ROUND_SIZE`'s mask term, from the side that is easy to get wrong.**
+    //
+    // Everything above uses page-aligned addresses and page-aligned sizes, and
+    // at those values the mask term looks like it does nothing: `aligned + mask`
+    // rounds back down to `aligned`. It only matters when the address carries
+    // an in-page offset, and then it is the difference between covering the
+    // page the range ends on and stopping one page short -- a protect that
+    // leaves the last page unprotected while reporting that it protected the
+    // range, which a program discovers when it writes through that page.
+    //
+    // The assertion is on the *reported size*, because the size is the only
+    // part of the answer the caller can check: Windows reports the range it
+    // acted on. The pair below is chosen so the two readings disagree rather
+    // than merely producing different numbers: `ROUND_SIZE(0x100, 0x800)` is
+    // `(0x800 + 0x100 + 0xfff) & ~0xfff`, which is `0x1000` -- one page --
+    // while the same expression without the mask term is `(0x800 + 0x100) &
+    // ~0xfff`, which is **zero**. A range of zero is not a range at all, and a
+    // protect that reported it would be claiming to have covered nothing.
+    {
+        const std::uint64_t misaligned_base = base + 0x100;
+        std::uint64_t addr = misaligned_base;
+        std::uint64_t size = 0x800;
+        std::uint32_t old = 0;
+        const auto r =
+            nt_protect_virtual_memory(f.ctx, &addr, &size, 0x40, &old);
+        check(r.ok(),
+              "protect: a range that starts partway into a page is protected");
+        check(addr == base,
+              "protect: the address is reported page-rounded down, so the "
+              "caller learns which page the range really began on");
+        check(size == 0x1000,
+              "protect: and the size covers the page the range touches -- "
+              "`ROUND_SIZE` adds the address's in-page offset *and* the mask "
+              "before rounding; without the mask the same request would report "
+              "a size of zero, claiming to have protected nothing while having "
+              "changed a page");
     }
 
     std::uint64_t free_addr = base;
@@ -2490,6 +2777,8 @@ int main() {
     test_allocation_validates_before_it_places();
     test_an_allocation_is_granular_and_recorded();
     test_free_refuses_three_different_problems();
+    test_decommit_keeps_the_reservation();
+    test_decommit_refuses_what_it_cannot_do();
     test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure();
     test_read_and_write_report_a_bad_buffer_differently();
     test_handles_are_reused_and_a_double_close_is_visible();

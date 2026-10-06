@@ -200,6 +200,23 @@ public:
     Result<std::uint32_t> protect(std::uint64_t base,
                                   PageProtection protection) noexcept;
 
+    // Changes the protection of a range that may be inside a region, without
+    // touching the ledger.
+    //
+    // This is the kernel half of `MEM_DECOMMIT` and of the commit that undoes
+    // it, and it exists because neither operation is a whole region: a program
+    // may decommit the middle of a reservation and commit it back later, and
+    // the addresses stay held the whole time. The range is rounded outward to
+    // whole pages here rather than by the caller, because that is the unit
+    // `mprotect` itself works in and the unit a commit has.
+    //
+    // The ledger is not updated: the caller has already cut the region it wants
+    // recorded, and doing both here would be two records for one operation.
+    // `protect()` above is the whole-region operation that does both, for the
+    // callers for which "a whole region" is the right answer.
+    Result<std::uint64_t> protect_range(std::uint64_t base, std::uint64_t size,
+                                        PageProtection protection) noexcept;
+
     // Flushes a mapped range to its backing store and counts the syscall.
     //
     // This is the mapper's side of `NtFlushProcessWriteBuffers`, and it is

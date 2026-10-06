@@ -522,4 +522,45 @@ Result<std::uint32_t> Mapper::protect(std::uint64_t base,
     return out;
 }
 
+Result<std::uint64_t> Mapper::protect_range(std::uint64_t base,
+                                            std::uint64_t size,
+                                            PageProtection protection) noexcept {
+    if (size == 0) {
+        return fail<std::uint64_t>(Status::InvalidParameter, 0, base);
+    }
+
+    // The range is widened to whole pages, for the reason a commit is: the
+    // kernel's unit is a page and a range that is not page-aligned names a
+    // state no mprotect can produce. Widening rather than narrowing is what
+    // keeps a decommit from leaving live bytes inside a range the caller was
+    // told it had released.
+    const std::uint64_t first = AddressSpace::round_down(base, AddressSpace::kPageSize);
+    std::uint64_t want = base - first + size;
+    if (want % AddressSpace::kPageSize != 0) {
+        want = AddressSpace::round_up(want, AddressSpace::kPageSize);
+    }
+    if (first + want < first) {
+        return fail<std::uint64_t>(Status::InvalidParameter, 0, base);
+    }
+
+    // The modifier bits are refused here for the reason protect() refuses
+    // them: a modifier that arrives as nothing is worse than a refusal.
+    if (static_cast<std::uint32_t>(protection) & 0xf00U) {
+        return fail<std::uint64_t>(Status::NotImplemented, 0, base);
+    }
+
+    ++syscalls_made_;
+    const sys::Result p = sys::mprotect(reinterpret_cast<void*>(first),
+                                        static_cast<std::size_t>(want),
+                                        protection_to_prot(protection));
+    if (p.failed()) {
+        return fail<std::uint64_t>(Status::InvalidAddress, p.error, base);
+    }
+
+    Result<std::uint64_t> out;
+    out.value = want;
+    out.status = Status::Success;
+    return out;
+}
+
 } // namespace occ::runtime

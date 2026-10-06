@@ -266,17 +266,28 @@ private:
 // refuse allocations Windows places, which is a refusal and so a silent
 // failure. Asserting the limit itself is the only way to see it.
 
-// Whether a `zero_bits` value accepts a *requested* address. From
-// `virtual.c:5450-5455`, where the below-32 test is a shift and the at-or-above
-// 32 test is a mask, and the two are not the same comparison written twice.
+// Whether a `zero_bits` value accepts a *requested* address.
 //
-// Below 32 the question is "does this address have any bit set at or above
-// position 32-zero_bits", which is `addr >> (32 - zero_bits)`. At or above 32
-// Wine writes `addr & ~zero_bits` -- the mask is `zero_bits` *as a number*,
-// not a run of that many low ones. That looks like a bug in Wine and may be
-// one; it is copied here because the job is to accept what Windows accepts, and
-// a program that works on Windows must work here. The two agree at
-// zero_bits == 32, which is the only value either is likely to see in practice.
+// **This is the two-branch rule Windows documents, and the two branches are
+// not the same comparison written twice.** Below 32 the value is a *count*:
+// `ZeroBits` is "the number of high-order address bits that must be zero", so
+// the question is "does this address have any bit set at or above position
+// 32-zero_bits", which is `addr >> (32 - zero_bits) == 0`. At or above 32 the
+// same parameter changes kind -- the documentation says so in as many words
+// ("When ZeroBits is larger than 32, the value is a *bitmask*") -- and the
+// test becomes `addr & ~zero_bits == 0`: an address is acceptable when it has
+// no bit set outside the mask the caller supplied. The kind change is the
+// whole of the rule; a reader who assumes one comparison is a misreading of
+// the interface and not a simplification of it.
+//
+// Wine implements the mask branch here (`virtual.c:5453-5455`) and this
+// runtime follows it, because the job is to accept what Windows accepts and a
+// program that runs on Windows must run here. Wine's *other* half of the same
+// rule -- `get_zero_bits_limit`, which is where a search *starts* rather than
+// what it accepts -- reads the at-or-above-32 value as a shift amount instead,
+// and the two disagree for every such value. `zero_bits_limit` below is
+// written to the mask reading so that the two halves agree here; the comment
+// there records the divergence in full.
 //
 // `zero_bits == 0` accepts every address. In Wine that falls out of the source
 // rather than out of a clause: both checks are guarded by `*addr && zero_bits`,
@@ -295,53 +306,67 @@ private:
     return (addr & ~static_cast<std::uint64_t>(zero_bits)) == 0;
 }
 
-// The highest address a `zero_bits` window allows, as Wine computes it in
-// `get_zero_bits_limit` (`unix_private.h:456-476`).
+// The exclusive ceiling of a `zero_bits` window -- the highest address plus
+// one that a search under the window may place a region at.
 //
 // Zero means "no window at all", and it is not the same as a window of one bit:
 // `zero_bits == 0` returns 0 immediately, before any shifting, so a caller that
-// asked for no constraint gets the whole space. The shifting below 32 is
-// `32 + zero_bits` because a zero_bits value below 32 describes the top of a
-// 32-bit window -- zero_bits 21 means "below 2^53", not "below 2^21" -- and
-// writing `zero_bits` where Wine writes `32 + zero_bits` gives a limit that is
-// billions of bytes too low and refuses allocations Windows places without
-// trouble. At or above 32 the value is a split into 16/8/4/2/1 chunks rather
-// than one shift, because `zero_bits` there can exceed 32 and a single `>>` of
-// a 64-bit value by more than 63 is undefined; the loop is Wine's and is
-// transcribed because the alternative -- clamping -- would answer differently
-// for every value above 2^32.
+// asked for no constraint gets the whole space, and every caller of `map_below`
+// treats a ceiling of zero as "do not call me".
+//
+// **Below 32 the value is a count and the ceiling is `2^(32-zero_bits) - 1`.**
+// The shifting is `32 + zero_bits` because a zero_bits value below 32 describes
+// the top of a *32-bit* window -- zero_bits 21 means "below 2^53", not "below
+// 2^21" -- and writing `zero_bits` where the sum belongs gives a limit billions
+// of bytes too low, refusing allocations Windows places without trouble. The
+// ceiling is unsigned all-ones shifted right by that amount, which is
+// `2^(64-shift) - 1` and so `2^(32-zero_bits) - 1`: for zero_bits 1 that is
+// `0x7FFFFFFF` ("below 2^31"), which is the reading Wine's own test asserts
+// from the other side (`dlls/ntdll/tests/virtual.c:139`).
+//
+// **At or above 32 the value is a bitmask and the ceiling is `zero_bits + 1`.**
+// Windows documents the kind change in the parameter's own description ("When
+// ZeroBits is larger than 32, the value is a bitmask"), and the mask reading
+// makes the two halves of the rule agree: `zero_bits_accepts` accepts an
+// address exactly when `addr & ~zero_bits == 0`, whose largest solution is
+// `addr == zero_bits` itself, so the largest a search may place is `zero_bits`
+// and the exclusive ceiling is one past it. A search bounded by anything
+// smaller places a region the accept test then refuses, and a search bounded by
+// anything larger promises room the accept test does not have -- either way the
+// two halves of one rule answer differently about the same address.
+//
+// **Wine reads the same value as a shift amount here, and is wrong to.** Its
+// `get_zero_bits_limit` (`unix_private.h:456-476`) runs the at-or-above-32 case
+// through a 16/8/4/2/1 split and then shifts all-ones right by the result, so
+// `zero_bits == 32` yields `0x3F` -- a 64-byte window -- while the same file's
+// `NtMapViewOfSection` (`virtual.c:5453-5455`) accepts addresses up to the mask
+// `0x20`. The two cannot both be right, and the mask reading is the documented
+// one, so the mask reading is what this runtime implements. This is a
+// deliberate, recorded divergence: it is not copied from Wine, and a future
+// reader comparing the two `zero_bits` functions side by side needs this
+// paragraph to know why they differ at all.
+//
+// The practical shape of the bug it fixes: `zero_bits == 32` is the value a
+// program asks for when it wants memory under 4 GiB, and Wine's 0x3F ceiling is
+// below the 64 KiB allocation granularity and below `AddressSpace::kUserMin`,
+// so every such request fails with STATUS_NO_MEMORY on a machine with the whole
+// low 4 GiB free. Windows places those, so a program that works there and not
+// here has found this.
 [[nodiscard]] constexpr std::uint64_t zero_bits_limit(
     std::uint32_t zero_bits) noexcept {
     if (zero_bits == 0) {
         return 0;
     }
-    unsigned int shift;
-    std::uint32_t bits = zero_bits;
     if (zero_bits < 32) {
-        shift = 32 + zero_bits;
-    } else {
-        shift = 63;
-        if (bits >> 16) {
-            shift -= 16;
-            bits >>= 16;
-        }
-        if (bits >> 8) {
-            shift -= 8;
-            bits >>= 8;
-        }
-        if (bits >> 4) {
-            shift -= 4;
-            bits >>= 4;
-        }
-        if (bits >> 2) {
-            shift -= 2;
-            bits >>= 2;
-        }
-        if (bits >> 1) {
-            shift -= 1;
-        }
+        // `2^(32 - zero_bits) - 1`, as all-ones shifted right by `32 + zero_bits`.
+        return ~static_cast<std::uint64_t>(0) >>
+               static_cast<unsigned int>(32u + zero_bits);
     }
-    return ~static_cast<std::uint64_t>(0) >> shift;
+    // The mask branch: the largest address the mask admits, made exclusive.
+    // `zero_bits` is 32 bits wide, so a mask is at most `0xFFFFFFFF` and the
+    // sum is at most `0x100000000`: it cannot reach 64 bits, so it cannot wrap
+    // back to zero and silently turn a window into "no window".
+    return static_cast<std::uint64_t>(zero_bits) + 1;
 }
 
 // ------------------------------------------------------------------------
@@ -807,12 +832,23 @@ Result<std::uint64_t> nt_allocate_virtual_memory_ex(
     const MemExtendedParameter* parameters, std::uint32_t count) noexcept;
 
 // Frees memory. `MEM_RELEASE` requires the region's base and a size of zero;
-// `MEM_DECOMMIT` takes any range inside it.
+// `MEM_DECOMMIT` takes any range inside it and requires a nonzero size.
 //
-// The size of zero means two different things in the two types, and getting
-// them backwards is a use-after-free: for `MEM_RELEASE` it means "the whole
-// region, and only if I am at its base", and for `MEM_DECOMMIT` it is
-// simply a refusal. Wine distinguishes them and so does this.
+// **The two types are different operations and not two spellings of one.** A
+// release gives the addresses back; a decommit keeps them and only makes the
+// pages fault until something commits them again. The size of zero means two
+// different things in the two types, and getting them backwards is a
+// use-after-free: for `MEM_RELEASE` it means "the whole region, and only if I
+// am at its base", and for `MEM_DECOMMIT` it is simply a refusal. Wine
+// distinguishes them and so does this.
+//
+// A decommit is recorded as a cut of the ledger's region -- the range becomes
+// reserved memory inside a region that still holds its addresses -- and its
+// pages are mprotected away rather than unmapped, so a later `MEM_COMMIT` into
+// the same range brings them back and a pointer into the reservation stays
+// valid throughout. Wine's three page states are modelled here because a
+// program that decommits and recommits is the ordinary way to return memory to
+// the system without giving up an address.
 Result<std::uint64_t> nt_free_virtual_memory(NtContext& ctx,
                                              std::uint64_t* addr,
                                              std::uint64_t* size,

@@ -2,6 +2,13 @@
 # Mutation harness for the ntdll memory layer: the parameter rules, the
 # rounding, the handle table, the range checks.
 #
+# Three sources are mutated rather than one, because the layer is three files
+# and some of its rules live in the ledger rather than in the calls:
+# `ntdll.cpp` holds the calls, `ntdll.h` holds the two `zero_bits` rules, and
+# `address_space.cpp` holds the commit state that a decommit and a recommit move.
+# A rule written in one of them and asserted through another is exactly the case
+# a single-file harness would miss.
+#
 # Same contract as mutate-exports.sh, and for the same reason: a mutant that
 # survives is a hole in the suite, and a harness that reports "all caught" is
 # only worth what the mutants were worth. Every mutant below is a change a
@@ -29,6 +36,7 @@ TEST_SAN="$BUILD_SAN/tests/occ_test_ntdll"
 SRC=/workspace/Occ/src/runtime/ntdll.cpp
 HDR=/workspace/Occ/include/occ/runtime/ntdll.h
 MAPPER=/workspace/Occ/src/runtime/mapper.cpp
+SPACE=/workspace/Occ/src/runtime/address_space.cpp
 
 # Taken now, at run time, for the reason mutate-exports.sh's comment gives at
 # length: a fixed path is a claim about what the file contained, and this script
@@ -51,6 +59,7 @@ cleanup() {
     cp "$WORK/ntdll.pristine" "$SRC" 2>/dev/null || true
     cp "$WORK/ntdll.h.pristine" "$HDR" 2>/dev/null || true
     cp "$WORK/mapper.pristine" "$MAPPER" 2>/dev/null || true
+    cp "$WORK/space.pristine" "$SPACE" 2>/dev/null || true
     cmake --build "$BUILD" -j"$(nproc)" >/dev/null 2>&1 || true
     cmake --build "$BUILD_SAN" -j"$(nproc)" >/dev/null 2>&1 || true
     rm -rf "$WORK"
@@ -62,6 +71,7 @@ trap 'exit 143' TERM
 cp "$SRC" "$WORK/ntdll.pristine"
 cp "$HDR" "$WORK/ntdll.h.pristine"
 cp "$MAPPER" "$WORK/mapper.pristine"
+cp "$SPACE" "$WORK/space.pristine"
 
 caught=0
 survived=0
@@ -73,6 +83,7 @@ restore() {
     cp "$WORK/ntdll.pristine" "$SRC"
     cp "$WORK/ntdll.h.pristine" "$HDR"
     cp "$WORK/mapper.pristine" "$MAPPER"
+    cp "$WORK/space.pristine" "$SPACE"
 }
 
 # mutate NAME FILE OLD NEW [OLD NEW ...]
@@ -233,19 +244,39 @@ mutate "the-above-32-zero-bits-mask-is-recomputed" "$HDR" \
 "    return (addr & ~static_cast<std::uint64_t>(zero_bits)) == 0;" \
 "    return (addr & ~((1ULL << (64 - zero_bits)) - 1)) == 0;"
 
-# The limit's shift losing the 32. `get_zero_bits_limit` computes
-# `32 + zero_bits` below 32 and `0` means "no window at all"; dropping the 32
-# gives a limit billions of bytes too low, so every `zero_bits` placement
-# refuses an allocation Windows places without trouble. A mutation whose whole
-# effect is a *refusal* of something legal, which is the quietest failure mode
-# there is.
+# The limit's shift losing the 32. The below-32 branch computes
+# `2^(32 - zero_bits) - 1`, so the shift amount is `32 + zero_bits`; dropping
+# the 32 gives a limit billions of bytes too low, so every `zero_bits`
+# placement refuses an allocation Windows places without trouble. A mutation
+# whose whole effect is a *refusal* of something legal, which is the quietest
+# failure mode there is.
 mutate "the-zero-bits-limit-loses-its-32" "$HDR" \
-"    if (zero_bits < 32) {
-        shift = 32 + zero_bits;
-    } else {" \
-"    if (zero_bits < 32) {
-        shift = zero_bits;
-    } else {"
+"    return ~static_cast<std::uint64_t>(0) >>
+               static_cast<unsigned int>(32u + zero_bits);" \
+"    return ~static_cast<std::uint64_t>(0) >>
+               static_cast<unsigned int>(zero_bits);"
+
+# The mask branch of the limit read as a *shift* again -- which is exactly what
+# Wine's `get_zero_bits_limit` does, and the bug this runtime does not copy. The
+# mutant returns `~0ULL >> zero_bits` for every at-or-above-32 value, so
+# `zero_bits == 32` yields a 64-byte window and every request for memory under
+# 4 GiB fails on a machine with 4 GiB free. The mask reading and the shift
+# reading differ at every such value, so the boundary walk in the suite --
+# which asserts the ceiling and the accept test agree -- is what kills it.
+mutate "the-zero-bits-mask-branch-is-read-as-a-shift" "$HDR" \
+"    return static_cast<std::uint64_t>(zero_bits) + 1;" \
+"    return ~static_cast<std::uint64_t>(0) >>
+               static_cast<unsigned int>(zero_bits);"
+
+# The ceiling made inclusive rather than exclusive. `map_below` places a region
+# so that it *ends* at or below the ceiling, so the ceiling is one past the
+# last admissible base; a ceiling that is the base itself promises one byte more
+# than the window has, and the accept test then refuses the region the search
+# just found. The disagreement is one byte wide, which is why the boundary walk
+# asserts both sides of it.
+mutate "the-zero-bits-mask-ceiling-is-inclusive" "$HDR" \
+"    return static_cast<std::uint64_t>(zero_bits) + 1;" \
+"    return static_cast<std::uint64_t>(zero_bits);"
 
 # `zero_bits == 0` treated as "the whole space" rather than as "no window". Both
 # readings are defensible and only one is Wine's: `get_zero_bits_limit` returns
@@ -263,25 +294,53 @@ mutate "the-zero-bits-zero-means-no-window" "$HDR" \
 # ------------------------------------------------------------ ROUND_SIZE
 
 # The page offset dropped from the rounding. `ROUND_SIZE` adds the address's
-# in-page offset to the size *before* rounding, and that is what makes a size of
-# zero at a page-aligned address cover one page rather than none. Without the
+# in-page offset to the size *before* rounding, and that is what makes a range
+# that starts partway into a page cover the whole page it ends on. Without the
 # offset every partial-page range protects or frees one page less than Windows
 # does -- in a call that succeeds either way, which is the worst kind of
 # divergence: the program carries on and the bug surfaces later as a page that
-# was not protected.
+# was not protected. The misaligned range in the protect cases is the assertion
+# that kills it.
+#
+# This mutant and the mask-term one below delete different terms of the same
+# expression, and both must be caught: the two are the over- and under-rounding
+# ends of one macro, and a suite that pinned only one of them could not tell a
+# correct `ROUND_SIZE` from one that is wrong in the other direction.
 mutate "round-size-drops-the-in-page-offset" "$SRC" \
 "    return (size + (addr & (AddressSpace::kPageSize - 1)) +
-            AddressSpace::kPageSize) &
+            (AddressSpace::kPageSize - 1)) &
            ~(AddressSpace::kPageSize - 1);" \
-"    return (size + AddressSpace::kPageSize) & ~(AddressSpace::kPageSize - 1);"
+"    return (size + (AddressSpace::kPageSize - 1)) &
+           ~(AddressSpace::kPageSize - 1);"
 
-# The `+ page_mask` dropped, which is the other half of the same macro. This one
-# is the off-by-one every reader's eye offers to fix: without it a page-aligned
-# request of exactly one page comes back as zero, and a protect call that
-# reports zero changed nothing while having changed a page.
-mutate "round-size-loses-its-extra-page" "$SRC" \
+# The mask term inflated from `page_mask` to `page_size`, which is the bug this
+# runtime shipped and the mutation is named for the survivor it would have been.
+# `aligned + mask` rounds back down to `aligned`; `aligned + page_size` rounds
+# up to `aligned + page_size`, so every request from a program that read the
+# alignment rules -- which is every such request -- covers one page more than
+# the caller named, and a free or a protect reaches into memory the program did
+# not ask about. It survived a first run of this harness because the assertions
+# had been written to match it, with the correct formula spelled out in the
+# comment two lines above them; the mutation is here so the suite cannot go back
+# to agreeing with it.
+mutate "round-size-adds-a-page-size-instead-of-a-mask" "$SRC" \
+"    return (size + (addr & (AddressSpace::kPageSize - 1)) +
+            (AddressSpace::kPageSize - 1)) &
+           ~(AddressSpace::kPageSize - 1);" \
 "    return (size + (addr & (AddressSpace::kPageSize - 1)) +
             AddressSpace::kPageSize) &
+           ~(AddressSpace::kPageSize - 1);"
+
+# The mask term dropped altogether. Without it a page-aligned request of exactly
+# one page comes back as that page rather than as two, which is right, and a
+# *partially* aligned range comes back one page short -- the case the offset
+# mutation above covers from the other side. These two mutants are the two ends
+# of the same over- and under-rounding, and a suite that pins only one of them
+# cannot tell a correct `ROUND_SIZE` from one that is wrong in the other
+# direction.
+mutate "round-size-loses-its-mask-term" "$SRC" \
+"    return (size + (addr & (AddressSpace::kPageSize - 1)) +
+            (AddressSpace::kPageSize - 1)) &
            ~(AddressSpace::kPageSize - 1);" \
 "    return (size + (addr & (AddressSpace::kPageSize - 1))) &
            ~(AddressSpace::kPageSize - 1);"
@@ -447,6 +506,64 @@ mutate "the-handle-index-is-not-verified" "$SRC" \
     }"
 
 # --------------------------------------------------- the region's lifetime
+
+# **`MEM_DECOMMIT` falling through to the release path.** This was the code's
+# actual behaviour until it was fixed, and this mutant is the bug: every
+# accepted free type reached one `unmap()`, so a decommit of the middle of a
+# reservation released the *whole* reservation and returned success. The three
+# damages are all silent -- the addresses go back to the system, a later commit
+# into the same range fails with MEMORY_NOT_ALLOCATED, and a pointer the program
+# kept into the reservation dangles. A suite that asserted only "the call
+# returned success" passed against it, which is why the decommit cases assert
+# the state the call left instead.
+mutate "a-decommit-falls-through-to-a-release" "$SRC" \
+"    if ((type & mem::kDecommit) != 0 && (type & mem::kRelease) == 0) {" \
+"    if (false) {"
+
+# The decommit's mprotect replaced by the release's unmap. The three-way cut of
+# the ledger is left in place and only the kernel half changes, which is the
+# subtler half of the same bug: the region still reads as reserved and the
+# addresses are still in the ledger, but the kernel has given them back, so the
+# next `MAP_FIXED_NOREPLACE` on a neighbouring address can take them and the
+# ledger and the kernel disagree from that point on.
+mutate "a-decommit-unmaps-instead-of-protecting" "$SRC" \
+"            ctx.placement->protect_range(base, effective_size,
+                                         PageProtection::NoAccess);" \
+"            ctx.placement->unmap(round_addr(base));"
+
+# The committed bit carried across a protection change dropped, so a
+# decommitted range becomes committed again by a call that only meant to change
+# its protection. `set_protection` rebuilds the region through `make_region`,
+# which builds a committed region, and the line that copies `committed` back is
+# the only thing keeping a reservation reserved across an unrelated call.
+mutate "a-protect-recommits-a-reservation" "$SPACE" \
+"    updated.committed = at->committed;" \
+"    updated.committed = true;"
+
+# The decommit's head/tail kept committed but the *middle* left committed too --
+# the cut made and the flag never cleared. The ledger then reports the range as
+# ordinary memory and a recommit of it is a no-op that reports success, while
+# the pages are mprotected away and the program faults on its next touch.
+mutate "a-decommit-does-not-clear-the-commit" "$SPACE" \
+"    middle.committed = false;" \
+"    middle.committed = true;"
+
+# The empty-range case refused instead of answered with success. When the two
+# roundings meet there are no whole pages to release, Wine returns SUCCESS
+# having done nothing, and a runtime that refused would reject a call Windows
+# accepts -- the direction of divergence that costs a program a working path
+# rather than giving it a wrong answer, and so the one nobody notices.
+mutate "a-decommit-refuses-an-empty-range" "$SPACE" \
+"    if (first >= last) {
+        out.value = 0;
+        out.status = Status::Success;
+        return out;
+    }" \
+"    if (first >= last) {
+        out.value = 0;
+        out.status = Status::InvalidParameter;
+        return out;
+    }"
 
 # The unmap's size read from the region *after* the unmap removed it. This is
 # the use-after-free that AddressSanitizer found and a plain run does not: the

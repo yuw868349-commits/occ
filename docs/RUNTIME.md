@@ -1138,12 +1138,31 @@ functions disagree in Wine, and the disagreement is transcribed rather than
 smoothed over: a program that works on Windows relies on each function's own
 rule, and harmonising them here would break one of the two.
 
-The comparison itself is a shift below 32 and a mask at or above it, and the
-mask is Wine's own `addr & ~zero_bits` — the mask is `zero_bits` *as a number*,
-not a run of that many low ones. That looks like a bug in Wine and may be one.
-It is copied because the job is to accept what Windows accepts, and a program
-that works there must work here. The two spellings agree at exactly one value,
-32, which is why a test of only 32 cannot tell them apart.
+**`zero_bits` changes kind at 32, and the two functions agree here.** Below 32
+the value is a *count* of high-order address bits that must be zero, and both
+the accept test and the search ceiling read it as one: `zero_bits == 21` means
+"below 2^53", and the ceiling is `2^(32 - zero_bits) - 1`. At or above 32 the
+documentation says the value "is a bitmask", and both halves read it as one:
+`zero_bits_accepts` accepts an address exactly when `addr & ~zero_bits == 0`,
+whose largest solution is `zero_bits` itself, so the search ceiling is the mask
+plus one. The mask is `zero_bits` *as a number* and not a run of that many low
+ones; the two spellings agree at exactly one value, 32, which is why a test of
+only 32 cannot tell them apart.
+
+**Wine's two halves disagree, and this runtime does not copy that.** Wine's
+`NtMapViewOfSection` uses the mask reading (`virtual.c:5453-5455`), and its
+`get_zero_bits_limit` (`unix_private.h:456-476`) reads the same value as a
+*shift amount* instead, so for `zero_bits == 32` the accept test admits
+addresses up to `0x20` while the ceiling the search uses is `0x3F` — a 64-byte
+window, below the 64 KiB allocation granularity. Every request for memory under
+4 GiB therefore fails with `STATUS_NO_MEMORY` on a machine with the whole low
+4 GiB free. The mask reading is the documented one, so the mask reading is what
+both halves do here. This is a deliberate divergence from Wine and the one place
+in this layer where the transcription stops: a program that works on Windows has
+to work here, and copying Wine's arithmetic would refuse an allocation Windows
+places. A boundary walk in the suite asserts the property directly — for every
+mask value, the last address the ceiling admits is one the accept test takes,
+and the first address past it is one the accept test refuses.
 
 **The `zero_bits` window has to be placed by this process.** Wine hands the
 limit to wineserver, which places the mapping with the whole address space in
@@ -1161,6 +1180,19 @@ Windows accepts, in a program that was never wrong — the direction of divergen
 nobody tests for. The dead clause stays for the same reason: removing a clause
 that does nothing is safe today and wrong the day the constant's value changes.
 
+**`MEM_DECOMMIT` is not a release.** Windows has three page states — free,
+reserved and committed — and only the first two are address-space facts. A
+release gives the addresses back; a decommit keeps them and only makes the pages
+fault until something commits them again. The ledger models the third state with
+`Region::committed`, a decommit of a range inside a region cuts that region into
+up to three pieces (only the middle one loses its commit), and the pages are
+`mprotect`ed away rather than unmapped, so a `MEM_COMMIT` into the same range
+brings them back at the same addresses. Every accepted free type used to fall
+through to one `unmap()`, which took the whole reservation away and returned
+success — the addresses went back to the system, a later commit failed with
+`MEMORY_NOT_ALLOCATED`, and a pointer the program had kept dangled. Nothing in
+the return value said so.
+
 **`ROUND_SIZE` is not `round_up(size)`.** `virtual.c:189` adds the address's
 offset *within its page* to the size before rounding:
 
@@ -1168,14 +1200,23 @@ offset *within its page* to the size before rounding:
 #define ROUND_SIZE(addr,size) (((SIZE_T)(size) + ((UINT_PTR)(addr) & page_mask) + page_mask) & ~page_mask)
 ```
 
-Two consequences, and both are places every reader's eye offers to fix. A size
-of **zero** at a page-aligned address rounds to **one page**, so
-`NtProtectVirtualMemory` with a zero size protects the page the address is in
-rather than refusing — and a suite that expected a refusal here was testing a
-rule Windows does not have. And the `+ page_mask` means a page-aligned request
-of exactly one page comes back as *two*: the extra page is Wine's, and removing
-it makes this runtime protect less than Windows does, in a call that succeeds
-either way, which is the worst kind of divergence.
+Two consequences. A size that starts partway into a page is widened to cover the
+whole page it ends on, so a range is never left with a live byte past its end.
+And the term added before the mask is `page_mask`, which is one *less* than a
+page — that single bit is what leaves an already-aligned size untouched
+(`aligned + mask` rounds back down to `aligned`). Writing `page_size` there is
+the bug this file shipped for a while: every request from a program that had
+read the alignment rules is aligned, and each one then covered one page *more*
+than the caller named, so a free or a protect reached into memory the program
+did not ask about. The correct formula was written in the comment above the
+wrong code the whole time, which is how it survived reading.
+
+**A zero size in `NtProtectVirtualMemory` is a clause of its own.** The macro
+above cannot express it — a range of length zero touches no pages, so
+`ROUND_SIZE(addr, 0)` is zero, and Wine asks the kernel to protect nothing and
+returns success having changed nothing. Windows protects the page the address is
+in, and a program passing zero is asking for exactly that page; the call is
+written out rather than left to the macro for that reason.
 
 **Zero means opposite things in two functions.** `nt_free_virtual_memory`: zero
 is "the size must be at the base", which is what `MEM_RELEASE` requires.

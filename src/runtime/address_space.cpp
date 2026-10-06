@@ -394,9 +394,140 @@ Result<std::uint32_t> AddressSpace::set_protection(
                                  at->section, at->section_index);
     updated.initial_protection = at->initial_protection;
     updated.protection_changes = at->protection_changes + 1;
+    // **The commit state is carried over, and it has to be.** `make_region`
+    // builds a region that is committed because that is what every newly
+    // recorded region is; a protection change on a reserved range would
+    // otherwise commit it, which is the opposite of what a program that
+    // decommitted and then re-protected the range expects. A protection is not
+    // a commit and the two are independent fields.
+    updated.committed = at->committed;
     *at = std::move(updated);
 
     out.value = at->protection_changes;
+    out.status = Status::Success;
+    return out;
+}
+
+Result<std::uint64_t> AddressSpace::decommit(std::uint64_t base,
+                                             std::uint64_t size) noexcept {
+    Result<std::uint64_t> out;
+
+    // The range is cut as Wine cuts it, and the two roundings are in
+    // *opposite* directions -- which is the part a reader gets wrong.
+    //
+    //   first  `ROUND_SIZE(0, base)` in Wine, which is the base rounded *up*
+    //          to a page boundary.
+    //   last   `ROUND_ADDR(base + size)` in Wine, which is the base plus the
+    //          size rounded *down* to a page boundary.
+    //
+    // It looks like an inconsistency and it is a deliberate one: a decommit
+    // releases the whole pages it *covers*, and the caller's `size` has already
+    // been widened by one page by `ROUND_SIZE` at the call site above. Taking
+    // the first page up and the last page down is what keeps the range the
+    // ledger records equal to the range the kernel is told about.
+    //
+    // **A range that rounds away to nothing is a success and not an error.**
+    // When the two roundings meet -- a range entirely inside one page, or one
+    // that ends exactly where it starts after rounding -- there are no whole
+    // pages to release, and Wine answers SUCCESS having done nothing
+    // (`decommit_pages` guards its own mmap with `host_start < host_end` and
+    // returns SUCCESS either way). Refusing would make this runtime reject a
+    // call Windows accepts, which is the direction of divergence nobody tests
+    // for; reporting zero bytes is the honest answer and the one a caller can
+    // check.
+    if (size == 0) {
+        out.status = Status::InvalidParameter;
+        return out;
+    }
+    const std::uint64_t first = round_up(base, kPageSize);
+    const std::uint64_t last = round_down(base + size, kPageSize);
+    if (first >= last) {
+        out.value = 0;
+        out.status = Status::Success;
+        return out;
+    }
+    const std::uint64_t want = last - first;
+
+    // The region that must contain the whole range. `find()` returns the
+    // region holding the first page; the range is rejected unless that same
+    // region holds the last page too, so a decommit that straddles two regions
+    // is refused rather than applied to one of them.
+    const Region* found = find(first);
+    if (found == nullptr) {
+        out.status = Status::MemoryNotAllocated;
+        return out;
+    }
+    if (found->kind != RegionKind::Private) {
+        out.status = Status::InvalidParameter;
+        return out;
+    }
+    if (found->end() < last) {
+        out.status = Status::MemoryNotAllocated;
+        return out;
+    }
+
+    // The three-way cut. The pieces are built as values and inserted at once,
+    // because the vector may reallocate and `found` is a pointer into it -- the
+    // hazard the header warns about at `find()` is exactly this, and holding
+    // `found` across an `insert` is what it forbids.
+    const Region whole = *found;
+    const auto at = std::lower_bound(
+        regions_.begin(), regions_.end(), whole.base,
+        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
+
+    // A decommit of a range that is already reserved is not an error, but it
+    // also has nothing to do: the bytes are already where the caller wants
+    // them. Answering success rather than a status is Windows' behaviour and
+    // the reason a program may decommit twice.
+    if (!whole.committed) {
+        out.value = want;
+        out.status = Status::Success;
+        return out;
+    }
+
+    std::vector<Region> pieces;
+    pieces.reserve(3);
+
+    // The head: everything before the range, still committed.
+    if (first > whole.base) {
+        Region head = make_region(whole.base, first - whole.base,
+                                  whole.protection, whole.kind, whole.section,
+                                  whole.section_index);
+        head.initial_protection = whole.initial_protection;
+        head.protection_changes = whole.protection_changes;
+        head.committed = true;
+        pieces.push_back(std::move(head));
+    }
+
+    // The middle: the range, now reserved. Its protection is kept -- a
+    // reservation does not change the protection a later commit would restore,
+    // and Windows reports the old protection back through a recommit.
+    Region middle = make_region(first, last - first, whole.protection,
+                                whole.kind, whole.section, whole.section_index);
+    middle.initial_protection = whole.initial_protection;
+    middle.protection_changes = whole.protection_changes;
+    middle.committed = false;
+    pieces.push_back(std::move(middle));
+
+    // The tail: everything after the range, still committed.
+    if (whole.end() > last) {
+        Region tail = make_region(last, whole.end() - last, whole.protection,
+                                  whole.kind, whole.section,
+                                  whole.section_index);
+        tail.initial_protection = whole.initial_protection;
+        tail.protection_changes = whole.protection_changes;
+        tail.committed = true;
+        pieces.push_back(std::move(tail));
+    }
+
+    regions_.erase(at);
+    const auto insert_at = std::lower_bound(
+        regions_.begin(), regions_.end(), pieces.front().base,
+        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
+    regions_.insert(insert_at, std::make_move_iterator(pieces.begin()),
+                    std::make_move_iterator(pieces.end()));
+
+    out.value = want;
     out.status = Status::Success;
     return out;
 }
@@ -412,6 +543,32 @@ const Region* AddressSpace::find(std::uint64_t addr) const noexcept {
     }
     const Region& candidate = *(at - 1);
     return candidate.contains(addr) ? &candidate : nullptr;
+}
+
+Result<std::uint64_t> AddressSpace::commit(std::uint64_t base) noexcept {
+    Result<std::uint64_t> out;
+
+    const auto at = std::lower_bound(
+        regions_.begin(), regions_.end(), base,
+        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
+
+    if (at == regions_.end() || at->base != base) {
+        out.status = Status::InvalidAddress;
+        return out;
+    }
+    if (at->kind != RegionKind::Private) {
+        out.status = Status::InvalidParameter;
+        return out;
+    }
+
+    // Already committed is success and not an error: Windows lets a program
+    // commit a range twice, and the second call reports the protection the
+    // first one left. Nothing is flipped, so the change counter stays put --
+    // a commit is not a protection change.
+    at->committed = true;
+    out.value = at->size;
+    out.status = Status::Success;
+    return out;
 }
 
 std::uint64_t AddressSpace::bytes_of_kind(RegionKind k) const noexcept {

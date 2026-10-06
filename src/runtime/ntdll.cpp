@@ -31,15 +31,27 @@ namespace {
 // addr+size)` means extending to the end of the page `addr+size` lands on,
 // which is one page further than rounding `size` alone would reach.
 //
+// **The term added is `page_mask`, which is `page_size - 1`, and writing
+// `page_size` there is a bug that hides at the boundary.** With `page_mask`
+// the three cases come out right: an unaligned address extends to the end of
+// the page it lands on, an aligned `size` stays put (`aligned + mask` rounds
+// back down to `aligned`), and the two combined extend once. With `page_size`
+// the last two each gain a page: a request that was already page-aligned --
+// which is every request made by a program that read the alignment rules --
+// covers one page more than the caller named, so a free or a protect reaches
+// into memory the program did not ask about. The formula was written both ways
+// in this file at different times and the comment above always said
+// `page_mask`, which is how the wrong one survived reading.
+//
 // `AddressSpace::round_up` rounds a size. This rounds a *range*, and the
 // difference is named rather than hidden inside an existing call because a
-// caller that gets it wrong frees or protects one page less than the program
-// asked for, which is the kind of error that appears as a crash in a
+// caller that gets it wrong frees or protects one page more than the program
+// asked for, which is the kind of error that appears as a corruption in a
 // different function entirely.
 [[nodiscard]] constexpr std::uint64_t round_size_from(std::uint64_t addr,
                                                       std::uint64_t size) noexcept {
     return (size + (addr & (AddressSpace::kPageSize - 1)) +
-            AddressSpace::kPageSize) &
+            (AddressSpace::kPageSize - 1)) &
            ~(AddressSpace::kPageSize - 1);
 }
 
@@ -676,6 +688,20 @@ Result<std::uint64_t> nt_allocate_virtual_memory(NtContext& ctx,
                 "a commit-only request must cover a whole reservation from its "
                 "base; " + std::to_string(base) + " does not");
         }
+        // The ledger first, so that a reserved range is marked committed before
+        // the kernel's protection change can fail -- and the protection change
+        // then carries the flag over rather than clearing it (`set_protection`
+        // keeps `committed`). A commit that the kernel then refused has moved
+        // `committed` and nothing else, and the caller sees the failure either
+        // way; an ordering the other way round would let a successful mprotect
+        // on a range the ledger still called reserved be reachable.
+        const Result<std::uint64_t> committed = ctx.space->commit(base);
+        if (!committed.ok()) {
+            return refuse<std::uint64_t>(
+                committed.status,
+                "the commit of the reservation at " + std::to_string(base) +
+                    " could not be recorded");
+        }
         const Result<std::uint32_t> changed =
             ctx.placement->protect(r->base,
                                   static_cast<PageProtection>(protect));
@@ -1096,6 +1122,77 @@ Result<std::uint64_t> nt_free_virtual_memory(NtContext& ctx,
                 "MEM_RELEASE|MEM_COALESCE_PLACEHOLDERS");
     }
 
+    // **`MEM_DECOMMIT` is not a release, and the two go different ways here.**
+    //
+    // This is the correction of a real defect: every accepted type used to fall
+    // through to one `unmap()`, so a program that decommitted the middle of a
+    // reservation had the *whole* reservation taken away -- the addresses went
+    // back to the system, a later `MEM_COMMIT` into the same range failed with
+    // MEMORY_NOT_ALLOCATED, and a pointer the program had kept into the
+    // reservation dangled. Nothing about the call said so; it returned success.
+    //
+    // The two operations differ in three ways, and each is load-bearing:
+    //
+    //   size    DECOMMIT takes a nonzero size and may be told any range inside
+    //           the region; RELEASE requires a zero size and the region's base.
+    //   extent  DECOMMIT frees no address space, so the cut is within the
+    //           ledger's region and the region survives as reserved memory.
+    //   kernel  DECOMMIT's pages must fault on the next touch, so the range is
+    //           mprotected away rather than unmapped -- an `unmap()` would
+    //           release the addresses, which is the bug being fixed.
+    if ((type & mem::kDecommit) != 0 && (type & mem::kRelease) == 0) {
+        if (given_size == 0) {
+            return refuse<std::uint64_t>(
+                Status::InvalidParameter,
+                "MEM_DECOMMIT with a size of zero: there is no range to "
+                "decommit, and a zero size means something only to "
+                "MEM_RELEASE");
+        }
+
+        // The kernel first, so that a refused mprotect leaves the ledger
+        // describing the memory as it still is. The order is the reverse of
+        // `unmap()`'s -- there the kernel call's result is what the ledger is
+        // told -- and it is chosen here because the ledger's cut and the
+        // kernel's mprotect must cover the *same* range, which is the one the
+        // kernel rounds outward. Asking the ledger first and the kernel second
+        // could leave the ledger with a cut the kernel refused.
+        const Result<std::uint64_t> protected_range =
+            ctx.placement->protect_range(base, effective_size,
+                                         PageProtection::NoAccess);
+        if (!protected_range.ok()) {
+            return refuse<std::uint64_t>(
+                protected_range.status,
+                "the kernel refused to decommit " +
+                    std::to_string(effective_size) + " bytes at " +
+                    std::to_string(base) + ": " +
+                    std::strerror(ctx.placement->last_failure().error));
+        }
+
+        const Result<std::uint64_t> cut =
+            ctx.space->decommit(base, effective_size);
+        if (!cut.ok()) {
+            return refuse<std::uint64_t>(
+                cut.status,
+                "the decommit of " + std::to_string(effective_size) +
+                    " bytes at " + std::to_string(base) +
+                    " could not be recorded: the range is not inside one "
+                    "private region");
+        }
+
+        // `*addr` is written back as the rounded address the call acted on and
+        // `*size` as the size Wine reports back. Wine's `ROUND_SIZE` widens a
+        // size by a whole page -- `(size + (addr & mask) + mask) & ~mask` -- so
+        // a page-aligned request for 64 KiB is reported as 68 KiB. That looks
+        // like an off-by-one and is the format: the caller learns the range
+        // that actually lost its commit, which is one page past what it named.
+        // Reporting `effective_size` rather than the ledger's cut keeps this
+        // function's answer identical to Wine's, which is what a program
+        // comparing the two would rely on.
+        *addr = base;
+        *size = effective_size;
+        return Result<std::uint64_t>{base};
+    }
+
     // A release of a placeholder-only region keeps the reservation. Neither
     // placeholder kind is implemented here -- a placeholder is a reservation
     // that is not committed, and this ledger's regions are committed from the
@@ -1175,7 +1272,22 @@ Result<std::uint64_t> nt_protect_virtual_memory(NtContext& ctx,
     }
 
     const std::uint64_t given_addr = *addr;
-    const std::uint64_t effective_size = round_size_from(given_addr, *size);
+    // **A size of zero means the one page the address is in, and that is a
+    // clause rather than a consequence of the rounding.** Wine computes
+    // `ROUND_SIZE(addr, 0)`, which is `(0 + (addr & mask) + mask) & ~mask` --
+    // zero for a page-aligned address -- and then asks the kernel to protect
+    // nothing, which is a success that changed nothing. Windows protects the
+    // page the address falls in, and a program that passes zero is asking for
+    // exactly that: "the page this address is in". Answering with a real
+    // protection change matters because the caller's next move is usually to
+    // write through the address it just asked about.
+    //
+    // The rule is written out rather than left to the macro because the macro
+    // cannot express it: `ROUND_SIZE`'s whole job is to widen a size to cover
+    // the pages the *range* touches, and a range of length zero touches none.
+    const std::uint64_t effective_size =
+        *size == 0 ? AddressSpace::kPageSize
+                   : round_size_from(given_addr, *size);
     const std::uint64_t base = round_addr(given_addr);
 
     if (base == 0) {
