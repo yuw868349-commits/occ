@@ -160,6 +160,26 @@ struct PeSection {
     std::uint32_t raw_size = 0;
     std::uint32_t raw_offset = 0;
 
+    // How much of the address space this section occupies, which is not always
+    // `virtual_size`.
+    //
+    // `VirtualSize` of zero is legal and means "as much as the file holds",
+    // which is what every linker emits for a section whose contents are
+    // entirely file-backed -- there is nothing to zero-fill, so there is no
+    // size to state. A PE that says zero is not malformed and a parser that
+    // treats it as an empty section is wrong: it makes the section's whole
+    // address range unaddressable, so an RVA that the Windows loader maps
+    // resolves to nothing here, and everything downstream -- an import
+    // descriptor, a relocation, a string the image reads at run time -- is
+    // reported as absent from a file that contains it.
+    //
+    // The fallback is to the raw size and not to a page, because the rule is
+    // about how much *file* there is to map, and rounding up to a page here
+    // would claim address space beyond what the file provides.
+    [[nodiscard]] std::uint64_t mapped_size() const noexcept {
+        return virtual_size != 0 ? virtual_size : raw_size;
+    }
+
     // The characteristics bitfield. Reported as a raw value with three
     // accessors rather than as a struct, because the bits that matter for
     // analysis are a subset and a reader that models all of them invites

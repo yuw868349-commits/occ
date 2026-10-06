@@ -2116,6 +2116,374 @@ void test_prefetch_names_the_parameter_that_is_wrong() {
     (void)nt_free_virtual_memory(f.ctx, &free_addr, &free_size, mem::kRelease);
 }
 
+// The section's own information class must not carry a host address.
+//
+// NtQuerySection's SectionInformation fills a SectionSectionInformation, whose
+// section_address used to be written with the address of the HandleTable entry
+// -- a pointer into this process's own heap. Every other field of every Nt*
+// call in this layer is a value in the guest's address space or a count, and
+// this one was a pointer into the observer's.
+//
+// The check is differential rather than a scan for host-range values, because
+// the correct answers include sizes, and a size is a small number that can
+// easily fall inside one of the host's own mappings -- a scan flags it and is
+// then wrong about what it found. Two sections that differ in nothing but which
+// one is asked about must produce byte-identical buffers: any value that varies
+// between them describes this process's bookkeeping rather than the guest, and
+// the address of a HandleTable entry is exactly such a value.
+void test_a_section_query_carries_no_host_address() {
+    Fixture f;
+    HandleTable table;
+
+    // Two sections, identical in every way a guest can observe. If a returned
+    // buffer distinguishes them, the distinguishing byte describes the host.
+    Handle first = 0;
+    Handle second = 0;
+    const auto made_first = nt_create_section(f.ctx, table, 0x10000, 0x04, &first);
+    const auto made_second = nt_create_section(f.ctx, table, 0x10000, 0x04, &second);
+    check(made_first.ok() && made_second.ok(), "host address: two sections are created");
+    if (!made_first.ok() || !made_second.ok()) {
+        return;
+    }
+
+    // Every class, because a leak in one of them would survive a comparison that
+    // covered only the others.
+    const SectionInformationClass classes[] = {
+        SectionInformationClass::BasicInformation,
+        SectionInformationClass::ImageInformation,
+        SectionInformationClass::SectionInformation,
+    };
+    for (SectionInformationClass cls : classes) {
+        // Each class' own buffer, sized generously so a length refusal is not
+        // what is being measured.
+        std::uint8_t buf_first[128] = {};
+        std::uint8_t buf_second[128] = {};
+        std::uint64_t len_first = 0;
+        std::uint64_t len_second = 0;
+        const auto r_first = nt_query_section(f.ctx, table, first, cls, buf_first,
+                                              sizeof(buf_first), &len_first);
+        const auto r_second = nt_query_section(f.ctx, table, second, cls, buf_second,
+                                               sizeof(buf_second), &len_second);
+        if (!r_first.ok() || !r_second.ok()) {
+            // ImageInformation about a non-image is refused, which is correct
+            // and is covered elsewhere. It writes nothing, so there is nothing
+            // to compare.
+            check(r_first.status == Status::SectionNotImage &&
+                      r_second.status == Status::SectionNotImage,
+                  "host address: the only class that refused did so for the "
+                  "documented reason");
+            continue;
+        }
+
+        check(len_first == len_second && std::memcmp(buf_first, buf_second, len_first) == 0,
+              "host address: a section query gives two equally-shaped sections "
+              "the same answer, so nothing in it describes the host's own "
+              "bookkeeping");
+        if (std::memcmp(buf_first, buf_second, len_first) != 0) {
+            for (std::size_t off = 0; off + 8 <= len_first; off += 8) {
+                std::uint64_t a = 0;
+                std::uint64_t b = 0;
+                std::memcpy(&a, buf_first + off, 8);
+                std::memcpy(&b, buf_second + off, 8);
+                if (a != b) {
+                    std::fprintf(stderr,
+                                 "     class %u offset %llu differs: %llx vs %llx\n",
+                                 static_cast<unsigned>(cls),
+                                 static_cast<unsigned long long>(off),
+                                 static_cast<unsigned long long>(a),
+                                 static_cast<unsigned long long>(b));
+                }
+            }
+        }
+    }
+
+    // And the specific field, named. The comparison above says the answer does
+    // not vary with the host; this says the field that used to hold a host
+    // address holds zero, which is the Windows-semantics answer rather than
+    // merely a host-independent one.
+    SectionSectionInformation info{};
+    const auto r = nt_query_section(
+        f.ctx, table, first, SectionInformationClass::SectionInformation,
+        &info, sizeof(info), nullptr);
+    check(r.ok() && info.section_address == 0,
+          "host address: a section's address is zero -- a section is an object "
+          "and not a mapping, so it has no address to report");
+    check(info.section_size == 0x10000,
+          "host address: and the size beside it is still the section's, which "
+          "is the one field of the pair that can be answered");
+}
+
+// NtMapViewOfSectionEx's address requirements constrain the placement.
+//
+// The parameters were parsed and range-checked and then dropped: a caller could
+// ask for a view at or above an address, or aligned to a boundary, and get one
+// anywhere. The cases below pin all three constraints.
+//
+// Every case here is written so that it has one way to pass. An earlier version
+// accepted either an honoured requirement or a refusal, which made the cases
+// pass whether or not the requirement was enforced -- a refusal on a host that
+// could have satisfied the request is a correct answer to a different question.
+// The requirements chosen here are ones the address space can satisfy, so
+// "refused" is a failure and not an excuse: a runtime that cannot honour a
+// request it could have honoured has still answered wrongly, because the caller
+// cannot tell that case from a runtime that ignored the parameter.
+void test_a_views_address_requirements_constrain_the_placement() {
+    Fixture f;
+    HandleTable table;
+
+    Handle section = 0;
+    const auto made = nt_create_section(f.ctx, table, 0x10000, 0x04, &section);
+    if (!made.ok()) {
+        std::fprintf(stderr, "SKIP requirements: %s\n", made.detail.c_str());
+        return;
+    }
+
+    // A range at the bottom of the window, freed again, so the "at or above"
+    // case has room below the address it names for the mapper to have used
+    // instead. The mapper searches downward from the top of the window, so
+    // without something occupying the top the view lands far above any bound
+    // this test could name and the constraint would hold by accident.
+    const std::uint64_t floor_base = a_free_base(0x400000);
+    if (floor_base == 0) {
+        std::fprintf(stderr,
+                     "SKIP requirements: no free range to place against\n");
+        return;
+    }
+    std::uint64_t floor_addr = floor_base;
+    std::uint64_t floor_size = 0x400000;
+    (void)nt_free_virtual_memory(f.ctx, &floor_addr, &floor_size,
+                                 mem::kRelease);
+
+    // The bottom of the window is occupied, so a view with no requirement lands
+    // above `floor_base`. That address is what the "at or above" case has to
+    // beat, and it is recorded rather than assumed: if the space is too full for
+    // the probe to place anything, the case below is measuring nothing.
+    // Where the view goes with no requirement at all. Every case below names a
+    // bound this placement does not already meet, so a runtime that drops the
+    // requirement is caught rather than agreeing by coincidence. Recorded rather
+    // than assumed, because the mapper's choice is a fact about the address
+    // space and not something this file can state.
+    std::uint64_t plain_addr = 0;
+    std::uint64_t plain_size = 0;
+    const auto plain =
+        nt_map_view_of_section_ex(f.ctx, table, section, &plain_addr,
+                                  &plain_size, 0, 0, 0, nullptr, 0, 0, 0,
+                                  0x04);
+    if (!plain.ok()) {
+        std::fprintf(stderr, "SKIP requirements: no plain placement to "
+                             "compare against: %s\n",
+                     plain.detail.c_str());
+        return;
+    }
+    {
+        std::uint64_t addr = plain_addr;
+        std::uint64_t size = plain_size;
+        (void)nt_unmap_view_of_section(f.ctx, &addr, &size);
+    }
+
+    // The granularity a bound has to meet to be usable at all, and the step the
+    // alignment case measures in.
+    constexpr std::uint64_t alignment = 0x200000;
+
+    // Alignment. 2 MiB, which the plain address above does not meet -- checked
+    // rather than assumed, because an address that happened to be aligned would
+    // make this case pass with the requirement ignored.
+    {
+        check((plain_addr & (alignment - 1)) != 0,
+              "requirements: the unconstrained placement is not already 2 MiB "
+              "aligned, so the alignment case below can tell the two apart");
+        MemExtendedParameterAddressRequirements req{};
+        req.alignment = alignment;
+        const MemExtendedParameter param{kMemExtendedParameterAddressRequirements,
+                                         &req, 0};
+        std::uint64_t addr = 0;
+        std::uint64_t size = 0;
+        const auto r = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &param, 1, 0, 0,
+            0x04);
+        check(r.ok() && (addr & (alignment - 1)) == 0,
+              "requirements: a view asked for at 2 MiB alignment arrives 2 MiB "
+              "aligned, and is refused rather than placed misaligned if it "
+              "cannot be");
+        if (r.ok()) {
+            std::uint64_t unmap = addr;
+            std::uint64_t unmap_size = 0;
+            (void)nt_unmap_view_of_section(f.ctx, &unmap, &unmap_size);
+        }
+    }
+
+    // Lowest starting address. The bound is above the plain placement, so a
+    // runtime that drops the requirement puts the view below it and is caught.
+    {
+        MemExtendedParameterAddressRequirements req{};
+        req.lowest_starting_address = plain_addr + alignment;
+        const MemExtendedParameter param{kMemExtendedParameterAddressRequirements,
+                                         &req, 0};
+        std::uint64_t addr = 0;
+        std::uint64_t size = 0;
+        const auto r = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &param, 1, 0, 0,
+            0x04);
+        check(r.ok() && addr >= req.lowest_starting_address,
+              "requirements: a view asked for at or above an address arrives "
+              "at or above it, and is refused rather than placed below it if "
+              "it cannot be");
+        if (r.ok()) {
+            std::uint64_t unmap = addr;
+            std::uint64_t unmap_size = 0;
+            (void)nt_unmap_view_of_section(f.ctx, &unmap, &unmap_size);
+        } else {
+            check(f.space.find(addr) == nullptr,
+                  "requirements: a refused placement leaves nothing mapped");
+        }
+    }
+
+    // Highest ending address. A range the plain placement ends above, so the
+    // bound has to move the view or refuse it. The refusal has to undo the
+    // placement: a caller that was refused and can still read the address it
+    // asked about has been given the mapping anyway.
+    {
+        MemExtendedParameterAddressRequirements req{};
+        req.highest_ending_address = plain_addr + 0x10000;
+        req.lowest_starting_address = AddressSpace::kUserMin;
+        const MemExtendedParameter param{kMemExtendedParameterAddressRequirements,
+                                         &req, 0};
+        std::uint64_t addr = 0;
+        std::uint64_t size = 0;
+        const auto r = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &param, 1, 0, 0,
+            0x04);
+        if (r.ok()) {
+            check(addr + size <= req.highest_ending_address + 1,
+                  "requirements: a view placed under a highest ending address "
+                  "ends inside it");
+            std::uint64_t unmap = addr;
+            std::uint64_t unmap_size = 0;
+            (void)nt_unmap_view_of_section(f.ctx, &unmap, &unmap_size);
+        } else {
+            check(r.status == Status::ConflictingAddresses,
+                  "requirements: a range the view cannot fit in is "
+                  "ConflictingAddresses, which names the conflict rather than "
+                  "the argument");
+            check(f.space.find(addr) == nullptr,
+                  "requirements: and nothing is mapped at the address the "
+                  "refused view would have used");
+        }
+    }
+
+    // A requirement the plain placement cannot satisfy and the space cannot
+    // either: a range below everything mappable. This is the case where a
+    // refusal is the only correct answer, and it pins that the refusal undoes
+    // the placement rather than leaving it behind.
+    {
+        MemExtendedParameterAddressRequirements req{};
+        req.highest_ending_address = 0x20000;
+        req.lowest_starting_address = AddressSpace::kUserMin;
+        const MemExtendedParameter param{kMemExtendedParameterAddressRequirements,
+                                         &req, 0};
+        std::uint64_t addr = 0;
+        std::uint64_t size = 0;
+        const auto r = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &param, 1, 0, 0,
+            0x04);
+        check(!r.ok() && r.status == Status::ConflictingAddresses,
+              "requirements: a range below anything mappable is refused, since "
+              "no placement could satisfy it");
+        check(f.space.find(addr) == nullptr,
+              "requirements: and the refused placement was unmapped, so the "
+              "address the caller was given names nothing");
+    }
+
+    // A requested address together with requirements is refused, which is the
+    // rule the allocation form applies: one names a place and the other asks
+    // the runtime to search for one.
+    {
+        MemExtendedParameterAddressRequirements req{};
+        req.lowest_starting_address = AddressSpace::kUserMin;
+        const MemExtendedParameter param{kMemExtendedParameterAddressRequirements,
+                                         &req, 0};
+        std::uint64_t addr = floor_base;
+        std::uint64_t size = 0;
+        const auto r = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &param, 1, 0, 0,
+            0x04);
+        check(!r.ok() && r.status == Status::InvalidParameter,
+              "requirements: an address and requirements together are refused, "
+              "because honouring both would mean choosing which wins");
+    }
+
+    // A null output pointer, which the extended form inherits from the plain
+    // one and which used to be dereferenced before it was checked.
+    {
+        MemExtendedParameterAddressRequirements req{};
+        req.lowest_starting_address = AddressSpace::kUserMin;
+        const MemExtendedParameter param{kMemExtendedParameterAddressRequirements,
+                                         &req, 0};
+        const auto r = nt_map_view_of_section_ex(
+            f.ctx, table, section, nullptr, nullptr, 0, 0, 0, &param, 1, 0, 0,
+            0x04);
+        check(!r.ok() && r.status == Status::InvalidParameter,
+              "requirements: a null address output is refused before anything "
+              "is placed");
+    }
+
+    // The malformed cases still are, which is the half of this that already
+    // worked and is pinned so the enforcement above did not come at their cost.
+    {
+        MemExtendedParameterAddressRequirements req{};
+        req.alignment = 0x3000; // not a power of two
+        const MemExtendedParameter param{kMemExtendedParameterAddressRequirements,
+                                         &req, 0};
+        std::uint64_t addr = 0;
+        std::uint64_t size = 0;
+        const auto r = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &param, 1, 0, 0,
+            0x04);
+        check(!r.ok() && r.status == Status::InvalidParameter,
+              "requirements: an alignment that is not a power of two is still "
+              "refused before anything is placed");
+
+        MemExtendedParameterAddressRequirements below{};
+        below.highest_ending_address = 0x2000;
+        below.lowest_starting_address = 0x3000;
+        const MemExtendedParameter inverted{
+            kMemExtendedParameterAddressRequirements, &below, 0};
+        const auto inv = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &inverted, 1, 0, 0,
+            0x04);
+        check(!inv.ok() && inv.status == Status::InvalidParameter,
+              "requirements: a highest ending address below the lowest "
+              "starting one is still refused");
+
+        const MemExtendedParameter null_ptr{
+            kMemExtendedParameterAddressRequirements, nullptr, 0};
+        const auto np = nt_map_view_of_section_ex(
+            f.ctx, table, section, &addr, &size, 0, 0, 0, &null_ptr, 1, 0, 0,
+            0x04);
+        check(!np.ok() && np.status == Status::InvalidParameter,
+              "requirements: a null requirements pointer is still refused");
+    }
+
+    // No parameters at all is the plain placement, and it has to keep working:
+    // enforcement that only fires when a caller uses the extended form is
+    // enforcement nobody trips over.
+    {
+        std::uint64_t addr = 0;
+        std::uint64_t size = 0;
+        const auto r = nt_map_view_of_section_ex(f.ctx, table, section, &addr,
+                                                 &size, 0, 0, 0, nullptr, 0, 0,
+                                                 0, 0x04);
+        check(r.ok() && addr != 0,
+              "requirements: the extended form with no parameters places a "
+              "view exactly as the plain one does");
+        if (r.ok()) {
+            std::uint64_t unmap = addr;
+            std::uint64_t unmap_size = 0;
+            (void)nt_unmap_view_of_section(f.ctx, &unmap, &unmap_size);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -2132,6 +2500,8 @@ int main() {
     test_locking_reports_access_denied_and_not_a_bad_argument();
     test_comparing_two_addresses_of_one_allocation();
     test_prefetch_names_the_parameter_that_is_wrong();
+    test_a_section_query_carries_no_host_address();
+    test_a_views_address_requirements_constrain_the_placement();
 
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

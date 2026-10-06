@@ -74,6 +74,43 @@ enum class ProbeKind : std::uint8_t {
     Return,
 };
 
+// Where a subscription is measured, which the pid and cpu arguments of
+// perf_event_open select between three different questions:
+//
+//   pid > 0, cpu == -1   every thread of that one process
+//   pid == -1, cpu >= 0  any process at all, on that one CPU
+//   pid == 0, cpu == -1   the calling process and nothing else
+//
+// The third is the one a uprobe layer must not ask for. A uprobe fires in
+// whichever process maps the file, and the process being observed is the
+// target -- not the observer, which is a different program that happens to be
+// the one calling perf_event_open. Asking for the caller produces a
+// subscription that is live, holds a ring buffer, and reports the observer's
+// own calls: it looks like working function-level observation and is not.
+struct PerfSubscription {
+    int pid = 0;
+    int cpu = -1;
+    // Whether threads and children created after the event is opened are
+    // counted too. Needed because the target's threads mostly do not exist
+    // when the subscription is made -- Wine creates them, and an image with
+    // more than one thread is normal.
+    bool inherit = false;
+};
+
+// What a subscription for `target_pid` is opened against.
+//
+// Zero means no target has been named, which is the state a layer is in
+// between registering its probes and being told what it is watching. That
+// answer is the caller's own process, because there is nothing else to ask
+// for: naming a pid that does not exist fails, and naming -1 measures the
+// whole machine rather than the run.
+//
+// Free rather than a member because it is the one decision in the
+// subscription that can be checked without a tracefs and without a permitted
+// perf_event_open, and it is the decision whose wrong answer produces a
+// subscription that works and observes the wrong program.
+[[nodiscard]] PerfSubscription perf_subscription_target(int target_pid) noexcept;
+
 // One registered probe.
 struct Uprobe {
     // The name this layer was asked for, which is the symbol's name. It is
@@ -94,6 +131,20 @@ struct Uprobe {
     // registered but no subscription was made. See Uprobes::enable for why
     // the two steps can be separated.
     int fd = -1;
+
+    // The scope the last subscription attempt asked perf_event_open for, and
+    // zero-initialized until one is made.
+    //
+    // Recorded before the open rather than after it succeeds, so that a probe
+    // whose subscription was refused still says which process it was refused
+    // for. That is the question a reader of a failed run has, and "the
+    // subscription failed" does not answer it.
+    //
+    // It is also the only way to tell a layer that measures the target from
+    // one that measures the observer without a kernel event behind the probe:
+    // both hold live descriptors and both fill rings, and the difference is
+    // two integers.
+    PerfSubscription scope{};
 
     // What to call the six argument registers on a hit, in ABI order. Held
     // here because this is the last place that knows which function the
@@ -263,6 +314,29 @@ public:
     [[nodiscard]] int subscribe(std::size_t index,
                                 std::string& detail) noexcept;
 
+    // Names the process the subscriptions measure.
+    //
+    // A probe has to be registered before the target starts -- the trap goes
+    // into the file, and the file is mapped when the loader runs -- so the
+    // registration cannot wait for a pid that does not exist yet. Naming the
+    // target afterwards is therefore the normal order, not an exception.
+    //
+    // Re-subscribing every probe is the point of this: a subscription opened
+    // against the wrong pid is not merely narrow, it is measuring the
+    // observer, and no amount of polling recovers the target's calls from it.
+    // Each already-subscribed probe is therefore closed and reopened against
+    // the new pid. A probe whose reopen fails loses its descriptor and is
+    // reported through the usual "registered but not subscribed" path rather
+    // than being left holding a ring that measures nothing.
+    //
+    // Zero clears the target, which returns the layer to measuring its
+    // caller. It is accepted because a caller that has lost its target has no
+    // better answer, and refusing would leave it holding the previous one.
+    void set_target_pid(int pid) noexcept;
+
+    // The process the subscriptions measure, or zero when none was named.
+    [[nodiscard]] int target_pid() const noexcept { return target_pid_; }
+
     // Removes every probe and the tracefs events behind them.
     void clear() noexcept;
 
@@ -313,6 +387,11 @@ private:
 
     std::vector<Uprobe> probes_;
     std::uint64_t lost_hits_ = 0;
+    // The process every subscription measures, or zero when no target was
+    // named. Zero is a real answer rather than an unset field: it is what a
+    // layer holds between registering its probes and being told which
+    // process it is watching, and it resolves to the calling process.
+    int target_pid_ = 0;
     // The next event number to try. The kernel requires the name to be
     // unique within the group, and a name that collides is refused -- so
     // the counter is advanced on every attempt rather than only on success,

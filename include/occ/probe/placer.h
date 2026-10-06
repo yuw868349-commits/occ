@@ -110,6 +110,15 @@ public:
     [[nodiscard]] const Uprobes& layer() const noexcept { return probes_; }
     [[nodiscard]] Uprobes& layer() noexcept { return probes_; }
 
+    // Names the process the probes measure, and reopens every subscription
+    // against it.
+    //
+    // Separate from place() because the order is forced: the probes have to be
+    // registered before the target starts, and the target's pid does not
+    // exist until after that. A placer that resolved a pid during place()
+    // would be a placer that could not place anything.
+    void set_target_pid(int pid) noexcept { probes_.set_target_pid(pid); }
+
     // Where the tracefs root resolved to, empty when it never resolved
     // because no placement got that far.
     [[nodiscard]] const std::string& tracefs_root() const noexcept {

@@ -2686,7 +2686,7 @@ Result<std::uint64_t> nt_map_view_of_section_ex(
     std::uint64_t offset, const MemExtendedParameter* parameters,
     std::uint32_t count, std::uint32_t inherit, std::uint32_t alloc_type,
     std::uint32_t protect) noexcept {
-    // The extended form validates its parameter array and then places the
+// The extended form validates its parameter array and then places the
     // view the same way, because the two forms differ in what they may say
     // about *where* rather than in what they do. So the parameter checks come
     // first and the placement is the shared code below.
@@ -2696,6 +2696,19 @@ Result<std::uint64_t> nt_map_view_of_section_ex(
                                          std::to_string(count) +
                                          " with no array");
     }
+
+    // What the requirements ask for, kept rather than only checked. This used
+    // to validate the structure and then throw the answers away, so a caller
+    // could ask for a view at or above an address and be given one anywhere:
+    // the parse ran, every field was range-checked, and none of it reached the
+    // placement. A requirement that is validated and not applied is worse than
+    // one that is not validated, because the caller has been told its
+    // parameters were understood.
+    std::uint64_t req_alignment = 0;
+    std::uint64_t req_low = 0;
+    std::uint64_t req_high = 0;
+    bool have_requirements = false;
+
     for (std::uint32_t i = 0; i < count; ++i) {
         if (parameters[i].type >= 32) {
             return refuse<std::uint64_t>(
@@ -2712,6 +2725,11 @@ Result<std::uint64_t> nt_map_view_of_section_ex(
             const auto* req =
                 static_cast<const MemExtendedParameterAddressRequirements*>(
                     parameters[i].pointer);
+            // The same three tests `NtAllocateVirtualMemoryEx` applies, and
+            // for the same reasons: an alignment that is not a power of two or
+            // is below the granularity asks for an address the allocator never
+            // hands out, and a bound outside the window or not granular names
+            // a place no mapping can be recorded.
             if (req->alignment != 0) {
                 const std::uint64_t a = req->alignment;
                 if ((a & (a - 1)) != 0 ||
@@ -2722,6 +2740,7 @@ Result<std::uint64_t> nt_map_view_of_section_ex(
                             " is not a power of two, or is smaller than the "
                             "allocation granularity");
                 }
+                req_alignment = a;
             }
             if (req->lowest_starting_address != 0 &&
                 (!AddressSpace::is_granular(req->lowest_starting_address) ||
@@ -2737,7 +2756,30 @@ Result<std::uint64_t> nt_map_view_of_section_ex(
                     Status::InvalidParameter,
                     "a highest ending address below the lowest starting one");
             }
+            req_low = req->lowest_starting_address;
+            req_high = req->highest_ending_address;
+            have_requirements = true;
         }
+    }
+
+    if (addr == nullptr || size == nullptr) {
+        return refuse<std::uint64_t>(Status::InvalidParameter,
+                                     "NtMapViewOfSectionEx was given a null "
+                                     "output pointer");
+    }
+
+    // A requested address and address requirements are mutually exclusive,
+    // which is the rule `NtAllocateVirtualMemoryEx` applies at
+    // `virtual.c:4731` and the reason is the same: one names a place and the
+    // other asks the runtime to search for one. Honouring both would mean
+    // choosing which wins, and a runtime that quietly picked one is a runtime
+    // a program cannot predict.
+    if (have_requirements && *addr != 0) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "an address and address requirements were both given; the first "
+            "names a place and the second asks to search for one, and Windows "
+            "refuses rather than choosing between them");
     }
 
     // The plain call does the placement, and the extended one differs only in
@@ -2745,9 +2787,149 @@ Result<std::uint64_t> nt_map_view_of_section_ex(
     // behaviour through the shared path is deliberate: two implementations of
     // "put a view somewhere" would be two implementations to keep in step,
     // which is the thing this file exists to avoid.
-    return nt_map_view_of_section(ctx, table, handle, addr, zero_bits,
-                                  commit_size, offset, size, inherit,
-                                  alloc_type, protect);
+    const Result<std::uint64_t> placed =
+        nt_map_view_of_section(ctx, table, handle, addr, zero_bits,
+                               commit_size, offset, size, inherit,
+                               alloc_type, protect);
+    if (!placed.ok() || !have_requirements) {
+        return placed;
+    }
+
+    // The shared path places without knowing about the requirements, so its
+    // answer is checked and, where it falls outside what the caller asked for,
+    // undone and the request placed again under the constraints. Checking
+    // afterwards and stopping there would be enough to be *correct* -- a
+    // refused call has changed nothing -- but it would not be *useful*: a
+    // caller that asked for 2 MiB alignment in a space with room would be told
+    // it could not be had, which is a different answer from the one it asked
+    // for and one it cannot act on. The retry is bounded and uses the same
+    // `map` the shared path uses, so the only policy here is which addresses
+    // are eligible, not how a mapping is made.
+    const std::uint64_t view_bytes = *size;
+    const std::uint64_t want =
+        AddressSpace::round_up(view_bytes, AddressSpace::kGranularity);
+
+    const auto violates = [&](std::uint64_t candidate) -> std::string {
+        if (req_alignment != 0 &&
+            (candidate & (req_alignment - 1)) != 0) {
+            return "it is not aligned to the " +
+                   std::to_string(req_alignment) + " the caller asked for";
+        }
+        if (req_low != 0 && candidate < req_low) {
+            return "it is below the lowest starting address the caller named";
+        }
+        // The end is computed as a difference rather than a sum for the reason
+        // `map_below` gives its own: a base and a size near the top of the
+        // window add to a wrapped value, and a wrapped end compares as though
+        // it fit inside a range it does not.
+        if (req_high != 0 &&
+            (want > req_high ||
+             candidate > req_high - std::min(req_high, want))) {
+            return "it ends above the highest ending address the caller named";
+        }
+        return std::string();
+    };
+
+    if (violates(*addr).empty()) {
+        return placed;
+    }
+
+    // The undo, before the retry rather than after a failed one: a view left
+    // mapped at an address the caller was not given is reachable by the guest,
+    // and it would also be one more region competing with the retry for the
+    // space the retry is about to search. The section's view count is
+    // decremented for the same reason the unmap happens: the increment the
+    // placement did is no longer true, and a count left high makes
+    // NtQuerySection report a section as still mapped.
+    const std::uint64_t rejected = *addr;
+    HandleEntry* entry = table.find(handle);
+    const Result<std::uint64_t> undone = ctx.placement->unmap(rejected);
+    if (entry != nullptr && entry->view_count > 0) {
+        --entry->view_count;
+    }
+    if (!undone.ok()) {
+        return refuse<std::uint64_t>(
+            undone.status,
+            "the view the mapper chose at " + std::to_string(rejected) +
+                " does not meet the address requirements the caller gave, and "
+                "it could not be unmapped: " +
+                std::strerror(ctx.placement->last_failure().error));
+    }
+
+    // The constrained search. It descends from the top of the permitted range,
+    // as `map_below` does and for the same reason: the ranges a program names
+    // are usually low, and descending reaches the dense low part of the space
+    // first. The stride is the coarser of the alignment and the granularity --
+    // a stride below the alignment would retry addresses that cannot satisfy it,
+    // and a stride below the granularity would retry addresses the ledger can
+    // never have free.
+    const std::uint64_t stride =
+        req_alignment > AddressSpace::kGranularity ? req_alignment
+                                                   : AddressSpace::kGranularity;
+    std::uint64_t ceiling =
+        req_high != 0 ? req_high : AddressSpace::kUserMax;
+    if (ceiling > AddressSpace::kUserMax) {
+        ceiling = AddressSpace::kUserMax;
+    }
+    if (want > ceiling - AddressSpace::kUserMin) {
+        return refuse<std::uint64_t>(
+            Status::ConflictingAddresses,
+            "a view of " + std::to_string(want) +
+                " bytes cannot fit below the highest address the caller named, "
+                + std::to_string(ceiling) +
+                ", so there is no address in the permitted range");
+    }
+
+    std::uint64_t candidate =
+        AddressSpace::round_down(ceiling - want, stride);
+    // Sixteen thousand strides of 64 KiB is a gigabyte of search; a space with a
+    // suitable hole in it has one within a few steps, and a space without one
+    // has to be able to say so rather than walk the whole 47-bit window.
+    constexpr std::uint64_t kMaxAttempts = 16384;
+    for (std::uint64_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (candidate < req_low || candidate < AddressSpace::kUserMin) {
+            break;
+        }
+        if (violates(candidate).empty()) {
+            const Result<std::uint64_t> constrained =
+                ctx.placement->map(candidate, want,
+                                   static_cast<PageProtection>(protect),
+                                   RegionKind::Mapped);
+            if (constrained.ok()) {
+                const std::uint64_t base = constrained.value;
+                if (entry != nullptr) {
+                    ++entry->view_count;
+                }
+                *addr = base;
+                *size = view_bytes;
+                return Result<std::uint64_t>{base};
+            }
+            // A hole the ledger does not know about is the kernel's to refuse,
+            // and the refusal is about this candidate only: the next one down
+            // may be free. Anything else means the space is out of room.
+            if (constrained.status != Status::ConflictingAddresses) {
+                return refuse<std::uint64_t>(
+                    constrained.status,
+                    "a view at " + std::to_string(candidate) +
+                        " that meets the address requirements the caller gave "
+                        "could not be mapped: " +
+                        std::strerror(ctx.placement->last_failure().error));
+            }
+        }
+        if (candidate < stride) {
+            break;
+        }
+        candidate -= stride;
+    }
+
+    return refuse<std::uint64_t>(
+        Status::ConflictingAddresses,
+        "no address between " + std::to_string(req_low) + " and " +
+            std::to_string(ceiling) + " is free, aligned to " +
+            std::to_string(stride) + ", and big enough for a " +
+            std::to_string(want) +
+            "-byte view. The view the mapper chose without the requirements "
+            "was unmapped rather than left in place");
 }
 
 Result<std::uint64_t> nt_unmap_view_of_section(NtContext& ctx,
@@ -2911,7 +3093,15 @@ Result<std::uint64_t> nt_query_section(NtContext& ctx, HandleTable& table,
 
     switch (info_class) {
     case SectionInformationClass::BasicInformation: {
-        SectionBasicInformation out;
+        // The answer is written into the caller's buffer one member at a time
+        // rather than copied out of a local structure. A structure copy would
+        // carry the padding between `attributes` and `base_address` with it, and
+        // padding is not a member: it holds no defined value, so what a copy
+        // would put there is whatever the compiler left on the stack. Those four
+        // bytes then reach the guest as part of the answer -- a host address, in
+        // the host's layout, different on every call. Windows leaves the padding
+        // alone, and so does this.
+        SectionBasicInformation out{};
         // **`SEC_*` attributes, not the `MEM_*` allocation type.** Wine fills
         // this from `reply->flags` (`virtual.c:5738`), which the server builds
         // from the view's protection word -- `SEC_IMAGE`, `SEC_FILE`,
@@ -2937,7 +3127,17 @@ Result<std::uint64_t> nt_query_section(NtContext& ctx, HandleTable& table,
         // whoever created it, and there is no address to report.
         out.base_address = 0;
         out.size = entry->section_size;
-        std::memcpy(buffer, &out, sizeof(out));
+        // Member by member, for the reason given above: this is the one answer
+        // structure with padding in it, so this is the one place a whole-
+        // structure copy would carry stack bytes into the guest's buffer. The
+        // other two have no padding and are copied whole below.
+        auto* bytes = static_cast<std::uint8_t*>(buffer);
+        std::memcpy(bytes + offsetof(SectionBasicInformation, attributes),
+                    &out.attributes, sizeof(out.attributes));
+        std::memcpy(bytes + offsetof(SectionBasicInformation, base_address),
+                    &out.base_address, sizeof(out.base_address));
+        std::memcpy(bytes + offsetof(SectionBasicInformation, size), &out.size,
+                    sizeof(out.size));
         if (result_length != nullptr) {
             *result_length = sizeof(out);
         }
@@ -2960,6 +3160,9 @@ Result<std::uint64_t> nt_query_section(NtContext& ctx, HandleTable& table,
         out.image_base = 0;
         out.image_size = static_cast<std::uint32_t>(entry->section_size);
         out.image_flags = 0;
+        // Four members, all 4 or 8 bytes wide and in descending order, so this
+        // structure has no padding and a whole-structure copy carries nothing
+        // but the members.
         std::memcpy(buffer, &out, sizeof(out));
         if (result_length != nullptr) {
             *result_length = sizeof(out);
@@ -2975,8 +3178,25 @@ Result<std::uint64_t> nt_query_section(NtContext& ctx, HandleTable& table,
         // extent, and there is no Wine call that reports it -- which is why
         // this class exists.
         SectionSectionInformation out;
-        out.section_address = reinterpret_cast<std::uint64_t>(entry);
+        // Always null, and the reason is the same one `BasicInformation`
+        // gives above: a section is an object, not a mapping, and it has no
+        // address until somebody maps a view of it. There is no section
+        // address in the guest's address space to report, and there never
+        // will be -- the space a view lands in is chosen at NtMapViewOfSection
+        // time, not at NtCreateSection time.
+        //
+        // This used to write `reinterpret_cast<std::uint64_t>(entry)`, which
+        // is a pointer into this process's `HandleTable::entries_` vector. A
+        // guest reading the buffer got a host heap address: it described a
+        // region of the host's address space, it said nothing about the
+        // guest's, and it leaked the host's allocator layout into a PE. The
+        // number was also meaningless to the guest in the strongest sense --
+        // no PE can do anything with it, because the address it names is not
+        // in the address space the PE runs in. The size beside it was the
+        // one field of the pair that could be answered, and it still is.
+        out.section_address = 0;
         out.section_size = entry->section_size;
+        // Two 8-byte members, so no padding to carry.
         std::memcpy(buffer, &out, sizeof(out));
         if (result_length != nullptr) {
             *result_length = sizeof(out);

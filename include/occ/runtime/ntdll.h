@@ -1084,6 +1084,11 @@ struct SectionImageInformation {
 };
 
 struct SectionSectionInformation {
+    // Always zero. A section is an object rather than a mapping, so it has no
+    // address until a view of it is mapped, and the address that view landed
+    // at is a property of the mapping rather than of the section. Reporting
+    // anything else here means reporting a host address in a buffer a guest
+    // reads.
     std::uint64_t section_address = 0;
     std::uint64_t section_size = 0;
 };

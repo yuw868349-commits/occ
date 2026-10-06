@@ -425,6 +425,18 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     spawn.add("entry", out.entry);
     events.commit();
 
+    // The probes were registered above, before the target existed, because a
+    // uprobe has to be in the file before the loader maps it. The pid arrives
+    // only now, and a subscription opened before this point measures the
+    // observer rather than the target: it is live, it fills a ring, and every
+    // hit in it is a call the observer made. Naming the target reopens each
+    // subscription against it.
+    //
+    // Done unconditionally rather than under options.observe, because the
+    // layer is the runner's and a target it is not polling still should not be
+    // measured by accident.
+    placer.set_target_pid(spawned.pid);
+
     // The container releases the target as soon as it has been set up, so
     // there is no stopped process to resume and this call is a no-op. It is
     // deliberately not called: the call is implemented as a non-blocking

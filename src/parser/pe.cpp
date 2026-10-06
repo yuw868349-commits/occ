@@ -479,9 +479,15 @@ std::uint64_t PeSection::virtual_end() const noexcept {
     // the top of the address space with a large virtual_size would wrap, and
     // a caller comparing against the wrapped end would believe a section
     // that is enormous is a section that ends early.
-    return virtual_address > UINT64_MAX - virtual_size
+    //
+    // The size is `mapped_size()` rather than `virtual_size` because an end
+    // computed from a zero VirtualSize is the section's own start, which says
+    // the section occupies no address space at all -- see the accessor for why
+    // that is the wrong answer for a section whose contents are in the file.
+    const std::uint64_t span = mapped_size();
+    return virtual_address > UINT64_MAX - span
                ? UINT64_MAX
-               : static_cast<std::uint64_t>(virtual_address) + virtual_size;
+               : static_cast<std::uint64_t>(virtual_address) + span;
 }
 
 std::uint64_t PeSection::raw_end() const noexcept {
@@ -1427,7 +1433,15 @@ bool PeImage::resolve_rva(std::uint64_t rva, std::uint64_t& file_offset,
             continue;
         }
         const std::uint64_t delta = rva - s.virtual_address;
-        if (delta >= s.virtual_size) {
+        // `mapped_size()` and not `virtual_size`. A VirtualSize of zero means
+        // "as much as the file holds" rather than "nothing", and comparing
+        // against the field directly made such a section unreachable: every
+        // delta is at or above zero, so the loop skipped the section and an
+        // RVA the Windows loader maps resolved to nothing. Nothing crashed and
+        // every answer was a refusal, which is the shape of this bug -- a
+        // caller cannot tell a file that does not contain the address from a
+        // parser that will not look.
+        if (delta >= s.mapped_size()) {
             continue;
         }
 

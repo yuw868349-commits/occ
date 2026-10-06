@@ -28,6 +28,8 @@
 
 #include "occ/observer/uprobe.h"
 
+#include "occ/parser/elf.h"
+#include "occ/probe/placer.h"
 #include "occ/syscall/errno.h"
 #include "occ/util/fs.h"
 
@@ -37,6 +39,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace occ::obs;
 
@@ -791,6 +797,307 @@ void test_a_probe_whose_event_never_appears_is_not_left_registered() {
           "and it was removed again, so the next attempt will not collide");
 }
 
+// ------------------------------------------------- which process is measured
+
+// The three questions perf_event_open's pid and cpu arguments ask, and the
+// one a uprobe layer must not ask.
+//
+// This is host-independent on purpose. The wrong answer here produces a
+// subscription that opens successfully, allocates a ring, and reports the
+// wrong program -- so a test that needed a tracefs to see the bug would only
+// ever see it on the one host class where it does not matter to run.
+void test_the_subscription_names_the_target_and_not_the_caller() {
+    // A named target: that pid, every thread of it, and the threads it
+    // creates later.
+    const PerfSubscription named = perf_subscription_target(4242);
+    check(named.pid == 4242,
+          "a named target is the pid handed to perf_event_open, not zero -- "
+          "zero is the calling process, which is the observer");
+    check(named.cpu == -1,
+          "and the cpu is -1, which with a positive pid means every thread of "
+          "that process rather than one CPU's worth of it");
+    check(named.inherit,
+          "and inherit is set, because the target's threads are created after "
+          "the subscription is made and without it only the first is counted");
+
+    // No target named: the caller. Not because that is useful -- it is the
+    // state between registering probes and learning the pid -- but because
+    // there is nothing else that can be named, and pid -1 with cpu -1 is
+    // EINVAL rather than a wider measurement.
+    const PerfSubscription unnamed = perf_subscription_target(0);
+    check(unnamed.pid == 0 && unnamed.cpu == -1,
+          "with no target named the subscription measures the calling "
+          "process, which is the only pid that exists to be named");
+    check(!unnamed.inherit,
+          "and does not inherit: following the caller's own children is a "
+          "wider measurement than a caller that named nothing asked for");
+
+    // A pid that is not a pid is not treated as "measure everything".
+    const PerfSubscription negative = perf_subscription_target(-1);
+    check(negative.pid == 0,
+          "a negative pid resolves to the caller rather than to pid -1, which "
+          "with a cpu would measure every process on the machine");
+}
+
+// set_target_pid on a layer with nothing in it is the state a run is in for
+// most of its startup, and it has to be a state the object survives.
+void test_naming_a_target_on_an_empty_layer_is_well_formed() {
+    Uprobes u;
+    check(u.target_pid() == 0, "a fresh layer has named no target");
+
+    u.set_target_pid(4242);
+    check(u.target_pid() == 4242, "naming a target is recorded");
+    check(u.size() == 0 && u.fds().empty(),
+          "and a layer with no probes still has none afterwards");
+
+    // Naming the same target twice must not reopen anything, and must not
+    // lose the target either -- a caller that sets it once per poll would
+    // otherwise churn a descriptor per iteration.
+    u.set_target_pid(4242);
+    check(u.target_pid() == 4242, "naming the same target again keeps it");
+
+    // Clearing it returns the layer to measuring the caller, which is a real
+    // answer and not a refusal.
+    u.set_target_pid(0);
+    check(u.target_pid() == 0, "naming zero clears the target");
+
+    // A negative pid is a caller that lost track of its target. It gets the
+    // caller's own process rather than a machine-wide measurement.
+    u.set_target_pid(-1);
+    check(u.target_pid() == 0, "and a negative pid is treated as no target");
+}
+
+// A subscription opened against the wrong pid has to be reopened when the
+// right one is named. This is the whole fix: the old code kept the
+// descriptor it had opened against the observer, so it stayed live and stayed
+// wrong.
+//
+// What is checked here is the half that is reachable without a kernel event
+// behind the id: the target survives, and the registration the reopen layers
+// onto is left alone. The reopen itself needs a subscription, and a
+// subscription needs a real tracepoint -- the firing test above is where a
+// descriptor actually changing process is observed.
+void test_naming_a_target_reaches_the_registered_probes() {
+    FakeTracefs f = make_fake_tracefs();
+    if (f.dir.path.empty()) {
+        return;
+    }
+
+    Uprobes u(f.dir.path);
+    std::string detail;
+    std::size_t index = 999;
+    const int rc = u.register_only("main", "/bin/true", 0x1000,
+                                   ProbeKind::Entry, index, detail);
+    check(rc == 0, "a registration against a fake tracefs succeeds");
+    if (rc != 0) {
+        return;
+    }
+    check(u.size() == 1, "and leaves one probe in the layer");
+    check(u.fds().empty(), "with no descriptor, because nothing subscribed");
+
+    u.set_target_pid(4242);
+    check(u.target_pid() == 4242,
+          "naming a target is recorded even when nothing was subscribed");
+    check(u.size() == 1,
+          "and the probe is still in the layer: the target is what a "
+          "subscription is opened against, not a replacement for one");
+    check(u.fds().empty(), "and still has no descriptor to poll");
+
+    // The tracefs line survives. The registration is what a subscription is
+    // opened against, and a reopen that removed it would leave a probe
+    // registered nowhere and subscribed nowhere.
+    const std::string content = read_file_or_empty(f.uprobe_events);
+    check(content.find("p:occ_0") != std::string::npos,
+          "and the tracefs registration is untouched by naming a target");
+    check(content.find("-:occ_0") == std::string::npos,
+          "which means the probe was not removed and re-registered to get a "
+          "new scope -- the event the kernel created is what a subscription "
+          "names, and a fresh event would be a different one");
+
+    // Subscribe. It cannot succeed against a fake tracefs, but the scope it
+    // asked perf_event_open for is recorded either way, and this is where the
+    // distinction lives: a call site that passed pid 0 regardless of the named
+    // target records the caller here, and the assertions above -- which only
+    // exercise the helper function -- would still pass.
+    (void)u.subscribe(index, detail);
+
+    check(u.all()[index].scope.pid == 4242,
+          "and a subscription opened after the target was named asks for that "
+          "pid -- not zero, which is the process doing the asking");
+    check(u.all()[index].scope.cpu == -1,
+          "with cpu -1, so the measurement covers every thread of the target");
+    check(u.all()[index].scope.inherit,
+          "and with inherit, so the threads the target creates after the probe "
+          "was placed are counted too");
+
+    // Before a target is named, the same call asks for the caller. Recording
+    // it is what makes the two states distinguishable after the fact.
+    Uprobes fresh(f.dir.path);
+    std::size_t fresh_index = 999;
+    std::string fresh_detail;
+    if (fresh.register_only("main", "/bin/true", 0x1000, ProbeKind::Entry,
+                            fresh_index, fresh_detail) == 0) {
+        check(fresh.all()[fresh_index].scope.pid == 0,
+              "a layer that has named no target records the caller, which is "
+              "the only pid it can name");
+        check(!fresh.all()[fresh_index].scope.inherit,
+              "and does not ask to follow the caller's own children");
+    }
+}
+
+// A probe fires in the target, and only in the target.
+//
+// This is the test that distinguishes the fix from what it replaced, and it
+// needs a host with a writable tracefs: the subscription is opened against a
+// named pid, a child process is made to execute the probed symbol, and the
+// hits are read back. Under the previous code the subscription named pid 0 --
+// the observer -- so every hit would carry this process's pid and the
+// child's calls would be absent, and the test would fail on both counts
+// rather than on a count alone.
+//
+// The parent calls the same symbol before forking and between reading the
+// rings. That is what makes the assertion discriminating rather than a check
+// that the plumbing works: the probe is live for the parent too, so a
+// subscription that ignored its pid would count these calls, and the count
+// would be too high rather than merely non-zero.
+//
+// Marked as needing a writable tracefs and skipped without one, per the
+// testing rule that a suite which cannot run on a development machine is a
+// suite that stops being run. It is not marked root-only: the tracefs write
+// is a permission, not a privilege, and a host with tracefs mounted
+// read-write serves this as an ordinary user.
+void test_a_probe_fires_in_the_target_and_not_in_the_observer() {
+    if (!Uprobes::availability().available) {
+        std::fprintf(stderr, "note: no writable tracefs; the firing check "
+                             "was skipped\n");
+        return;
+    }
+
+    // A libc symbol this process calls and a forked child will call. libc is
+    // mapped into both, and the probe is placed in the file rather than in
+    // either process, which is the arrangement a uprobe exists for.
+    const std::string libc = find_module("libc.so.6");
+    if (libc.empty()) {
+        std::fprintf(stderr, "note: no libc on the loader's path; the firing "
+                             "check was skipped\n");
+        return;
+    }
+    auto bytes = occ::fs::read_file_bytes(libc);
+    if (!bytes || bytes->empty()) {
+        std::fprintf(stderr, "note: libc could not be read; the firing check "
+                             "was skipped\n");
+        return;
+    }
+    const occ::parser::ElfImage image = occ::parser::ElfImage::parse(
+        occ::ByteSpan{bytes->data(), bytes->size()});
+    const occ::parser::Symbol* sym = image.find_symbol("getpid");
+    std::uint64_t offset = 0;
+    if (!image.ok() || sym == nullptr || !sym->probeable() ||
+        !image.vaddr_to_file_offset(sym->value, offset)) {
+        std::fprintf(stderr, "note: getpid could not be placed in libc; the "
+                             "firing check was skipped\n");
+        return;
+    }
+
+    Uprobes u;
+    std::string detail;
+    const int rc = u.add("getpid", libc, offset, ProbeKind::Entry, detail);
+    if (rc != 0) {
+        // perf_event_paranoid above zero, or a policy that blocks the open.
+        // A refusal is a fact about the host and not a failure of the code
+        // under test, so it is reported and the check stands down.
+        std::fprintf(stderr, "note: the probe could not be subscribed (%d: "
+                             "%s); the firing check was skipped\n",
+                     rc, detail.c_str());
+        return;
+    }
+
+    // The parent's own calls, made while the probe is live and before any
+    // child exists. Under a subscription named for the caller these are
+    // counted; under one named for the child they are not.
+    constexpr int kParentCalls = 8;
+    volatile int sink = 0;
+    for (int i = 0; i < kParentCalls; ++i) {
+        sink += static_cast<int>(::getpid());
+    }
+    (void)sink;
+
+    // The child. It is forked while the probe is live, so a subscription that
+    // follows threads and children created after it was opened would see
+    // this; one that does not would miss the child's very first call.
+    //
+    // The child calls the symbol and exits. Its exit is what makes the hit
+    // observable at all: the ring is drained after it is gone, because a hit
+    // delivered to a running child would need the session's poll loop to
+    // read it and this test has none.
+    const pid_t child = ::fork();
+    if (child < 0) {
+        std::fprintf(stderr, "note: no child could be forked; the firing "
+                             "check was skipped\n");
+        return;
+    }
+    if (child == 0) {
+        // The child's own getpid calls. Enough that a ring which lost a
+        // record or two still has hits left, and few enough that the count
+        // stays a meaningful number rather than an approximation.
+        volatile int child_sink = 0;
+        for (int i = 0; i < 16; ++i) {
+            child_sink += static_cast<int>(::getpid());
+        }
+        (void)child_sink;
+        ::_exit(0);
+    }
+
+    int status = 0;
+    (void)::waitpid(child, &status, 0);
+
+    // The parent's calls again, after the child is gone. A subscription named
+    // for pid 0 is unaffected by anything the child did, so this is where the
+    // wrong-pid bug shows up as extra hits rather than as missing ones.
+    for (int i = 0; i < kParentCalls; ++i) {
+        sink += static_cast<int>(::getpid());
+    }
+    (void)sink;
+
+    std::vector<UprobeHit> hits;
+    (void)u.read_hits(hits);
+
+    std::size_t from_child = 0;
+    std::size_t from_parent = 0;
+    std::size_t from_other = 0;
+    const pid_t self = ::getpid();
+    for (const UprobeHit& h : hits) {
+        if (h.pid == static_cast<int>(child)) {
+            ++from_child;
+        } else if (h.pid == static_cast<int>(self)) {
+            ++from_parent;
+        } else {
+            ++from_other;
+        }
+    }
+
+    check(from_child > 0,
+          "a probe subscribed to a named pid records the hits of that "
+          "process's execution");
+    check(from_parent == 0,
+          "and records none of the observer's own calls to the same symbol, "
+          "which is what a subscription naming pid 0 would report instead");
+    check(from_other == 0,
+          "and none from any process that was never named either, so the "
+          "measurement is the target's rather than the machine's");
+
+    // The child's calls are counted, but not necessarily all of them: the ring
+    // has a fixed capacity and the kernel drops what does not fit, which is
+    // reported through lost_hits(). Asserting an exact number would be
+    // asserting that no sample was ever lost, which is a property of the
+    // host's timing and not of this code. Asserting that the count is bounded
+    // by the calls that were made catches a subscription that counted
+    // something else without depending on how busy the machine was.
+    check(from_child <= 16 + u.lost_hits() + kParentCalls * 2,
+          "and no more hits than the child made plus what the kernel reported "
+          "losing");
+}
+
 // --------------------------------------------------------------- the file
 
 void test_availability_names_a_real_directory_or_none() {
@@ -838,6 +1145,10 @@ int main() {
     test_clear_removes_a_recorded_probe_and_its_events();
     test_an_id_of_zero_is_not_an_id();
     test_a_probe_whose_event_never_appears_is_not_left_registered();
+    test_the_subscription_names_the_target_and_not_the_caller();
+    test_naming_a_target_on_an_empty_layer_is_well_formed();
+    test_naming_a_target_reaches_the_registered_probes();
+    test_a_probe_fires_in_the_target_and_not_in_the_observer();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

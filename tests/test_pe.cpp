@@ -443,6 +443,128 @@ void test_raw_size_exceeds_virtual_size() {
           "raw>virtual: past the virtual size does not resolve");
 }
 
+// A section whose VirtualSize is zero is mapped, not absent.
+//
+// `VirtualSize` of zero is what a linker writes for a section whose contents
+// are entirely in the file: there is no zero-fill to size, so there is no size
+// to state. The field is not optional and a zero is not a claim that the
+// section is empty -- the raw size is right there saying how many bytes it
+// holds. Reading the field directly made the whole section unreachable, because
+// every delta into it is at or above zero and so "outside" it, and an RVA the
+// Windows loader maps resolved to nothing here.
+//
+// The check is on bytes rather than on offsets: a wrong file offset and a
+// right one are both numbers inside the file, and a reader that resolved to the
+// wrong one would produce a plausible answer that described the wrong bytes.
+// Distinctive content at a known spot, read back through the resolution, is
+// the only thing that distinguishes them.
+void test_zero_virtual_size_still_maps() {
+    Spec s = base_spec();
+    s.sections[0].virtual_size = 0;
+    s.sections[0].raw_size = 0x400;
+    Built b = build(s);
+
+    // A recognisable pattern over the section's raw data. Written into the file
+    // directly rather than through a spec field because the builder has no
+    // "these are the contents" concept, and a test about what the section
+    // resolves to needs contents that are not all zero -- zero is what both a
+    // correct read of unwritten space and a wrong offset into the headers can
+    // produce.
+    for (std::size_t i = 0; i < 0x400; ++i) {
+        b.bytes[b.data_at + i] =
+            static_cast<std::uint8_t>((i * 7u + 3u) & 0xffU);
+    }
+
+    const PeImage p = parse_image(b.bytes);
+    check(p.ok(), "zero virtual: parses");
+    if (!p.ok()) {
+        return;
+    }
+
+    check(p.sections()[0].virtual_size == 0,
+          "zero virtual: the section really does declare a VirtualSize of zero, "
+          "so this case is the one it claims to be");
+
+    // The section's extent, which is the number a reader sizing the section
+    // asks for.
+    check(p.sections()[0].mapped_size() == 0x400,
+          "zero virtual: the section occupies its raw size when VirtualSize "
+          "says nothing");
+    check(p.sections()[0].virtual_end() == 0x1000 + 0x400,
+          "zero virtual: and its address range ends where its contents end, "
+          "not where it starts");
+
+    // Every byte of it resolves, first through the offset and then through the
+    // contents that offset names. Sampled across the section rather than only
+    // at its edges: the first and last bytes are the ones most likely to be
+    // right by accident, since an off-by-one at either end still resolves
+    // somewhere.
+    std::uint64_t off = 0;
+    bool every_byte_resolves = true;
+    bool every_byte_reads_back = true;
+    for (std::uint64_t i = 0; i < 0x400; ++i) {
+        if (!p.to_file_offset(0x1000 + i, off)) {
+            every_byte_resolves = false;
+            break;
+        }
+        if (b.bytes[static_cast<std::size_t>(off)] !=
+            static_cast<std::uint8_t>((i * 7u + 3u) & 0xffU)) {
+            every_byte_reads_back = false;
+            break;
+        }
+    }
+    check(every_byte_resolves,
+          "zero virtual: every byte of the section resolves to a file offset, "
+          "which is what makes the section addressable at all");
+    check(every_byte_reads_back,
+          "zero virtual: and every one of those offsets names the byte the "
+          "section stores there");
+
+    // The loaded-image question as well as the file question: past the raw data
+    // there is nothing, so it is a refusal rather than an answer, and the
+    // refusal is what keeps a section from claiming address space it does not
+    // have.
+    check(!p.to_file_offset(0x1000 + 0x400, off),
+          "zero virtual: an address past the section's contents is not part of "
+          "the image");
+
+    // And the reason a reader cares, which is a whole table rather than a
+    // string: an import directory living in such a section. The descriptor and
+    // the name it points at are both reached by RVA, so before the fix neither
+    // resolved and the image was reported to import nothing -- a file that
+    // names a DLL, described as naming none, with no error to say so.
+    Spec imports = base_spec();
+    imports.sections[0].virtual_size = 0;
+    imports.sections[0].raw_size = 0x600;
+    imports.sections[0].characteristics = 0x60000020;
+    Built ib = build(imports);
+
+    const std::string dll = "KERNEL32.dll";
+    const std::size_t name_at = ib.data_at + 0x200;
+    std::memcpy(&ib.bytes[name_at], dll.data(), dll.size() + 1);
+    // The name's RVA, from where it landed rather than from where it was
+    // meant to land: the difference between the two is the whole bug.
+    const std::uint32_t name_rva =
+        0x1000 + static_cast<std::uint32_t>(name_at - ib.data_at);
+    for (std::size_t i = 0; i < 20; ++i) {
+        ib.bytes[ib.data_at + i] = 0;
+    }
+    put32(ib.bytes, ib.data_at + 12, name_rva);   // the descriptor's Name
+    // The twenty bytes after it stay zero, which is the null terminator the
+    // walk ends on. A terminator that carried a Name would be a second
+    // descriptor rather than an end, and the walk would report the DLL twice.
+    const std::size_t dirs = ib.opt + 96;
+    put32(ib.bytes, dirs + 1 * 8, 0x1000);
+    put32(ib.bytes, dirs + 1 * 8 + 4, 40);
+
+    const PeImage ip = parse_image(ib.bytes);
+    check(ip.ok() && ip.imports().size() == 1 &&
+              ip.imports()[0] == dll,
+          "zero virtual: an import directory in such a section is walked and "
+          "the DLL it names is reported, which is what every caller that "
+          "loads an image needs from the parser");
+}
+
 // SizeOfHeaders larger than the file.
 //
 // Found by fuzz/fuzz_pe.cpp, twice, and the two findings were one defect.
@@ -2492,6 +2614,7 @@ int main() {
     test_dll();
     test_rva_conversion();
     test_raw_size_exceeds_virtual_size();
+    test_zero_virtual_size_still_maps();
     test_headers_size_larger_than_the_file();
     test_multiple_sections();
     test_section_at_top_of_address_space();

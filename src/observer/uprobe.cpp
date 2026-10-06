@@ -265,6 +265,31 @@ std::uint64_t parse_number(const std::string& s) noexcept {
 
 } // namespace
 
+PerfSubscription perf_subscription_target(int target_pid) noexcept {
+    PerfSubscription out;
+    // A negative pid is not a request for "the caller" and is not a request
+    // for "every process"; it is what a caller passes when it has lost track
+    // of which process it was watching, and honouring it as the caller's own
+    // process is the answer least likely to be what was meant. Treated as no
+    // target named, which resolves to the same place.
+    if (target_pid > 0) {
+        out.pid = target_pid;
+        out.cpu = -1;
+        // The target's threads are created after this point. Wine starts one
+        // and then makes more, and a subscription that counted only the
+        // threads that existed when it was opened would report the first few
+        // calls of a target that spends its life in the others. `inherit` is
+        // what covers threads and children the target creates later.
+        //
+        // It is set only when a pid was named. Inherited onto the caller's own
+        // thread group it would follow every process the observer forks,
+        // which is a wider measurement than the caller asked for and is not
+        // filtered by anything afterwards.
+        out.inherit = true;
+    }
+    return out;
+}
+
 ProbeAvailability Uprobes::availability(const std::string& explicit_root) noexcept {
     ProbeAvailability out;
 
@@ -562,13 +587,31 @@ int Uprobes::subscribe(std::size_t index, std::string& detail) noexcept {
     attr.exclude_kernel = 1;
     attr.exclude_hv = 1;
 
-    // pid 0 with cpu -1 asks for every process. That is deliberate: a
-    // uprobe on a shared library is attached once and fires for whichever
-    // process maps it, and the ntdll case is exactly that -- Wine loads one
-    // ntdll and every PE the session starts shares it. Restricting to one
-    // pid would observe the first process and miss the children, which is
-    // where a sample runs.
-    auto r = sys::perf_event_open(&attr, 0, -1, -1, 0);
+    // Whichever process is being observed, and every thread of it.
+    //
+    // This used to pass pid 0, which perf_event_open defines as "the calling
+    // process" -- the observer. A uprobe fires in whichever process maps the
+    // file, so the result was a subscription that was live, held a ring
+    // buffer, and counted the observer's own calls: function-level
+    // observation that reported the wrong program and looked healthy while
+    // doing it. The target is named with set_target_pid, which a caller does
+    // after the target exists; until then this is the caller's own process,
+    // which is the only thing that can be named.
+    //
+    // Stored on the probe and read back out rather than kept in a local,
+    // because the recorded scope is what a reader -- and a test -- checks, and
+    // a local would leave the value that was asked for and the value that is
+    // reported as two things that can drift apart. Reading it back makes
+    // divergence impossible rather than merely unlikely.
+    p.scope = perf_subscription_target(target_pid_);
+    // Threads and children the target creates after this call. The target's
+    // threads mostly do not exist yet -- a probe is registered before the
+    // loader runs, so the process is either not started or is one thread into
+    // startup -- and without this a subscription counts the first thread and
+    // none of the rest.
+    attr.inherit = p.scope.inherit ? 1 : 0;
+
+    auto r = sys::perf_event_open(&attr, p.scope.pid, p.scope.cpu, -1, 0);
     if (r.failed()) {
         if (r.error == sys::kEacces || r.error == sys::kEperm) {
             detail = "perf_event_open refused the subscription to the " +
@@ -578,7 +621,13 @@ int Uprobes::subscribe(std::size_t index, std::string& detail) noexcept {
                      "does not";
         } else {
             detail = "perf_event_open refused the subscription to the " +
-                     p.name + " probe (errno " + std::to_string(r.error) + ")";
+                     p.name + " probe (errno " + std::to_string(r.error) +
+                     "); it was asked for pid " +
+                     std::to_string(p.scope.pid) +
+                     (p.scope.pid == 0
+                          ? ", which is the observer itself, so this run has "
+                            "not named a target to measure"
+                          : ", which is the process being observed");
         }
         return r.error;
     }
@@ -610,6 +659,36 @@ int Uprobes::subscribe(std::size_t index, std::string& detail) noexcept {
     p.ring_data_offset = ps;
     p.ring_tail = 0;
     return 0;
+}
+
+void Uprobes::set_target_pid(int pid) noexcept {
+    if (pid == target_pid_) {
+        return;
+    }
+    target_pid_ = pid > 0 ? pid : 0;
+
+    // Every existing subscription is reopened. Leaving one pointed at the
+    // previous pid would be the worse of the two answers: the descriptor is
+    // live, the ring fills, and the hits in it come from a process nobody
+    // asked about. Reopening costs one perf_event_open per probe and happens
+    // once per run, at the moment the target becomes known.
+    for (std::size_t i = 0; i < probes_.size(); ++i) {
+        Uprobe& p = probes_[i];
+        if (p.fd < 0) {
+            continue;
+        }
+        release(p);
+        // The detail is dropped deliberately. The caller asked for a change
+        // of scope, not for a per-probe report, and a probe that cannot be
+        // reopened keeps its tracefs registration and is visible as
+        // registered-but-unsubscribed through fds() -- which is the same
+        // honest signal a probe whose subscription failed at add() time
+        // gives. The error code is not discarded silently either: the probe
+        // is left without a descriptor, so the count a session reports is
+        // lower than the count that was placed.
+        std::string detail;
+        (void)subscribe(i, detail);
+    }
 }
 
 void Uprobes::release(Uprobe& p) noexcept {
