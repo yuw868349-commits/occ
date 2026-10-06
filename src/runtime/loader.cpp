@@ -245,6 +245,69 @@ void store_u64(std::uint64_t va, std::uint64_t v) noexcept {
     return load_from(space, va, &out, sizeof out);
 }
 
+// The width, in bytes, of the field a relocation of this type writes.
+//
+// The switch in `apply_one` below is the authority on what each type does, and
+// this is the same mapping kept where a caller can read it before the write:
+// a caller that has to know how many bytes will land needs the answer before
+// it calls, not after. The two are kept in step by the fact that every arm of
+// `apply_one` writes exactly one of the widths below, and a type that falls
+// off the end here is one `apply_one` refuses as well.
+//
+// Absolute has no field -- it is padding -- and its width is zero, which is
+// the value that makes the containment test in `region_for_write` succeed for
+// any mapped address. That is correct: nothing is written, so nothing has to
+// fit. The caller skips Absolute before reading this, so the zero is a
+// fallback rather than a case in the walk.
+[[nodiscard]] constexpr std::uint64_t relocation_width(
+    std::uint16_t type) noexcept {
+    switch (type) {
+    case kRelBasedHigh:
+    case kRelBasedLow:
+    case kRelBasedHighAdj:
+        return 2;
+    case kRelBasedHighLow:
+        return 4;
+    case kRelBasedDir64:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+// The region a field of `bytes` width at `va` fits in entirely, or null.
+//
+// The stores below take an address and a width and write that many bytes, and
+// every one of them is reached from a file's arithmetic rather than from
+// anything this process decided. `find(va)` is the check they used to lean on,
+// and it answers a narrower question than the one that matters: it says the
+// first byte is mapped, not that the field is. A DIR64 relocation whose RVA
+// lands one byte before the end of the last mapped region passes `find` and
+// then writes seven bytes past it.
+//
+// This is the store-side twin of `load_from` above, and it exists for the same
+// reason: both operations take an address and a width, and the containment
+// test has to be made against the width. `load_from` can report the overrun to
+// its caller; a store cannot, for the reason given above its definition, so
+// the caller has to ask first.
+//
+// `r->end()` is exclusive, and the sum is written as a subtraction from the
+// end rather than as `va + bytes <= r->end()` so that a `bytes` that would
+// overflow past the top of the address space cannot wrap into the test and
+// pass it.
+[[nodiscard]] const Region* region_for_write(const AddressSpace& space,
+                                             std::uint64_t va,
+                                             std::uint64_t bytes) noexcept {
+    const Region* r = space.find(va);
+    if (r == nullptr) {
+        return nullptr;
+    }
+    if (bytes > r->size || va - r->base > r->size - bytes) {
+        return nullptr;
+    }
+    return r;
+}
+
 // What went wrong when a relocation could not be written.
 struct RelocFailure {
     bool failed = false;
@@ -525,12 +588,18 @@ TlsResult commit_tls_index(const TlsModule& m, AddressSpace& space,
         }
     };
 
-    const Region* r = space.find(m.index_va);
+    // The index is four bytes and the test is against four bytes. The field's
+    // address comes from the file's TLS directory, so a directory whose
+    // AddressOfIndex names the last byte of a region is a file that can be
+    // written one byte and probed for three -- which is what `find` alone
+    // would allow, since it answers for the first byte only.
+    const Region* r =
+        region_for_write(space, m.index_va, sizeof(std::uint32_t));
     if (r == nullptr) {
         release();
         out.error = TlsError::MalformedDirectory;
         out.detail = "the TLS index at " + hex_of(m.index_va) +
-                     " is in no region this load made";
+                     " has no four bytes in any region this load made";
         return out;
     }
     if ((protection_to_prot(r->protection) & PROT_WRITE) == 0) {
@@ -892,9 +961,31 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                     continue;
                 }
                 const std::uint64_t rva = page_rva + offset;
-                if (rva > image_size - 8 && type == kRelBasedDir64) {
+
+                // Every relocation type, not just DIR64, and against the width
+                // each one writes.
+                //
+                // The image's size is the bound available here: this pass runs
+                // before anything is mapped, so there is no region to test
+                // against and the arithmetic is all there is. The write pass
+                // checks the map again, and against the region rather than the
+                // image, because a relocation into a gap between sections
+                // passes this test and has to be caught there.
+                //
+                // The width matters here for the same reason it matters there.
+                // A HIGH relocates two bytes and a HIGHLOW four, and a check
+                // that used 8 for all of them would refuse files it could
+                // place; one that used 1 would admit a DIR64 whose last seven
+                // bytes fall outside the image. `image_size < field_bytes` is
+                // tested first so that the subtraction cannot wrap when the
+                // image is smaller than the field, which is the case a file
+                // with a four-byte SizeOfImage reaches on its first entry.
+                const std::uint64_t field_bytes = relocation_width(type);
+                if (image_size < field_bytes ||
+                    rva > image_size - field_bytes) {
                     out.error = LoadError::BadRelocation;
-                    out.detail = "a DIR64 relocation points outside the image";
+                    out.detail = "a " + std::to_string(field_bytes * 8) +
+                                 "-bit relocation points outside the image";
                     return out;
                 }
 
@@ -1299,6 +1390,12 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                 // exists for: the plan's check is against SizeOfImage, and
                 // the image's size includes gaps that were never mapped.
                 //
+                // The containment test is against the *field*, not against its
+                // first byte. `space.find(va)` would answer the narrower
+                // question and let a DIR64 at the last mapped byte through,
+                // which writes seven bytes past the region. `region_for_write`
+                // is the check that takes the width.
+                //
                 // The writability half cannot fail here -- every region went
                 // in as read-write and nothing has protected any of them yet
                 // -- and it is checked anyway, because the check costs one
@@ -1306,11 +1403,14 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                 // that would fault. A loader that arrived here with a
                 // read-only region in its own map has a placement bug, and
                 // it should report that rather than fault inside apply_one.
-                const Region* target = space.find(va);
+                const std::uint64_t field_bytes = relocation_width(type);
+                const Region* target = region_for_write(space, va, field_bytes);
                 if (target == nullptr) {
                     out.error = LoadError::RelocationNotWritable;
-                    out.detail = "a relocation at RVA " + hex_of(rva) +
-                                 " names an address the image does not cover";
+                    out.detail = "a " + std::to_string(field_bytes * 8) +
+                                 "-bit relocation at RVA " + hex_of(rva) +
+                                 " names an address the image does not cover "
+                                 "for its whole width";
                     rollback_placement(*placement, batch);
                     return out;
                 }
@@ -1553,12 +1653,18 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                     // what makes it safe. The test above walked placements
                     // rather than the space, and the space now holds
                     // exactly those regions plus the headers.
-                    const Region* slot = space.find(imp.iat_va);
+                    // The slot is eight bytes and the test is against eight.
+                    // `find(imp.iat_va)` would answer for the first byte, and
+                    // a directory whose LastThunk lands three bytes before the
+                    // end of a section would then be written past it.
+                    const Region* slot = region_for_write(
+                        space, imp.iat_va, sizeof(std::uint64_t));
                     if (slot == nullptr) {
                         out.error = LoadError::RelocationNotWritable;
                         out.detail = "the IAT slot for " + dll + "!" +
                                      imp.name +
-                                     " is not in a region this load made";
+                                     " has no eight bytes in a region this "
+                                     "load made";
                         rollback_placement(*placement, batch);
                         return out;
                     }
