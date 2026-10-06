@@ -11,6 +11,7 @@
 // split across two reads, two packets in one read, a checksum that fails,
 // and a payload that contains the framing characters.
 
+#include "occ/observer/ptrace.h"
 #include "occ/observer/rsp.h"
 #include "occ/observer/session.h"
 #include "occ/observer/transport.h"
@@ -23,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "occ/syscall/syscall.h"
@@ -162,8 +165,11 @@ void test_bad_checksum() {
     const Packet p = d.take();
     check(!p.checksum_ok, "the checksum is reported as bad");
     check(p.data.empty(), "a bad packet yields no payload");
-    check(d.retransmit_requested(),
-          "a bad checksum asks the far end to retransmit");
+    // The request for a resend is the '-' this owes the sender, not a state
+    // saying we should replay our own last packet. The distinction is
+    // covered in test_a_damaged_packet_does_not_ask_for_a_retransmission.
+    check(d.pending_ack() == '-',
+          "a bad checksum asks the far end to send the packet again");
 }
 
 void test_retransmit_request() {
@@ -620,6 +626,94 @@ void test_wx_permission_transition() {
     check(plain.transitions().empty(), "and no transition is recorded");
 }
 
+// The two entry points that install watches describe a region the same way.
+// A caller that chased a mapping and got back a report with no partial entry
+// would read the region as fully watched, however few of its bytes the
+// registers actually reached -- and it would reach that conclusion because of
+// which function it called rather than because of anything about the target.
+void test_wx_chase_reports_partial_coverage() {
+    WriteExecuteTracker tracker;
+    Watchpoints watches;
+    const int pid = static_cast<int>(::getpid());
+
+    if (Watchpoints::machine_slots() == 0) {
+        // A kernel without debug registers arms nothing, and every region is
+        // correctly reported unwatched. Asserting coverage here would be
+        // asserting a property of the host.
+        std::fprintf(stderr,
+                     "  note: no hardware debug registers, skipping the "
+                     "chase parity check\n");
+        return;
+    }
+
+    // Longer than the four registers can cover, so whatever is installed is
+    // necessarily partial.
+    const ArmReport first = tracker.chase(watches, pid, 0x340000, 4096);
+    if (first.watches_installed == 0) {
+        std::fprintf(stderr,
+                     "  note: no watch could be installed, skipping the "
+                     "chase parity check\n");
+        return;
+    }
+    check(first.bytes_covered <= first.bytes_total,
+          "the chased coverage fits inside the region");
+
+    // Reaching the same region again goes down the already-armed path, which
+    // is the one that used to report the coverage and nothing else.
+    const ArmReport again = tracker.chase(watches, pid, 0x340000, 4096);
+    check(again.watches_installed == 0,
+          "re-chasing an armed region installs nothing new");
+    check(again.bytes_covered == first.bytes_covered,
+          "and reports the coverage the region already had");
+
+    if (again.bytes_covered < again.bytes_total) {
+        check(!again.partial.empty(),
+              "a region reached through the already-armed path is still "
+              "reported as partial");
+        check(!again.complete(),
+              "so the report does not claim the region is fully watched");
+    }
+
+    // The two reports agree about whether coverage was complete, which is the
+    // property a caller comparing them depends on.
+    check(first.complete() == again.complete(),
+          "both reports agree on whether the region is fully covered");
+
+    tracker.release(watches);
+}
+
+// The cached public view has to notice a length change from a merge as well
+// as from an extension. A merge changes a region's length while leaving the
+// number of regions alone, which is the case a size-only invalidation misses:
+// a caller sizing work from the stale length would be working from a range
+// that no longer exists.
+void test_wx_targets_track_a_merged_length() {
+    WriteExecuteTracker tracker;
+    const int pid = static_cast<int>(::getpid());
+    std::string detail;
+
+    (void)tracker.watch(pid, 0x350000, 4096, detail);
+    (void)tracker.watch(pid, 0x360000, 4096, detail);
+    check(tracker.targets().size() == 2, "two disjoint regions are reported");
+
+    // Read the cached view so it is warm, then merge into the first region.
+    check(tracker.targets()[0].length == 4096,
+          "the first region starts one page long");
+    (void)tracker.watch(pid, 0x350800, 4096, detail);
+
+    const auto& after = tracker.targets();
+    check(after.size() == 2, "the overlapping range did not add a region");
+    bool merged = false;
+    for (const auto& t : after) {
+        if (t.base == 0x350000 && t.length == 8192) {
+            merged = true;
+        }
+    }
+    check(merged,
+          "the merged region reports the union's length rather than the one "
+          "the cache was built with");
+}
+
 // ------------------------------------------------------------- gdb transport
 
 // The transport is tested against a real socket rather than a mock because
@@ -838,17 +932,21 @@ void test_connection_drops_corrupt_packet() {
     Packet p = decoder.take();
     check(!p.checksum_ok, "a bad checksum is reported");
 
-    // A failed checksum also asks for a retransmission, and that is what the
-    // sender does about it: the protocol has no other way to recover a
-    // packet that arrived damaged. The retransmission carries the same bytes
-    // rather than a rebuilt packet, because the sender's copy is the only one
-    // known to be what it meant to send.
+    // A failed checksum asks the sender for the packet again, and that is
+    // what the sender does about it: the protocol has no other way to
+    // recover a packet that arrived damaged. The resend is requested with
+    // '-', and the packet itself is the sender's to resend -- it is not a
+    // request for this side to replay its own last reply, which is the other
+    // direction entirely and would put a packet on the wire nobody asked
+    // for.
     PacketDecoder again;
     again.feed("$g#00", 5);
     check(again.has_packet(), "the corrupt packet is framed");
     (void)again.take();
-    check(again.retransmit_requested(),
-          "a failed checksum asks for a retransmission");
+    check(again.pending_ack() == '-',
+          "a failed checksum asks the sender to send the packet again");
+    check(!again.retransmit_requested(),
+          "a failed checksum does not ask us to replay our last packet");
     // The packet to resend is the last one that arrived intact, not the
     // damaged one: replying with damaged bytes would reproduce the same
     // error. Nothing intact has arrived here, so there is nothing to resend.
@@ -1201,12 +1299,16 @@ void test_parse_vcont() {
     // The capability query. A debugger sends this to decide whether to use
     // vCont at all, and answers with the actions it may then send. Advertising
     // an action that is not implemented is worse than advertising none.
+    //
+    // The list and the resume answers are covered by
+    // test_vcont_query_lists_the_actions and
+    // test_vcont_resume_is_answered_with_silence, which also check what
+    // happens to the empty answer on the wire. This covers the action
+    // parsing the two share.
     bool consume = true;
     bool step = true;
     int signal = 0;
-    const std::string q = parse_vcont("", 4242, consume, step, signal);
-    check(q == "c:C;s:S;r:t",
-          "the capability query lists the supported actions");
+    (void)parse_vcont("", 4242, consume, step, signal);
     check(!consume, "the capability query asks for no resume");
     check(!step, "the capability query sets no step");
     check(signal == 0, "the capability query carries no signal");
@@ -1215,11 +1317,10 @@ void test_parse_vcont() {
     consume = false;
     step = true;
     signal = 0;
-    std::string reply = parse_vcont(";c", 4242, consume, step, signal);
+    (void)parse_vcont(";c", 4242, consume, step, signal);
     check(consume, "a continue consumes");
     check(!step, "a continue does not step");
     check(signal == 0, "a continue carries no signal");
-    check(reply == "T" + hex_number(4242), "the reply names the thread");
 
     // A step consumes and steps.
     consume = false;
@@ -1283,6 +1384,484 @@ void test_parse_vcont() {
     check(signal == 0, "a stop-only packet clears the signal");
 }
 
+// ------------------------------------------------- ptrace stop classification
+
+// Builds the wait status a stop arrives in.
+//
+// The layout is the kernel's: the stop signal in bits 0-6, bit 7 as the
+// marker PTRACE_O_TRACESYSGOOD sets on a syscall stop, the event number in
+// bits 16-23, and the exit code in the top byte. The values are the ones the
+// host produces -- a fork stop here is 0x0001057f and the PTRACE_EVENT_STOP
+// that PTRACE_INTERRUPT raises is 0x0080057f -- so these are the numbers
+// classify_status has to read rather than numbers invented to suit it.
+constexpr int status_for(int event, int signal) noexcept {
+    return (event << 16) | (signal << 8) | 0x7f;
+}
+
+void test_event_number_is_in_the_high_byte() {
+    // A fork stop. Read as `status >> 8` the event comes out as 0x105, which
+    // is not an event number at all: the shift picks up the signal and the
+    // syscall marker instead. Every event then misses its case and the stop
+    // is reported as a bare SIGTRAP, so the child the event announced is
+    // never configured and never resumed.
+    const Stop fork_stop =
+        classify_status(4242, status_for(kPtraceEventFork, 5));
+    check(fork_stop.kind == StopKind::NewChild,
+          "a fork event is a new-child stop");
+    check(fork_stop.synthetic,
+          "a fork event is synthetic and must not be redelivered");
+
+    // The events the session acts on differently. Each reaching the right
+    // case is the point: a misrouted exec or seccomp trap is reported as a
+    // breakpoint and the target runs on past a change the observer was
+    // supposed to see.
+    check(classify_status(1, status_for(kPtraceEventClone, 5)).kind ==
+              StopKind::NewChild,
+          "a clone event is a new-child stop");
+    check(classify_status(1, status_for(kPtraceEventVfork, 5)).kind ==
+              StopKind::NewChild,
+          "a vfork event is a new-child stop");
+    check(classify_status(1, status_for(kPtraceEventExec, 5)).kind ==
+              StopKind::Exec,
+          "an exec event is an exec stop");
+    check(classify_status(1, status_for(kPtraceEventSeccomp, 5)).kind ==
+              StopKind::SeccompTrap,
+          "a seccomp event is a seccomp trap");
+    check(classify_status(1, status_for(kPtraceEventExit, 5)).kind ==
+              StopKind::Exited,
+          "an exit event is the final stop");
+    check(classify_status(1, status_for(kPtraceEventVforkDone, 5)).kind ==
+              StopKind::Signal,
+          "a vfork-done event is a stop to be resumed");
+
+    // The number is 128 and it shares the byte every other event uses, so it
+    // has to be matched as a value. Read as anything else, a
+    // PTRACE_INTERRUPT is reported as a plain SIGTRAP and the session's
+    // redelivery rule then suppresses a signal the tracee should have seen.
+    const Stop interrupt = classify_status(1, status_for(kPtraceEventStop, 5));
+    check(interrupt.kind == StopKind::GroupStop,
+          "PTRACE_EVENT_STOP is a group stop");
+    check(interrupt.signal == 19,
+          "PTRACE_EVENT_STOP carries the group-stop signal");
+
+    // A real SIGTRAP with no event is a breakpoint or a single step, and it
+    // is the only case that may be read as a signal. It is the case the
+    // event-number read has to leave alone.
+    const Stop plain = classify_status(1, status_for(0, 5));
+    check(plain.kind == StopKind::Signal, "a bare SIGTRAP is a signal stop");
+    check(plain.signal == 5, "a bare SIGTRAP carries SIGTRAP");
+
+    // A syscall stop is distinguished by the marker bit, not by the event
+    // byte. It differs from a bare SIGTRAP only in bit 7 of the signal byte,
+    // so a classifier that read the wrong place would call every syscall stop
+    // a breakpoint and the session would emit a breakpoint event per
+    // syscall.
+    const Stop syscall_stop = classify_status(1, status_for(0, 5 | 0x80));
+    check(syscall_stop.kind == StopKind::SyscallStop,
+          "the TRACESYSGOOD marker is a syscall stop");
+    check(syscall_stop.synthetic,
+          "a syscall stop is synthetic and must not be redelivered");
+
+    // A status with the top bit set is negative as an int and arrives that
+    // way from the kernel. The event byte is read from the unsigned value, so
+    // this is a shape the read has to survive rather than an artificial one.
+    const int negative = static_cast<int>(0x8000'0000u) | 0x057f;
+    check(classify_status(1, negative).kind == StopKind::Signal,
+          "a status with the top bit set is still classified");
+
+    // Exits are decided before the event byte is consulted, and the exit
+    // code is the low byte rather than anything above it.
+    check(classify_status(1, 0x00000007).kind == StopKind::Exited,
+          "an exited process is reported as exited");
+    check(classify_status(1, 0x00000007).exit_code == 7,
+          "the exit code is read from the status");
+}
+
+void test_group_stop_is_not_an_event() {
+    // A group stop carries no event: the event byte is zero and the signal
+    // is SIGSTOP. It proves the event field and the signal field are read
+    // from different places -- reading the event as `status >> 8` finds 0x13
+    // here, which is not an event, and sends the stop down the SIGTRAP path.
+    const Stop group = classify_status(7, status_for(0, 19));
+    check(group.kind == StopKind::GroupStop, "SIGSTOP is a group stop");
+    check(!group.synthetic,
+          "a group stop is not synthetic: SIGSTOP has a meaning to deliver");
+}
+
+// -------------------------------------------------------------- the vCont answers
+
+void test_vcont_query_lists_the_actions() {
+    // "vCont?" is the packet with the "vCont" prefix already stripped, so
+    // the question mark is all that is left. Answering it with an empty
+    // packet -- which is what "this packet names no action I can perform"
+    // produces -- is read as a stub that does not implement vCont.
+    bool consume = true;
+    bool step = true;
+    int signal = 0;
+    const std::string q = parse_vcont("?", 4242, consume, step, signal);
+    check(q == "vCont;c;C;s;S", "the query lists the supported actions");
+    check(!q.empty(), "the query is answered with a packet, not with silence");
+    check(!consume, "the query asks for no resume");
+    check(!step, "the query sets no step");
+    check(signal == 0, "the query carries no signal");
+
+    // Every advertised action has to be one the parser acts on. "r" and "t"
+    // used to be advertised and then refused by the action scan, so a
+    // debugger believing the reply could ask for a restart and get silence.
+    //
+    // The check is on the action list rather than on the whole answer,
+    // because the answer carries the "vCont" prefix and the "t" in it is not
+    // an advertised stop action.
+    const std::size_t prefix = q.find(';');
+    check(prefix != std::string::npos, "the answer names its own prefix");
+    const std::string actions = q.substr(prefix);
+    check(actions == ";c;C;s;S",
+          "the advertised actions are exactly the four that are performed");
+    check(actions.find('r') == std::string::npos,
+          "the query does not advertise a restart it cannot perform");
+    check(actions.find('t') == std::string::npos,
+          "the query does not advertise a stop it cannot perform");
+
+    // Each advertised letter resumes when sent, which is what makes the list
+    // a statement about this parser rather than a fixed string.
+    for (const char* verb : {"c", "C05", "s", "S05"}) {
+        consume = false;
+        step = false;
+        signal = 0;
+        (void)parse_vcont(std::string(";") + verb, 4242, consume, step, signal);
+        check(consume, "every advertised action resumes the tracee");
+    }
+}
+
+void test_vcont_resume_is_answered_with_silence() {
+    // A continue is not answered with a packet. The resume is the answer and
+    // the stop reply follows when the target actually stops, so anything sent
+    // here describes a stop that has not happened -- and the debugger, having
+    // resumed, takes it for the stop it was waiting for and reports the
+    // target at a program counter it has not reached.
+    //
+    // The two ways of saying nothing are the same std::string and mean
+    // opposite things on the wire, so what is checked is that the string is
+    // empty and the caller's decision to send nothing comes from the flags
+    // rather than from the emptiness.
+    bool consume = false;
+    bool step = false;
+    int signal = 0;
+    const std::string reply = parse_vcont(";c", 4242, consume, step, signal);
+    check(consume, "a continue asks for a resume");
+    check(reply.empty(),
+          "a continue is answered with no packet rather than a stop reply");
+
+    // And it must not be a stop reply in disguise. "T" followed by a thread
+    // number is what this returned before: a malformed stop reply, since the
+    // byte after T is the signal, describing a stop that never happened.
+    check(reply.empty() || reply[0] != 'T',
+          "a continue is not answered with a T-form stop reply");
+}
+
+void test_vcont_through_the_dispatcher_answers_correctly() {
+    // The parser alone cannot be wrong about silence: it returns a string
+    // either way. The defect lived one level up, where the return value was
+    // framed unconditionally -- so an empty answer became "$#00", which is
+    // the protocol's "not supported" and the exact opposite of the intended
+    // silence. Only Reply distinguishes them, so the dispatch is what has to
+    // be tested.
+    Tracer tracer;
+    Breakpoints bps;
+    Writer events;
+    DebugServer server(tracer, bps, 4242, events);
+
+    const Reply query = server.handle("vCont?");
+    check(query.send, "the capability query is answered on the wire");
+    check(query.payload == "vCont;c;C;s;S",
+          "the query answers with the action list");
+
+    server.clear_resume();
+    const Reply resume = server.handle("vCont;c");
+    check(!resume.send, "a vCont continue sends nothing at all");
+    check(resume.payload.empty(), "a vCont continue has no payload to frame");
+    check(server.resume_requested(), "the continue is left for the loop");
+
+    // A vCont naming only an action this stub cannot perform is a different
+    // case and keeps the empty packet: the packet was understood and is not
+    // implemented, which is what "$#00" means.
+    server.clear_resume();
+    const Reply unsupported = server.handle("vCont;t");
+    check(unsupported.send, "a stop-only vCont is answered on the wire");
+    check(unsupported.payload.empty(),
+          "a stop-only vCont frames as the empty packet");
+}
+
+// ------------------------------------------------------------- register widths
+
+// A child stopped on its own ptrace stop, which is what the handlers need to
+// be handed: a read of the tracee's memory or registers only succeeds
+// against a process this one controls.
+//
+// The stop is waited for here rather than left to the caller. A tracer
+// cannot read a tracee that has not reported its stop -- GETREGS fails with
+// ESRCH -- so a helper that left the wait to the caller would hand back a
+// pid that answers E01 to everything, and the tests using it would pass
+// without having checked anything. Nothing waits again afterwards: a ptrace
+// stop is reported once, and a second wait would consume nothing and leave
+// the child parked, so the tests only kill it.
+int fork_traced_stopped() {
+    const int pid = ::fork();
+    if (pid != 0) {
+        int status = 0;
+        ::waitpid(pid, &status, __WALL);
+        return pid;
+    }
+    if (ptrace(kPtraceTraceme, 0, nullptr, nullptr).failed()) {
+        ::_exit(126);
+    }
+    ::raise(SIGSTOP);
+    for (;;) {
+        ::pause();
+    }
+}
+
+void test_single_register_is_answered_at_its_own_width() {
+    // A 'p' reply is sized by the target description, not by the width of
+    // the register file. Eight bytes for %eflags is not padding GDB
+    // discards: it reads the four it expects and then reads the next four as
+    // the following register, so every register after the first short one
+    // shows a shifted value under the wrong name.
+    check(gdb_regnum_width(0) == 64, "rax is answered at eight bytes");
+    check(gdb_regnum_width(16) == 64, "rip is answered at eight bytes");
+    check(gdb_regnum_width(17) == 32, "eflags is answered at four bytes");
+    check(gdb_regnum_width(18) == 32, "cs is answered at four bytes");
+    check(gdb_regnum_width(23) == 32, "gs is answered at four bytes");
+    check(gdb_regnum_width(24) == 80, "st0 is answered at ten bytes");
+    check(gdb_regnum_width(31) == 80, "st7 is answered at ten bytes");
+    check(gdb_regnum_width(32) == 32, "fctrl is answered at four bytes");
+    check(gdb_regnum_width(39) == 32, "fop is answered at four bytes");
+
+    // The three past the core feature are not at the block index. GDB
+    // reserves 40 through 51 for the SSE and AVX banks this description does
+    // not declare, so a width looked up by block position would answer a
+    // question about %fs_base with %st0's ten bytes.
+    check(gdb_regnum_width(gdb_regnum_fs_base()) == 64,
+          "fs_base is answered at eight bytes");
+    check(gdb_regnum_width(gdb_regnum_gs_base()) == 64,
+          "gs_base is answered at eight bytes");
+    check(gdb_regnum_width(gdb_regnum_orig_rax()) == 64,
+          "orig_rax is answered at eight bytes");
+
+    // A register in the SSE/AVX gap has no width, because the description
+    // does not declare it. Zero is what says "no answer", and it keeps the
+    // handler from framing an undeclared register as eight bytes of zero.
+    check(gdb_regnum_width(40) == 0, "an undeclared register has no width");
+    check(gdb_regnum_width(45) == 0, "an AVX register has no width");
+    check(gdb_regnum_width(151) == 0, "a number below the bases has none");
+
+    // The widths above are what the handler is told to use; what matters is
+    // the length that reaches the wire. A 'p' reply is sized by the
+    // description on the other end, so a reply that is eight bytes for a
+    // four-byte register is not padded over -- GDB reads four bytes as the
+    // register and the next four as the register after it.
+    //
+    // This needs a tracee, because the handler reads the registers through
+    // ptrace and answers E01 for a pid it cannot read. The length is then
+    // checked against the width the description declares.
+    const int pid = fork_traced_stopped();
+    if (pid == 0) {
+        return;
+    }
+
+    Tracer tracer;
+    Breakpoints bps;
+    Writer events;
+    DebugServer server(tracer, bps, pid, events);
+
+    struct Expectation {
+        const char* packet;
+        std::size_t digits;
+        const char* what;
+    };
+    // Every entry is a register whose width is not eight bytes, plus %rip as
+    // the control: it is eight, and a handler that padded everything to
+    // eight would pass the narrow cases only by being wrong about all of
+    // them.
+    const Expectation cases[] = {
+        {"p10", 16, "rip is sent as eight bytes"},
+        {"p11", 8, "eflags is sent as four bytes"},
+        {"p12", 8, "cs is sent as four bytes"},
+        {"p17", 8, "gs is sent as four bytes"},
+        {"p18", 20, "st0 is sent as ten bytes"},
+        {"p1f", 20, "st7 is sent as ten bytes"},
+        {"p20", 8, "fctrl is sent as four bytes"},
+        {"p27", 8, "fop is sent as four bytes"},
+        {"p98", 16, "fs_base is sent as eight bytes"},
+        {"p99", 16, "gs_base is sent as eight bytes"},
+        {"p9a", 16, "orig_rax is sent as eight bytes"},
+    };
+    for (const Expectation& c : cases) {
+        const Reply r = server.handle(c.packet);
+        check(r.payload.size() == c.digits, c.what);
+    }
+
+    // A register in the undeclared gap gets no payload at all rather than
+    // eight bytes of zero: GDB has no width for it, so there is nothing it
+    // could read correctly out of a reply.
+    check(server.handle("p28").payload.empty(),
+          "an undeclared register is answered with no bytes");
+
+    // The kill is the cleanup, not part of what is being checked, and a
+    // child that outlives the test is a leaked process rather than a failed
+    // assertion. The status it would report is discarded deliberately.
+    (void)tracer.kill(pid);
+}
+
+// --------------------------------------------------------------- hex on the wire
+
+// A protocol number spelled with uppercase digits.
+//
+// hex_number is the canonical form and produces lowercase, because that is
+// what this implementation emits. The tests need the other case as an input,
+// and a separate helper is clearer than transforming hex_number's output:
+// what is under test is that a packet spelled in a case this code never
+// produces is still read.
+std::string to_upper_hex(std::uint64_t value) noexcept {
+    std::string digits = hex_number(value);
+    for (char& c : digits) {
+        if (c >= 'a' && c <= 'f') {
+            c = static_cast<char>(c - 'a' + 'A');
+        }
+    }
+    return digits;
+}
+
+void test_hex_fields_accept_both_cases() {
+    // The address and length fields of m, M and Z are read by this file's
+    // own scanner rather than by the shared helpers, and it used to accept
+    // lowercase only. GDB writes either case depending on the packet, so a
+    // request whose address was spelled with uppercase digits was answered
+    // E01 -- which the debugger reports as "cannot access memory" rather
+    // than as a parse failure, and that is why the defect survived.
+    //
+    // The read is against a real tracee so that a successful parse is
+    // distinguishable from a refused one. Against a pid that cannot be traced
+    // every spelling answers E01 and the case is invisible, which would make
+    // this test pass with or without the fix.
+    const int pid = fork_traced_stopped();
+    if (pid == 0) {
+        return;
+    }
+
+    Tracer tracer;
+    Breakpoints bps;
+    Writer events;
+    DebugServer server(tracer, bps, pid, events);
+
+    // The stack pointer is an address the tracee has mapped and can be read
+    // at, which a hardcoded one is not: the text segment is somewhere in the
+    // high half and an address invented for the test is very likely to be
+    // unmapped, and an unmapped address answers E01 whatever the parser did
+    // with the digits.
+    Registers regs{};
+    if (tracer.get_regs(pid, regs).failed()) {
+        check(false, "the tracee's registers are readable");
+        (void)tracer.kill(pid);
+        return;
+    }
+
+    // Aligned down a page. The pointer itself is readable, but the sixteen
+    // bytes above it are whatever the child was doing when it stopped and
+    // the value is not stable between runs; below the pointer the stack is
+    // mapped and already unwound, so the bytes are the same on every run and
+    // the two spellings can be compared for equality rather than for size.
+    const std::uint64_t page = regs.rsp & ~static_cast<std::uint64_t>(0xfff);
+    const std::string lower_addr = "m" + hex_number(page) + ",10";
+    const std::string upper_addr = "m" + to_upper_hex(page) + ",10";
+
+    // Both spellings have to return the same bytes, and they have to return
+    // bytes rather than an error: an uppercase address that parsed produces
+    // the same payload as the lowercase one, and one that did not produces
+    // E01.
+    const std::string lower = server.handle(lower_addr).payload;
+    const std::string upper = server.handle(upper_addr).payload;
+    // Sixteen bytes is thirty-two hex digits, and the count is what says the
+    // read reached the tracee rather than being refused.
+    check(lower.size() == 32, "a lowercase memory read reaches the tracee");
+    check(lower == upper,
+          "an uppercase memory address parses like a lowercase one");
+
+    // The length field goes through the same scan as the address, so it has
+    // to take both cases too. Ten bytes is twenty hex digits: if the digits
+    // parsed we get twenty, and if they did not we get the three of E01.
+    const std::string lower_len =
+        server.handle("m" + hex_number(page) + ",a").payload;
+    const std::string upper_len =
+        server.handle("m" + hex_number(page) + ",A").payload;
+    check(lower_len.size() == 20, "a lowercase length reads ten bytes");
+    check(upper_len == lower_len,
+          "an uppercase length reads the same bytes as a lowercase one");
+
+    // Garbage is still refused. A scanner that accepted both cases by
+    // ignoring the ones it did not recognise would read wherever the
+    // truncated number landed and return bytes for it.
+    check(server.handle("m" + hex_number(page) + ",zz").payload == "E01",
+          "a non-hexadecimal length is still refused");
+    check(server.handle("mzzzzzzzzzzzz,10").payload == "E01",
+          "a non-hexadecimal address is still refused");
+    check(server.handle("m" + hex_number(page) + ",").payload == "E01",
+          "an empty length is still refused");
+
+    // A breakpoint packet's address goes through the same scan, and a
+    // lowercase-only reader refused the whole packet there too. The address
+    // is the stack pointer again: what is under test is whether the digits
+    // parsed, and an address that could not be poked would refuse the packet
+    // for a second reason.
+    const std::string bp_lower =
+        server.handle("Z0," + hex_number(page) + ",1").payload;
+    const std::string bp_upper =
+        server.handle("Z0," + to_upper_hex(page) + ",1").payload;
+    check(bp_lower == bp_upper,
+          "a breakpoint address parses the same in either case");
+    check(server.handle("Z0,ZZZZZZZZZZZZ,1").payload != "OK",
+          "a non-hexadecimal breakpoint address is refused");
+
+    // The kill is the cleanup, not part of what is being checked, and a child
+    // that outlives the test is a leaked process rather than a failed
+    // assertion. The status it would report is discarded deliberately.
+    (void)tracer.kill(pid);
+}
+
+// ------------------------------------------------------------- damaged packets
+
+void test_a_damaged_packet_does_not_ask_for_a_retransmission() {
+    // A packet whose checksum does not match is one we could not read. The
+    // protocol's answer is '-' -- send it again -- which is what the pending
+    // acknowledgment already says.
+    //
+    // It is not a request for us to resend our own last packet. That flag
+    // means the far end saw a checksum fail on something we sent, and
+    // setting it on receipt of a damaged packet makes the session echo its
+    // last reply at a debugger that never asked: the debugger sees an answer
+    // to a question it did not pose, and the retransmission it does send
+    // arrives beside a packet meaning something else. Both directions are
+    // then off by one for the rest of the session.
+    PacketDecoder d;
+    std::string packet = encode_packet("g");
+    packet[packet.size() - 1] = (packet[packet.size() - 1] == '0') ? '1' : '0';
+
+    check(d.feed(packet) == 1, "the damaged packet is still framed");
+    const Packet p = d.take();
+    check(!p.checksum_ok, "the checksum is reported as bad");
+    check(d.pending_ack() == '-', "a damaged packet is acknowledged with -");
+    check(!d.retransmit_requested(),
+          "a damaged packet does not put us in a resend state");
+
+    // A real retransmission request is the other direction and still works,
+    // which is what makes the absence above a decision rather than a missing
+    // feature.
+    PacketDecoder e;
+    e.feed("-", 1);
+    check(e.retransmit_requested(),
+          "a minus from the far end still asks for a retransmission");
+}
+
 } // namespace
 
 int main() {
@@ -1315,6 +1894,8 @@ int main() {
     test_watch_alignment();
     test_write_watch_width();
     test_wx_chase_prefers_new_mapping();
+    test_wx_chase_reports_partial_coverage();
+    test_wx_targets_track_a_merged_length();
     test_wx_permission_transition();
     test_listener_binds_loopback();
     test_listener_stays_listening();
@@ -1325,6 +1906,14 @@ int main() {
     test_register_block_matches_description();
     test_serve_target_description();
     test_parse_vcont();
+    test_event_number_is_in_the_high_byte();
+    test_group_stop_is_not_an_event();
+    test_vcont_query_lists_the_actions();
+    test_vcont_resume_is_answered_with_silence();
+    test_vcont_through_the_dispatcher_answers_correctly();
+    test_single_register_is_answered_at_its_own_width();
+    test_hex_fields_accept_both_cases();
+    test_a_damaged_packet_does_not_ask_for_a_retransmission();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

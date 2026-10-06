@@ -187,6 +187,42 @@ std::uint64_t gdb_register(const Registers& r, std::size_t regnum) noexcept {
     }
 }
 
+// The declared width of a register, in bits, by the number GDB uses for it.
+//
+// This is the 'p' half of the layout kGdbFields describes for the 'g' half,
+// and it has to be a separate table rather than an index into that one. The
+// two numberings are the same only across the forty core registers: GDB
+// reserves 40 through 51 for the SSE and AVX banks this description does not
+// declare, so %fs_base is position 40 in the block and register 152 here.
+// Looking the width up by block position would answer a question about %st0
+// with %eflags's four bytes.
+//
+// The widths are the target description's, not the kernel's. %eflags and the
+// six segment selectors are 32 bits even though the kernel carries them in
+// 64-bit fields, %st0-%st7 are 80, and the x87 control block is 32. Sending
+// eight bytes for %eflags is the same width error as sending it in the 'g'
+// block: GDB sizes the answer from the description, so a reply that is too
+// long is not padded over, it is read as the next register's value shifted.
+unsigned gdb_regnum_bits(std::size_t regnum) noexcept {
+    if (regnum <= kPcRegnum) {
+        return 64; // rax-r15, then %rip
+    }
+    if (regnum <= 23) {
+        return 32; // %eflags and cs/ss/ds/es/fs/gs
+    }
+    if (regnum <= 31) {
+        return 80; // %st0-%st7
+    }
+    if (regnum <= 39) {
+        return 32; // %fctrl-%fop
+    }
+    if (regnum == kFsBaseRegnum || regnum == kGsBaseRegnum ||
+        regnum == kOrigRaxRegnum) {
+        return 64;
+    }
+    return 0;
+}
+
 // Writes back the registers the kernel accepts from SETREGS on this
 // architecture: the sixteen general registers and %rip.
 //
@@ -524,8 +560,27 @@ Reply DebugServer::handle(std::string_view packet) noexcept {
         // observable: it is named for the answer, and a stub that stays
         // silent fails it.
         if (starts_with(args, "Cont")) {
-            return Reply::packet(
-                handle_vcont(args.substr(std::string_view{"Cont"}.size())));
+            const std::string_view rest =
+                args.substr(std::string_view{"Cont"}.size());
+            // The capability query is answered with the action list and is
+            // the only vCont form that has a reply of its own. A resume is
+            // not: the loop performs the resume and the stop reply follows
+            // when the target actually stops, so answering here would put a
+            // stop on the wire for a target that is still running. The two
+            // are told apart by the query rather than by the emptiness of
+            // the returned string, because "no reply" and "an empty packet"
+            // are the same string and mean opposite things.
+            if (rest.empty() || rest == "?") {
+                return Reply::packet(handle_vcont(rest));
+            }
+            const std::string answer = handle_vcont(rest);
+            // A vCont that named no action this stub can perform is
+            // "unsupported" and gets the empty packet. One that named a
+            // resume gets silence, because the resume is the answer.
+            if (resume_requested_) {
+                return Reply::nothing();
+            }
+            return Reply::packet(answer);
         }
         return Reply::unsupported();
 
@@ -563,12 +618,28 @@ Reply DebugServer::handle(std::string_view packet) noexcept {
             // different way to ask.
             return Reply::packet(std::string{});
         }
+        const unsigned bits = gdb_regnum_bits(static_cast<std::size_t>(which));
+        if (bits == 0) {
+            // A number inside the range this stub answers for but outside the
+            // description: one of the SSE or AVX banks GDB numbers between
+            // the x87 block and %fs_base. There is no width to send it at,
+            // and zero bytes would be a packet with no payload, which reads
+            // as "unsupported" rather than as a zero of some width.
+            return Reply::packet(std::string{});
+        }
         Registers r{};
         if (tracer_->get_regs(pid_, r).failed()) {
             return Reply::packet("E01");
         }
-        return Reply::packet(
-            hex_u64_le(gdb_register(r, static_cast<std::size_t>(which))));
+        // The reply is the register at the width the description declares
+        // for it, not eight bytes. GDB reads exactly as many as the
+        // description says the register is wide, so a %eflags answered with
+        // sixteen hex digits is four bytes of the register followed by four
+        // bytes of whatever the debugger then reads as the next register.
+        std::string out;
+        append_gdb_register(out, gdb_register(r, static_cast<std::size_t>(which)),
+                            bits);
+        return Reply::packet(out);
     }
 
     case 'm':
@@ -719,6 +790,10 @@ std::size_t gdb_regnum_orig_rax() noexcept {
     return kOrigRaxRegnum;
 }
 
+unsigned gdb_regnum_width(std::size_t regnum) noexcept {
+    return gdb_regnum_bits(regnum);
+}
+
 std::string serve_target_description(std::string_view args) noexcept {
     // The packet is "qXfer:features:read:ANNEX:OFFSET,LENGTH" and the
     // dispatcher has already removed the "qXfer:features:read:" prefix, so
@@ -790,9 +865,20 @@ std::string parse_vcont(std::string_view args, int pid, bool& consume,
     // thread. The older packets remain the fallback for a debugger that does
     // not use it, so implementing vCont does not replace them.
     //
-    // "vCont?" asks which actions are supported. The answer is the list of
-    // them, separated by colons, exactly as it would appear in a request,
-    // and it is the answer that lets a debugger choose vCont at all.
+    // "vCont?" asks which actions are supported and the answer is the list
+    // of them, in the form they would appear in a request and prefixed with
+    // "vCont;" so a stub's reply is recognisable as a vCont answer rather
+    // than as an unrelated payload. It is the answer that lets a debugger
+    // choose vCont at all, so it is a real packet: gdb parses the reply and
+    // falls back to the single-letter packets when it cannot, and a stub that
+    // answers the query with an empty packet reads as one that does not
+    // implement vCont at all.
+    //
+    // Only the four actions this stub acts on are advertised. "r" and "t"
+    // are deliberately absent: the session loop owns the tracee and is the
+    // only thing that resumes it, so a restart or a stop sent from here
+    // would be a request the loop could not honour, and advertising an
+    // action is a promise to perform it.
     //
     // The outputs are cleared before the query is answered rather than
     // after. A debugger sends the query before any action, and a stub that
@@ -803,8 +889,15 @@ std::string parse_vcont(std::string_view args, int pid, bool& consume,
     step = false;
     signal = 0;
 
-    if (args.empty()) {
-        return "c:C;s:S;r:t";
+    // The query arrives as "vCont?" and the dispatcher has already removed
+    // the "vCont" prefix, so what is left here is the question mark. An
+    // empty argument list is the same query written without one, and both
+    // are answered identically. Testing for an empty list alone would leave
+    // the query this stub is required to answer falling through to the
+    // action scan below, where "?" is not a verb and the answer comes back
+    // empty.
+    if (args.empty() || args == "?") {
+        return "vCont;c;C;s;S";
     }
 
     std::size_t pos = 0;
@@ -862,10 +955,19 @@ std::string parse_vcont(std::string_view args, int pid, bool& consume,
     if (!consume) {
         return {};
     }
-    // The reply is the thread that was selected, which is the only thread
-    // there is. The session does not resume inside the packet layer: the
-    // loop owns the tracee and decides when it runs.
-    return "T" + hex_number(static_cast<std::uint64_t>(pid));
+    // A resume is answered with nothing, and this returns an empty string to
+    // say so. The reply to a continue is not a packet at all: the resume is
+    // the answer, and the stop reply follows when the target stops again.
+    // Framing an empty payload here would instead say "unsupported" and the
+    // debugger would conclude the target cannot be resumed.
+    //
+    // The pid is not used and the parameter stays because the query answer
+    // and the resume decision are read together by the caller, and a
+    // signature that changed shape with the protocol's two modes would make
+    // the query path and the resume path look unrelated when they are two
+    // answers to the same packet.
+    (void)pid;
+    return {};
 }
 
 
@@ -874,11 +976,12 @@ std::string DebugServer::handle_qxfer_features(std::string_view args) noexcept {
 }
 
 std::string DebugServer::handle_vcont(std::string_view args) noexcept {
-    // The reply is returned unchanged whether or not a resume was requested:
-    // "vCont?" produces an answer with no resume behind it, and a resume the
-    // loop has not yet performed still answers with the thread it named. The
-    // flags come back through the same references the loop reads, so the
-    // packet layer does not decide when the tracee runs.
+    // The capability query returns the action list and nothing else. A
+    // resume returns an empty string, which the caller turns into silence
+    // rather than into an empty packet: the packet layer does not decide when
+    // the tracee runs, and a stop reply belongs to the loop that waited for
+    // the stop. The flags come back through the same references the loop
+    // reads.
     return parse_vcont(args, pid_, resume_requested_, step_, resume_signal_);
 }
 
@@ -944,39 +1047,50 @@ std::string DebugServer::handle_write_registers(std::string_view args) noexcept 
     return "OK";
 }
 
+// Reads one address or length field off the wire.
+//
+// The digit test accepts both cases. GDB writes hexadecimal in either case
+// depending on the packet and the build -- a memory read it composes from
+// its own symbols arrives with uppercase digits often enough that a
+// lowercase-only reader answers E01 to a request for an address it could
+// have read, and the failure surfaces as "cannot access memory" in the
+// debugger rather than as a parse error here. The helpers in rsp.cpp have
+// always accepted both; these three were written out longhand and did not.
+std::uint64_t parse_hex_field(std::string_view s, bool& ok) noexcept {
+    std::uint64_t v = 0;
+    ok = !s.empty();
+    for (const char c : s) {
+        int d = -1;
+        if (c >= '0' && c <= '9') {
+            d = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            d = c - 'a' + 10;
+        } else if (c >= 'A' && c <= 'F') {
+            d = c - 'A' + 10;
+        }
+        if (d < 0) {
+            ok = false;
+            return 0;
+        }
+        v = (v << 4) | static_cast<std::uint64_t>(d);
+    }
+    return v;
+}
+
 std::string DebugServer::handle_read_memory(std::string_view args) noexcept {
     const std::size_t comma = args.find(',');
     if (comma == std::string_view::npos) {
         return "E01";
     }
 
-    std::uint64_t addr = 0;
-    std::uint64_t length = 0;
-    {
-        std::uint64_t a = 0;
-        for (char c : args.substr(0, comma)) {
-            const int d = (c >= '0' && c <= '9')
-                              ? c - '0'
-                              : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1);
-            if (d < 0) {
-                return "E01";
-            }
-            a = (a << 4) | static_cast<std::uint64_t>(d);
-        }
-        addr = a;
+    bool ok = false;
+    const std::uint64_t addr = parse_hex_field(args.substr(0, comma), ok);
+    if (!ok) {
+        return "E01";
     }
-    {
-        std::uint64_t l = 0;
-        for (char c : args.substr(comma + 1)) {
-            const int d = (c >= '0' && c <= '9')
-                              ? c - '0'
-                              : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1);
-            if (d < 0) {
-                break;
-            }
-            l = (l << 4) | static_cast<std::uint64_t>(d);
-        }
-        length = l;
+    const std::uint64_t length = parse_hex_field(args.substr(comma + 1), ok);
+    if (!ok) {
+        return "E01";
     }
 
     // The protocol's read is capped by what fits in one packet. A debugger
@@ -1007,15 +1121,10 @@ std::string DebugServer::handle_write_memory(std::string_view args) noexcept {
         return "E01";
     }
 
-    std::uint64_t addr = 0;
-    for (char c : args.substr(0, comma)) {
-        const int d = (c >= '0' && c <= '9')
-                          ? c - '0'
-                          : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1);
-        if (d < 0) {
-            return "E01";
-        }
-        addr = (addr << 4) | static_cast<std::uint64_t>(d);
+    bool ok = false;
+    const std::uint64_t addr = parse_hex_field(args.substr(0, comma), ok);
+    if (!ok) {
+        return "E01";
     }
 
     const std::size_t colon = args.find(':', comma);
@@ -1053,15 +1162,10 @@ std::string DebugServer::handle_breakpoint(std::string_view args) noexcept {
         return "E01";
     }
 
-    std::uint64_t addr = 0;
-    for (char c : rest.substr(0, comma)) {
-        const int d = (c >= '0' && c <= '9')
-                          ? c - '0'
-                          : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1);
-        if (d < 0) {
-            return "E01";
-        }
-        addr = (addr << 4) | static_cast<std::uint64_t>(d);
+    bool ok = false;
+    const std::uint64_t addr = parse_hex_field(rest.substr(0, comma), ok);
+    if (!ok) {
+        return "E01";
     }
 
     if (type != '0') {
@@ -1212,6 +1316,41 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
     // attached.
     bool released_for_debugger = false;
 
+    // Set when a stop has been reported to an attached debugger and the
+    // target is being held for the next resume.
+    //
+    // This is the same state the initial hold is in, reached later and for a
+    // different reason: the first hold is waiting for a debugger to arrive
+    // and say continue, this one is waiting for a debugger that has already
+    // continued to say so again. Sharing the branch that acts on it is what
+    // keeps "the target is stopped and a debugger owns it" a single state
+    // rather than two that have to be kept in agreement.
+    bool waiting_for_continue = false;
+
+    // Reports a stop to the attached debugger, and reports it once.
+    //
+    // The stop reply is the answer to a continue, so it belongs here rather
+    // than in the packet handler: the handler runs before the target has
+    // moved, and anything it sent would describe a stop that had not
+    // happened. A debugger waiting on a continue sees nothing until the
+    // kernel actually stops the tracee, and this is where that becomes
+    // visible.
+    //
+    // Nothing is sent when no debugger is attached. The session runs the same
+    // way either way, and a stop reply written to a closed descriptor would
+    // be a write whose failure says nothing about the run.
+    auto report_stop = [&](int gdb_signal) {
+        if (!connection.valid()) {
+            return;
+        }
+        Registers at_stop{};
+        std::uint64_t pc = 0;
+        if (tracer.get_regs(config.pid, at_stop).ok()) {
+            pc = at_stop.rip;
+        }
+        (void)connection.send_packet(encode_stop_reply(gdb_signal, pc));
+    };
+
     // The process has been seized and is stopped. The first resume is what
     // lets it run at all.
     const bool trace_syscalls = config.trace_syscalls;
@@ -1332,6 +1471,35 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
                 n.add("length", u.length);
                 events.commit();
             }
+
+            // Write tracking without syscall tracing observes less than it
+            // appears to, and the difference is not visible in the output.
+            //
+            // A hardware watch does not stop the target: the kernel records
+            // the access in a ring and the tracee keeps running. The ring is
+            // read where the session already has a reason to look, which is
+            // at a stop. With syscall tracing on there are two stops per
+            // syscall, so the ring is drained continuously and a write is
+            // reported within microseconds of happening. With it off, the
+            // only stops are the ones something else caused -- a signal, a
+            // breakpoint, the exit -- so writes accumulate in the ring and
+            // are reported in a burst at the next one of those, or never if
+            // the ring wraps first.
+            //
+            // A run that reports nothing is therefore ambiguous between
+            // "the target wrote nothing" and "nothing was read", and the
+            // tracker cannot tell the two apart either. Stating the
+            // dependency is the honest answer: the combination works, it
+            // just observes at the resolution of the target's other stops.
+            if (!config.trace_syscalls) {
+                auto& n = events.begin(EventKind::Note);
+                n.add("text", std::string_view{
+                                  "write tracking is on without syscall "
+                                  "tracing: writes are reported at the "
+                                  "target's next stop rather than as they "
+                                  "happen"});
+                events.commit();
+            }
         }
     }
 
@@ -1358,13 +1526,24 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             // address and different byte counts, and the byte count is what
             // tells them apart.
             std::uint64_t width = 1;
-            std::uint8_t code[16];
+            // Zeroed, and the read is checked, because the bytes are fed to
+            // the decoder whether or not the read worked. An array left
+            // uninitialized here is decoded as instruction bytes on a failed
+            // read, and the width the decoder then reports is whatever the
+            // stack happened to hold -- so the event says the write was one
+            // byte, four or eight, and the answer changes between runs of
+            // the same target. Zeroing does not make the answer right, but
+            // it makes it a stated assumption rather than a leftover.
+            std::uint8_t code[16] = {};
             const auto rr = tracer.peek(ev.pid, ev.rip);
             if (rr.ok()) {
-                (void)tracer.read_memory(ev.pid, ev.rip, code, sizeof(code));
-                const AccessDecode d = decode_access(code, sizeof(code));
-                if (d.valid && d.width != 0) {
-                    width = d.width;
+                const auto bytes = tracer.read_memory(ev.pid, ev.rip, code,
+                                                      sizeof(code));
+                if (bytes.ok() && bytes.value > 0) {
+                    const AccessDecode d = decode_access(code, sizeof(code));
+                    if (d.valid && d.width != 0) {
+                        width = d.width;
+                    }
                 }
             }
             wx.note_write(ev.pid, ev.address, width, ev.rip);
@@ -1532,8 +1711,7 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
         // port would be a way to run nothing. It is the tracee's stops that
         // drive this loop, so a debugger that has not arrived yet is simply
         // not there yet.
-        if (config.serve_gdb && !connection.valid()) {
-            const int listen_fd = config.gdb_listen_fd >= 0
+        if (config.serve_gdb && !connection.valid()) {            const int listen_fd = config.gdb_listen_fd >= 0
                                       ? config.gdb_listen_fd
                                       : config.gdb_read_fd;
             if (listen_fd >= 0) {
@@ -1557,6 +1735,42 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
                 }
             }
         } else if (config.serve_gdb && connection.valid()) {
+            // A second debugger is turned away rather than left waiting.
+            //
+            // The branch above only accepts while no connection is held, so a
+            // second client cannot displace the first -- but it is never told
+            // so either. It sits in the listen queue until this run ends, and
+            // from the outside that is indistinguishable from a stub that
+            // hung: gdb waits through its retries and reports a remote
+            // connection failure with nothing to say about the cause. Two
+            // debuggers cannot both drive one tracee, so the second is
+            // accepted and closed immediately, which ends its wait with a
+            // connection reset rather than a timeout.
+            //
+            // The refused descriptor is closed rather than kept, because
+            // holding it would leak one per attempt and the client can retry
+            // indefinitely.
+            if (config.gdb_listen_fd >= 0) {
+                sys::PollFd second{};
+                second.fd = config.gdb_listen_fd;
+                second.events = 0x0001; // POLLIN
+                second.revents = 0;
+                const auto ready = sys::poll(&second, 1, 0);
+                if (ready.ok() && ready.value > 0) {
+                    const auto extra = sys::accept4(config.gdb_listen_fd,
+                                                    nullptr, nullptr,
+                                                    0x80000 /* SOCK_CLOEXEC */);
+                    if (extra.ok()) {
+                        (void)sys::close(static_cast<int>(extra.value));
+                        auto& note = events.begin(EventKind::Note);
+                        note.add("text", std::string_view{
+                                            "a second debugger was refused: one "
+                                            "tracee has one debugger"});
+                        events.commit();
+                    }
+                }
+            }
+
             // Reading with a zero timeout keeps the tracee's stops from being
             // delayed by a debugger that has nothing to say. The target is
             // the thing making progress here; the debugger is a passenger.
@@ -1621,7 +1835,16 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
         // a blocking read because the loop has to keep draining the event
         // stream and servicing the protocol while it waits, and because a
         // debugger that connects and then goes quiet must not wedge the run.
-        if (hold_for_debugger && !released_for_debugger) {
+        //
+        // The same branch serves a later hold. Once a stop has been reported
+        // to an attached debugger, the target stays stopped until the next
+        // resume for exactly the reason the first hold does: a resumed
+        // target runs on its own and the next chance to set a breakpoint is
+        // gone. Falling through to the wait below instead would block in
+        // waitpid on a process that is already stopped, which never returns
+        // and takes the protocol with it.
+        if ((hold_for_debugger && !released_for_debugger) ||
+            waiting_for_continue) {
             // Nothing is resumed until a continue arrives, so this branch
             // runs on every pass and is the run's whole behaviour while it
             // waits. The poll with no descriptors is a sleep that cannot
@@ -1630,18 +1853,30 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             // says nothing must not wedge the run.
             if (server.resume_requested()) {
                 const int signal = server.resume_signal();
+                const bool step = server.step_requested();
                 server.clear_resume();
-                released_for_debugger = true;
-                auto& note = events.begin(EventKind::Note);
-                note.add("text", std::string_view{
-                                    "the debugger resumed the target"});
-                Registers held{};
-                if (tracer.get_regs(config.pid, held).ok()) {
-                    note.add_hex("pc", held.rip);
-                    note.add_hex("sp", held.rsp);
+                waiting_for_continue = false;
+                if (hold_for_debugger && !released_for_debugger) {
+                    released_for_debugger = true;
+                    auto& note = events.begin(EventKind::Note);
+                    note.add("text", std::string_view{
+                                        "the debugger resumed the target"});
+                    Registers held{};
+                    if (tracer.get_regs(config.pid, held).ok()) {
+                        note.add_hex("pc", held.rip);
+                        note.add_hex("sp", held.rsp);
+                    }
+                    events.commit();
                 }
-                events.commit();
-                if (resume(config.pid, signal) != 0) {
+                // A step is a single step rather than a continue, because
+                // the debugger asked for one instruction and a continue would
+                // run until the next event of any kind. The distinction is
+                // carried by the packet the debugger sent, not inferred here.
+                const int rc = step ? [&] {
+                    auto r = tracer.singlestep(config.pid, signal);
+                    return r.failed() ? r.error : 0;
+                }() : resume(config.pid, signal);
+                if (rc != 0) {
                     out.failed = true;
                     out.detail = "the target could not be resumed by the debugger";
                     break;
@@ -1758,6 +1993,36 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             if (msg.ok()) {
                 const int child = static_cast<int>(msg.value);
                 traced.push_back(child);
+
+                // The options have to be set on the child as well.
+                // PTRACE_SETOPTIONS does not cross a fork: a child arrives
+                // traced, because the tracing itself is inherited, but with
+                // an empty option set. The consequence is that the child's
+                // own fork, exec and seccomp stops are never reported, so
+                // the session follows one generation and then goes blind --
+                // a target that forks again is not observed past the second
+                // level, and the stop that announced the deeper child is
+                // never seen by anyone.
+                //
+                // The failure is ignored rather than fatal. The child is
+                // already stopped and has to be resumed either way, and a
+                // session that refused to run because one child's options
+                // could not be set would trade a partial observation for no
+                // observation at all. What is lost is recorded instead, so
+                // the gap is a fact in the stream rather than a silence.
+                auto child_opts = tracer.set_options(child, options);
+                if (child_opts.failed()) {
+                    auto& warn = events.begin(EventKind::Note);
+                    warn.add("text", std::string_view{
+                                        "a new child was not configured: its "
+                                        "own fork and exec stops will not be "
+                                        "reported"});
+                    warn.add("pid", static_cast<std::uint64_t>(child));
+                    warn.add("errno", static_cast<std::int64_t>(
+                                          child_opts.error));
+                    events.commit();
+                }
+
                 auto& e = events.begin(EventKind::ProcessSpawn);
                 e.add("pid", static_cast<std::uint64_t>(child));
                 e.add("parent", static_cast<std::uint64_t>(stop.pid));
@@ -2033,6 +2298,17 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
                         }
                         continue;
                     }
+
+                    // A breakpoint the debugger set and nobody asked to
+                    // continue from is the stop a person is waiting for. It
+                    // is reported and the target is held, because resuming
+                    // it here would step over the breakpoint the debugger
+                    // just asked to be stopped at.
+                    if (connection.valid()) {
+                        report_stop(gdb_signal_for_breakpoint());
+                        waiting_for_continue = true;
+                        continue;
+                    }
                 }
             }
 
@@ -2049,6 +2325,19 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
                 continue;
             }
 
+            // A stop the debugger is driving has to be reported rather than
+            // resumed. The debugger asked to continue, the target ran, and
+            // this is the stop that continue's answer promised; the loop then
+            // holds until the next resume. Auto-resuming here instead would
+            // leave the debugger waiting for a stop reply that never comes,
+            // and it would never learn the target had reached a breakpoint.
+            if (connection.valid()) {
+                report_stop(stop.synthetic ? gdb_signal_for_breakpoint()
+                                           : stop.signal);
+                waiting_for_continue = true;
+                continue;
+            }
+
             (void)resume(stop.pid, deliver);
             continue;
         }
@@ -2057,6 +2346,15 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             // A group stop is continued with a zero signal, or with SIGCONT
             // to actually deliver the stop to the group. Continuing with
             // SIGSTOP here would re-stop the process immediately.
+            //
+            // An attached debugger is told about it first, for the same
+            // reason a signal stop is reported: it is a stop, and the
+            // protocol has one reply for a stop.
+            if (connection.valid()) {
+                report_stop(gdb_signal_for_trap());
+                waiting_for_continue = true;
+                continue;
+            }
             (void)resume(stop.pid, stop.signal == kSigstop ? 0 : stop.signal);
             continue;
         }

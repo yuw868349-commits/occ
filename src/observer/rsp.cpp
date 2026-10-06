@@ -200,7 +200,21 @@ std::size_t PacketDecoder::feed(const char* data, std::size_t length) noexcept {
                 last_.push_back(hex_char(d));
             } else {
                 p.checksum_ok = false;
-                want_retransmit_ = true;
+                // want_retransmit_ is deliberately not set here. That flag
+                // means the far end asked us to resend our last packet, and
+                // this is the opposite direction: we received bytes we could
+                // not read. Setting it makes the session echo its own last
+                // packet at a debugger that never asked for it, which
+                // desynchronises the stream in both directions -- the
+                // debugger sees a reply to a question it did not ask, and
+                // the retransmission it does send is answered by a packet
+                // that means something else entirely.
+                //
+                // Asking for the damaged packet back is pending_ack_ below,
+                // which is the protocol's own mechanism and is what actually
+                // gets the bytes resent. last_ is left alone for the same
+                // reason: the packet that failed is not a packet we can
+                // vouch for, so it is not a candidate for replay.
             }
             // Every framed packet is acknowledged, including a damaged one.
             // The two cases differ in the byte: '+' says the packet arrived

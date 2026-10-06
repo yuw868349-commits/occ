@@ -106,8 +106,24 @@ Stop classify_status(int pid, int status) noexcept {
 
     if (stopsig == kSigtrap) {
         // Either a real SIGTRAP delivered to the tracee, or one of the
-        // event stops. The event is in the high byte of the status.
-        const int event = status >> 8;
+        // event stops. The event is in bits 16-23 of the status.
+        //
+        // The event is not in the byte above the signal. A wait status packs
+        // three fields -- the stop signal in bits 0-6, bit 7 as the syscall
+        // marker, the event in bits 16-23, and the exit code in the top byte
+        // -- so reading the event as `status >> 8` picks up the signal and
+        // the syscall marker instead and never matches an event number. The
+        // failure is silent in the worst direction: a fork, exec or seccomp
+        // stop falls through to the plain-SIGTRAP case, so the child a
+        // TRACECLONE stop announced is never resumed and hangs forever while
+        // the session believes it saw a breakpoint.
+        //
+        // The shift is done on the unsigned value and masked to the byte
+        // rather than on the int. A status with the top bit set is negative
+        // as a signed int, and an arithmetic shift there would sign-extend
+        // bits that are not part of the event field.
+        const auto event = static_cast<int>(
+            (static_cast<unsigned int>(status) >> 16) & 0xffU);
         switch (event) {
         case kPtraceEventFork:
         case kPtraceEventVfork:
@@ -135,6 +151,21 @@ Stop classify_status(int pid, int status) noexcept {
             out.kind = StopKind::Signal;
             out.synthetic = true;
             out.signal = 0;
+            return out;
+        case kPtraceEventStop:
+            // The stop a PTRACE_INTERRUPT or a group-stop produces on a
+            // process that was seized rather than attached. It is 128, which
+            // is outside the range the other events use, and it has to be
+            // named here: falling through to the plain-SIGTRAP case below
+            // would report a signal the kernel never delivered, and the
+            // session's own redelivery rule would then suppress a signal the
+            // tracee should have seen.
+            //
+            // It is a group-stop in the sense that matters to a tracer --
+            // the tracee is parked and will not run until it is continued --
+            // so it is classified as one and resumed with a zero signal.
+            out.kind = StopKind::GroupStop;
+            out.signal = kSigstop;
             return out;
         default:
             break;

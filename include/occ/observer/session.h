@@ -239,6 +239,18 @@ struct SessionResult {
 [[nodiscard]] std::size_t gdb_regnum_gs_base() noexcept;
 [[nodiscard]] std::size_t gdb_regnum_orig_rax() noexcept;
 
+// The width in bits of the register GDB numbers with `regnum`, which is the
+// width a 'p' reply for it has to be encoded at. Zero when this stub does not
+// answer for that number.
+//
+// Separate from gdb_register_bits because that one is indexed by position in
+// the 'g' block and this one by GDB's register number. The two agree only
+// across the forty core registers; past that GDB's numbering skips the SSE and
+// AVX banks, so the same number selects a different register in each. A 'p'
+// reply padded to eight bytes because the block index said 64 is the same
+// misalignment the block itself would have, one register at a time.
+[[nodiscard]] unsigned gdb_regnum_width(std::size_t regnum) noexcept;
+
 // Answers the packet body after "vCont". Consumes and step_requested() are
 // set when the packet asked for a resume, which the session loop performs
 // rather than the packet layer.
