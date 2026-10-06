@@ -13,12 +13,34 @@ namespace {
 
 constexpr std::uint64_t kPageSize = 4096;
 
+// The last page a user-space address can occupy, and the address one past its
+// end. Both are needed and they are not the same value: a region beginning at
+// kUserPageTop is entirely inside the space, so refusing it would make the
+// highest usable page unavailable for no reason, while a region reaching
+// kUserPageEnd has a page that does not exist.
+constexpr std::uint64_t kUserPageTop = 0x00007ffffffff000ULL;
+constexpr std::uint64_t kUserPageEnd = 0x0000800000000000ULL;
+
 std::uint64_t page_floor(std::uint64_t v) noexcept {
     return v & ~(kPageSize - 1);
 }
 
+// Rounds up to a page boundary without wrapping.
+//
+// The subtraction form matters at the top of the address space. Adding
+// kPageSize-1 to a value a page short of the end wraps to a small number,
+// and page_ceil would then report a length near zero for a region whose
+// pages are real, which every later calculation would treat as a region of
+// almost no bytes rather than as the error it is.
 std::uint64_t page_ceil(std::uint64_t v) noexcept {
-    return (v + kPageSize - 1) & ~(kPageSize - 1);
+    const std::uint64_t remainder = v & (kPageSize - 1);
+    if (remainder == 0) {
+        return v;
+    }
+    // The page-aligned value plus the difference, which cannot overflow for
+    // any v whose last page begins at or below v: the sum is the next page
+    // boundary and v is already below it.
+    return (v & ~(kPageSize - 1)) + kPageSize;
 }
 
 // Parses one line of /proc/<pid>/maps into a range and its permissions.
@@ -122,6 +144,31 @@ RegionClass classify(const RegionPerms& p) noexcept {
 
 } // namespace
 
+std::size_t watch_width(std::uint64_t address, std::uint64_t left) noexcept {
+    // A write watch is encodable at four or eight bytes and nothing else,
+    // so the choice is between those two rather than among four widths: an
+    // address that is eight-aligned gets the eight-byte form, and a
+    // four-aligned one that is not gets the four-byte form. The first
+    // address of a region is page-aligned, so the common case is eight.
+    std::size_t widest = 0;
+    if (address % 8 == 0 && left >= 8) {
+        widest = 8;
+    } else if (address % 4 == 0 && left >= 4) {
+        widest = 4;
+    }
+
+    // A watch may reach past the end of the region -- the kernel allows it,
+    // and the extra bytes belong to a mapping the tracker is not claiming --
+    // but the bytes it counts must not. Charging a region for bytes it does
+    // not contain would push its covered count past its own length, which
+    // hides a partial coverage from the report and overstates what was
+    // watched by up to four bytes.
+    if (widest > left) {
+        return static_cast<std::size_t>(left);
+    }
+    return widest;
+}
+
 std::vector<RegionInfo> process_regions(int pid) noexcept {
     std::vector<RegionInfo> out;
 
@@ -198,7 +245,23 @@ int WriteExecuteTracker::watch(int pid, std::uint64_t base,
         return sys::kEinval;
     }
 
+    // A region whose pages run off the end of the address space is refused
+    // rather than rounded. page_ceil would wrap near the top, and the
+    // subtraction that derives the length would then produce a value near two
+    // to the sixty-four, which reads as a region rather than as the mistake
+    // it is.
+    //
+    // The comparison is written as a difference because `base + length` is
+    // the sum that wraps. A region one page long beginning at the last page
+    // is inside the space and is accepted; one byte more, or a region
+    // beginning at the address past it, is not.
+    if (base > kUserPageTop || length > kUserPageEnd - base) {
+        detail = "the region runs past the end of the address space";
+        return sys::kEinval;
+    }
+
     Region r;
+    r.pid = pid;
     r.target.base = page_floor(base);
     r.target.length = page_ceil(base + length) - r.target.base;
 
@@ -212,7 +275,7 @@ int WriteExecuteTracker::watch(int pid, std::uint64_t base,
     // entries for one range would double-count the bytes and let the second
     // one's arm overwrite the first one's coverage.
     for (auto& existing : regions_) {
-        if (existing.target.base == r.target.base) {
+        if (existing.pid == pid && existing.target.base == r.target.base) {
             if (r.target.length > existing.target.length) {
                 // Growing a region that already has watches invalidates the
                 // coverage recorded for it, because the new bytes have none.
@@ -227,7 +290,13 @@ int WriteExecuteTracker::watch(int pid, std::uint64_t base,
 
     // A region that overlaps one already tracked is merged into it, so that
     // the tracker never holds two entries that both claim the same bytes.
+    // The pid is part of the test: another process mapping the same address
+    // is a different region, and merging them would report one process's
+    // writes as the other's.
     for (auto& existing : regions_) {
+        if (existing.pid != pid) {
+            continue;
+        }
         const std::uint64_t a0 = existing.target.base;
         const std::uint64_t a1 = a0 + existing.target.length;
         const std::uint64_t b0 = r.target.base;
@@ -252,9 +321,9 @@ int WriteExecuteTracker::watch(int pid, std::uint64_t base,
 }
 
 WriteExecuteTracker::Region* WriteExecuteTracker::find_region(
-    std::uint64_t address) noexcept {
+    int pid, std::uint64_t address) noexcept {
     for (auto& r : regions_) {
-        if (address >= r.target.base &&
+        if (r.pid == pid && address >= r.target.base &&
             address < r.target.base + r.target.length) {
             return &r;
         }
@@ -265,11 +334,14 @@ WriteExecuteTracker::Region* WriteExecuteTracker::find_region(
 void WriteExecuteTracker::note_write(int pid, std::uint64_t address,
                                      std::uint64_t bytes,
                                      std::uint64_t rip) noexcept {
-    (void)pid;
     (void)rip;
     ++writes_seen_;
 
-    Region* r = find_region(address);
+    // The write is attributed to the region in the process that made it. A
+    // region in another process that happens to cover the same address is a
+    // different region, and crediting this write to it would build a
+    // transition out of two unrelated processes.
+    Region* r = find_region(pid, address);
     if (r == nullptr) {
         // A write outside every watched region. The watch hardware fires on
         // an address range, so this happens when the faulting instruction
@@ -290,7 +362,7 @@ void WriteExecuteTracker::note_write(int pid, std::uint64_t address,
 
 bool WriteExecuteTracker::note_permission(int pid, std::uint64_t address,
                                           const RegionPerms& perms) noexcept {
-    Region* r = find_region(address);
+    Region* r = find_region(pid, address);
     if (r == nullptr) {
         return false;
     }
@@ -308,6 +380,7 @@ bool WriteExecuteTracker::note_permission(int pid, std::uint64_t address,
     }
 
     Transition t;
+    t.pid = pid;
     t.address = r->target.base;
     t.bytes_written = r->bytes;
     t.write_count = r->writes;
@@ -318,14 +391,18 @@ bool WriteExecuteTracker::note_permission(int pid, std::uint64_t address,
     transitions_.push_back(t);
     r->reported = true;
 
-    (void)pid;
     return true;
 }
 
 void WriteExecuteTracker::flush(int pid, obs::Writer& events) noexcept {
+    // The transitions carry the pid they happened in, which is not always the
+    // one the caller passes: a region is attributed to the process that
+    // wrote it, and a caller flushing after handling a stop in one thread
+    // would otherwise stamp another thread's transition with its own pid.
+    (void)pid;
     for (const auto& t : transitions_) {
         auto& e = events.begin(obs::EventKind::MemoryWrite);
-        e.add("pid", static_cast<std::uint64_t>(pid));
+        e.add("pid", static_cast<std::uint64_t>(t.pid));
         e.add_hex("address", t.address);
         e.add("bytes_written", t.bytes_written);
         e.add("write_count", t.write_count);
@@ -357,12 +434,24 @@ WriteExecuteTracker::targets() const noexcept {
     // The regions are stored with their bookkeeping alongside, so the
     // public view is built once and cached rather than recomputed on a
     // query a caller may make per event.
-    if (targets_cache_.size() != regions_.size()) {
+    //
+    // The cache is invalidated by the total length as well as the count.
+    // Merging two regions or extending one changes a length without changing
+    // how many regions there are, so a count-only test would hand back the
+    // old lengths and a caller sizing coverage from them would be working
+    // from a region that no longer exists.
+    std::uint64_t length = 0;
+    for (const auto& r : regions_) {
+        length += r.target.length;
+    }
+    if (targets_cache_.size() != regions_.size() ||
+        targets_cache_length_ != length) {
         targets_cache_.clear();
         targets_cache_.reserve(regions_.size());
         for (const auto& r : regions_) {
             targets_cache_.push_back(r.target);
         }
+        targets_cache_length_ = length;
     }
     return targets_cache_;
 }
@@ -386,7 +475,17 @@ ArmReport WriteExecuteTracker::arm(Watchpoints& watchpoints,
     // buy, and a decoder's staging buffer is short by nature: it holds one
     // decoded routine, not a heap. Certainty on the short region is what
     // catches the transition.
-    std::vector<std::size_t> order(regions_.size());
+    //
+    // Only this process's regions are considered. A watch is a per-process
+    // resource, so spending a register on another process's region would
+    // install nothing and consume a slot that could have covered a region
+    // the target can actually write to.
+    std::vector<std::size_t> order;
+    for (std::size_t i = 0; i < regions_.size(); ++i) {
+        if (regions_[i].pid == pid) {
+            order.push_back(i);
+        }
+    }
     for (std::size_t i = 0; i < order.size(); ++i) {
         order[i] = i;
     }
@@ -416,31 +515,14 @@ ArmReport WriteExecuteTracker::arm(Watchpoints& watchpoints,
         std::uint64_t covered = 0;
 
         while (covered < r.target.length && slots > 0) {
-            // The widest watch that is naturally aligned at this offset.
-            // A write watch is only encodable at four or eight bytes, so the
-            // choice is between those two rather than among four widths: an
-            // address that is four-aligned gets the eight-byte form, and one
-            // that is not gets the four-byte form. The first address of a
-            // region is always page-aligned, so the common case is eight.
-            //
-            // When neither is possible -- a region whose base is odd, which
-            // the page rounding above makes unreachable -- the region is
-            // reported as unwatched rather than given a watch the kernel
-            // would refuse.
+            // The widest watch that is naturally aligned at this offset and
+            // does not run past the region. When nothing fits -- a base that
+            // is neither four- nor eight-aligned, which the page rounding in
+            // watch() makes unreachable -- the region is reported as
+            // unwatched rather than given a watch the kernel would refuse.
             const std::uint64_t addr = base + covered;
-            std::size_t width = 0;
-            if (addr % 8 == 0 && r.target.length - covered >= 8) {
-                width = 8;
-            } else if (addr % 4 == 0 && r.target.length - covered >= 4) {
-                width = 4;
-            } else if (addr % 8 == 0 && r.target.length - covered >= 4) {
-                // The remaining tail is between four and seven bytes. The
-                // watch is eight wide and the last few bytes fall outside
-                // the region, which the kernel allows: a watch may cover
-                // more than the region asked about, and the extra bytes
-                // belong to a mapping the tracker is not claiming.
-                width = 8;
-            }
+            const std::size_t width =
+                watch_width(addr, r.target.length - covered);
 
             if (width == 0) {
                 break;
@@ -460,6 +542,12 @@ ArmReport WriteExecuteTracker::arm(Watchpoints& watchpoints,
             }
 
             r.watch_addresses.push_back(addr);
+            // width is already bounded by what is left of the region --
+            // watch_width returns the smaller of the widest encodable watch
+            // and the bytes remaining -- so advancing by it cannot push
+            // `covered` past the length. That bound is what keeps the
+            // `covered < r.target.length` test above honest about a region
+            // whose last few bytes no watch reaches.
             covered += width;
             --slots;
         }
@@ -542,7 +630,7 @@ ArmReport WriteExecuteTracker::chase(Watchpoints& watchpoints, int pid,
         return report;
     }
 
-    Region* r = find_region(base);
+    Region* r = find_region(pid, base);
     if (r == nullptr) {
         return report;
     }
@@ -562,20 +650,15 @@ ArmReport WriteExecuteTracker::chase(Watchpoints& watchpoints, int pid,
 
     // The watches this region needs if the registers allow it. Computed
     // before the eviction so the eviction knows what it is freeing room for.
+    // The widths come from the same enumeration the install loop below uses,
+    // so the count cannot disagree with what is later placed.
     const std::size_t capacity = Watchpoints::machine_slots();
     std::size_t wanted_watches = 0;
     {
         std::uint64_t left = r->target.length;
         std::uint64_t at = region_base;
         while (left > 0) {
-            std::size_t w = 0;
-            if (at % 8 == 0 && left >= 8) {
-                w = 8;
-            } else if (at % 4 == 0 && left >= 4) {
-                w = 4;
-            } else if (at % 8 == 0 && left >= 4) {
-                w = 8;
-            }
+            const std::size_t w = watch_width(at, left);
             if (w == 0) {
                 break;
             }
@@ -599,14 +682,8 @@ ArmReport WriteExecuteTracker::chase(Watchpoints& watchpoints, int pid,
 
     while (covered < r->target.length && slots > 0) {
         const std::uint64_t addr = region_base + covered;
-        std::size_t width = 0;
-        if (addr % 8 == 0 && r->target.length - covered >= 8) {
-            width = 8;
-        } else if (addr % 4 == 0 && r->target.length - covered >= 4) {
-            width = 4;
-        } else if (addr % 8 == 0 && r->target.length - covered >= 4) {
-            width = 8;
-        }
+        const std::size_t width =
+            watch_width(addr, r->target.length - covered);
         if (width == 0) {
             break;
         }
@@ -620,6 +697,10 @@ ArmReport WriteExecuteTracker::chase(Watchpoints& watchpoints, int pid,
             break;
         }
         r->watch_addresses.push_back(addr);
+        // width is already bounded by the bytes left, so it is what the
+        // region is credited with. The bound lives in watch_width because
+        // both this loop and arm() need it and a second copy of the rule is
+        // a second place for it to drift.
         covered += width;
         --slots;
     }
@@ -628,10 +709,21 @@ ArmReport WriteExecuteTracker::chase(Watchpoints& watchpoints, int pid,
         r->armed = true;
         r->covered = covered;
         r->armed_at = ++arm_clock_;
-        report.bytes_covered = covered;
         report.watches_installed = r->watch_addresses.size();
-    } else {
-        report.unwatched.push_back(r->target);
+    }
+
+    // The accounting arm performs, so a chased region and an armed one are
+    // described identically.
+    report.bytes_covered = covered;
+    if (covered < r->target.length) {
+        WatchTarget t;
+        t.base = r->target.base;
+        t.length = r->target.length;
+        if (covered == 0) {
+            report.unwatched.push_back(t);
+        } else {
+            report.partial.push_back(ArmReport::Partial{t, covered});
+        }
     }
 
     return report;

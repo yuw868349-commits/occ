@@ -195,6 +195,17 @@ bool mkdir_p(const std::string& path, unsigned int mode) noexcept {
                 if (r.failed() && r.error != 17 /* EEXIST */) {
                     return false;
                 }
+            } else if (!cur.empty()) {
+                // The component exists and is not a directory. There is no
+                // way to descend through it, so this path cannot be created
+                // and saying otherwise is the failure that matters: a caller
+                // takes a true return as "the directory is there" and then
+                // finds every write into it refused, one layer of error away
+                // from the cause. A file where a directory belongs is the
+                // ordinary shape of this -- a stale record, a mount point
+                // that was replaced -- and it has to be reported here rather
+                // than left for the next open to discover.
+                return false;
             }
             if (i < path.size()) {
                 if (cur.size() > 1) {

@@ -124,11 +124,33 @@ class Writer {
 public:
     Writer() = default;
 
-    void attach(int fd) noexcept { sink_ = Sink{fd}; }
+    // Attaching a sink also clears the failure, because the flag describes
+    // the sink that was attached rather than the writer: a writer moved
+    // onto a fresh descriptor has not yet failed on it, and a caller that
+    // rotated the descriptor after a broken pipe needs the count of lost
+    // events to start again rather than to carry the old sink's failure
+    // forever.
+    void attach(int fd) noexcept {
+        sink_ = Sink{fd};
+        failed_ = false;
+    }
+
+    // Forgets a reported failure without moving the writer. A sink that
+    // failed once is not permanently broken: a pipe the reader had not
+    // drained reports EAGAIN, and the next write succeeds. Without this a
+    // single transient refusal marks every later event of the run as
+    // failed, which is what the flag is read for.
+    void clear_failure() noexcept { failed_ = false; }
 
     // Emits an event with the fields every event carries: the kind, the
     // session it belongs to, and the time it was observed. Callers fill in
     // the rest through the returned reference.
+    //
+    // Beginning while an event is already open returns that event rather
+    // than starting a new one. The alternative discards the fields already
+    // added to it, and a caller that reached the second begin by a path
+    // other than the intended one -- an early return, say -- would lose
+    // them with no indication that it had.
     [[nodiscard]] Event& begin(EventKind kind) noexcept;
 
     // Encodes and writes the event returned by begin. Safe to call when an
@@ -145,12 +167,23 @@ public:
     [[nodiscard]] bool failed() const noexcept { return failed_; }
 
 private:
-    [[nodiscard]] std::uint64_t now_ns() const noexcept;
+    // Returns false when the clock could not be read, which is not the
+    // same answer as a reading of zero: a failed clock must not put the
+    // event at time zero, because a zero timestamp is also what a real
+    // reading looks like at the start of the monotonic epoch, and a
+    // consumer cannot tell the two apart.
+    [[nodiscard]] bool now_ns(std::uint64_t& out) const noexcept;
 
     Sink sink_;
     Event current_;
     std::uint64_t session_ = 0;
     std::uint64_t written_ = 0;
+    // The last time the clock was read successfully. An event whose own
+    // reading failed is stamped with this rather than dropped, because a
+    // stream with a hole in its ordering is worse than one whose events
+    // carry the previous timestamp, and because the alternative -- a zero
+    // -- would place the event before every event that came before it.
+    std::uint64_t last_ns_ = 0;
     bool failed_ = false;
     bool open_ = false;
 };

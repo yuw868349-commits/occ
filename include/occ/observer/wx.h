@@ -36,6 +36,9 @@ namespace occ::obs {
 
 // A region the target wrote to and that later became executable.
 struct Transition {
+    // The process the transition happened in. Two processes can map the same
+    // address, so the address alone does not say whose region this was.
+    int pid = 0;
     std::uint64_t address = 0;
     // The number of bytes written across every write the tracker saw.
     std::uint64_t bytes_written = 0;
@@ -211,6 +214,11 @@ public:
 
 private:
     struct Region {
+        // The process this region belongs to. Two processes can map the same
+        // address, and a tracker that merged them would attribute one
+        // process's writes to the other and report a W-to-X transition in a
+        // process that never made one.
+        int pid = 0;
         WatchTarget target;
         RegionPerms perms;
         bool written = false;
@@ -234,7 +242,8 @@ private:
         std::uint64_t armed_at = 0;
     };
 
-    Region* find_region(std::uint64_t address) noexcept;
+    // The region containing `address` for `pid`, or null when there is none.
+    Region* find_region(int pid, std::uint64_t address) noexcept;
 
     std::vector<Region> regions_;
     std::vector<Transition> transitions_;
@@ -242,9 +251,30 @@ private:
     // The public view of the regions, rebuilt when the set changes rather
     // than on every query.
     mutable std::vector<WatchTarget> targets_cache_;
+    // The shape the cache was built from. Comparing the size alone is not
+    // enough: merging or extending a region changes its length without
+    // changing how many regions there are, so a size-only comparison would
+    // hand back a length that no longer describes any region.
+    mutable std::uint64_t targets_cache_length_ = 0;
     // The next value of Region::armed_at.
     std::uint64_t arm_clock_ = 0;
 };
+
+// The widest watch that can be placed at `address` given `left` bytes of the
+// region still to cover, or zero when nothing fits.
+//
+// A write watch is encodable at four or eight bytes and nothing else, so the
+// choice is between those two rather than among four widths: an address that
+// is eight-aligned gets the eight-byte form and a four-aligned one that is
+// not gets the four-byte form. `left` bounds the answer, because a watch
+// reaching past the end of the region covers bytes the tracker is not
+// claiming and would report coverage the region does not have.
+//
+// Exposed because arm and chase both need it and the two must not be allowed
+// to drift apart: a watch installed at a different width in one path than in
+// the other makes the coverage reported depend on which entry point ran.
+[[nodiscard]] std::size_t watch_width(std::uint64_t address,
+                                      std::uint64_t left) noexcept;
 
 // Reads the permission of the page containing `address` from a stopped
 // process's own /proc/<pid>/maps. Returns false when the address is not

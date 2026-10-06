@@ -33,7 +33,13 @@ struct SessionRecord {
     int pid = 0;
     // The process the session observes, which is not the session's own pid.
     std::string target;
-    std::uint64_t started_ns = 0;
+    // The observed process's start time, as field 22 of /proc/<pid>/stat in
+    // clock ticks since boot. It is stored rather than the observer's own
+    // clock because only this value describes the process: two processes
+    // that ran at different times can share a pid once the first has been
+    // reaped, and a registry that cannot tell them apart would send an
+    // attach to an unrelated program.
+    std::uint64_t start_ticks = 0;
     // Where the event stream is being written. A session that was started
     // with its stream on a terminal has no path here and reports empty.
     std::string stream_path;
@@ -42,8 +48,18 @@ struct SessionRecord {
     std::string directory;
 };
 
-// The directory the registry lives in. Created on first use.
-[[nodiscard]] std::string registry_root() noexcept;
+// The directory the registry lives in, created on first use. Returns false
+// and fills `error` when the directory could not be created or read: a
+// caller that cannot tell that apart from an empty registry reports "no
+// running sessions" when the answer is that the registry is unavailable,
+// which is a different fact and needs a different response.
+[[nodiscard]] bool registry_root(std::string& root, std::string& error) noexcept;
+
+// The target process's start time in clock ticks, or false when it cannot
+// be read. Exposed because a caller registering a session has to establish
+// the same pair that find_session will later check.
+[[nodiscard]] bool process_start_ticks(int pid,
+                                      std::uint64_t& out) noexcept;
 
 // Writes a record for a session this process is running. Returns the id, or
 // an empty string when the entry could not be written, which is reported
@@ -53,29 +69,26 @@ struct SessionRecord {
                                            const std::string& stream_path,
                                            std::string& error) noexcept;
 
-// Rewrites the record with a new process id, which is what a run that
-// replaced its image has to do: the session is the same one but the
-// process the registry points at is not.
-[[nodiscard]] bool update_session_pid(const std::string& id, int pid,
-                                      std::string& error) noexcept;
-
 // Removes the record. Called on every path out of a session, including the
 // failing ones, because a stale record sends a later attach to a pid that
 // belongs to something else.
 void unregister_session(const std::string& id) noexcept;
 
-// Every record whose process is still alive. A record whose process has
-// gone is removed rather than returned, because a registry that reported
-// dead sessions would make every caller check.
+// Every record whose process is still alive under the same start time. A
+// record whose process has gone, or whose pid now belongs to a process that
+// started later, is removed rather than returned: a pid that has been
+// reused is worse than a dead session, because it looks alive.
 [[nodiscard]] std::vector<SessionRecord> live_sessions() noexcept;
 
 // One record by id, or by the pid it observes if `by_pid` is set.
 [[nodiscard]] bool find_session(const std::string& key, bool by_pid,
                                 SessionRecord& out) noexcept;
 
-// True when a process with this pid exists and is not a zombie. Uses
-// kill(pid, 0) rather than reading /proc, which is one syscall instead of
-// an open, a read, and a parse.
+// True when a process with this pid exists. Uses kill(pid, 0) rather than
+// reading /proc, which is one syscall instead of an open, a read, and a
+// parse. This answers existence only; a pid being alive is not evidence
+// that it is the process a record was written for, which is what
+// process_start_ticks is for.
 [[nodiscard]] bool process_alive(int pid) noexcept;
 
 } // namespace occ::obs

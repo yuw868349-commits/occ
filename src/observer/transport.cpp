@@ -35,6 +35,12 @@ constexpr std::uint16_t kAfInet = 2;
 constexpr int kSockStream = 1;
 constexpr int kSockCloexec = 0x80000;
 
+// The one poll event this file asks for, written out for the same reason the
+// socket address above is: <poll.h> is a libc header and the value is a
+// single bit. POLLIN is 0x0001, and it is also what comes back in revents
+// when there is a connection to take.
+constexpr short kPollIn = 0x0001;
+
 // Big endian in the address, which is the one field whose byte order is not
 // the target's: the kernel reads a port as network order whatever the
 // machine it runs on does with integers.
@@ -65,10 +71,21 @@ bool Listener::accept(Connection& out, int timeout_ms) noexcept {
     // port would then sit here forever when nobody connects.
     sys::PollFd pfd{};
     pfd.fd = fd_;
-    pfd.events = 0x0001; // POLLIN
+    pfd.events = kPollIn;
     pfd.revents = 0;
     const auto ready = sys::poll(&pfd, 1, timeout_ms);
     if (ready.failed() || ready.value == 0) {
+        return false;
+    }
+
+    // Readiness is not the same answer as readability. poll reports an error
+    // on the listening socket -- a revoked capability, a descriptor closed
+    // under us -- by setting POLLERR or POLLHUP in revents, and it reports
+    // them *without* POLLIN. Calling accept4 anyway turns one failure into a
+    // second one, and the second is the one the caller sees, so the error
+    // that explains it is the one that gets reported. Returning here keeps
+    // the first cause and skips a syscall that cannot succeed.
+    if ((pfd.revents & kPollIn) == 0) {
         return false;
     }
 
@@ -104,8 +121,12 @@ bool Listener::open(std::uint16_t port, std::string& error) noexcept {
 
     const auto sock = sys::socket(kAfInet, kSockStream | kSockCloexec, 0);
     if (sock.failed()) {
+        // `error`, not `value`. A failed Result carries the negative of the
+        // errno in `value` -- classify() builds it as Result{raw, -raw} --
+        // so reading the number out of `value` hands strerror a negative
+        // errno and the message names the wrong failure or none at all.
         error = std::string{"cannot create a socket: "} +
-                util::strerror(static_cast<int>(sock.value));
+                util::strerror(sock.error);
         return false;
     }
     fd_ = static_cast<int>(sock.value);
@@ -126,7 +147,15 @@ bool Listener::open(std::uint16_t port, std::string& error) noexcept {
         // The two failures here call for different responses from whoever
         // asked for the port, so they are named rather than reported as a
         // single "bind failed".
-        const int err = static_cast<int>(bound.value);
+        //
+        // The comparison is against the positive errno in `error`. Reading
+        // the number out of `value` gives its negation, and a comparison
+        // between that and kEaddrinuse can never be true -- the branch is
+        // still compiled, still looks like it handles the busy port, and
+        // never runs. A busy port would then be reported as "cannot bind the
+        // port: Invalid argument", which is the kind of message that sends
+        // an operator looking at the wrong thing.
+        const int err = bound.error;
         error = err == sys::kEaddrinuse
                     ? "the port is already in use by another session"
                     : std::string{"cannot bind the port: "} + util::strerror(err);
@@ -147,7 +176,7 @@ bool Listener::open(std::uint16_t port, std::string& error) noexcept {
     const auto listening = sys::listen(fd_, 1);
     if (listening.failed()) {
         error = std::string{"cannot listen: "} +
-                util::strerror(static_cast<int>(listening.value));
+                util::strerror(listening.error);
         close();
         return false;
     }
@@ -208,8 +237,14 @@ bool Connection::pump() noexcept {
         return true;
     }
     // A read that would block means there is nothing yet, which is not a
-    // failure: the caller waits for readiness and comes back.
-    if (got.value == -sys::kEintr) {
+    // failure: the caller waits for readiness and comes back. EAGAIN is
+    // checked alongside EINTR because the two arrive by different routes and
+    // both mean "nothing was transferred, and nothing is wrong". The
+    // descriptor is blocking today, so EAGAIN cannot be produced by this
+    // socket as it stands -- and a caller may set O_NONBLOCK on it, which is
+    // the caller's right and which would turn this function's answer to a
+    // moment of quiet into "the peer closed" if only EINTR were handled.
+    if (got.error == sys::kEintr || got.error == sys::kEagain) {
         return true;
     }
     return false;
@@ -220,13 +255,28 @@ bool Connection::flush_ack() noexcept {
         return true;
     }
     const char ack = decoder_.pending_ack();
-    decoder_.clear_ack();
     // A single byte, written directly: going through send_packet would frame
     // an acknowledgement, and an acknowledgement is not a packet.
+    //
+    // The acknowledgement is cleared only once it has been written. Clearing
+    // it first and writing second loses it on any failure that is not
+    // EINTR: the decoder has already forgotten it, so flush_ack() returns
+    // true on the next call without a byte having left the process, and the
+    // client waits for a '+' that will never come. The order below means a
+    // failure leaves the acknowledgement pending, so the caller that
+    // retries -- or the caller that reports the failure -- has something to
+    // retry or report.
     const auto wrote = sys::write(fd_, &ack, 1);
     if (wrote.failed()) {
-        return wrote.value == -sys::kEintr;
+        // EINTR is the one failure that carries no information: the signal
+        // arrived before any byte was transferred, and the same write can be
+        // tried again. Returning false here is still the correct answer,
+        // because this call transferred nothing -- the previous version
+        // returned true, which told the caller the byte was on its way when
+        // it had not been written at all.
+        return false;
     }
+    decoder_.clear_ack();
     return true;
 }
 

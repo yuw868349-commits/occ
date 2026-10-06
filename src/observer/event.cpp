@@ -128,12 +128,19 @@ bool Sink::write_line(std::string_view line) noexcept {
             }
             return false;
         }
+        if (r.value == 0) {
+            // A descriptor that accepts nothing and reports no error would
+            // advance the offset by nothing, so the loop would reissue the
+            // same write forever. There is no state to wait for and no
+            // progress to make, so this is a disconnection like any other.
+            return false;
+        }
         off += static_cast<std::size_t>(r.value);
     }
     return true;
 }
 
-std::uint64_t Writer::now_ns() const noexcept {
+bool Writer::now_ns(std::uint64_t& out) const noexcept {
     // clock_gettime through the syscall layer, so that a run which has
     // replaced its own address space still has a working clock without
     // depending on the vdso having been set up for the new image.
@@ -144,20 +151,35 @@ std::uint64_t Writer::now_ns() const noexcept {
     Timespec ts{};
     auto r = sys::clock_gettime(kClockMonotonic, &ts);
     if (r.failed()) {
-        return 0;
+        return false;
     }
-    return static_cast<std::uint64_t>(ts.sec) * 1000000000ULL +
-           static_cast<std::uint64_t>(ts.nsec);
+    out = static_cast<std::uint64_t>(ts.sec) * 1000000000ULL +
+          static_cast<std::uint64_t>(ts.nsec);
+    return true;
 }
 
 Event& Writer::begin(EventKind kind) noexcept {
+    if (open_) {
+        // The event in flight keeps the fields it already has. Starting a
+        // fresh one here would drop them, and commit() writes whatever the
+        // body holds, so the loss would be silent.
+        return current_;
+    }
     current_ = Event{};
     // The kind name is handed over as a string_view. A bare const char*
     // would make the overload set prefer the bool one, and every event would
     // claim its kind was true.
     current_.add("kind", std::string_view{event_kind_name(kind)});
     current_.add("session", session_);
-    current_.add("t", now_ns());
+    std::uint64_t t = 0;
+    if (now_ns(t)) {
+        last_ns_ = t;
+    }
+    // A clock that could not be read stamps the event with the last time it
+    // was. Zero is not the fallback: it is a value the monotonic clock can
+    // genuinely produce, so using it to mean "unknown" would make an
+    // unreadable clock indistinguishable from a real reading.
+    current_.add("t", last_ns_);
     open_ = true;
     return current_;
 }
