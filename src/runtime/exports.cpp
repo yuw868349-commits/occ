@@ -114,6 +114,49 @@ namespace internal {
     return true;
 }
 
+// A host-implemented export, found by the name the guest wrote, compared the
+// way every export name is compared.
+//
+// The lookup this returns has an address that is already absolute. A host
+// export has no image and no base -- the address is the whole of the answer
+// -- so what would be `base + rva` for a mapped module is simply the address
+// itself here, and a reader who wants to know how far the answer travelled
+// reads `chain`: one module, the one that was asked, because a host export
+// cannot forward anywhere.
+[[nodiscard]] ExportLookup host_lookup_by_name(const ExportModule& module,
+                                               std::string_view name) noexcept {
+    for (const HostExport& entry : module.host_exports) {
+        if (export_name_equal(entry.name, name)) {
+            ExportLookup out;
+            out.address = entry.address;
+            out.module = &module;
+            out.by_ordinal = false;
+            out.chain.push_back(module.name);
+            return out;
+        }
+    }
+    return ExportLookup{};
+}
+
+// The same table, by ordinal. The zero default on `HostExport::ordinal` is
+// what keeps an unnamed ordinal export from existing by accident: a module
+// that never declared an ordinal has no entry a zero can match, which is the
+// rule an image follows too -- ordinal zero is below every real base.
+[[nodiscard]] ExportLookup host_lookup_by_ordinal(
+    const ExportModule& module, std::uint32_t ordinal) noexcept {
+    for (const HostExport& entry : module.host_exports) {
+        if (entry.ordinal != 0 && entry.ordinal == ordinal) {
+            ExportLookup out;
+            out.address = entry.address;
+            out.module = &module;
+            out.by_ordinal = true;
+            out.chain.push_back(module.name);
+            return out;
+        }
+    }
+    return ExportLookup{};
+}
+
 }  // namespace internal
 
 // A *module* name, compared without regard to case, and declared in the header
@@ -267,6 +310,20 @@ ExportLookup ExportRegistry::walk(const ExportModule& module, std::size_t index,
         // one are asking the same question of the same table.
         if (!internal::index_of(entry.forwarder_ordinal, target->ordinal_base,
                                 target->exports.size(), target_index)) {
+            // A module with host exports has no image table for `index_of`
+            // to range-check against, and the ordinal may still be a real
+            // export of it. Asked of the host table before giving up, the
+            // chain ends at the module the forwarder named -- the same shape
+            // the recursive path below produces for an image table.
+            if (!target->host_exports.empty()) {
+                ExportLookup via_host = internal::host_lookup_by_ordinal(
+                    *target, entry.forwarder_ordinal);
+                if (via_host.address != 0) {
+                    via_host.chain = std::move(chain);
+                    via_host.chain.push_back(target->name);
+                    return via_host;
+                }
+            }
             return out;
         }
     } else {
@@ -281,6 +338,19 @@ ExportLookup ExportRegistry::walk(const ExportModule& module, std::size_t index,
             }
         }
         if (!found) {
+            // The same fallback the ordinal path takes: a forwarder into a
+            // module whose exports are implemented in the host is answered
+            // from the host table, with the chain extended by the module it
+            // landed on.
+            if (!target->host_exports.empty()) {
+                ExportLookup via_host =
+                    internal::host_lookup_by_name(*target, entry.forwarder_name);
+                if (via_host.address != 0) {
+                    via_host.chain = std::move(chain);
+                    via_host.chain.push_back(target->name);
+                    return via_host;
+                }
+            }
             return out;
         }
     }
@@ -297,7 +367,24 @@ ExportLookup ExportRegistry::find_by_name(std::string_view dll,
                                           std::string_view name,
                                           std::uint16_t hint) const {
     const ExportModule* module = find(dll);
-    if (module == nullptr || module->exports.empty()) {
+    if (module == nullptr) {
+        return ExportLookup{};
+    }
+
+    // Host-implemented exports are consulted before the image table, and
+    // unconditionally rather than only when the image table is empty. The
+    // module this runtime describes is the module the guest is answered by,
+    // and an implementation that exists answers before a table that might
+    // name the same thing and cannot deliver it: a host export is a promise
+    // about what a call will reach, and the promise outranks a file.
+    if (!module->host_exports.empty()) {
+        const ExportLookup host = internal::host_lookup_by_name(*module, name);
+        if (host.address != 0) {
+            return host;
+        }
+    }
+
+    if (module->exports.empty()) {
         return ExportLookup{};
     }
 
@@ -332,7 +419,21 @@ ExportLookup ExportRegistry::find_by_name(std::string_view dll,
 ExportLookup ExportRegistry::find_by_ordinal(std::string_view dll,
                                              std::uint16_t ordinal) const {
     const ExportModule* module = find(dll);
-    if (module == nullptr || module->exports.empty()) {
+    if (module == nullptr) {
+        return ExportLookup{};
+    }
+
+    // The host table by ordinal, before the image table, for the same reason
+    // the name lookup consults it first.
+    if (!module->host_exports.empty()) {
+        const ExportLookup host = internal::host_lookup_by_ordinal(
+            *module, static_cast<std::uint32_t>(ordinal));
+        if (host.address != 0) {
+            return host;
+        }
+    }
+
+    if (module->exports.empty()) {
         return ExportLookup{};
     }
 

@@ -67,6 +67,39 @@
 
 namespace occ::runtime {
 
+// An export whose implementation is a host address rather than a location in
+// a mapped image.
+//
+// This is the half of the export story that a DLL file cannot provide: a
+// module the runtime implements itself has no image, so its exports have no
+// RVAs and no base. What it has is functions in the host's own address space
+// -- the thunks a guest call reaches -- and for the few imports that are
+// data rather than code, variables in that same space. The address is the
+// whole answer: it is stored absolutely, it is already valid, and no base
+// arithmetic is ever applied to it.
+//
+// `ordinal` is the number the outside world would see. A module that is
+// implemented rather than loaded has no ordinal table to keep contiguous,
+// and nothing forces one here either; a guest that imports by ordinal gets
+// a match only when the number it names is the number a host export
+// declared, which is the same honesty an image without a name table gives.
+struct HostExport {
+    // The name a guest imports by, compared the way every other export
+    // name is compared: ASCII case-insensitive, no path.
+    std::string name;
+
+    // The ordinal a by-ordinal import names. Zero for an export that is
+    // named only, which is the common case and is what keeps an unset
+    // ordinal from colliding with the first real one.
+    std::uint32_t ordinal = 0;
+
+    // The host address. A function thunk's address for code, the variable's
+    // address for data, and never an RVA: this field means the same thing
+    // `ExportLookup::address` means for a mapped module, and that meaning
+    // is "jump here".
+    std::uint64_t address = 0;
+};
+
 // A module a guest may import from, as far as the resolver is concerned.
 struct ExportModule {
     // The name to match an import against, spelled the way the guest spells
@@ -113,6 +146,16 @@ struct ExportModule {
     // table's index is not the ordinal; the index plus this is, and getting
     // that wrong resolves every ordinal import to the wrong function.
     std::uint32_t ordinal_base = 0;
+
+    // Exports implemented in the host rather than read out of an image.
+    //
+    // A module can carry both: an image that has an export table *and*
+    // host-implemented entries is not a shape this layer has seen, and the
+    // lookup rule is the one that keeps it impossible to be surprised by --
+    // the host table is consulted first, and a name found there is answered
+    // from there. A module built from an image alone has an empty table,
+    // and a module built to describe a runtime-provided DLL has only this.
+    std::vector<HostExport> host_exports;
 };
 
 // What a lookup found, and what it looked for when it found nothing.

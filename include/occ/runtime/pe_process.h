@@ -216,6 +216,17 @@ public:
     [[nodiscard]] const AddressSpace& space() const noexcept { return space_; }
     [[nodiscard]] Mapper& mapper() noexcept { return mapper_; }
 
+    // The options the process was built from, read-only. `run_pe_process`
+    // reads the command line and the environment out of here because the
+    // thunks answer `__getmainargs` and `GetCommandLineA` from the same text
+    // the PEB holds: one source, three views, no chance to disagree. It is
+    // const for the same reason the run reads anything mid-flight -- the
+    // guest is living on these strings, and a caller rewriting them during
+    // the run would be rewriting the guest's world under its feet.
+    [[nodiscard]] const ProcessOptions& options() const noexcept {
+        return options_;
+    }
+
 private:
     PeProcess() noexcept = default;
 

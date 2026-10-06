@@ -22,7 +22,14 @@
 #include <memory>
 #include <utility>
 
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+
 #include "occ/util/fs.h"
+#include "occ/runtime/winabi.h"
 
 namespace occ::runtime {
 
@@ -544,6 +551,632 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
 
     image_out.ok = true;
     return self;
+}
+
+// --------------------------------------------------------------------------
+// Running the guest
+// --------------------------------------------------------------------------
+
+// Everything above builds a process; this section is the part that runs one,
+// and it is the only place in the runtime where control passes from host code
+// to guest code and back. The round trip has three legs:
+//
+//   1. `enter_guest` sets the segment base to the guest's TEB, switches to
+//      the stack the builder prepared, and calls the entry point. The call
+//      is the whole of the handoff -- the guest is native x86 code in this
+//      address space, and there is nothing to "emulate".
+//
+//   2. The guest runs. Every API it imports is a thunk compiled `ms_abi`,
+//      so its calls arrive as ordinary host calls on the guest's stack; the
+//      thunks read the `GuestState` through the thread-local pointer and
+//      answer. `ExitProcess`, `TerminateProcess`, `exit` and `abort` end by
+//      calling the terminate path this section installed, which is a
+//      `siglongjmp` -- not because anything failed, but because the guest's
+//      exit is an unwind past frames that own no C++ objects: the CRT
+//      startup, the thunks, the entry. A `longjmp` is exactly the right tool
+//      for an unwind of code nobody wrote in this language.
+//
+//   3. A fault is a signal. The guest is native code, so its null
+//      dereference is a real SIGSEGV, and the handler's job is to make the
+//      fault look the way Windows makes faults look: an EXCEPTION_RECORD and
+//      a CONTEXT on the stack of the filter the guest registered with
+//      `SetUnhandledExceptionFilter`, and the filter's verdict honored. A
+//      filter that declines, or none at all, dies by the signal -- which is
+//      what the same program does under a Unix loader, and what a Windows
+//      program does under a debugger-less loader too, once the last filter
+//      has declined.
+//
+// The section is deliberately the only place that knows both layouts: the
+// CONTEXT below is the Windows x64 shape, and the `ucontext_t` above it is
+// the kernel's. The conversion between them is byte-offset arithmetic, and
+// it is written as named constants because this is the one interface where
+// the offsets themselves are the contract.
+
+namespace {
+
+// `arch_prctl` operations. The header that names them (`asm/prctl.h`) is a
+// kernel header no portable program includes, and the numbers have not moved
+// since they were introduced, so they are defined here with the values the
+// kernel UAPI documents.
+constexpr unsigned long kArchSetGs = 0x1001;
+constexpr unsigned long kArchGetGs = 0x1004;
+
+// ---------------------------------------------------------------- context
+
+// The Windows x64 CONTEXT, as offsets into a 1232-byte buffer. The struct is
+// 16-byte aligned on Windows and so is the buffer it is built into.
+constexpr std::size_t kContextSize = 0x4D0;  // 1232 bytes
+static_assert(kContextSize % 16 == 0,
+              "the CONTEXT must fill whole 16-byte rows");
+
+constexpr std::uint32_t kContextAmd64 = 0x100000u;
+constexpr std::uint32_t kContextFull =
+    kContextAmd64 | 0x1u | 0x2u | 0x4u | 0x8u;  // CONTROL | INTEGER |
+                                                // SEGMENTS | FLOATING_POINT
+constexpr std::size_t kContextFlags = 0x30;
+constexpr std::size_t kContextMxCsr = 0x34;
+constexpr std::size_t kContextSegCs = 0x38;
+constexpr std::size_t kContextSegDs = 0x3A;
+constexpr std::size_t kContextSegEs = 0x3C;
+constexpr std::size_t kContextSegFs = 0x3E;
+constexpr std::size_t kContextSegGs = 0x40;
+constexpr std::size_t kContextSegSs = 0x42;
+constexpr std::size_t kContextEFlags = 0x44;
+constexpr std::size_t kContextRax = 0x78;
+constexpr std::size_t kContextRcx = 0x80;
+constexpr std::size_t kContextRdx = 0x88;
+constexpr std::size_t kContextRbx = 0x90;
+constexpr std::size_t kContextRsp = 0x98;
+constexpr std::size_t kContextRbp = 0xA0;
+constexpr std::size_t kContextRsi = 0xA8;
+constexpr std::size_t kContextRdi = 0xB0;
+constexpr std::size_t kContextR8 = 0xB8;
+constexpr std::size_t kContextR9 = 0xC0;
+constexpr std::size_t kContextR10 = 0xC8;
+constexpr std::size_t kContextR11 = 0xD0;
+constexpr std::size_t kContextR12 = 0xD8;
+constexpr std::size_t kContextR13 = 0xE0;
+constexpr std::size_t kContextR14 = 0xE8;
+constexpr std::size_t kContextR15 = 0xF0;
+constexpr std::size_t kContextRip = 0xF8;
+constexpr std::size_t kContextFltSave = 0x100;  // XSAVE_FORMAT, 512 bytes
+
+// The registers inside the floating-point save area, relative to its start.
+constexpr std::size_t kFltControlWord = 0x00;
+constexpr std::size_t kFltStatusWord = 0x02;
+constexpr std::size_t kFltTagWord = 0x04;
+constexpr std::size_t kFltErrorOpcode = 0x06;
+constexpr std::size_t kFltErrorOffset = 0x08;
+constexpr std::size_t kFltErrorSelector = 0x0C;
+constexpr std::size_t kFltDataOffset = 0x10;
+constexpr std::size_t kFltDataSelector = 0x14;
+constexpr std::size_t kFltMxCsr = 0x18;
+constexpr std::size_t kFltMxCsrMask = 0x1C;
+constexpr std::size_t kFltFloatRegisters = 0x20;  // 8 * 16 bytes
+constexpr std::size_t kFltXmmRegisters = 0xA0;    // 16 * 16 bytes
+
+// The kernel's FXSAVE64 area, which `uc_mcontext.fpregs` points at. Unlike
+// the 32-bit FXSAVE it holds all sixteen XMM registers, which is what makes
+// the copy below a straight one.
+constexpr std::size_t kFxCwd = 0x00;
+constexpr std::size_t kFxSwd = 0x02;
+constexpr std::size_t kFxTwd = 0x04;
+constexpr std::size_t kFxFop = 0x06;
+constexpr std::size_t kFxFip = 0x08;  // 8 bytes
+constexpr std::size_t kFxRdp = 0x10;  // 8 bytes
+constexpr std::size_t kFxMxCsr = 0x18;
+constexpr std::size_t kFxMxCsrMask = 0x1C;
+constexpr std::size_t kFxSt = 0x20;   // 8 * 16 bytes
+constexpr std::size_t kFxXmm = 0xA0;  // 16 * 16 bytes
+
+constexpr std::uint32_t kMxCsrReset = 0x1F80u;  // all exceptions masked
+
+// ------------------------------------------------------------ exceptions
+
+// The NTSTATUS codes a fault maps to, and the record the filter reads.
+constexpr std::uint32_t kStatusAccessViolation = 0xC0000005u;
+constexpr std::uint32_t kStatusInPageError = 0xC0000006u;
+constexpr std::uint32_t kStatusIllegalInstruction = 0xC000001Du;
+constexpr std::uint32_t kStatusBreakpoint = 0x80000003u;
+constexpr std::uint32_t kStatusSingleStep = 0x80000004u;
+constexpr std::uint32_t kStatusFloatDivideByZero = 0xC000008Eu;
+constexpr std::uint32_t kStatusFloatInexactResult = 0xC000008Fu;
+constexpr std::uint32_t kStatusFloatInvalidOperation = 0xC0000090u;
+constexpr std::uint32_t kStatusFloatOverflow = 0xC0000091u;
+constexpr std::uint32_t kStatusFloatUnderflow = 0xC0000093u;
+constexpr std::uint32_t kStatusIntegerDivideByZero = 0xC0000094u;
+constexpr std::uint32_t kStatusIntegerOverflow = 0xC0000095u;
+constexpr std::uint32_t kStatusPrivilegedInstruction = 0xC0000096u;
+constexpr std::uint32_t kStatusStackOverflow = 0xC00000FDu;
+
+constexpr std::uint32_t kExceptionNoncontinuable = 0x1u;
+constexpr std::int32_t kExecuteHandler = 1;  // EXCEPTION_EXECUTE_HANDLER
+constexpr std::uint64_t kExceptionInfoAccess = 0;  // read
+constexpr std::uint64_t kExceptionInfoWrite = 1;
+constexpr std::uint64_t kExceptionInfoExecute = 8;  // DEP
+
+// The guest's EXCEPTION_RECORD. Field for field the Windows shape; the
+// `static_assert`s are the proof, the way the TEB layout above is proven.
+struct GuestExceptionRecord {
+    std::uint32_t code = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t inner = 0;  // nested ExceptionRecord*, none here
+    std::uint64_t address = 0;
+    std::uint32_t parameters = 0;
+    std::uint32_t reserved = 0;
+    std::uint64_t information[15] = {};
+};
+static_assert(sizeof(GuestExceptionRecord) == 152,
+              "EXCEPTION_RECORD layout drifted");
+
+// The guest's EXCEPTION_POINTERS: the pair the filter receives.
+struct GuestExceptionPointers {
+    const GuestExceptionRecord* record = nullptr;
+    const void* context = nullptr;
+};
+static_assert(sizeof(GuestExceptionPointers) == 16,
+              "EXCEPTION_POINTERS layout drifted");
+
+// The filter is guest code: Microsoft ABI, called by address.
+using UnhandledFilterFn = std::int32_t (__attribute__((ms_abi))*)(
+    const GuestExceptionPointers* pointers);
+
+// --------------------------------------------------------- the run frame
+
+// What the fault handler needs to reach, carried beside the `GuestState`
+// because the handler cannot take parameters. All thread-local for the same
+// reason the state pointer is: the guest runs on one thread.
+struct RunFrame {
+    winabi::GuestState* state = nullptr;
+    // The stack region the builder placed, low end first. A fault below the
+    // low end is the stack overflow Windows names STATUS_STACK_OVERFLOW --
+    // a distinct code with distinct meaning, and free to detect once the
+    // region is known.
+    std::uint64_t stack_low = 0;
+    std::uint64_t stack_high = 0;
+};
+thread_local RunFrame g_run_frame;
+
+// Where the exit longjmp lands, and the code it carries. The buffer lives
+// here rather than on `run_pe_process`'s frame because the terminate path
+// has no parameter to carry it in; the code travels beside it because
+// `siglongjmp` treats a zero as a one, and exit code zero is the single most
+// common code a correct program produces.
+thread_local ::sigjmp_buf g_host_return;
+thread_local volatile std::uint32_t g_guest_exit_code = 0;
+
+// The exit path the thunks reach through `winabi::terminate`. The flush is
+// the callers' duty -- `ExitProcess` and `exit` flush before they get here,
+// and the fault handler flushes before it does -- so this is the jump and
+// nothing else.
+void guest_terminate(std::uint32_t code) noexcept {
+    g_guest_exit_code = code;
+    ::siglongjmp(g_host_return, 1);
+}
+
+// ------------------------------------------------------------------- jump
+
+// The handoff. Eight instructions, none of them optional:
+//
+//   `mov`    -- the stack the builder placed, which is 16-byte aligned and
+//               has the entry's shadow space subtracted first, because a
+//               Windows caller reserves those 32 bytes *below* its own frame
+//               and the callee writes them before it touches anything else;
+//   `sub`    -- the shadow space itself;
+//   `xor`    -- the frame pointer Windows' startup expects to start clean;
+//   `call`   -- the entry point, which pushes this stub's own address as the
+//               return address: an entry that returns lands on `ud2` and
+//               faults the honest way, since no Windows entry returns;
+//   `ud2`    -- the fence.
+//
+// The call destroys every caller-saved register and the guest destroys the
+// callee-saved ones besides; that is why the return leg is a `siglongjmp`,
+// which restores the register set `sigsetjmp` saved. Control "returns" from
+// this function only through that jump, never through the epilogue.
+void enter_guest_asm(std::uint64_t entry, std::uint64_t stack_top) noexcept {
+    __asm__ volatile("movq %1, %%rsp\n\t"
+                     "subq $32, %%rsp\n\t"
+                     "xorl %%ebp, %%ebp\n\t"
+                     "call *%0\n\t"
+                     "ud2\n\t"
+                     :
+                     : "r"(entry), "r"(stack_top)
+                     : "memory");
+}
+
+// ------------------------------------------------------------------ bytes
+
+// The field writers the CONTEXT builder uses. `memcpy` into a byte buffer
+// because the buffer is unaligned by design -- it is laid out the way
+// Windows lays out memory, not the way C structures align.
+void put_u8(std::uint8_t* base, std::size_t offset, std::uint8_t value) noexcept {
+    base[offset] = value;
+}
+
+void put_u16(std::uint8_t* base, std::size_t offset,
+             std::uint16_t value) noexcept {
+    std::memcpy(base + offset, &value, sizeof(value));
+}
+
+void put_u32(std::uint8_t* base, std::size_t offset,
+             std::uint32_t value) noexcept {
+    std::memcpy(base + offset, &value, sizeof(value));
+}
+
+void put_u64(std::uint8_t* base, std::size_t offset,
+             std::uint64_t value) noexcept {
+    std::memcpy(base + offset, &value, sizeof(value));
+}
+
+[[nodiscard]] std::uint8_t get_u8(const std::uint8_t* base,
+                                  std::size_t offset) noexcept {
+    return base[offset];
+}
+
+[[nodiscard]] std::uint16_t get_u16(const std::uint8_t* base,
+                                    std::size_t offset) noexcept {
+    std::uint16_t value = 0;
+    std::memcpy(&value, base + offset, sizeof(value));
+    return value;
+}
+
+[[nodiscard]] std::uint32_t get_u32(const std::uint8_t* base,
+                                    std::size_t offset) noexcept {
+    std::uint32_t value = 0;
+    std::memcpy(&value, base + offset, sizeof(value));
+    return value;
+}
+
+void copy_bytes(std::uint8_t* dst, const std::uint8_t* src,
+                std::size_t bytes) noexcept {
+    std::memcpy(dst, src, bytes);
+}
+
+// --------------------------------------------------------------- the maps
+
+// The CONTEXT, from the signal context. Integer registers, segments, flags
+// and the floating-point area are filled from the kernel's saved state; the
+// debug registers are left zero and *not claimed* in `ContextFlags`, because
+// a filter that reads `Dr0` of a process that has no hardware breakpoints
+// should be told the field is absent, not that it is zero.
+void fill_guest_context(std::uint8_t* context, const ::ucontext_t& uc) noexcept {
+    std::memset(context, 0, kContextSize);
+    const ::greg_t* g = uc.uc_mcontext.gregs;
+    put_u32(context, kContextFlags, kContextFull);
+    // The kernel packs the four segment registers into one slot, in the
+    // order CS, GS, FS, SS, sixteen bits each.
+    put_u16(context, kContextSegCs,
+            static_cast<std::uint16_t>((g[REG_CSGSFS] >> 0) & 0xFFFF));
+    put_u16(context, kContextSegGs,
+            static_cast<std::uint16_t>((g[REG_CSGSFS] >> 16) & 0xFFFF));
+    put_u16(context, kContextSegFs,
+            static_cast<std::uint16_t>((g[REG_CSGSFS] >> 32) & 0xFFFF));
+    put_u16(context, kContextSegSs,
+            static_cast<std::uint16_t>((g[REG_CSGSFS] >> 48) & 0xFFFF));
+    put_u32(context, kContextEFlags, static_cast<std::uint32_t>(g[REG_EFL]));
+    put_u64(context, kContextRax, static_cast<std::uint64_t>(g[REG_RAX]));
+    put_u64(context, kContextRcx, static_cast<std::uint64_t>(g[REG_RCX]));
+    put_u64(context, kContextRdx, static_cast<std::uint64_t>(g[REG_RDX]));
+    put_u64(context, kContextRbx, static_cast<std::uint64_t>(g[REG_RBX]));
+    put_u64(context, kContextRsp, static_cast<std::uint64_t>(g[REG_RSP]));
+    put_u64(context, kContextRbp, static_cast<std::uint64_t>(g[REG_RBP]));
+    put_u64(context, kContextRsi, static_cast<std::uint64_t>(g[REG_RSI]));
+    put_u64(context, kContextRdi, static_cast<std::uint64_t>(g[REG_RDI]));
+    put_u64(context, kContextR8, static_cast<std::uint64_t>(g[REG_R8]));
+    put_u64(context, kContextR9, static_cast<std::uint64_t>(g[REG_R9]));
+    put_u64(context, kContextR10, static_cast<std::uint64_t>(g[REG_R10]));
+    put_u64(context, kContextR11, static_cast<std::uint64_t>(g[REG_R11]));
+    put_u64(context, kContextR12, static_cast<std::uint64_t>(g[REG_R12]));
+    put_u64(context, kContextR13, static_cast<std::uint64_t>(g[REG_R13]));
+    put_u64(context, kContextR14, static_cast<std::uint64_t>(g[REG_R14]));
+    put_u64(context, kContextR15, static_cast<std::uint64_t>(g[REG_R15]));
+    put_u64(context, kContextRip, static_cast<std::uint64_t>(g[REG_RIP]));
+
+    const auto* fp =
+        reinterpret_cast<const std::uint8_t*>(uc.uc_mcontext.fpregs);
+    if (fp != nullptr) {
+        put_u32(context, kContextMxCsr, get_u32(fp, kFxMxCsr));
+        put_u16(context, kContextFltSave + kFltControlWord,
+                get_u16(fp, kFxCwd));
+        put_u16(context, kContextFltSave + kFltStatusWord,
+                get_u16(fp, kFxSwd));
+        put_u8(context, kContextFltSave + kFltTagWord, get_u8(fp, kFxTwd));
+        put_u16(context, kContextFltSave + kFltErrorOpcode,
+                get_u16(fp, kFxFop));
+        put_u32(context, kContextFltSave + kFltErrorOffset,
+                get_u32(fp, kFxFip));
+        put_u32(context, kContextFltSave + kFltDataOffset,
+                get_u32(fp, kFxRdp));
+        put_u32(context, kContextFltSave + kFltMxCsr, get_u32(fp, kFxMxCsr));
+        put_u32(context, kContextFltSave + kFltMxCsrMask,
+                get_u32(fp, kFxMxCsrMask));
+        copy_bytes(context + kContextFltSave + kFltFloatRegisters, fp + kFxSt,
+                   8 * 16);
+        copy_bytes(context + kContextFltSave + kFltXmmRegisters, fp + kFxXmm,
+                   16 * 16);
+    } else {
+        // No floating-point state was saved, which the kernel does not do
+        // once any has been used; the reset MXCSR is the honest default.
+        put_u32(context, kContextMxCsr, kMxCsrReset);
+    }
+}
+
+// The NTSTATUS a signal and its cause name. The stack-overflow test is
+// address arithmetic against the region the builder placed: a fault *below*
+// the stack's low end, within a window, is the guard-page probe that Windows
+// reports as STATUS_STACK_OVERFLOW, and a program whose recursion ran away
+// deserves the code that says so rather than a generic access violation.
+std::uint32_t exception_code_for(int sig, const ::siginfo_t& info,
+                                 const RunFrame& frame,
+                                 std::uint64_t address) noexcept {
+    switch (sig) {
+    case SIGSEGV:
+    case SIGBUS:
+        if (frame.stack_low != 0 && address < frame.stack_low &&
+            frame.stack_low - address <= (std::uint64_t{64} << 10)) {
+            return kStatusStackOverflow;
+        }
+        return sig == SIGBUS ? kStatusInPageError : kStatusAccessViolation;
+    case SIGILL:
+        return info.si_code == ILL_PRVOPC ? kStatusPrivilegedInstruction
+                                          : kStatusIllegalInstruction;
+    case SIGFPE:
+        switch (info.si_code) {
+        case FPE_INTDIV: return kStatusIntegerDivideByZero;
+        case FPE_INTOVF: return kStatusIntegerOverflow;
+        case FPE_FLTDIV: return kStatusFloatDivideByZero;
+        case FPE_FLTOVF: return kStatusFloatOverflow;
+        case FPE_FLTUND: return kStatusFloatUnderflow;
+        case FPE_FLTRES: return kStatusFloatInexactResult;
+        case FPE_FLTINV: return kStatusFloatInvalidOperation;
+        default: return kStatusFloatInvalidOperation;
+        }
+    case SIGTRAP:
+        return info.si_code == TRAP_TRACE ? kStatusSingleStep
+                                          : kStatusBreakpoint;
+    default:
+        return kStatusAccessViolation;
+    }
+}
+
+// The record the filter reads. The access-violation parameters are the
+// operation and the address, with the operation decided by the page-fault
+// error code the kernel saved: bit 1 is a write, bit 4 an instruction fetch.
+// The in-page record carries a third parameter, the paging status the kernel
+// would have named, which here has no source and is zero for that reason.
+void fill_exception_record(GuestExceptionRecord& record, std::uint32_t code,
+                           std::uint64_t address, int sig,
+                           const ::ucontext_t& uc) noexcept {
+    record.code = code;
+    record.flags = kExceptionNoncontinuable;
+    record.inner = 0;
+    record.address = address;
+    record.parameters = 0;
+    record.reserved = 0;
+    for (std::uint64_t& slot : record.information) {
+        slot = 0;
+    }
+    if (code == kStatusAccessViolation) {
+        record.parameters = 2;
+        std::uint64_t operation = kExceptionInfoAccess;
+        if (sig == SIGSEGV) {
+            const ::greg_t err = uc.uc_mcontext.gregs[REG_ERR];
+            if ((err & 0x10) != 0) {
+                operation = kExceptionInfoExecute;
+            } else if ((err & 0x2) != 0) {
+                operation = kExceptionInfoWrite;
+            }
+        }
+        record.information[0] = operation;
+        record.information[1] = address;
+    } else if (code == kStatusInPageError) {
+        record.parameters = 3;
+        record.information[0] = kExceptionInfoAccess;
+        record.information[1] = address;
+        record.information[2] = 0;
+    }
+}
+
+// ----------------------------------------------------------- the handler
+
+// The fault, seen from the host's side. It records what happened in the
+// state the run reports, gives the guest's filter its say in Windows' own
+// terms, and otherwise kills the process with the signal -- which is what
+// the same code does under a Unix loader, and what Windows does once every
+// filter has declined.
+//
+// The handler runs on the alternate stack, which is what makes a fault in
+// the guest's own stack survivable long enough to be reported.
+void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcept {
+    auto* uc = static_cast<::ucontext_t*>(context_void);
+    const ::greg_t* g = uc->uc_mcontext.gregs;
+    const std::uint64_t rip = static_cast<std::uint64_t>(g[REG_RIP]);
+    const bool from_memory = (sig == SIGSEGV || sig == SIGBUS) && info != nullptr;
+    const std::uint64_t address =
+        from_memory ? reinterpret_cast<std::uint64_t>(info->si_addr) : rip;
+
+    winabi::GuestState* state = g_run_frame.state;
+    if (state != nullptr) {
+        state->faulted = true;
+        state->fault_signal = sig;
+        state->fault_address = address;
+    }
+
+    const std::uint32_t code =
+        exception_code_for(sig, info != nullptr ? *info : ::siginfo_t{},
+                           g_run_frame, address);
+    const std::uint64_t filter = state != nullptr ? state->unhandled_filter : 0;
+    if (filter != 0) {
+        alignas(16) std::uint8_t context[kContextSize];
+        fill_guest_context(context, *uc);
+        GuestExceptionRecord record;
+        fill_exception_record(record, code, address, sig, *uc);
+        const GuestExceptionPointers pointers{&record, context};
+        const auto tell = reinterpret_cast<UnhandledFilterFn>(filter);
+        if (tell(&pointers) == kExecuteHandler) {
+            // The filter accepted the failure, which on Windows means the
+            // process unwinds and ends with the exception's code. The flush
+            // is here rather than in the exit path because nothing else on
+            // this path was given the chance to flush.
+            ::fflush(nullptr);
+            guest_terminate(code);
+        }
+        // EXCEPTION_CONTINUE_SEARCH means the filter declined; EXCEPTION_
+        // CONTINUE_EXECUTION from a top-level filter would resume into the
+        // same faulting instruction, and Windows itself treats the combination
+        // as a defect in the filter. Both end here, the way the loader ends
+        // them: with the signal.
+    }
+
+    ::signal(sig, SIG_DFL);
+    ::sigset_t unblock;
+    ::sigemptyset(&unblock);
+    ::sigaddset(&unblock, sig);
+    ::sigprocmask(SIG_UNBLOCK, &unblock, nullptr);
+    ::raise(sig);
+    ::_exit(128 + sig);  // only if the raise could not deliver
+}
+
+}  // namespace
+
+// Start the process and run it to completion.
+//
+// The state the thunks serve is built here, from the options the caller
+// built the process with, so that the PEB's command line, `GetCommandLineA`
+// and `__getmainargs` are three views of the one string rather than three
+// strings that agree by luck. The exit codes and the fault reports come back
+// through the terminate path and the handler above; the caller sees a
+// `RunOutcome` and none of the plumbing.
+[[nodiscard]] RunOutcome run_pe_process(PeProcess& process) noexcept {
+    RunOutcome outcome;
+    const ProcessImage& image = process.image();
+    if (!image.ok) {
+        outcome.detail =
+            std::string(process_error_name(image.error)) + ": " + image.detail;
+        return outcome;
+    }
+    const ProcessOptions& options = process.options();
+
+    // --- the state the thunks serve --------------------------------------
+
+    winabi::GuestState state;
+    state.space = &process.space();
+    state.mapper = &process.mapper();
+    state.teb = image.teb;
+    state.peb = image.peb;
+    state.image_base = image.module.base;
+    state.command_line = options.command_line;
+    (void)winabi::utf8_to_utf16(options.command_line, state.command_line_u16);
+    state.image_path_dos = winabi::to_dos_path(options.image_path);
+
+    // The argv the C startup hands out, which is the command line parsed by
+    // the Microsoft rules -- the same rules the guest would apply itself,
+    // which is why the parse lives in `winabi` next to the builder it
+    // inverts. `argv_table` ends in a null because a C `argv` does, and a
+    // program that walks its own `argv` past `argc` is walking somewhere
+    // real.
+    state.arguments = winabi::split_command_line(options.command_line);
+    state.argv_table.reserve(state.arguments.size() + 1);
+    for (const std::string& argument : state.arguments) {
+        state.argv_table.push_back(argument.c_str());
+    }
+    state.argv_table.push_back(nullptr);
+
+    // The environment table, pointing into the options' own storage, which
+    // lives as long as the process does. Null-terminated for the same reason
+    // the argv is.
+    state.env_table.reserve(options.environment.size() + 1);
+    for (const std::string& entry : options.environment) {
+        state.env_table.push_back(entry.c_str());
+    }
+    state.env_table.push_back(nullptr);
+
+    for (const ProcessImage::RegionRecord& region : image.regions) {
+        if (region.kind == RegionKind::Stack) {
+            g_run_frame.stack_low = region.base;
+            g_run_frame.stack_high = region.base + region.size;
+        }
+    }
+
+    winabi::set_guest_state(&state);
+    winabi::install_terminate_path(&guest_terminate);
+    g_run_frame.state = &state;
+
+    // --- the fault plumbing ----------------------------------------------
+
+    // An alternate stack for the handler. A fault on the guest's own stack
+    // -- the stack overflow above -- has nowhere to run a handler on the
+    // stack it faulted on, and the alternate stack is the only reason the
+    // fault can be reported rather than silently fatal.
+    constexpr std::size_t kAltStackBytes = 64 * 1024;
+    const std::unique_ptr<std::uint8_t[]> alt_storage(
+        new std::uint8_t[kAltStackBytes]);
+    ::stack_t alt_stack{};
+    alt_stack.ss_sp = alt_storage.get();
+    alt_stack.ss_size = kAltStackBytes;
+    ::stack_t previous_alt{};
+    ::sigaltstack(&alt_stack, &previous_alt);
+
+    constexpr int kFaultSignals[] = {SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGTRAP};
+    constexpr std::size_t kFaultSignalCount =
+        sizeof(kFaultSignals) / sizeof(kFaultSignals[0]);
+    struct ::sigaction action {};
+    action.sa_sigaction = &guest_fault_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    ::sigemptyset(&action.sa_mask);
+    struct ::sigaction previous[kFaultSignalCount] = {};
+    for (std::size_t i = 0; i < kFaultSignalCount; ++i) {
+        ::sigaction(kFaultSignals[i], &action, &previous[i]);
+    }
+
+    // The host's GS base, kept so the process that continues after this run
+    // -- the same thread, with its own TLS conventions -- finds the segment
+    // base it left behind.
+    std::uint64_t host_gs_base = 0;
+    ::syscall(SYS_arch_prctl, kArchGetGs, &host_gs_base);
+
+    // --- the run ---------------------------------------------------------
+    //
+    // The `sigsetjmp` is the return leg. The branch the guest enters does
+    // not complete -- the entry point's only ways out are the terminate jump
+    // (which lands on the `sigsetjmp` with a nonzero value) and a fault the
+    // filter declined (which kills the process) -- so what is spelled as an
+    // `if` is really a rendezvous: the guest leaves through the jump, and
+    // the code below it runs with the host's registers exactly as they were
+    // saved, GS base included.
+    if (::sigsetjmp(g_host_return, 1) == 0) {
+        ::syscall(SYS_arch_prctl, kArchSetGs, state.teb);
+        enter_guest_asm(image.entry_point, image.initial_stack_pointer);
+        __builtin_unreachable();
+    }
+
+    // --- home again -------------------------------------------------------
+
+    ::syscall(SYS_arch_prctl, kArchSetGs, host_gs_base);
+    for (std::size_t i = 0; i < kFaultSignalCount; ++i) {
+        ::sigaction(kFaultSignals[i], &previous[i], nullptr);
+    }
+    ::sigaltstack(&previous_alt, nullptr);
+    winabi::install_terminate_path(nullptr);
+    winabi::set_guest_state(nullptr);
+    g_run_frame = RunFrame{};
+
+    const std::uint32_t code = g_guest_exit_code;
+    outcome.exit_code = code;
+    if (state.faulted) {
+        // The filter accepted the failure and the process ended with the
+        // exception's code, the way Windows ends it. The fault fields say
+        // where; the exit code is the NTSTATUS.
+        outcome.exited = false;
+        outcome.fault_address = state.fault_address;
+        outcome.signal = state.fault_signal;
+        outcome.detail = "the guest faulted (signal " +
+                         std::to_string(state.fault_signal) +
+                         ") and the unhandled-exception filter accepted it";
+    } else {
+        outcome.exited = true;
+    }
+    return outcome;
 }
 
 } // namespace occ::runtime
