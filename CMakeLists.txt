@@ -457,12 +457,26 @@ if(OCC_USE_LIBCXX AND OCC_STATIC_LINK)
     endif()
 endif()
 
-if(OCC_ENABLE_FUZZ)
-    # A sanitized build cannot be a static build. libFuzzer supplies main(),
-    # and ASan needs the dynamic loader's data to install its shadow memory --
-    # linking -static against it fails with an undefined reference to
-    # _DYNAMIC, which names neither the cause nor the flag.
-    #
+# A sanitized build cannot be a static build either, and a sanitizer build
+# is two different things here. libFuzzer supplies main(), and ASan needs the
+# dynamic loader's data to install its shadow memory -- linking -static
+# against it fails with an undefined reference to _DYNAMIC, which names
+# neither the cause nor the flag. The same failure arrives through the other
+# door when the sanitizers are configured by hand, because the flags go into
+# CMAKE_CXX_FLAGS rather than into any variable this file set: the check
+# reads the flags, not a project option, and a build whose own comments
+# describe sanitizers as incompatible with -static cannot link -static the
+# moment its flags say -fsanitize. OCC_ENABLE_FUZZ is part of the match below
+# as well, but stating both is cheaper than proving the overlap is total.
+set(OCC_SANITIZED_BUILD OFF)
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize" OR
+   CMAKE_CXX_FLAGS_DEBUG MATCHES "-fsanitize" OR
+   CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-fsanitize" OR
+   CMAKE_CXX_FLAGS_RELEASE MATCHES "-fsanitize")
+    set(OCC_SANITIZED_BUILD ON)
+endif()
+
+if(OCC_ENABLE_FUZZ OR OCC_SANITIZED_BUILD)
     # This has to happen before the -static below is turned into a link
     # option. Setting OCC_STATIC_LINK after add_link_options(-static) is too
     # late: the option is already on every target in the directory, so the
@@ -547,12 +561,14 @@ add_library(occ_core STATIC
     src/engine/pe_engine.cpp
     src/engine/apk_engine.cpp
     src/runner/run.cpp
+    src/runner/pe_runner.cpp
     src/runtime/address_space.cpp
     src/runtime/mapper.cpp
     src/runtime/loader.cpp
     src/runtime/exports.cpp
     src/runtime/ntdll.cpp
     src/runtime/pe_process.cpp
+    src/runtime/winabi.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

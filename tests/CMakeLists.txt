@@ -24,29 +24,11 @@ endfunction()
 
 # Whether this build compiles the tests against a sanitizer runtime.
 #
-# Detected from the flags rather than from OCC_ENABLE_FUZZ, because the two are
-# independent and only the first one describes what the binaries are. A
-# developer who configures a sanitizer build by hand --
-#
-#   cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-#         -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -g"
-#
-#   -- which is the command docs/BUILD.md gives, and the one that produced
-#   every ASan run in this project's history -- leaves OCC_ENABLE_FUZZ off. A
-#   check written as "not a fuzz build" then concludes the tests are ordinary,
-#   builds them, registers them, and runs them. What it misses is that
-#   occ_core is instrumented, so the library the tests link needs the ASan
-#   runtime and the tests inherit the runtime's behaviour whether or not they
-#   were compiled with it. That is what the exclusion below is for, and
-#   inferring it from the wrong variable defeats it.
-if(CMAKE_CXX_FLAGS MATCHES "-fsanitize" OR
-   CMAKE_CXX_FLAGS_DEBUG MATCHES "-fsanitize" OR
-   CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-fsanitize" OR
-   CMAKE_CXX_FLAGS_RELEASE MATCHES "-fsanitize")
-    set(OCC_SANITIZED_BUILD ON)
-else()
-    set(OCC_SANITIZED_BUILD OFF)
-endif()
+# The answer comes from the top level, which performs the same flag-reading
+# check before it decides whether the main binary may link -static. The
+# check cannot live only here: the -static decision happens in the parent
+# scope, and a sanitizer build discovered below it would already have linked
+# a binary the sanitizers cannot run.
 
 # Two of these install a mechanism in the child process that a sanitizer
 # runtime cannot survive, and neither failure is in this project's code.
@@ -96,6 +78,7 @@ occ_add_test(occ_test_probe_wiring test_probe_wiring.cpp)
 occ_add_test(occ_test_pe test_pe.cpp)
 occ_add_test(occ_test_runtime_loader test_runtime_loader.cpp)
 occ_add_test(occ_test_runtime_exports test_runtime_exports.cpp)
+occ_add_test(occ_test_winabi test_winabi.cpp)
 occ_add_test(occ_test_mapper test_mapper.cpp)
 occ_add_test(occ_test_ntdll test_ntdll.cpp)
 occ_add_test(occ_test_placement test_placement.cpp)
