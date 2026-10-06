@@ -529,19 +529,34 @@ Result<std::uint64_t> Mapper::protect_range(std::uint64_t base,
         return fail<std::uint64_t>(Status::InvalidParameter, 0, base);
     }
 
-    // The range is widened to whole pages, for the reason a commit is: the
-    // kernel's unit is a page and a range that is not page-aligned names a
-    // state no mprotect can produce. Widening rather than narrowing is what
-    // keeps a decommit from leaving live bytes inside a range the caller was
-    // told it had released.
-    const std::uint64_t first = AddressSpace::round_down(base, AddressSpace::kPageSize);
-    std::uint64_t want = base - first + size;
-    if (want % AddressSpace::kPageSize != 0) {
-        want = AddressSpace::round_up(want, AddressSpace::kPageSize);
+    // **The range is rounded the way a decommit rounds it, which is not the
+    // obvious way.** The first page is taken *up* and the last page *down*:
+    // that is `decommit_pages` in Wine (`host_start = ROUND_SIZE(0, base)`,
+    // `host_end = ROUND_ADDR(base + size)`), and it is what makes the range the
+    // kernel is told about equal to the range `AddressSpace::decommit` records.
+    // The two have to agree -- a ledger that records one span while the kernel
+    // covers another is a ledger that is wrong about which pages fault.
+    //
+    // The caller is expected to have widened `size` already (`ROUND_SIZE` at
+    // the call site, which adds a page for a range with an in-page offset), so
+    // the two roundings normally meet exactly on whole pages and this is a
+    // no-op. Writing it out anyway means the function is correct on its own
+    // rather than correct because of who calls it.
+    const std::uint64_t first =
+        AddressSpace::round_up(base, AddressSpace::kPageSize);
+    const std::uint64_t last =
+        AddressSpace::round_down(base + size, AddressSpace::kPageSize);
+    if (first >= last) {
+        // No whole page in the range. There is nothing to protect and the
+        // caller's ledger cut is empty as well, so this is a success that did
+        // nothing rather than a refusal -- the same answer `decommit` gives
+        // for the same shape.
+        Result<std::uint64_t> out;
+        out.value = 0;
+        out.status = Status::Success;
+        return out;
     }
-    if (first + want < first) {
-        return fail<std::uint64_t>(Status::InvalidParameter, 0, base);
-    }
+    const std::uint64_t want = last - first;
 
     // The modifier bits are refused here for the reason protect() refuses
     // them: a modifier that arrives as nothing is worse than a refusal.
