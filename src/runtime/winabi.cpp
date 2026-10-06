@@ -583,6 +583,38 @@ void append_unsigned(std::string& out, std::uint32_t value) {
     }
 }
 
+// The text-mode translation the guest's CRT writes with. A Windows
+// program's stdout and stderr open in text mode, so the "\n" its printf
+// prints becomes \r\n in the pipe -- which is what everything reading a
+// Windows program's output sees, and what wine reproduces. The host's
+// stdio has no such mode, so the bridge performs the conversion on the
+// way through, and *only* here: WriteFile is not the CRT and does not
+// translate, which is the same layering Windows has. A program that
+// writes through the kernel gets its bytes verbatim; a program that
+// writes through printf gets its newlines expanded.
+[[nodiscard]] std::string text_mode_expand(const char* text,
+                                           std::size_t length) {
+    std::size_t newlines = 0;
+    for (std::size_t i = 0; i < length; ++i) {
+        if (text[i] == '\n') {
+            ++newlines;
+        }
+    }
+    if (newlines == 0) {
+        return std::string(text, length);
+    }
+    std::string out;
+    out.reserve(length + newlines);
+    for (std::size_t i = 0; i < length; ++i) {
+        if (text[i] == '\n') {
+            out += "\r\n";
+        } else {
+            out += text[i];
+        }
+    }
+    return out;
+}
+
 // How one conversion consumes the save area. `Int` reads four bytes, the
 // wide forms read eight, `Floating` reads the bit pattern of a double.
 enum class ArgClass : std::uint8_t {
@@ -850,12 +882,39 @@ int host_vfprintf(std::FILE* stream, const char* fmt,
     // The guest's format string may itself contain a conversion the
     // descriptor has no parameter for -- it cannot, because every
     // conversion above pushed what it asked for -- so the call is the
-    // host's own and runs unmodified.
+    // host's own and runs unmodified. It runs into a memory stream
+    // rather than the caller's, because the text-mode translation below
+    // has to see the formatted bytes before the stream does.
+    char* text = nullptr;
+    std::size_t length = 0;
+    std::FILE* mem = ::open_memstream(&text, &length);
+    if (mem == nullptr) {
+        return -1;
+    }
     va_list ap;
     static_assert(sizeof(ap) == sizeof(SysvVaList),
                   "the host descriptor must be the ABI's");
     __builtin_memcpy(&ap, &built, sizeof(ap));
-    return ::vfprintf(stream, rebuilt.c_str(), ap);
+    const int written = ::vfprintf(mem, rebuilt.c_str(), ap);
+    ::fclose(mem);
+    if (written < 0 || text == nullptr) {
+        ::free(text);
+        return -1;
+    }
+
+    // The formatted text is the guest's own; the delivery is the CRT's
+    // text mode, which stands between the format and the stream: a
+    // newline leaves as a carriage return and a newline, the way the
+    // Windows CRT hands bytes to WriteFile. The answer the guest sees is
+    // still the format's own count -- the carriage returns are the
+    // stream's doing, not characters the format produced.
+    const std::string delivered = text_mode_expand(text, length);
+    ::free(text);
+    if (::fwrite(delivered.data(), 1, delivered.size(), stream) !=
+        delivered.size()) {
+        return -1;
+    }
+    return written;
 }
 
 // --------------------------------------------------------------------------
@@ -1882,8 +1941,21 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_fputc(
     if (g == nullptr) {
         return -1;
     }
-    return ::fputc(c, translate_stream(
-                          *g, reinterpret_cast<std::uint64_t>(stream)));
+    // A character going out through the CRT travels in the stream's text
+    // mode: a newline becomes a carriage return and a newline, exactly as
+    // the Windows CRT's own fputc delivers it. WriteFile never sees this
+    // path, and the guest's return value is still the character, not the
+    // bytes the expansion added.
+    const unsigned char byte = static_cast<unsigned char>(c);
+    const std::string expanded =
+        text_mode_expand(reinterpret_cast<const char*>(&byte), 1);
+    std::FILE* target =
+        translate_stream(*g, reinterpret_cast<std::uint64_t>(stream));
+    if (::fwrite(expanded.data(), 1, expanded.size(), target) !=
+        expanded.size()) {
+        return -1;
+    }
+    return byte;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t cr_fwrite(
@@ -1893,11 +1965,72 @@ extern "C" __attribute__((ms_abi)) std::uint64_t cr_fwrite(
     if (g == nullptr) {
         return 0;
     }
+    // A degenerate request -- a zero dimension, or a total that overflows
+    // the host's address space -- writes nothing, as the C contract says.
+    if (size == 0 || count == 0 || count > SIZE_MAX / size) {
+        return 0;
+    }
+    const auto* bytes = static_cast<const char*>(buffer);
+    const std::size_t requested = static_cast<std::size_t>(size * count);
+    // Bytes going out through the CRT travel in the stream's text mode:
+    // newlines are expanded on the way to the host, so the bytes the host
+    // writes are not the bytes the guest asked for. The item count the
+    // guest sees is its own -- walk its buffer back through the
+    // expansion, and how many of its bytes fit in what the host took,
+    // carriages and all, is how many of its items were written.
+    const std::string expanded = text_mode_expand(bytes, requested);
     const std::size_t written = ::fwrite(
-        buffer, static_cast<std::size_t>(size),
-        static_cast<std::size_t>(count),
+        expanded.data(), 1, expanded.size(),
         translate_stream(*g, reinterpret_cast<std::uint64_t>(stream)));
-    return static_cast<std::uint64_t>(written);
+    std::size_t taken = 0;
+    std::size_t produced = 0;
+    while (taken < requested) {
+        const std::size_t next =
+            produced + (bytes[taken] == '\n' ? 2 : 1);
+        if (next > written) {
+            break;
+        }
+        produced = next;
+        ++taken;
+    }
+    return static_cast<std::uint64_t>(taken / size);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fputs(
+    const char* text, void* stream) noexcept {
+    const GuestState* g = require_state();
+    if (g == nullptr || text == nullptr) {
+        return -1;
+    }
+    // A string through the CRT leaves in the stream's text mode, like any
+    // CRT byte does; fputs adds no newline of its own, and the answer is
+    // nonnegative on success, the way the Windows CRT answers.
+    const std::string expanded = text_mode_expand(text, ::strlen(text));
+    std::FILE* target =
+        translate_stream(*g, reinterpret_cast<std::uint64_t>(stream));
+    return ::fwrite(expanded.data(), 1, expanded.size(), target) ==
+                   expanded.size()
+               ? 0
+               : -1;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_puts(
+    const char* text) noexcept {
+    const GuestState* g = require_state();
+    if (g == nullptr || text == nullptr || g->iob_base == 0) {
+        return -1;
+    }
+    // puts appends its own newline, and the whole line -- appended newline
+    // included -- leaves through the stream's text mode. The guest's
+    // stdout is slot one of its own file table.
+    std::string line(text);
+    line += '\n';
+    const std::string expanded = text_mode_expand(line.data(), line.size());
+    std::FILE* target = translate_stream(*g, g->iob_base + kGuestFileSlot);
+    return ::fwrite(expanded.data(), 1, expanded.size(), target) ==
+                   expanded.size()
+               ? 0
+               : -1;
 }
 
 extern "C" __attribute__((ms_abi)) void* cr_malloc(
@@ -2125,12 +2258,14 @@ void add_msvcrt(ExportModule& module) {
         e("exit", reinterpret_cast<void*>(&cr_exit)),
         e("fprintf", reinterpret_cast<void*>(&cr_fprintf)),
         e("fputc", reinterpret_cast<void*>(&cr_fputc)),
+        e("fputs", reinterpret_cast<void*>(&cr_fputs)),
         e("free", reinterpret_cast<void*>(&cr_free)),
         e("fwrite", reinterpret_cast<void*>(&cr_fwrite)),
         e("localeconv", reinterpret_cast<void*>(&cr_localeconv)),
         e("malloc", reinterpret_cast<void*>(&cr_malloc)),
         e("memcpy", reinterpret_cast<void*>(&cr_memcpy)),
         e("memset", reinterpret_cast<void*>(&cr_memset)),
+        e("puts", reinterpret_cast<void*>(&cr_puts)),
         e("signal", reinterpret_cast<void*>(&cr_signal)),
         e("strerror", reinterpret_cast<void*>(&cr_strerror)),
         e("strlen", reinterpret_cast<void*>(&cr_strlen)),

@@ -400,6 +400,17 @@ void test_vfprintf_conversions() {
               out == "1.500000",
           "L on a floating conversion reads a double");
 
+    // The stream's text mode. A newline through the CRT leaves as a
+    // carriage return and a newline -- what the Windows CRT does before a
+    // byte ever reaches WriteFile -- while the answer the guest sees is
+    // the format's own count, the newline still one character.
+    check(bridge_printf(out, "line\n", Slots().raw(0).get()) == 5 &&
+              out == "line\r\n",
+          "the CRT's text mode expands a newline on the way out");
+    check(bridge_printf(out, "plain", Slots().raw(0).get()) == 5 &&
+              out == "plain",
+          "text without newlines goes through unchanged");
+
     // The refusals that keep the host from misreading the guest: the
     // guest's `wchar_t` is 16 bits and the host's is 32, so a wide string
     // passed through would print half its characters; and `%n` cannot
