@@ -276,20 +276,30 @@ long remove_tree(const std::string& path) noexcept {
 }
 
 std::string current_directory() noexcept {
-    // The kernel returns the length it wrote, and refuses with ERANGE if the
-    // buffer is too small. Starting at a page is not a guess about the
-    // depth: PATH_MAX is the bound the kernel enforces anyway, and anything
-    // longer is not a path this system will accept.
+    // The kernel returns the length it wrote -- the null terminator
+    // included, which is the raw getcwd(2)'s own count -- and refuses with
+    // ERANGE if the buffer is too small. Starting at a page is not a guess
+    // about the depth: PATH_MAX is the bound the kernel enforces anyway,
+    // and anything longer is not a path this system will accept.
     std::array<char, 4096> buf{};
     auto r = sys::getcwd(buf.data(), buf.size());
     if (r.failed()) {
         return {};
     }
     const auto len = static_cast<std::size_t>(r.value);
-    if (len == 0 || len >= buf.size()) {
+    // A working directory is at least "/" plus the terminator, so anything
+    // under two bytes is not an answer the kernel gives; above the buffer
+    // there was no answer at all.
+    if (len < 2 || len >= buf.size()) {
         return {};
     }
-    return std::string(buf.data(), len);
+    // The terminator is *not* part of the string. Counting it would place
+    // a null byte inside the path, where it ends every fold and every
+    // append after it -- invisible in most prints, which is exactly what
+    // makes it fatal: a caller that walks the bytes by size, as the
+    // relative-path fold does, builds a path that stops at the cwd and
+    // drops the name the caller appended.
+    return std::string(buf.data(), len - 1);
 }
 
 std::string absolute_path(const std::string& path) noexcept {
