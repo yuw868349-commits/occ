@@ -11,10 +11,13 @@ eleven.
 
 | Host | Kernel | libc | Compiler | Result |
 |---|---|---|---|---|
-| Ubuntu 24.04.3 LTS | 6.6.117 x86-64 | glibc 2.39 | Clang 23.1.2 + libc++ 23 | clean, tests 6/6 |
-| Ubuntu 24.04.3 LTS | 6.6.117 x86-64 | glibc 2.39 | Clang 20.1.2 + libc++ 20 | clean, tests 6/6 |
-| Ubuntu 24.04.3 LTS | 6.6.117 x86-64 | glibc 2.39 | GCC 16.0.1 + libstdc++ | clean, tests 6/6 |
-| Tencent Cloud Linux, x86-64 | 5.15 | glibc 2.32 | Clang 23.1.2 + libc++ | clean, tests 6/6, GDB 15.1 attaches |
+| Ubuntu 24.04.3 LTS | 6.6.117 x86-64 | glibc 2.39 | Clang 23.1.2 + libc++ 23 | clean, tests 20/20 |
+| Ubuntu 24.04.3 LTS | 6.6.117 x86-64 | glibc 2.39 | Clang 20.1.2 + libc++ 20 | clean, tests 20/20 |
+| Ubuntu 24.04.3 LTS | 6.6.117 x86-64 | glibc 2.39 | GCC 16.0.1 + libstdc++ | clean, tests 20/20 |
+| Tencent Cloud Linux, x86-64 | 5.15 | glibc 2.32 | Clang 23.1.2 + libc++ | clean, tests 20/20, GDB 15.1 attaches |
+
+The fraction is the test binaries. `docs/ROADMAP.md` has the assertion count
+behind them.
 
 Every row was built from a clean configure with warnings as errors, and the
 test suite run. `docs/BUILD.md` has the compiler and standard library matrix in
@@ -61,10 +64,10 @@ The checks, and what failing means:
 | `overlayfs` | the root layer | **The root filesystem layer cannot be built** |
 | `cgroup v2` | resource limits | No limits; the run proceeds without them |
 | `seccomp` | syscall filtering | No default-deny filter; the target is not restricted |
-| `bpf` | the eBPF syscall path | Syscalls cannot be read from outside |
-| `perf_event` | W^X tracking | Hardware breakpoints unavailable; `--track-wx` reports it and stops |
-| `tracefs` | eBPF field offsets | Field offsets cannot be read at runtime |
-| `binderfs` | the APK engine | Nothing yet — the engine does not exist |
+| `bpf` | the seccomp filter path | The filter cannot be loaded; the target is not restricted |
+| `perf_event` | W^X tracking and uprobes | Hardware breakpoints unavailable; `--track-wx` reports it and stops |
+| `tracefs` | uprobe registration | Function-level probes cannot be placed |
+| `binderfs` | nothing occ runs today | Reported for completeness; see below |
 | `kernel config` | `CONFIG_*` assertions | Cloud images ship neither `/boot/config-*` nor `/proc/config.gz` |
 
 Two of these are worth expanding, because they are the ones that decide
@@ -81,25 +84,26 @@ prevent. The error names all three directories, because the most common cause
 by far is the work directory landing on a different filesystem from the upper
 directory, which the kernel reports as `EINVAL` with no detail.
 
-**`perf_event` gates W^X tracking specifically.** `paranoid 2` allows
+**`perf_event` gates W^X tracking and uprobes.** `paranoid 2` allows
 hardware breakpoints for the owning user, which is what the tracker uses, so
 no privilege is needed beyond occ's own. A host at `paranoid 3` or higher
 loses `--track-wx` and the stream says so with a `note` rather than silently
-watching nothing.
+watching nothing. The same check covers the uprobe subscription path, which
+also goes through `perf_event_open`.
 
 ## Failing soft, and what it looks like
 
 The `bpf` and `seccomp` checks are the ones that degrade rather than block: a
-host without unprivileged bpf loses the eBPF syscall path, and a host without
-seccomp loses the default-deny filter. Either way the target still runs and the
-stream carries a `note` saying which capability was not acquired — the
-`note` kind exists so that a missing capability is visible in the record rather
-than inferred from an absence.
+host that refuses the `bpf` syscall loses the filter, and a host without
+seccomp support cannot have one at all. Either way the target still runs and
+the stream carries a `note` saying which capability was not acquired — the
+`note` kind exists so that a missing capability is visible in the record
+rather than inferred from an absence.
 
-The `binderfs` check fails on any host that does not have it mounted, and that
-is currently the only check whose subject does not exist: the APK engine is
-not written. It is listed because the check is real and will matter when the
-engine is.
+The `binderfs` check is the one whose subject occ does not currently need. The
+APK engine is in the tree, and it reads a package and refuses to run it
+rather than needing an Android runtime, so nothing in occ opens binderfs. The
+check is real and would matter to an engine that did.
 
 ## Kernel configuration
 
@@ -178,9 +182,9 @@ failure will be as far from the cause. Two things follow:
 
 occ depends on kernel behaviour, not kernel API stability: `PTRACE_*` and
 `perf_event_open` are stable, but the *semantics* occ depends on — a seccomp
-`TRAP` producing a stop the trace loop can classify, an `eBPF` raw tracepoint
-firing on syscall entry with the field offsets at a known position — are the
-parts that vary.
+`TRAP` producing a stop the trace loop can classify, a `PTRACE_SYSCALL` stop
+arriving with the register block the observer expects — are the parts that
+vary.
 
 That is why the honest statement is a minimum, not a range: **Linux 5.15 or
 newer, with cgroup v2.** A host older than 5.15 is missing `PTRACE_EVENT_STOP`

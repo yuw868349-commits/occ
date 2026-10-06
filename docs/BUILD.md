@@ -16,12 +16,15 @@ and the full test suite run. "Clean" means zero errors and zero warnings.
 
 | Compiler | Standard library | Result |
 |---|---|---|
-| Clang 23.1.2 | libc++ 23 | clean, 16/16 |
+| Clang 23.1.2 | libc++ 23 | clean, 20/20 |
 | Clang 20.1.2 | libc++ 20 | not re-verified since the suite grew |
-| GCC 16.0.1 | libstdc++ | clean, 16/16 |
+| GCC 16.0.1 | libstdc++ | clean, 20/20 |
 | GCC 16.0.1 | libc++ 23 | falls back to libstdc++ |
 | GCC 14.2 | libc++ 20 | falls back to libstdc++ |
 | GCC 13.3 | libc++ 23 | falls back to libstdc++ |
+
+The fraction is the test binaries, of which there are twenty; it is the
+suite's size rather than a compiler count.
 
 The two rows marked clean were re-run most recently; the older Clang row is
 left as it was rather than restated as current, because a number nobody has
@@ -176,7 +179,7 @@ isolation code the binary ships, which is the point.
 **Built, and only in a build that asks for them.** `fuzz/` holds six
 `LLVMFuzzerTestOneInput` targets -- the ELF reader, the zip reader, the PE
 reader, the PE loader, the GDB RSP codec and the seccomp-BPF emitter -- plus a
-`seeds/` directory of thirty-five seeds that `tools/make_pe_seeds.py` writes
+`seeds/` directory of thirty-six seeds that `tools/make_pe_seeds.py` writes
 and `occ_test_seeds` checks against it.
 `fuzz/README.md` records what each harness asserts and, at more length, what
 each one deliberately does not.
@@ -216,7 +219,7 @@ than it was: nothing needing a real process is exercised, so the container, the
 probe plumbing and the uprobe path are unverified by anything in that
 directory.
 
-The seccomp emitter is the interesting one, because it is 402 lines of
+The seccomp emitter is the interesting one, because it is 467 lines of
 arithmetic producing a structure the kernel either executes or refuses without
 explaining why, and because its input is a typed `SeccompPolicy` rather than
 bytes -- so the harness has to invent a surface before there is anything to
@@ -227,7 +230,8 @@ kernel's opinion would come in. That was the first design and it does not
 survive libFuzzer: a harness that forks per input deadlocks against the
 driver's process management often enough to make a suite unreliable, and not
 as a function of the input. `occ_test_seccomp` is where the kernel is asked,
-in a build without a sanitizer, and it really installs forty-nine filters.
+in a build without a sanitizer, and it makes 91 assertions of which 37 install
+a real filter in a forked child.
 `fuzz/README.md` has the measurements.
 
 ## Sanitizer build of the test suite

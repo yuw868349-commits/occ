@@ -30,8 +30,10 @@ instead of it, depending on what you are doing.
 
 Occ does not write to the target's memory. Concretely:
 
-- Breakpoints are hardware breakpoints by default. No `0xCC` is written
-  into target text.
+- Breakpoints are hardware breakpoints, through
+  `perf_event_open(PERF_TYPE_BREAKPOINT)`. No `0xCC` is written into target
+  text, and there is no software-breakpoint mode: `Watchpoints` in
+  `src/observer/watchpoint.cpp` has no int3 path at all.
 - Memory is read with `process_vm_readv`, which does not stop or alter the
   target.
 - `ptrace` is used for stop, continue, single-step, signal delivery, and
@@ -47,13 +49,13 @@ for the reader to discover:
    the mechanism is the kernel's, and it is on by default for the PE
    engine because function-level observability is the point of the engine.
 
-2. **Software breakpoints.** Disabled by default. Enabled with
-   `--allow-int3-fallback`, at which point Occ writes `0xCC` into the
-   target. Events emitted from software breakpoints are marked as such.
-
 The claim is "Occ does not write to the target unless you ask it to", not
 "nothing is ever written". The first is true. The second is not, and any
 tool claiming it would be wrong.
+
+An earlier version of this file described a software-breakpoint fallback
+enabled by `--allow-int3-fallback`. No such flag exists in `src/cmd_*.cpp`
+and no such code path exists in the tree.
 
 ## Privileges
 
@@ -61,15 +63,15 @@ Occ requires root or:
 
 ```
 CAP_SYS_ADMIN    namespaces, mounts, pivot_root, cgroup
-CAP_NET_ADMIN    veth pairs and nftables rules
-CAP_BPF          BPF program and map creation
-CAP_PERFMON      perf_event_open for breakpoints and tracepoints
+CAP_NET_ADMIN    network namespace manipulation
+CAP_BPF          loading the seccomp filter program
+CAP_PERFMON      perf_event_open for breakpoints and uprobes
 CAP_SYS_PTRACE   ptrace and process_vm_readv
 CAP_SYS_RESOURCE rlimit changes
 ```
 
-This is the same requirement class as Docker, strace, and bpftrace. It is
-not a gap to be worked around. A tracing tool that cannot trace is not
+This is the same requirement class as Docker and strace. It
+is not a gap to be worked around. A tracing tool that cannot trace is not
 useful, and pretending otherwise would mean shipping something that fails
 in ways the user cannot diagnose.
 
@@ -85,10 +87,10 @@ of them are worth knowing about.
 |---|---|
 | `kernel.unprivileged_bpf_disabled` | Does not apply to Occ, which runs with `CAP_BPF`. Reported for completeness. |
 | `kernel.perf_event_paranoid` | Above 2 blocks non-root perf use. Occ runs as root, so this is informational. |
-| `binderfs` not available | Blocks the APK engine. Reported as a hard failure for that engine only. |
+| `binderfs` not available | Nothing occ runs today depends on it. Reported for completeness. |
 | cgroup v2 not mounted or not writable | Limits cannot be applied. Occ reports it rather than running without limits and saying nothing. |
 | `CONFIG_*` unavailable | `/proc/config.gz` and `/boot/config-$(uname -r)` are both commonly absent on cloud images. `occ doctor` reports `unavailable` and continues; a missing config file is not an error. |
-| AppArmor or SELinux in enforcing mode | May deny mounts, ptrace, or BPF. Reported when a profile is enforcing. |
+| AppArmor or SELinux in enforcing mode | May deny mounts, ptrace, or the seccomp filter. Reported when a profile is enforcing. |
 
 ## Untrusted input
 
@@ -135,7 +137,9 @@ under libFuzzer, which calls a harness thousands of times a second and manages
 its own processes while this one was forking underneath it. Six campaigns over
 one corpus, five clean and one hung, with the hang a function of neither the
 input nor the run count. So the kernel oracle stayed where it already was, in
-`tests/test_seccomp.cpp`, which really installs forty-nine filters covering all
+`tests/test_seccomp.cpp`, which makes 91 assertions, 37 of them a forked
+child that installs a real filter and makes a call it has an opinion about,
+covering all
 seven comparisons and all five actions in a build without a sanitizer -- a
 stronger oracle than an assertion, and a bounded one. The division loses
 nothing: the test answers whether the kernel will take a filter, and the
@@ -148,5 +152,11 @@ target is.
 ## Reporting
 
 Do not open a public issue for a memory safety bug in a parser or a
-privilege escalation in the isolation layer. See `SECURITY.md` at the
-repository root for the contact path.
+privilege escalation in the isolation layer.
+
+There is no private contact path. No `SECURITY.md` exists at the repository
+root, no security contact address is configured anywhere in the tree, and
+this file is the whole of the policy. A maintainer who wants a private
+channel has to add one; until then, a report about a parser or the
+isolation layer has nowhere private to go, and that is worth stating
+rather than implying otherwise.

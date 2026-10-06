@@ -14,8 +14,12 @@ executes under isolation and emits facts.
 `occ run` executes a target and observes it. It does not dispatch on the
 target's format: it will exec an ELF, and it will also exec a PE or an APK,
 but the kernel's binfmt handler decides what that means, not this project.
-There is no PE engine and no APK engine — `src/engine/` is empty. Against an
-ELF target on Linux the full observation surface is available. See
+`src/engine/` holds one engine per format — `exe_engine.cpp` for ELF,
+`pe_engine.cpp` for PE, `apk_engine.cpp` for APK — and `engine.cpp` is the
+table that names them. What each engine does with the format differs, and
+the difference is stated where it applies rather than here: the ELF engine
+runs the image, the PE engine assembles a run around a Wine loader it finds
+on the host, and the APK engine reads the package and refuses. See
 `docs/ROADMAP.md` for the state of each part, including what is known to be
 missing.
 
@@ -43,15 +47,16 @@ Every run gets:
   emitter.
 
 The isolation layer is the security boundary of this project. Its seccomp
-emitter is tested against a filter the kernel actually installs -- 49
-assertions, one per rule operator -- and its container setup is tested for
-the things that have to be refused, such as an overlay mount with no upper
-directory, which must fail and say at which stage it failed.
+emitter is tested against filters the kernel actually installs — 91
+assertions, and 37 of them are a forked child that installs a real filter
+and makes a call the filter has an opinion about — and its container setup
+is tested for the things that have to be refused, such as an overlay mount
+with no upper directory, which must fail and say at which stage it failed.
 
 It is not fuzzed. The emitter's input is a typed policy rather than bytes,
 so there is nothing to hand a fuzzer that a caller controls; `fuzz/README.md`
-explains what the four parser harnesses do cover and, at more length, what
-none of them reaches.
+explains what the six harnesses do cover and, at more length, what none of
+them reaches.
 
 ## Privilege model
 
@@ -68,12 +73,15 @@ by `occ doctor` rather than silently degraded.
 
 The target is not instrumented by Occ.
 
-- Syscall tracing uses eBPF programs constructed in-tree and attached to
-  raw tracepoints. There is no libbpf, no BTF, no CO-RE. Tracepoint field
-  offsets are read at runtime from tracefs.
-- Function-level monitoring uses hardware breakpoints via
-  `perf_event_open(PERF_TYPE_BREAKPOINT)`. No `int3` is written into the
-  target by default.
+- Syscall tracing uses `PTRACE_SYSCALL`, with `PTRACE_O_TRACESYSGOOD` so a
+  syscall stop is distinguishable from a real `SIGTRAP`. The register block
+  is read at the stop.
+- The isolation layer's filter is seccomp-BPF, assembled as an instruction
+  array by an emitter in the tree. There is no libbpf, no BTF, no CO-RE,
+  and no eBPF program anywhere in this codebase.
+- Function-level monitoring uses uprobes through
+  `perf_event_open(PERF_TYPE_BREAKPOINT)`, registered by writing a line into
+  tracefs.
 - Memory reads use `process_vm_readv` from outside the target.
 - `ptrace` is used for process control only: stop, continue, single-step,
   and signal delivery. It is not used to patch target memory.
@@ -101,18 +109,15 @@ set listed in `docs/RSP.md`: `qSupported`, `g`, `G`, `m`, `M`, `c`, `s`,
 served from observer data. Writes go through `process_vm_writev` and
 `PTRACE_SETREGSET` at a stop point.
 
-## PE engine (not implemented)
+## PE engine
 
-The design for PE support is below. It is written down because the boundary it
-has to respect is worth deciding in advance, and because a reader who finds
-this section should know it describes intent. **None of it is in the tree.**
-`occ run` does not load PE through Wine; exec'ing a `.exe` on Linux hands it
-to the kernel's binfmt handler, and whatever that does is not this project's
-work. `docs/ROADMAP.md` has the current state.
-
-Runs a user-supplied Wine installation inside the isolation layer as the PE
-loader and API translation layer. Occ does not modify Wine. It hooks Wine's
-Unix-side `ntdll` through a uprobe and turns those probes into events.
+The PE engine is in the tree and it does not run a PE image by itself. It
+looks for a Wine loader on the host, assembles a run around the one it
+finds — the loader, a per-run prefix under the run's scratch directory, the
+library directory bound read-only, and the `.so`-side `Nt*` probes planned
+and placed — and on a host without one it refuses and names what it could
+not find. It does not modify Wine. It hooks Wine's Unix-side `ntdll`
+through a uprobe and turns those probes into events.
 
 Fidelity is bounded by the Wine build supplied. Timing-sensitive,
 SEH-detail-sensitive, and undocumented-structure-sensitive anti-analysis
@@ -123,6 +128,11 @@ of implying universal coverage.
 A stripped Wine with no dynamic symbol table degrades function-level
 observability to syscall-level only. This is a reduction in granularity,
 not a failure, and is reported as such.
+
+The APK engine reads a package and refuses to run it. An APK is a zip whose
+native code is a `lib/*/lib*.so` inside it; occ has no Android runtime, so
+the engine names the manifest, the dex and the native libraries and reports
+that they were not run. `docs/ROADMAP.md` has the current state.
 
 ## Build
 
@@ -170,12 +180,19 @@ OCC_ENABLE_FUZZ=ON cmake -S . -B build-fuzz -G Ninja
 include/occ/     public headers
   syscall/       typed syscall wrappers, one per syscall
   isolation/     namespaces, rootfs, cgroup, seccomp
-  observer/      ebpf, perf, ptrace control, event encoding
-  parser/        elf, pe, zip, axml
-  engine/        pe (exe) engine
-  runner/        gdb rsp, ndjson, adb
-  util/          logging, procfs, strings, hexdump
+  observer/      event encoding, ptrace control, rsp server, transport,
+                 watchpoints, W^X tracking, uprobes, the Wine ntdll
+                 probe table
+  parser/        elf, pe, format detection
+  engine/        one engine per format: elf, pe, apk
+  runtime/       the PE-facing runtime: address space, loader, mapper,
+                 export resolution, ntdll
+  probe/         turning a requested symbol into a placed uprobe
+  runner/        spawning a target under the isolation and observation
+                 layers
+  util/          logging, filesystem, strings, spans
 src/             implementation, mirrors include/occ
+  main.cpp, cmd_*.cpp   the subcommands
 tests/           unit tests
 fuzz/            libFuzzer harnesses
 docs/            design notes
@@ -191,7 +208,12 @@ tools/           development helpers, not shipped
 - `docs/BUILD.md` — toolchain details, static linking, reproducible flags
 - `docs/ROADMAP.md` — what is implemented, what is not, in plain terms
 - `docs/COMPAT.md` — hosts this has actually been built and run on
+- `docs/RUNTIME.md` — the PE-facing runtime: loader, address space,
+  relocations, export resolution, and the `ntdll` surface
 
 ## License
 
-See `LICENSE`.
+No license has been declared for this repository. There is no `LICENSE`
+file, and nothing in the build, the CMake configuration, or the history so
+far states one. Until a license is added, the default copyright rules
+apply and the code is not licensed for reuse by anyone.

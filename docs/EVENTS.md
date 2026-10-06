@@ -139,7 +139,7 @@ syscall pair, and the last three, with the middle of the syscall log cut:
 
 **Observation is mostly syscalls.** Five kinds carry the session's structure
 and the rest is a syscall log, so a consumer that wants the structure filters
-the other eleven kinds out.
+the other twelve kinds out.
 
 Two details are visible in the sample and are not obvious from the schema.
 **Entry and exit do not pair up**: 29 entries against 28 exits, because the

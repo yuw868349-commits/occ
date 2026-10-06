@@ -9,10 +9,10 @@ strange, the answer is probably here.
 Occ links against libc++ and the kernel. Nothing else.
 
 That rule has a cost and it is paid deliberately. The components that
-matter — the isolation setup, the seccomp emitter, the eBPF emitter, the
-parsers, the RSP server — are where the project's correctness lives, and
-they are small enough to own outright. A security boundary that delegates
-to a dependency is a boundary whose behavior you cannot fully describe.
+matter — the isolation setup, the seccomp emitter, the parsers, the RSP
+server — are where the project's correctness lives, and they are small
+enough to own outright. A security boundary that delegates to a dependency
+is a boundary whose behavior you cannot fully describe.
 
 The rule does not extend to reinventing tools that are not part of the
 boundary. Occ does not contain a disassembler or an emulator. Those belong
@@ -105,41 +105,38 @@ analyst's time. The default is `EPERM`; kill-on-violation is opt-in.
 
 ### Network
 
-Default-deny, always. The namespace is created without a network
-interface, so "deny" is the absence of a path rather than a rule that
+Default-deny, always. `CLONE_NEWNET` is among the namespaces the container
+is created with, so "deny" is the absence of a path rather than a rule that
 could be misconfigured.
 
-When network is requested, a veth pair is created and nftables rules are
-written through netlink directly. There is no `slirp4netns`, no userspace
-network stack. The rules are NAT for outbound and a drop for inbound,
-which is the minimum that makes a package manager work.
+There is no opt-in path. Setting up a veth pair and writing nftables rules
+through netlink is not implemented, so a run gets an empty network namespace
+and stays there. A target that needs to reach a package manager does not get
+a route. This is stated rather than deferred because the capability and the
+absence of it look the same from outside: the run is silent either way.
 
 ## The observer layer
 
-### eBPF without libbpf
-
-Programs are assembled as raw instruction arrays. Maps are created and
-updated through the `bpf` syscall. There is no BTF and no CO-RE.
-
-The consequence is that struct field offsets are not known at compile
-time. They are read at runtime from `/sys/kernel/tracing/events/<cat>/<name>/format`,
-which the kernel generates and keeps current. This is slower at startup
-and correct across kernel versions, which is the right trade for a tool
-that must not break when the host is updated.
+The consequence is that the filter is described by a typed policy rather than
+by bytes, which is the boundary that matters: the emitter's input is a
+`SeccompPolicy` the caller assembles, so a caller cannot hand it an
+arbitrary program. That is also why the emitter is not fuzzed from bytes --
+`fuzz/README.md` explains what the seccomp harness does instead.
 
 ### Ring buffer and backpressure
 
-The ring buffer has a fixed capacity. When it fills, the kernel drops
-events and increments an overrun counter. Occ reads that counter and emits
-a `dropped` event carrying the count.
+The perf ring used for watchpoints and uprobes has a fixed capacity. When it
+fills, the kernel drops records and reports `PERF_RECORD_LOST`. Occ reads
+that count and reports it: a lost watchpoint sample or uprobe hit appears in
+the session summary as a degradation rather than as an absence.
 
-Losing events silently would make every downstream conclusion suspect.
+Losing records silently would make every downstream conclusion suspect.
 Reporting the loss makes it a fact the analyst can weigh.
 
-The consumer runs on its own thread. The producer is the kernel, so the
-only backpressure available is capacity; the consumer is written to drain
-faster than the producer can fill, and the drop event is the signal that
-it failed to.
+Syscall records do not go through a ring at all. They are read from the
+register block at a `PTRACE_SYSCALL` stop, so there is no buffer to overrun
+and no loss to report; the cost is a stop per syscall, which is the trade
+this design makes for not needing an eBPF program attached to the host.
 
 ### Hardware breakpoints
 
@@ -152,9 +149,10 @@ debugger decide. A software breakpoint writes `0xCC` into the target,
 which changes what the target observes, which changes what it does. That
 is a decision for the person driving the debugger, not for the tool.
 
-`--allow-int3-fallback` opts in explicitly. When it is on, software
-breakpoints appear in the event stream as their own event type so that no
-consumer can mistake one for a hardware breakpoint.
+There is no software-breakpoint mode to opt into. `Watchpoints` is hardware
+only, and `int3.cpp` does not exist: an implementation that wrote `0xCC`
+into target text would contradict the "target unmodified" claim that
+`docs/SECURITY.md` makes, and there is no flag that turns a claim off.
 
 ### ptrace
 

@@ -133,10 +133,19 @@ NtCreateFile
           not by a chain of conditionals
 ```
 
-Cards are executable. `occ doctor` runs the card suite against the runtime
-and reports which cards pass. This is the measurable completeness that a
-patch list cannot provide: a card either passes or it does not, and the
-count of passing cards is a number that can be compared between builds.
+Cards are not executable here. An earlier version of this file claimed that
+`occ doctor` runs the card suite against the runtime and reports which cards
+pass, and that the count of passing cards is a number two builds can be
+compared on. None of that is implemented: `occ doctor` reports thirteen
+checks about the host — identity, kernel, procfs, namespaces, mounts,
+cgroup v2, seccomp, bpf, perf_event, tracefs, binderfs, kernel config — and
+nothing about the runtime. The cards are prose in this document, and a card
+is checked by the assertions in the test that covers the call, not by a
+runner.
+
+That is a weaker guarantee than an executable card and it is the reason the
+idea is written down: the ordering claims above are the ones a test asserts
+one at a time, and nothing in the tree collects them into a single number.
 
 ## What is built, in order
 
@@ -153,8 +162,12 @@ programs this runtime is for are not games that need to be rescued. A
 refusal that names the field and the constraint is worth more here than a
 load that succeeds for reasons the reader cannot see.
 
-Events: `image_mapped` (base, size, protection, per section),
-`relocation_applied` (address, type, delta), `tls_initialized`.
+Events: the image's shape is reported through the `image_loaded`,
+`mapping`, `section` and `import` kinds. There is no per-relocation or
+per-TLS event: `docs/EVENTS.md` has the seventeen kinds that exist, and
+neither `relocation_applied` nor `tls_initialized` nor `image_mapped` is
+one of them. What the loader decides is observable through `occ check`,
+which prints the placement plan rather than emitting records for it.
 
 Depends on: `parser::PeImage`, which already parses the headers and
 sections. The loader adds the mapping, the relocation pass, and the TLS
@@ -762,7 +775,7 @@ an address already occupied, and then failed with `EEXIST` at an address the
 finder had certified as free. A probe that cannot release what it took has
 not found a free range; it has moved one.
 
-87 checks. Three mutations were tried against it and each is caught by the
+92 checks. Three mutations were tried against it and each is caught by the
 case written for it: removing `MAP_FIXED_NOREPLACE` (11 failures), removing
 the batch's rollback (1 failure, the case that exists for exactly that), and
 stripping modifiers instead of refusing them (6 failures).
@@ -924,7 +937,7 @@ which compares the regions and the high water — and the loosening was checked
 by re-tightening it and confirming the seeds still fail, so that a weaker
 assertion is not doing the work of a missing fix.
 
-**412 checks, 28 mutations, none surviving.** The 28 are the ones a
+**382 checks, 28 mutations, none surviving.** The 28 are the ones a
 plausible mistake would make, and the report is written to be worth what they
 were worth: four are rejected by the compiler and counted separately rather
 than as coverage, and two more are documented in the harness as

@@ -9,47 +9,56 @@ that added this file.
 
 ## Where the code is
 
-About 20,700 lines across 62 files. The distribution is uneven on purpose —
-the observation layer is the product, and it is the deepest part.
+About 33,600 lines across 72 files under `src/` and `include/`. The
+distribution is uneven on purpose — the observation layer is the product,
+and it is the deepest part.
 
 | Area | Files | State |
 |---|---|---|
 | `src/observer/` | 10 | The deepest part. Event schema, ptrace control, RSP server, transport, watchpoints, W^X tracking, uprobes, the Wine ntdll probe table |
+| `src/runtime/` | 5 | The PE-facing runtime: address space, image loader, mapper, export resolution, the `ntdll` surface |
+| `src/` (top level) | 6 | `main.cpp` and the five subcommand files |
+| `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 | `src/util/` | 4 | Strings, spans, filesystem, logging |
+| `src/parser/` | 3 | ELF parsing including the dynamic symbols, PE parsing, format detection |
 | `src/isolation/` | 2 | Namespaces, overlay root, cgroup v2, seccomp BPF, capabilities |
 | `src/syscall/` | 2 | Syscall numbers, errno, kernel ABI |
-| `src/parser/` | 3 | ELF parsing including the dynamic symbols, PE parsing, format detection |
-| `src/runner/` | 1 | Spawns a target under the isolation and observation layers |
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
-| `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
+| `src/runner/` | 1 | Spawns a target under the isolation and observation layers |
 
-The test suite is 2,924 assertions across twenty binaries. The counts are what
-the binaries print, not what the sources appear to contain — the two differ,
-because a check written across several lines is one assertion to a reader and
-none to a grep:
+The test suite is 2,725 assertions across twenty binaries. The counts are
+what the binaries print, not what the sources appear to contain — the two
+differ, because a check written across several lines is one assertion to a
+reader and none to a grep:
 
 | Test | Assertions |
 |---|---|
 | `test_pe` | 466 |
-| `test_engine` | 437 |
-| `test_runtime_loader` | 412 |
+| `test_runtime_loader` | 382 |
+| `test_observer` | 345 |
 | `test_ntdll` | 208 |
-| `test_observer` | 263 |
 | `test_placement` | 193 |
 | `test_elf` | 150 |
+| `test_engine` | 134 |
 | `test_runtime_exports` | 121 |
-| `test_uprobe` | 108 |
-| `test_ntdll_probes` | 102 |
+| `test_uprobe` | 128 |
+| `test_ntdll_probes` | 99 |
 | `test_mapper` | 92 |
+| `test_seccomp` | 91 |
 | `test_detect` | 65 |
-| `test_seccomp` | 63 |
 | `test_placer` | 46 |
 | `test_event` | 43 |
 | `test_seeds` | 41 |
 | `test_probe_wiring` | 36 |
+| `test_container` | 32 |
 | `test_gdb_interop` | 29 |
-| `test_container` | 25 |
 | `test_check` | 24 |
+
+Three of those counts are lower here than a build without a Wine
+installation would report. `test_engine` skips the probe-planning check, and
+`test_ntdll_probes` skips the symbol check, when no Wine `ntdll` is present
+on the host; both print the skip in a note rather than passing silently. The
+figures above are from a host with no Wine.
 
 `test_gdb_interop` is the one that does not run without a peer. It forks the
 host's gdb and drives a real attach, register read and detach through a
@@ -84,11 +93,13 @@ refusing to frame an empty payload at all. They are now different types
 `$#00` as the packet it is, and the decoder accepts one instead of reporting
 a checksum failure that the sender can never correct.
 
-**The event stream.** Thirteen event kinds on a Unix domain socket, one JSON
-object per line. Dropped events are reported as their own kind rather than
-lost, which is the property that makes a trace worth reading.
+**The event stream.** Seventeen event kinds on a Unix domain socket, one
+JSON object per line. Dropped events are reported rather than lost, which is
+the property that makes a trace worth reading: a lost uprobe hit is counted
+and reported as a degradation in the session summary, so a consumer can tell
+a function that was not called from a hit the kernel dropped.
 
-`file_opened` was one of the thirteen with a name and an enum value and no
+`file_opened` was one of the seventeen with a name and an enum value and no
 producer — `src/observer/event.cpp` mapped it to a string and
 `tests/test_event.cpp` built one to exercise the writer, and nothing in `src/`
 created one. It is implemented now: the path is read at the syscall's entry,
@@ -104,11 +115,12 @@ covered rather than implying the region was watched.
 overlay root over `pivot_root`; a cgroup v2 subtree; a default-deny seccomp
 filter from a bytecode emitter in the tree.
 
-**Isolation without the target knowing.** Syscalls come from eBPF attached to
-raw tracepoints, with field offsets read from tracefs at runtime — no libbpf,
-no BTF, no CO-RE. Memory is read with `process_vm_readv` from outside. The
-`ptrace` in the tree is for process control only, and `docs/SECURITY.md`
-draws that line explicitly.
+**Isolation without the target knowing.** Syscalls come from `PTRACE_SYSCALL`
+stops, with the register block read at the stop. Memory is read with
+`process_vm_readv` from outside. There is no eBPF program in this codebase:
+the filter is seccomp-BPF, which is a different thing that shares the `bpf`
+syscall. The `ptrace` in the tree is for process control and register access
+only, and `docs/SECURITY.md` draws that line explicitly.
 
 ## What does not work
 
@@ -194,14 +206,15 @@ inside the program, the program ends in a return, the reported count is the
 emitted one, the preamble is the five instructions the layout documents, and
 every rule's number is in the dispatch table. The one thing a fuzzer would
 reach for and cannot have is the kernel's verdict on the result, and that is
-`occ_test_seccomp`'s -- forty-nine filters, really installed, in a build
-without a sanitizer. Building it already found a real hole in the harness
+`occ_test_seccomp`'s -- 91 assertions, of which 37 install a real filter in a
+forked child and make a call it has an opinion about, in a build without a
+sanitizer. Building it already found a real hole in the harness
 itself, which is in `fuzz/README.md` under the heading about invariants that
 were wrong.
 
-**Syscall tracing needs a tracepoint that exists.** The eBPF programs attach
-to raw tracepoints whose field offsets are read at runtime. A kernel without
-the expected tracepoint produces no syscall events rather than an error, and
+**Syscall tracing needs a host that lets occ attach.** The syscall path is
+`PTRACE_SYSCALL` on the tracee, which needs `CAP_SYS_PTRACE` or root. A host
+that refuses the attach produces no syscall events rather than an error, and
 the run continues. `occ doctor` reports what the host has.
 
 **Function-level observation needs a tracefs.** A uprobe is registered by
@@ -230,8 +243,8 @@ up front is cheaper than a user discovering it.
 
 **`capabilities` has no dedicated test file.** Zero, against a pair of
 wrappers in `src/syscall/syscall.cpp` that a container setup calls to drop what
-it should not keep. The seccomp half has grown to 63 assertions covering a BPF
-emitter that is 402 lines of arithmetic on a structure the kernel rejects
+it should not keep. The seccomp half has grown to 91 assertions covering a BPF
+emitter that is 467 lines of arithmetic on a structure the kernel rejects
 without explanation; the capability half has a syscall wrapper and no test that
 it is reached with the right arguments. The security boundary is the part with
 the least test coverage, which is the wrong way round and is stated here rather
@@ -269,11 +282,14 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 2,924 assertions and needs no network. Three of the twenty
-binaries need a target binary and a host that permits namespaces and seccomp,
-one needs a gdb on `PATH`, and one needs a `python3` to re-run the seed
-generator; those are skipped rather than failed where the host does not have
-them, and the skip says so in a note. That last one is worth naming here: it
+The test suite is 2,725 assertions and needs no network. Six of the twenty
+binaries can skip: two need a host that permits namespaces and seccomp
+(`test_seccomp`, `test_container`), two need a Wine installation to find an
+`ntdll` in (`test_engine`, `test_ntdll_probes`), one needs a handwritten PE
+fixture on disk (`test_runtime_loader`), one needs a gdb on `PATH`, and one
+needs a `python3` to re-run the seed generator. Those are skipped rather than
+failed where the host does not have them, and the skip says so in a note. The
+last one is worth naming here: it
 is the only test whose skip weakens a guarantee rather than a measurement,
 because nothing else would notice a seed drifting away from the generator
 that describes it. A claim in this file that can be checked should be checked
