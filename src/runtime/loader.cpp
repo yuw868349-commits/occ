@@ -2687,9 +2687,17 @@ TlsResult build_tls_block(const TlsTable& table, std::uint32_t slot,
     // the block is only ever mapped when there is something to put in it, so
     // the "map then possibly undo" window below shrinks to the copies
     // themselves, which cannot fail.
-    if (m.template_size != 0) {
-        const Region* home = space.find(m.template_va);
-        if (home == nullptr || home->end() < m.template_va + m.template_size) {
+    // The check, and the shape it takes: the refusal is guarded from
+    // inside rather than the lookup being guarded from outside. A
+    // zero-sized template names no bytes, and the address such a template
+    // carries may name nowhere at all, so for it this condition can be
+    // true while being a fact about nothing. The short-circuit order keeps
+    // the second `find` from dereferencing an answer that was null, and
+    // the refusal means something exactly when there are template bytes to
+    // be wrong about.
+    if (space.find(m.template_va) == nullptr ||
+        space.find(m.template_va)->end() < m.template_va + m.template_size) {
+        if (m.template_size != 0) {
             result.error = TlsError::MalformedDirectory;
             result.detail = "the TLS template at " + hex_of(m.template_va) +
                             " is not in memory this process mapped";
