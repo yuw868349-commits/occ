@@ -137,12 +137,39 @@ public:
     // and does the placement itself, descending from the ceiling in granularity
     // steps and asking the kernel to confirm each candidate.
     //
-    // A `ceiling` of zero means the default: `map()` with no ceiling. The two
-    // are not spelled as one function with a defaulted argument because the
-    // default would have to be "no ceiling" and a caller reading `map(0, n, p,
-    // k, {}, 0, 0)` cannot tell that from a ceiling of zero, which is a real
-    // address and the bottom of the user window.
+    // A `ceiling` of zero is refused rather than read as "no ceiling": zero is
+    // a real address (the bottom of the user window) and a caller that meant
+    // "no constraint" wants `map_above` below, which starts at the floor and
+    // walks up. Spelling one function with a defaulted argument would make a
+    // caller reading `map_below(0, n, p, k)` unable to tell a ceiling of zero
+    // from a missing argument.
     Result<std::uint64_t> map_below(std::uint64_t ceiling, std::uint64_t size,
+                                    PageProtection protection,
+                                    RegionKind kind) noexcept;
+
+    // The same, with the caller naming the lowest address the result may use,
+    // and the search ascending from it.
+    //
+    // **This is the placement an unconstrained request wants, and Windows
+    // hands section views out this way.** `map_below` starts at the ceiling and
+    // walks down, which fits "at or above nothing, below this"; an
+    // unconstrained view has no ceiling, and the choice is between starting at
+    // the top of the user window and starting at the bottom. Windows starts at
+    // the bottom, and the difference is observable: a view placed a few
+    // granules below `kUserMax` leaves no room for a caller that then asks for
+    // "at or above this plus an alignment", which is an ordinary request and
+    // was unsatisfiable while the view placement used the descending search
+    // with the window's top as its ceiling.
+    //
+    // Every candidate is a granularity multiple and every attempt is a real
+    // `MAP_FIXED_NOREPLACE`, for the reasons `map_below` gives at length: the
+    // ledger knows what this process mapped and the kernel knows what anything
+    // mapped, and only the kernel's answer decides whether a mapping can
+    // happen. That is also what makes this placement guarantee the granularity
+    // a view is required to have -- `mmap(NULL, size)` promises page alignment
+    // only, and a view placed by the kernel's own search is on a granularity
+    // boundary by luck.
+    Result<std::uint64_t> map_above(std::uint64_t floor, std::uint64_t size,
                                     PageProtection protection,
                                     RegionKind kind) noexcept;
 
@@ -181,13 +208,15 @@ public:
 
     // Changes a region's protection and updates the ledger.
     //
-    // The whole region changes. A partial protect would split it, for the
-    // reason unmap() does not, and Windows's NtProtectVirtualMemory does
-    // allow a partial one -- so this is a limit of this API and not a
-    // statement about the platform. It is the limit that lets the change
-    // counter mean what its comment says: a region that has had its
-    // protection changed twice is a different story from one changed fifty
-    // times, and a per-region count is only a per-region count.
+    // **The whole region changes, and that is this operation's definition and
+    // not a limitation.** A caller that wants to change part of a region is
+    // asking for `protect_in_range()` below, which cuts the ledger; this
+    // exists for the callers for which "a whole region" is the right answer
+    // -- a section view being re-protected as a unit, say -- and keeping the
+    // two separate is what lets the change counter mean what its comment
+    // says: a region that has had its protection changed twice is a different
+    // story from one changed fifty times, and only a whole-region change keeps
+    // that count exact.
     //
     // PAGE_GUARD is refused. A guard page is a page whose first touch
     // signals and which then becomes ordinary, and Linux has no mprotect
@@ -199,6 +228,35 @@ public:
     // has a buffer overflow that does not fault.
     Result<std::uint32_t> protect(std::uint64_t base,
                                   PageProtection protection) noexcept;
+
+    // Changes the protection of a range that may be part of a region, and
+    // cuts the ledger so the change is recorded against the range alone.
+    //
+    // This is `NtProtectVirtualMemory`, and the cut is the point: Windows
+    // changes the pages the caller named and no others, so a region that is
+    // only partly protected stops being one region. `split()` in the address
+    // space does the cutting and `set_protection_at()` records the change on
+    // the piece that was cut, which is why this is not a variant of
+    // `protect()` above -- that one deliberately acts on the whole region,
+    // and saying it twice under one name would make the two callers
+    // impossible to tell apart in a diff.
+    //
+    // **Every page in the range must already be committed.** Windows answers
+    // `STATUS_NOT_COMMITTED` for a range that includes a reserved page, and
+    // does so *before* changing anything, because a protect is not a commit
+    // and a caller that protected half a reservation would otherwise believe
+    // it had memory it does not. The check is here rather than in the ntdll
+    // layer because the ledger is here.
+    //
+    // The range is the one the caller rounded; this does not round, because
+    // the ntdll layer has already computed the range Windows computes
+    // (`ROUND_SIZE`) and a second rounding here would either be a no-op or a
+    // disagreement with the ledger.
+    //
+    // Returns the new protection change count of the piece that was changed,
+    // or a status: `NotCommitted`, `InvalidParameter`, or `InvalidAddress`.
+    Result<std::uint32_t> protect_in_range(std::uint64_t base, std::uint64_t size,
+                                            PageProtection protection) noexcept;
 
     // Changes the protection of a range that may be inside a region, without
     // touching the ledger.

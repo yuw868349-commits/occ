@@ -540,10 +540,14 @@ public:
     // rather than silent.
     //
     // Returns the region's size, or InvalidAddress when no region starts at
-    // `base`. Requiring the start rather than any address inside is the same
-    // rule unmap() follows and for the same reason: a removal of a range
-    // inside a region would have to decide what happens to the two halves,
-    // and this type does not split.
+    // `base`. Requiring the start rather than any address inside is the rule
+    // unmap() follows, and it is a decision about *this* operation rather than
+    // a property of the type: a removal of a range inside a region would have
+    // to decide what happens to the two halves, and nothing here needs that.
+    // The operations that do act on part of a region -- `decommit()`,
+    // `commit()` and a partial `NtProtectVirtualMemory` -- cut it with
+    // `split()` first and then act on the piece, which is the same decision
+    // made where it is wanted rather than everywhere.
     Result<std::uint64_t> remove(std::uint64_t base) noexcept;
 
     // Changes a region's recorded protection and counts the change.
@@ -563,6 +567,54 @@ public:
     Result<std::uint32_t> set_protection(std::uint64_t base,
                                           PageProtection protection) noexcept;
 
+    // The same change, addressed by the index `split()` returned.
+    //
+    // A partial protection change has already cut the range out and holds the
+    // index of the piece it cut; looking that piece up again by its base would
+    // be the same search done twice, and worse, it would be a search that has
+    // to succeed for the change to be recorded at all. The index is exact --
+    // `split()` just returned it and nothing between the two calls holds a
+    // pointer into the vector, which is the condition the header's warning
+    // about `find()` spells out.
+    //
+    // Returns the new protection change count, or InvalidAddress when the
+    // index is past the end.
+    Result<std::uint32_t> set_protection_at(std::size_t index,
+                                            PageProtection protection) noexcept;
+
+    // Cuts `[base, base + size)` out of the region that contains it, so that
+    // the range is afterwards a region of its own.
+    //
+    // **This is the geometry half of every operation that acts on part of a
+    // region, and it is written once for that reason.** `MEM_DECOMMIT` and a
+    // partial `NtProtectVirtualMemory` both need the same thing -- the range
+    // they act on must stop sharing a ledger entry with its neighbours, or the
+    // change they make cannot be recorded as belonging to the range rather
+    // than to the whole region -- and a second copy of this cut is where the
+    // two would drift apart. It cuts into up to three pieces: a head before
+    // the range, the range itself, and a tail after it, keeping only the
+    // pieces that have a non-zero size.
+    //
+    // The fields of the middle piece are copied from the region it came out
+    // of, so a caller that wants to change something flips it afterwards
+    // through the returned index. `protection`, `initial_protection`,
+    // `protection_changes`, `section`, `kind` and `committed` all survive the
+    // cut, because the cut is a statement about which addresses belong to
+    // which entry and not about what the memory is.
+    //
+    // Unlike `decommit()`, this does not round: it cuts exactly where it is
+    // told. The caller does the rounding, because the direction depends on the
+    // operation -- a decommit rounds outward to whole pages, and a caller that
+    // wants the cut to match what the kernel was asked for has to be the one
+    // that decided the kernel's range.
+    //
+    // Returns the index of the middle piece, or a status. Refuses when no
+    // region contains the range, when the region is not private memory, or
+    // when the range reaches past the region's end -- the same conditions
+    // `decommit()` refuses on, checked here rather than at each call site so
+    // that a caller cannot forget one of them.
+    Result<std::size_t> split(std::uint64_t base, std::uint64_t size) noexcept;
+
     // Marks a range reserved and cleared of its commit, splitting the region
     // it lies in if the range does not cover it whole.
     //
@@ -571,7 +623,8 @@ public:
     // occupies. The range may start anywhere inside a region and may end
     // anywhere inside it -- Windows allows a decommit of the middle and is the
     // reason the operation cannot be an `unmap()` -- so the region is cut into
-    // up to three parts and only the middle one loses its commit.
+    // up to three parts and only the middle one loses its commit. The cut
+    // itself is `split()`, which is shared with a partial protection change.
     //
     // Returns the number of bytes decommitted, or a status. The cut is
     // page-aligned outward: a range that starts or ends inside a page takes the
@@ -582,14 +635,29 @@ public:
     // the region that contains it, or when the region is not private memory.
     Result<std::uint64_t> decommit(std::uint64_t base, std::uint64_t size) noexcept;
 
-    // Marks a region committed again after a decommit.
+    // Marks a range committed after a decommit, splitting the region it lies
+    // in if the range does not cover it whole.
     //
     // This is `MEM_COMMIT` into a reservation that a `MEM_DECOMMIT` had
-    // cleared, and it is the other half of the three-state model: the addresses
-    // never moved, so nothing is cut here and the region is flipped back in
-    // place. Returns the region's size, or InvalidAddress when no region starts
-    // at `base`.
-    Result<std::uint64_t> commit(std::uint64_t base) noexcept;
+    // cleared, and it is the other half of the three-state model. **It takes a
+    // range and not just a base because Windows lets a program commit part of
+    // a reservation**: committing the middle of a reservation is ordinary --
+    // a program reserves a large arena and commits it a page at a time as it
+    // needs it -- and an implementation that only accepted a whole reservation
+    // would force the caller to commit memory it is not going to use. The cut
+    // is `split()`, the same one a decommit uses, so a commit and the decommit
+    // that precedes it are exact inverses.
+    //
+    // The cut is page-aligned outward, like a decommit's, because a page is
+    // the unit the kernel commits and a half-page reservation cannot exist.
+    //
+    // A range that is already committed is a success and not an error:
+    // Windows lets a program commit a range twice. Nothing is flipped then,
+    // and the change counter stays put -- a commit is not a protection change.
+    //
+    // Refuses, rather than answering success, when the range reaches outside
+    // the region that contains it, or when the region is not private memory.
+    Result<std::uint64_t> commit(std::uint64_t base, std::uint64_t size) noexcept;
 
     // Finds the region containing an address, or nothing.
     //

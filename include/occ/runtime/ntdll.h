@@ -1073,9 +1073,12 @@ Result<std::uint64_t> nt_map_view_of_section_ex(
 
 // Unmaps a view.
 //
-// The whole region, and the region's base -- the same rule
-// `nt_free_virtual_memory` has, and for the same reason: this type does not
-// split regions.
+// The whole region, and the region's base -- the rule
+// `nt_free_virtual_memory` has, and it is a decision about the operation
+// rather than a limit of the type: `NtUnmapViewOfSection` in Windows names a
+// view, and a view is a region here, so there are no two halves to decide
+// about. The operations that do act on part of a region cut it with
+// `AddressSpace::split()` first.
 Result<std::uint64_t> nt_unmap_view_of_section(NtContext& ctx,
                                                std::uint64_t* addr,
                                                std::uint64_t* size) noexcept;

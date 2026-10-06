@@ -33,6 +33,14 @@ BUILD=/workspace/Occ/build
 BUILD_SAN=/workspace/Occ/build-asan
 TEST="$BUILD/tests/occ_test_ntdll"
 TEST_SAN="$BUILD_SAN/tests/occ_test_ntdll"
+# The layer is exercised from three files and a mutant caught anywhere is
+# caught. `occ_test_ntdll` reaches the calls, but `Mapper::protect`'s own
+# semantics -- a protection is not a commit -- are asserted in
+# `occ_test_mapper`, and a `Mapper` mutant that ntdll's path never runs through
+# would come back SURVIVED from a binary that was never asked about it. A
+# survivor has to mean the suite is blind, not that the wrong suite was run.
+SUITE="$BUILD/tests/occ_test_mapper $BUILD/tests/occ_test_placement"
+SUITE_SAN="$BUILD_SAN/tests/occ_test_mapper $BUILD_SAN/tests/occ_test_placement"
 SRC=/workspace/Occ/src/runtime/ntdll.cpp
 HDR=/workspace/Occ/include/occ/runtime/ntdll.h
 MAPPER=/workspace/Occ/src/runtime/mapper.cpp
@@ -154,7 +162,7 @@ PYEOF
     fi
     # The plain run first, because a mutant that segfaults or fails an
     # assertion is caught by the fastest signal available.
-    if ! "$TEST" >"$WORK/run.log" 2>&1; then
+    if ! "$TEST" >"$WORK/run.log" 2>&1 || ! $SUITE >"$WORK/run-suite.log" 2>&1; then
         echo "  [$name] caught"
         caught=$((caught + 1))
         restore
@@ -171,13 +179,13 @@ PYEOF
         restore
         return
     fi
-    if "$TEST_SAN" >"$WORK/run-san.log" 2>&1; then
+    if "$TEST_SAN" >"$WORK/run-san.log" 2>&1 && $SUITE_SAN >"$WORK/run-san-suite.log" 2>&1; then
         echo "  [$name] SURVIVED"
         survived=$((survived + 1))
         failed_names+=("$name")
         echo "      (passed under the sanitizer too -- a real gap, not a stale binary)"
     else
-        if grep -q "AddressSanitizer" "$WORK/run-san.log"; then
+        if grep -q "AddressSanitizer" "$WORK/run-san.log" "$WORK/run-san-suite.log" 2>/dev/null; then
             echo "  [$name] caught (AddressSanitizer -- the plain run passed it)"
         else
             echo "  [$name] caught (sanitizer build)"
@@ -545,8 +553,8 @@ mutate "a-protect-recommits-a-reservation" "$SPACE" \
 # ordinary memory and a recommit of it is a no-op that reports success, while
 # the pages are mprotected away and the program faults on its next touch.
 mutate "a-decommit-does-not-clear-the-commit" "$SPACE" \
-"    middle.committed = false;" \
-"    middle.committed = true;"
+"    regions_[cut.value].committed = false;" \
+"    regions_[cut.value].committed = true;"
 
 # The empty-range case refused instead of answered with success. When the two
 # roundings meet there are no whole pages to release, Wine returns SUCCESS
@@ -558,12 +566,18 @@ mutate "a-decommit-refuses-an-empty-range" "$SPACE" \
         out.value = 0;
         out.status = Status::Success;
         return out;
-    }" \
+    }
+    const std::uint64_t want = last - first;
+
+    // A decommit of a range that is already reserved" \
 "    if (first >= last) {
         out.value = 0;
         out.status = Status::InvalidParameter;
         return out;
-    }"
+    }
+    const std::uint64_t want = last - first;
+
+    // A decommit of a range that is already reserved"
 
 # The unmap's size read from the region *after* the unmap removed it. This is
 # the use-after-free that AddressSanitizer found and a plain run does not: the
@@ -578,6 +592,140 @@ mutate "the-unmap-size-is-read-after-the-unmap" "$SRC" \
     *size = region->size;
     return Result<std::uint64_t>{base};"
 
+
+# ------------------------------------------------- the range, not the region
+
+# **The whole-region protect, which is the bug this batch removed.** A protect
+# used to change the protection of the entire region the range fell in, so a
+# program that made one page read-only found its neighbour -- which it was still
+# writing to -- faulting, because the runtime had changed memory the caller
+# never named. The damage is silent in one direction and fatal in the other: a
+# whole-region protect that widens access hands out writable memory the caller
+# did not ask for, and one that narrows it takes away memory the caller was
+# using. Wine walks the range (`virtual.c:2039`), and so does this now.
+#
+# The replacement calls `protect_in_range` on the *region's* base and size
+# rather than the range's, which is exactly the old behaviour expressed through
+# the new primitive.
+mutate "a-protect-acts-on-the-region-not-the-range" "$SRC" \
+"        const std::uint64_t step = step_end - cursor;
+        const Result<std::uint32_t> changed = ctx.placement->protect_in_range(
+            cursor, step, static_cast<PageProtection>(new_protect));" \
+"        const std::uint64_t step = ctx.space->find(cursor)->size;
+        const Result<std::uint32_t> changed = ctx.placement->protect_in_range(
+            ctx.space->find(cursor)->base, step,
+            static_cast<PageProtection>(new_protect));"
+
+# The commit check turned into "the first page is committed", which is the
+# per-page mistake the two-pass walk exists to avoid. Windows refuses the whole
+# call with STATUS_NOT_COMMITTED when *any* page in the range is reserved, and
+# refuses it before changing anything. A check that looked only at the first
+# page would protect the committed head and then leave the caller with a range
+# it believes it protected and a call that said it did.
+mutate "the-commit-check-looks-only-at-the-first-page" "$SRC" \
+"        if (!piece->committed) {
+            return refuse<std::uint64_t>(
+                Status::NotCommitted,
+                \"the range covers \" + std::to_string(piece->base) +
+                    \", which is reserved rather than committed: a protection \"
+                    \"change is not a commit, so Windows refuses the whole call\");
+        }" \
+"        if (first_piece && !piece->committed) {
+            return refuse<std::uint64_t>(
+                Status::NotCommitted,
+                \"the first page is reserved\");
+        }"
+
+# A reservation made committable by a protect: the reserved page is treated as
+# committed so the range check passes, and the call silently hands the caller
+# memory that is not there. The status Windows uses to say "no" becomes a
+# success that lies.
+mutate "a-reserved-page-is-treated-as-committed" "$SRC" \
+"        if (!piece->committed) {" \
+"        if (false) {"
+
+# The cut dropped, so the ledger keeps one region while the kernel has two
+# protections. The pages outside the range read as the new protection in the
+# ledger and keep the old one in the kernel, which is a divergence between the
+# two that nothing later repairs -- and the change counter is attributed to the
+# whole region.
+mutate "a-protect-does-not-cut-the-ledger" "$MAPPER" \
+"    const Result<std::size_t> cut = space_->split(base, size);
+    if (!cut.ok()) {
+        return fail<std::uint32_t>(cut.status, 0, base);
+    }
+    const Result<std::uint32_t> changed =
+        space_->set_protection_at(cut.value, protection);" \
+"    const Region* one = space_->find(base);
+    const Result<std::uint32_t> changed =
+        space_->set_protection(one->base, protection);"
+
+# **The `split` result taken from `pieces` instead of from the ledger.** The
+# middle piece's index *within `pieces`* is not its index in the ledger unless
+# the cut happened at the front: `pieces` is spliced in at `insert_at`, and
+# everything before that point in the ledger is still there. Reporting the
+# `pieces` index addresses a region the caller never named, and the damage is
+# silent -- a decommit of the second half of a reservation clears the commit of
+# the first half, and the caller finds memory it did not touch faulting while
+# memory it did decommit does not. This was a real bug, caught by the
+# `not committed: the page the commit did not name is still reserved` assertion.
+mutate "the-split-answers-a-piece-index-not-a-ledger-index" "$SPACE" \
+"    const std::size_t ledger_index =
+        static_cast<std::size_t>(insert_at - regions_.begin()) + middle_index;" \
+"    const std::size_t ledger_index = middle_index;"
+
+# The `split` early return handing back index zero instead of the index of the
+# region it found. When the range already is a whole region the pieces vector
+# holds one entry, and its index in the pieces vector is 0 -- but index 0 in the
+# *ledger* is the first region, which is a different region the moment the range
+# is not the first one. This was a real bug during development: committing the
+# second half of a reservation flipped the `committed` flag on the first half.
+mutate "the-split-early-return-answers-zero" "$SPACE" \
+"    if (pieces.size() == 1) {
+        out.value = static_cast<std::size_t>(at - regions_.begin());
+        out.status = Status::Success;
+        return out;
+    }" \
+"    if (pieces.size() == 1) {
+        out.value = 0;
+        out.status = Status::Success;
+        return out;
+    }"
+
+# A commit committing the whole region rather than the range. The caller reserves
+# an arena and commits one page; a whole-region commit hands it every page, which
+# is memory the program never asked for and a `MEM_DECOMMIT` it does not owe.
+# This is the same class of mistake as the whole-region protect, on the other
+# half of the API.
+mutate "a-commit-commits-the-whole-region" "$SRC" \
+"        const Result<std::uint64_t> committed =
+            ctx.space->commit(base, commit_size);" \
+"        const Result<std::uint64_t> committed =
+            ctx.space->commit(base, reservation_end - base);"
+
+# The commit size rounded to the allocation granularity instead of a page. The
+# granularity is a rule about where a *reservation* starts; a commit names pages
+# inside one, and a size rounded up to 64 KiB reaches past the end of a
+# reservation whose length is not a multiple of 64 KiB -- so a commit of the
+# last page of such a reservation is refused as running past it.
+mutate "a-commit-size-rounds-to-the-granularity" "$SRC" \
+"        const std::uint64_t commit_size =
+            requested_size == 0
+                ? AddressSpace::kPageSize
+                : round_size_from(*addr, requested_size);" \
+"        const std::uint64_t commit_size =
+            AddressSpace::round_up(requested_size, AddressSpace::kGranularity);"
+
+# The commit address rounded to the granularity instead of a page. A commit of
+# the second page of a reservation would be placed at the reservation's start,
+# committing pages the caller did not name and reporting an address it did not
+# ask for.
+mutate "a-commit-address-rounds-to-the-granularity" "$SRC" \
+"        base = want_reserve ? AddressSpace::granularity_round_down(*addr)
+                            : AddressSpace::round_down(*addr,
+                                                       AddressSpace::kPageSize);" \
+"        base = AddressSpace::granularity_round_down(*addr);"
+
 # ------------------------------------------------ the mapper's own placement
 
 # The search giving up early, which is the loader's `still in the way after 64
@@ -586,8 +734,30 @@ mutate "the-unmap-size-is-read-after-the-unmap" "$SRC" \
 # runtime's own mappings. The mutant's effect is a refusal on a machine with
 # terabytes free, and refusals are the failure mode nobody debugs.
 mutate "the-placement-search-gives-up-early" "$MAPPER" \
-"    constexpr std::uint64_t kMaxAttempts = 16384;" \
-"    constexpr std::uint64_t kMaxAttempts = 64;"
+"    constexpr std::uint64_t kMaxAttempts = 16384;
+    for (std::uint64_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (candidate < floor_ || candidate > ceiling_room ||
+            !in_the_user_window(candidate, size)) {" \
+"    constexpr std::uint64_t kMaxAttempts = 64;
+    for (std::uint64_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (candidate < floor_ || candidate > ceiling_room ||
+            !in_the_user_window(candidate, size)) {"
+
+# The same cap in the ascending search, and it is a separate mutant rather than
+# the same one applied twice: the two searches have their own `kMaxAttempts`
+# and a change to one leaves the other alone, which is exactly the shape a
+# single mutant with an ambiguous anchor cannot measure. The reach here is the
+# unconstrained-view path, where a program that has filled the low part of its
+# window still expects a load to place.
+mutate "the-ascending-search-gives-up-early" "$MAPPER" \
+"    constexpr std::uint64_t kMaxAttempts = 16384;
+    for (std::uint64_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (candidate > AddressSpace::kUserMax ||
+            !in_the_user_window(candidate, size)) {" \
+"    constexpr std::uint64_t kMaxAttempts = 64;
+    for (std::uint64_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (candidate > AddressSpace::kUserMax ||
+            !in_the_user_window(candidate, size)) {"
 
 # The search ascending instead of descending. The interesting ceilings are low
 # -- a program asking for memory below 2^32 wants the *lowest* address that

@@ -524,6 +524,74 @@ void test_protect_really_protects() {
     check(m.unmap(at).ok(), "unmap after the protection changes succeeds");
 }
 
+// A protection is not a commit.
+//
+// This is the one field `set_protection` rewrites that it must *not* invent.
+// `make_region` builds every region committed, because that is what mapping
+// produces, so a protection change that rebuilt the region from scratch and
+// kept only the protection would turn a reserved range into a committed one.
+// The program that decommitted a range and then re-protected it would believe
+// it had memory back; the pages are mprotected away, so its next touch faults
+// on memory it was told it owned.
+//
+// The check is on the ledger rather than on the pages, and it has to be:
+// `mprotect` on a reserved range succeeds on Linux whether or not anything was
+// ever committed, so only the state the runtime records distinguishes the two
+// answers. The mutant this test exists for is `updated.committed = true;` in
+// `AddressSpace::set_protection_at`, which the whole ntdll suite passes because
+// `NtProtectVirtualMemory` refuses a reserved range before it ever gets here.
+void test_a_protect_does_not_commit_a_reserved_range() {
+    AddressSpace space;
+    Mapper m(space);
+
+    const Result<std::uint64_t> r =
+        m.map(0, 64 * 1024, PageProtection::ReadWrite, RegionKind::Private);
+    check(r.ok(), "map for the reserved-protect test succeeds");
+    if (!r.ok()) {
+        return;
+    }
+    const std::uint64_t at = r.value;
+
+    // Committed to start with, because `map` produces committed memory, and
+    // checked so the assertion after the decommit is a difference and not the
+    // same answer read twice.
+    const Region* born = space.find(at);
+    check(born != nullptr && born->committed,
+          "a freshly mapped region is committed");
+
+    check(space.decommit(at, 64 * 1024).ok(),
+          "the range decommits before it is protected");
+    const Region* reserved = space.find(at);
+    check(reserved != nullptr && !reserved->committed,
+          "the decommitted range is reserved");
+
+    // The call under test. `Mapper::protect` does not check the commit state
+    // and is not supposed to: it is the whole-region primitive, and the layer
+    // that enforces the Windows rule is `NtProtectVirtualMemory`, which is
+    // tested in `occ_test_ntdll`.
+    check(m.protect(at, PageProtection::ReadOnly).ok(),
+          "protect over a reserved range succeeds");
+
+    const Region* after = space.find(at);
+    check(after != nullptr, "the range is still in the ledger after the protect");
+    check(after != nullptr && !after->committed,
+          "the protect did not commit the reserved range");
+    check(after != nullptr && after->protection == PageProtection::ReadOnly,
+          "the protect did change the protection");
+
+    // And the other direction, so the field is not simply pinned to false: a
+    // commit brings the commit back and a protect after it keeps it.
+    check(space.commit(at, 64 * 1024).ok(),
+          "the range commits again");
+    const Region* recommitted = space.find(at);
+    check(recommitted != nullptr && recommitted->committed,
+          "the recommitted range is committed again");
+    check(m.protect(at, PageProtection::ReadWrite).ok() &&
+              space.find(at) != nullptr &&
+              space.find(at)->committed,
+          "a protect over committed memory leaves it committed");
+}
+
 // The two protections that look like one and are not.
 void test_execute_and_write_copy_translate_separately() {
     // The translation is a function and these are its four executable values
@@ -951,6 +1019,7 @@ int main() {
     test_a_mapping_is_writable_memory();
     test_unmapping_removes_the_pages();
     test_protect_really_protects();
+    test_a_protect_does_not_commit_a_reserved_range();
     test_execute_and_write_copy_translate_separately();
     test_refusals_leave_nothing_behind();
     test_unmap_addresses_a_region_exactly();

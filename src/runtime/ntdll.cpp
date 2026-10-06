@@ -656,15 +656,26 @@ Result<std::uint64_t> nt_allocate_virtual_memory(NtContext& ctx,
     // on each function's own rule.
     std::uint64_t base = 0;
     const std::uint64_t window = zero_bits_limit(zero_bits);
+    const bool want_reserve = (type & mem::kReserve) != 0;
     if (*addr != 0) {
-        base = AddressSpace::granularity_round_down(*addr);
+        // **The rounding depends on the operation, and the two different
+        // roundings are both Windows'.** A reservation is placed at a 64 KiB
+        // boundary, so `MEM_RESERVE` rounds the requested address *down* to
+        // the granularity. A commit names pages inside a reservation that
+        // already exists, so it rounds *down to a page* and no further --
+        // rounding a commit to the granularity would move it to the start of
+        // the reservation, which is a different range from the one the caller
+        // named and would commit pages it did not ask for.
+        base = want_reserve ? AddressSpace::granularity_round_down(*addr)
+                            : AddressSpace::round_down(*addr,
+                                                       AddressSpace::kPageSize);
     }
 
     // The commit bit. `MEM_COMMIT` without `MEM_RESERVE` commits inside an
     // existing reservation, which is the one combination that needs a region
     // to already be there and is handled below rather than by the reserve
-    // path.
-    const bool want_reserve = (type & mem::kReserve) != 0;
+    // path. `want_reserve` itself was computed above, because the rounding of
+    // `base` depends on it.
 
     if (!want_reserve) {
         // Commit-only: inside a region that already exists.
@@ -675,6 +686,18 @@ Result<std::uint64_t> nt_allocate_virtual_memory(NtContext& ctx,
                 "nothing to commit: Windows commits into an existing "
                 "reservation and this runtime will not invent one");
         }
+        // **A commit is page-granular, while the granularity is a rule about
+        // reservation addresses.** `want` above is the requested size rounded
+        // up to 64 KiB, which is what a *reservation* is aligned to; a commit
+        // inside an existing reservation names pages and nothing more, so the
+        // size that matters here is `ROUND_SIZE(addr, size, page_mask)` --
+        // Wine's `virtual.c` commit path computes exactly that, and using the
+        // granularity-rounded size instead would make a commit of the second
+        // page of a reservation reach past the region and fail.
+        const std::uint64_t commit_size =
+            requested_size == 0
+                ? AddressSpace::kPageSize
+                : round_size_from(*addr, requested_size);
         const Region* r = ctx.space->find(base);
         if (r == nullptr) {
             return refuse<std::uint64_t>(
@@ -682,11 +705,34 @@ Result<std::uint64_t> nt_allocate_virtual_memory(NtContext& ctx,
                 "nothing is reserved at " + std::to_string(base) +
                     " to commit");
         }
-        if (base != r->base || r->end() - base < want) {
+        if (r->kind != RegionKind::Private) {
             return refuse<std::uint64_t>(
                 Status::InvalidParameter,
-                "a commit-only request must cover a whole reservation from its "
-                "base; " + std::to_string(base) + " does not");
+                "the range at " + std::to_string(base) +
+                    " is not private memory, and this runtime does not commit "
+                    "pages of a section view");
+        }
+        // **The range must lie inside the reservation, and that is the whole
+        // of the geometry rule.** It used to be "must cover a whole
+        // reservation from its base", which is a rule Windows does not have:
+        // a program reserves an arena and commits it a page at a time, and a
+        // runtime that insisted on the whole reservation would make every
+        // caller commit memory it is not going to use. Wine commits a range
+        // (`virtual.c`, `commit_pages`), and so does this.
+        //
+        // The end is captured *before* the commit, because `commit()` cuts the
+        // ledger and rebuilding the vector is what invalidates `r` -- the
+        // warning the header carries about `find()` is exactly this hazard,
+        // and reading `r->end()` after the call is a use-after-free that a
+        // plain run usually gets away with.
+        const std::uint64_t reservation_end = r->end();
+        if (base + commit_size > reservation_end) {
+            return refuse<std::uint64_t>(
+                Status::InvalidParameter,
+                "the range " + std::to_string(base) + "+" +
+                    std::to_string(commit_size) +
+                    " reaches past the reservation that holds it, and a commit "
+                    "may not extend a reservation");
         }
         // The ledger first, so that a reserved range is marked committed before
         // the kernel's protection change can fail -- and the protection change
@@ -695,23 +741,28 @@ Result<std::uint64_t> nt_allocate_virtual_memory(NtContext& ctx,
         // `committed` and nothing else, and the caller sees the failure either
         // way; an ordering the other way round would let a successful mprotect
         // on a range the ledger still called reserved be reachable.
-        const Result<std::uint64_t> committed = ctx.space->commit(base);
+        const Result<std::uint64_t> committed =
+            ctx.space->commit(base, commit_size);
         if (!committed.ok()) {
             return refuse<std::uint64_t>(
                 committed.status,
                 "the commit of the reservation at " + std::to_string(base) +
                     " could not be recorded");
         }
-        const Result<std::uint32_t> changed =
-            ctx.placement->protect(r->base,
-                                  static_cast<PageProtection>(protect));
+        // The protection is applied to the committed range and not to the
+        // whole reservation. The caller named a range; a `protect()` here
+        // would change the protection of pages it did not name, which is the
+        // same defect the partial-protect fix removed from
+        // `NtProtectVirtualMemory`.
+        const Result<std::uint32_t> changed = ctx.placement->protect_in_range(
+            base, commit_size, static_cast<PageProtection>(protect));
         if (!changed.ok()) {
             return refuse<std::uint64_t>(changed.status,
                                          "the kernel refused the protection "
-                                         "change on the committed region");
+                                         "change on the committed range");
         }
         *addr = base;
-        *size = want;
+        *size = commit_size;
         return Result<std::uint64_t>{base};
     }
 
@@ -1310,32 +1361,105 @@ Result<std::uint64_t> nt_protect_virtual_memory(NtContext& ctx,
                 ", so there is nothing to protect");
     }
 
-    // The whole range must be inside this one region. Wine checks the size
-    // fits (`virtual.c:4912`), and this type does not split regions -- which
-    // is the same reason `Mapper::protect()` changes the whole region and
-    // says so.
-    if (region->end() - base < effective_size) {
-        return refuse<std::uint64_t>(
-            Status::InvalidParameter,
-            "the range extends past the region at " + std::to_string(base) +
-                ", and this runtime does not split a region to protect part of "
-                "it");
+    // **The protection applies to the range and not to the region.** Wine
+    // checks that the range fits one view and then calls `set_protection` on
+    // `[base, base + size)` (`virtual.c:2039`), which walks that range page by
+    // page -- and this runtime now does the same, cutting the ledger so that
+    // the pages outside the range keep the protection they had.
+    //
+    // The range is allowed to span more than one region, which is a place this
+    // runtime is deliberately *more* Windows-correct than Wine. Wine's
+    // `find_view` returns a single view and the call fails if the range
+    // crosses into the next one, so a protect that straddles two adjacent
+    // reservations is refused -- but on Windows the protection is a property
+    // of the pages, not of whatever bookkeeping the kernel keeps, and two
+    // contiguous committed ranges are one range to a caller. `split` and a
+    // per-region walk give the Windows answer.
+    //
+    // The walk is two passes and the order matters: **every** page is checked
+    // before **any** page is changed, so a range whose tail is reserved
+    // refuses the whole call with STATUS_NOT_COMMITTED rather than protecting
+    // the head and then failing. Windows refuses the whole call, and a caller
+    // that saw half its range change would be looking at memory it believes
+    // it protected.
+    const std::uint64_t range_end = base + effective_size;
+    std::uint64_t cursor = base;
+    std::uint32_t previous = 0;
+    bool first_piece = true;
+    while (cursor < range_end) {
+        const Region* piece = ctx.space->find(cursor);
+        if (piece == nullptr) {
+            return refuse<std::uint64_t>(
+                Status::InvalidParameter,
+                "the range reaches address " + std::to_string(cursor) +
+                    ", which is not mapped, so there is nothing to protect");
+        }
+        if (piece->kind != RegionKind::Private) {
+            return refuse<std::uint64_t>(
+                Status::InvalidParameter,
+                "the range covers a region at " + std::to_string(piece->base) +
+                    " that is not private memory, and this runtime does not "
+                    "re-protect a section view");
+        }
+        // Windows's commit rule: a protect is not a commit, and a range that
+        // includes a reserved page is STATUS_NOT_COMMITTED. Note that the
+        // check precedes the change for the whole call and not per piece.
+        if (!piece->committed) {
+            return refuse<std::uint64_t>(
+                Status::NotCommitted,
+                "the range covers " + std::to_string(piece->base) +
+                    ", which is reserved rather than committed: a protection "
+                    "change is not a commit, so Windows refuses the whole call");
+        }
+        if (first_piece) {
+            previous = static_cast<std::uint32_t>(piece->protection);
+            first_piece = false;
+        }
+        const std::uint64_t step_end = std::min(piece->end(), range_end);
+        if (step_end <= cursor) {
+            // A zero-length region cannot be stepped over. The ledger does not
+            // build one -- `record()` refuses a size of zero -- so reaching
+            // here means the ledger is inconsistent, and refusing is the only
+            // answer that cannot loop forever.
+            return refuse<std::uint64_t>(
+                Status::InvalidParameter,
+                "the ledger holds a zero-length region at " +
+                    std::to_string(cursor) + ", so the range cannot be walked");
+        }
+        cursor = step_end;
     }
 
-    const std::uint32_t previous =
-        static_cast<std::uint32_t>(region->protection);
-
-    const Result<std::uint32_t> changed = ctx.placement->protect(
-        region->base, static_cast<PageProtection>(new_protect));
-    if (!changed.ok()) {
-        return refuse<std::uint64_t>(changed.status,
-                                     "the kernel refused the protection change: " +
-                                         std::string(std::strerror(
-                                             ctx.placement->last_failure().error)));
+    // The change, now that the whole range has been shown to be private,
+    // committed memory. The pieces are re-walked because the first pass only
+    // borrowed each region; `protect_in_range` re-checks and cuts.
+    cursor = base;
+    while (cursor < range_end) {
+        const Region* piece = ctx.space->find(cursor);
+        const std::uint64_t step_end = std::min(piece->end(), range_end);
+        const std::uint64_t step = step_end - cursor;
+        const Result<std::uint32_t> changed = ctx.placement->protect_in_range(
+            cursor, step, static_cast<PageProtection>(new_protect));
+        if (!changed.ok()) {
+            // The two passes have already established that these pages are
+            // private and committed, so a failure here is the kernel refusing
+            // an mprotect -- and the honest report is the kernel's, which
+            // `last_failure()` carries.
+            return refuse<std::uint64_t>(
+                changed.status,
+                "the kernel refused the protection change on " +
+                    std::to_string(cursor) + ": " +
+                    std::string(std::strerror(
+                        ctx.placement->last_failure().error)));
+        }
+        cursor = step_end;
     }
 
     // The outputs, on success only -- including `*old_protect`, which the
-    // null check above exists because this line would fault.
+    // null check above exists because this line would fault. `*old_protect` is
+    // the protection of the *first* page, which is what Wine reports
+    // (`virtual.c:5633`, `old = get_win32_prot( vprot, ... )` with `vprot`
+    // filled from `base`), and it is the only page a caller with a
+    // heterogeneous range can be told about through one value.
     *addr = base;
     *size = effective_size;
     *old_protect = previous;
@@ -2753,11 +2877,38 @@ Result<std::uint64_t> nt_map_view_of_section(NtContext& ctx,
     }
 
     // The placement. A requested address is honoured when it is free; a null
-    // one asks the mapper, and a `zero_bits` window narrows where the mapper
-    // may look. Wine hands the window to wineserver as a limit
+    // one is placed by the mapper, and a `zero_bits` window narrows where the
+    // mapper may look. Wine hands the window to wineserver as a limit
     // (`virtual.c:5498`) and there is no server here, so the placement is done
     // in this process -- see `map_below` for why the kernel's own placement
     // cannot be asked for a bounded address.
+    std::uint64_t base = *addr;
+    const std::uint64_t want =
+        AddressSpace::round_up(view_size, AddressSpace::kGranularity);
+    const std::uint64_t window = zero_bits_limit(zero_bits);
+    // **A view with no address named is placed by the ascending search, not by
+    // the kernel's own placement, and the reason is alignment.** `mmap(NULL,
+    // size, ...)` promises page alignment and nothing more: Linux picks a hole
+    // and returns it, and the hole it picks is a 4 KiB-aligned address that is
+    // a 64 KiB multiple only by luck -- of the randomisation of `mmap_base`,
+    // and of where the surrounding mappings happen to end. On a plain run the
+    // luck holds often enough that the view tests passed; under a sanitizer it
+    // does not, and the view cases failed roughly one run in six with "at a
+    // granularity-aligned address" and the two assertions after it. The
+    // failure looked like a race in the mapping code, which is what an
+    // intermittent failure in a mapping test always looks like.
+    //
+    // Windows does not have that luck: a section view is placed on an
+    // allocation granularity boundary, which `NtQueryVirtualMemory` reports and
+    // a program is entitled to rely on. `map_above` is the search that
+    // guarantees it -- every candidate is a granularity multiple and every
+    // attempt is a real `MAP_FIXED_NOREPLACE` -- and it searches *upward* from
+    // the floor, which is where Windows places an unconstrained view.
+    //
+    // A `zero_bits` window keeps the descending search, because a window is a
+    // ceiling and `map_above` has no ceiling to honour. The two branches are
+    // the two shapes of request: "below this" descends, "at or above this (or
+    // unconstrained)" ascends.
     //
     // Note that no probe mapping is made first. An earlier version mapped the
     // size with `mmap(nullptr, ...)` to learn a base and then handed that base
@@ -2765,15 +2916,15 @@ Result<std::uint64_t> nt_map_view_of_section(NtContext& ctx,
     // second mapping failed with EEXIST every time, because the first one was
     // still there. The symptom was a view that could never be created, with a
     // "File exists" in the detail that named the real cause.
-    std::uint64_t base = *addr;
-    const std::uint64_t want =
-        AddressSpace::round_up(view_size, AddressSpace::kGranularity);
-    const std::uint64_t window = zero_bits_limit(zero_bits);
     const Result<std::uint64_t> mapped =
-        (base == 0 && window != 0)
-            ? ctx.placement->map_below(window, want,
-                                      static_cast<PageProtection>(protect),
-                                      RegionKind::Mapped)
+        (base == 0)
+            ? (window != 0
+                   ? ctx.placement->map_below(window, want,
+                                              static_cast<PageProtection>(protect),
+                                              RegionKind::Mapped)
+                   : ctx.placement->map_above(AddressSpace::kUserMin, want,
+                                              static_cast<PageProtection>(protect),
+                                              RegionKind::Mapped))
             : ctx.placement->map(base, want,
                                  static_cast<PageProtection>(protect),
                                  RegionKind::Mapped);

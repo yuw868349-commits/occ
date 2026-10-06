@@ -378,6 +378,20 @@ Result<std::uint32_t> AddressSpace::set_protection(
         return out;
     }
 
+    return set_protection_at(static_cast<std::size_t>(at - regions_.begin()),
+                             protection);
+}
+
+Result<std::uint32_t> AddressSpace::set_protection_at(
+    std::size_t index, PageProtection protection) noexcept {
+    Result<std::uint32_t> out;
+
+    if (index >= regions_.size()) {
+        out.status = Status::InvalidAddress;
+        return out;
+    }
+    Region* at = &regions_[index];
+
     at->protection = protection;
     // The executable flag is recomputed rather than set from the new
     // protection's bits at the call site, because it is an enumeration
@@ -404,6 +418,125 @@ Result<std::uint32_t> AddressSpace::set_protection(
     *at = std::move(updated);
 
     out.value = at->protection_changes;
+    out.status = Status::Success;
+    return out;
+}
+
+Result<std::size_t> AddressSpace::split(std::uint64_t base,
+                                        std::uint64_t size) noexcept {
+    Result<std::size_t> out;
+
+    if (size == 0) {
+        out.status = Status::InvalidParameter;
+        return out;
+    }
+
+    // The region that must contain the whole range. `find()` returns the
+    // region holding the first address; the range is rejected unless that same
+    // region holds the last address too, so a cut that straddles two regions
+    // is refused rather than applied to one of them. This is the same rule
+    // `decommit()` applies, and it is here rather than at the call sites so
+    // that a caller cannot decide to skip it.
+    const Region* found = find(base);
+    if (found == nullptr) {
+        out.status = Status::MemoryNotAllocated;
+        return out;
+    }
+    if (found->kind != RegionKind::Private) {
+        out.status = Status::InvalidParameter;
+        return out;
+    }
+    // `last` is the first address past the range. The range must end at or
+    // before the region's end, and it is `end()` rather than `end() - 1`
+    // because a range that fills the region exactly ends where the region
+    // does.
+    const std::uint64_t last = base + size;
+    if (last > found->end()) {
+        out.status = Status::MemoryNotAllocated;
+        return out;
+    }
+
+    // The three-way cut. The pieces are built as values and inserted at once,
+    // because the vector may reallocate and `found` is a pointer into it -- the
+    // hazard the header warns about at `find()` is exactly this, and holding
+    // `found` across an `insert` is what it forbids.
+    const Region whole = *found;
+    const auto at = std::lower_bound(
+        regions_.begin(), regions_.end(), whole.base,
+        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
+
+    std::vector<Region> pieces;
+    pieces.reserve(3);
+
+    // The head: everything before the range. It keeps every field, including
+    // the commit state -- the cut says nothing about what this memory is.
+    if (base > whole.base) {
+        Region head = make_region(whole.base, base - whole.base,
+                                  whole.protection, whole.kind, whole.section,
+                                  whole.section_index);
+        head.initial_protection = whole.initial_protection;
+        head.protection_changes = whole.protection_changes;
+        head.committed = whole.committed;
+        pieces.push_back(std::move(head));
+    }
+
+    // The middle: the range itself. Everything is carried over unchanged; the
+    // caller is the one that decides what, if anything, this piece becomes.
+    // Its index in the rebuilt vector is the answer, because a pointer into a
+    // vector about to be inserted into is exactly the dangling pointer the
+    // header warns about.
+    Region middle = make_region(base, size, whole.protection, whole.kind,
+                                whole.section, whole.section_index);
+    middle.initial_protection = whole.initial_protection;
+    middle.protection_changes = whole.protection_changes;
+    middle.committed = whole.committed;
+    const std::size_t middle_index = pieces.size();
+    pieces.push_back(std::move(middle));
+
+    // The tail: everything after the range, likewise unchanged.
+    if (whole.end() > last) {
+        Region tail = make_region(last, whole.end() - last, whole.protection,
+                                  whole.kind, whole.section,
+                                  whole.section_index);
+        tail.initial_protection = whole.initial_protection;
+        tail.protection_changes = whole.protection_changes;
+        tail.committed = whole.committed;
+        pieces.push_back(std::move(tail));
+    }
+
+    // Nothing to rebuild when the range already *is* the whole region: the
+    // pieces would reproduce the single region that is already there. The
+    // index is still the answer, and it is the index of the region in the
+    // vector that is already there -- *not* zero, which is what the pieces
+    // vector would have said and which is a different region the moment the
+    // range is not the first one in the ledger. Getting this wrong changes the
+    // wrong region, and the change is invisible until a program touches memory
+    // it never named.
+    if (pieces.size() == 1) {
+        out.value = static_cast<std::size_t>(at - regions_.begin());
+        out.status = Status::Success;
+        return out;
+    }
+
+    regions_.erase(at);
+    const auto insert_at = std::lower_bound(
+        regions_.begin(), regions_.end(), pieces.front().base,
+        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
+    // **The index has to be taken before the insert invalidates the iterator,
+    // and it is not `middle_index` on its own.** `middle_index` is the
+    // position of the middle piece *within `pieces`*, and `pieces` is spliced
+    // in at `insert_at` -- which is not the start of the ledger unless the cut
+    // happened to be at the first region. Reporting `middle_index` alone
+    // addresses the wrong region whenever the cut is not at the front, and the
+    // symptom is a caller switching the commit flag on a region it never
+    // named. This was a real bug: a decommit of the second half of a
+    // reservation cleared the commit of the *first* half.
+    const std::size_t ledger_index =
+        static_cast<std::size_t>(insert_at - regions_.begin()) + middle_index;
+    regions_.insert(insert_at, std::make_move_iterator(pieces.begin()),
+                    std::make_move_iterator(pieces.end()));
+
+    out.value = ledger_index;
     out.status = Status::Success;
     return out;
 }
@@ -448,84 +581,35 @@ Result<std::uint64_t> AddressSpace::decommit(std::uint64_t base,
     }
     const std::uint64_t want = last - first;
 
-    // The region that must contain the whole range. `find()` returns the
-    // region holding the first page; the range is rejected unless that same
-    // region holds the last page too, so a decommit that straddles two regions
-    // is refused rather than applied to one of them.
-    const Region* found = find(first);
-    if (found == nullptr) {
-        out.status = Status::MemoryNotAllocated;
-        return out;
-    }
-    if (found->kind != RegionKind::Private) {
-        out.status = Status::InvalidParameter;
-        return out;
-    }
-    if (found->end() < last) {
-        out.status = Status::MemoryNotAllocated;
-        return out;
-    }
-
-    // The three-way cut. The pieces are built as values and inserted at once,
-    // because the vector may reallocate and `found` is a pointer into it -- the
-    // hazard the header warns about at `find()` is exactly this, and holding
-    // `found` across an `insert` is what it forbids.
-    const Region whole = *found;
-    const auto at = std::lower_bound(
-        regions_.begin(), regions_.end(), whole.base,
-        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
-
     // A decommit of a range that is already reserved is not an error, but it
     // also has nothing to do: the bytes are already where the caller wants
     // them. Answering success rather than a status is Windows' behaviour and
-    // the reason a program may decommit twice.
-    if (!whole.committed) {
+    // the reason a program may decommit twice. It is checked before the cut
+    // because a cut would otherwise split the reserved region for no reason,
+    // and the ledger would grow without the answer changing.
+    if (const Region* before = find(first);
+        before != nullptr && before->kind == RegionKind::Private &&
+        before->end() >= last && !before->committed) {
         out.value = want;
         out.status = Status::Success;
         return out;
     }
 
-    std::vector<Region> pieces;
-    pieces.reserve(3);
-
-    // The head: everything before the range, still committed.
-    if (first > whole.base) {
-        Region head = make_region(whole.base, first - whole.base,
-                                  whole.protection, whole.kind, whole.section,
-                                  whole.section_index);
-        head.initial_protection = whole.initial_protection;
-        head.protection_changes = whole.protection_changes;
-        head.committed = true;
-        pieces.push_back(std::move(head));
+    // The cut. `split()` checks the range is inside one private region and
+    // refuses otherwise; the statuses it produces are the ones a decommit
+    // reports, so they are passed through unchanged.
+    const Result<std::size_t> cut = split(first, want);
+    if (!cut.ok()) {
+        out.status = cut.status;
+        return out;
     }
 
-    // The middle: the range, now reserved. Its protection is kept -- a
-    // reservation does not change the protection a later commit would restore,
-    // and Windows reports the old protection back through a recommit.
-    Region middle = make_region(first, last - first, whole.protection,
-                                whole.kind, whole.section, whole.section_index);
-    middle.initial_protection = whole.initial_protection;
-    middle.protection_changes = whole.protection_changes;
-    middle.committed = false;
-    pieces.push_back(std::move(middle));
-
-    // The tail: everything after the range, still committed.
-    if (whole.end() > last) {
-        Region tail = make_region(last, whole.end() - last, whole.protection,
-                                  whole.kind, whole.section,
-                                  whole.section_index);
-        tail.initial_protection = whole.initial_protection;
-        tail.protection_changes = whole.protection_changes;
-        tail.committed = true;
-        pieces.push_back(std::move(tail));
-    }
-
-    regions_.erase(at);
-    const auto insert_at = std::lower_bound(
-        regions_.begin(), regions_.end(), pieces.front().base,
-        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
-    regions_.insert(insert_at, std::make_move_iterator(pieces.begin()),
-                    std::make_move_iterator(pieces.end()));
+    // The middle piece loses its commit and nothing else. Its protection is
+    // kept -- a reservation does not change the protection a later commit
+    // would restore, and Windows reports the old protection back through a
+    // recommit. Held by `split()`'s index rather than by address, because the
+    // cut may have rebuilt the vector.
+    regions_[cut.value].committed = false;
 
     out.value = want;
     out.status = Status::Success;
@@ -545,28 +629,54 @@ const Region* AddressSpace::find(std::uint64_t addr) const noexcept {
     return candidate.contains(addr) ? &candidate : nullptr;
 }
 
-Result<std::uint64_t> AddressSpace::commit(std::uint64_t base) noexcept {
+Result<std::uint64_t> AddressSpace::commit(std::uint64_t base,
+                                           std::uint64_t size) noexcept {
     Result<std::uint64_t> out;
 
-    const auto at = std::lower_bound(
-        regions_.begin(), regions_.end(), base,
-        [](const Region& reg, std::uint64_t b) { return reg.base < b; });
-
-    if (at == regions_.end() || at->base != base) {
-        out.status = Status::InvalidAddress;
-        return out;
-    }
-    if (at->kind != RegionKind::Private) {
+    // The same outward rounding a decommit does, and for the same reason: a
+    // page is the unit the kernel commits, so a range that starts or ends
+    // inside a page takes the whole page. `first` and `last` are the range the
+    // cut works on, and they are what the answer reports.
+    if (size == 0) {
         out.status = Status::InvalidParameter;
         return out;
     }
+    const std::uint64_t first = round_up(base, kPageSize);
+    const std::uint64_t last = round_down(base + size, kPageSize);
+    if (first >= last) {
+        out.value = 0;
+        out.status = Status::Success;
+        return out;
+    }
+    const std::uint64_t want = last - first;
 
-    // Already committed is success and not an error: Windows lets a program
-    // commit a range twice, and the second call reports the protection the
-    // first one left. Nothing is flipped, so the change counter stays put --
-    // a commit is not a protection change.
-    at->committed = true;
-    out.value = at->size;
+    // A commit of a range that is already committed is not an error, but it
+    // also has nothing to do. Checked before the cut so the ledger does not
+    // grow for an answer that does not change, which is the same early return
+    // `decommit()` makes for the same shape.
+    if (const Region* before = find(first);
+        before != nullptr && before->kind == RegionKind::Private &&
+        before->end() >= last && before->committed) {
+        out.value = want;
+        out.status = Status::Success;
+        return out;
+    }
+
+    // The cut, shared with `decommit()`. Its refusals are this call's
+    // refusals: no region, not private, or a range past the region's end.
+    const Result<std::size_t> cut = split(first, want);
+    if (!cut.ok()) {
+        out.status = cut.status;
+        return out;
+    }
+
+    // The middle piece gains its commit and nothing else. The protection is
+    // untouched: a commit does not change the protection a decommit preserved,
+    // and Windows reports that protection back through the caller's next
+    // query. The change counter does not move either, for the same reason.
+    regions_[cut.value].committed = true;
+
+    out.value = want;
     out.status = Status::Success;
     return out;
 }

@@ -73,15 +73,18 @@ void check(bool ok, const char* what) {
 // page would return an address whose enclosing granule is only partly proven
 // free -- and the allocator that rounds to the granule can then land on a byte
 // the probe never tested, failing with EEXIST at an address this helper had
-// just reported as available. Sizing the probe at a granule makes the
-// kernel hand back a granule-aligned base (it aligns to the length when the
-// length asks for one), which the allocator's rounding cannot move.
+// just reported as available.
 //
-// The alternative -- probing a page and rounding the answer down -- reads as
-// more careful and is worse: it silently returns an address the probe never
-// proved anything about, and every caller below then tests against a mapping
-// that does not exist. A helper that reports a free base has to have checked
-// the base it reports.
+// **The probe does not promise granularity alignment, and the earlier version
+// of this comment wrongly said it did.** The claim was that the kernel aligns
+// a mapping to its length, which is true of `MAP_FIXED` and false of the hole
+// search: `mmap(NULL, 0x10000, ...)` promises page alignment only. On a plain
+// run the randomisation usually puts the hole on a 64 KiB boundary and under a
+// sanitizer it does not, which made the view cases fail intermittently. The
+// fix was not here -- it was in `nt_map_view_of_section`, which now places an
+// unnamed view with the granularity-stepping search rather than handing the
+// kernel a null address (`map_below`), because Windows guarantees a view is on
+// a granularity boundary and the kernel's own placement does not.
 std::uint64_t a_free_base(std::uint64_t bytes) noexcept {
     AddressSpace probe_space;
     Mapper probe(probe_space);
@@ -467,6 +470,83 @@ void test_allocation_validates_before_it_places() {
                   "room either places there or refuses -- never above, which "
                   "is what makes the descent rather than the ascent the "
                   "correct rule to test for");
+        }
+    }
+
+    // **The ascending search has the same attempt cap and the same reason to
+    // have it, and nothing tested it.**
+    //
+    // `Mapper::map_above` is the direction an unconstrained view is placed in,
+    // and it carries its own `kMaxAttempts` rather than sharing `map_below`'s.
+    // A mutant that lowered only the ascending cap survived the suite, and the
+    // reason is exactly the one the descent case above exists to prevent: the
+    // ascending search starts at the bottom, and every test that reached it
+    // started on a space whose bottom was empty, so one attempt was enough and
+    // the cap was never the difference between an answer and a refusal.
+    //
+    // The setup therefore fills the bottom of the space -- two hundred
+    // granules, which is more than 64 and less than 16384 -- and then asks for
+    // one more from the floor. With the cap at 64 the walk runs out of tries
+    // inside the filled run and reports NoMemory on a machine with a hundred
+    // and forty gigabytes free above it. With the cap at its real value it
+    // steps past the run and places.
+    //
+    // The request is `kUserMin + one granule`-ish rather than `kUserMin`
+    // because `floor` is rounded up and clamped, and the point is to start the
+    // search inside the filled run rather than at its edge.
+    {
+        Fixture up;
+        const std::uint64_t u_size = AddressSpace::kGranularity;
+        constexpr std::uint64_t kFill = 200;
+        std::vector<std::uint64_t> filled;
+        std::uint64_t cursor = AddressSpace::kUserMin;
+        bool filled_ok = true;
+        for (std::uint64_t i = 0; i < kFill; ++i) {
+            // Low addresses are where `mmap_min_addr` and the host's own
+            // mappings live, so a fill that starts at `kUserMin` can fail on
+            // the first granule for reasons that have nothing to do with the
+            // cap under test. The walk moves up until it finds room and then
+            // fills from there, and `filled_ok` records whether it got enough.
+            const auto m = up.mapper.map(cursor, u_size,
+                                         PageProtection::NoAccess,
+                                         RegionKind::Private);
+            if (!m.ok()) {
+                if (m.status == Status::ConflictingAddresses) {
+                    // Not fatal here: step over the host's mapping and keep
+                    // filling. This is the same skip the search itself does.
+                    cursor += AddressSpace::kGranularity;
+                    continue;
+                }
+                filled_ok = false;
+                break;
+            }
+            filled.push_back(cursor);
+            cursor += AddressSpace::kGranularity;
+        }
+        // The fill needs to be *contiguous* from a floor for the mutant to run
+        // out of tries inside it, so the floor is the lowest granule the fill
+        // managed to take.
+        if (filled_ok && filled.size() > 64) {
+            const std::uint64_t u_floor = filled.front();
+            const Result<std::uint64_t> at = up.mapper.map_above(
+                u_floor, u_size, PageProtection::ReadWrite,
+                RegionKind::Private);
+            check(at.ok(),
+                  "ascending placement: a request over two hundred occupied "
+                  "granules is still placed, because the ascending attempt cap "
+                  "is above a hundred -- at 64 the walk runs out of tries "
+                  "inside the filled run and reports NoMemory on a machine "
+                  "with room, which is the same quiet refusal the descending "
+                  "cap was raised to prevent");
+            check(!at.ok() || at.value >= u_floor,
+                  "ascending placement: and it is placed at or above the floor "
+                  "it was given, never below");
+            if (at.ok()) {
+                (void)up.mapper.unmap(at.value);
+            }
+        }
+        for (const std::uint64_t b : filled) {
+            (void)up.mapper.unmap(b);
         }
     }
     {
@@ -1213,6 +1293,371 @@ void test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure() {
     (void)nt_free_virtual_memory(f.ctx, &free_addr, &free_size, mem::kRelease);
 }
 
+// **A protect changes the range it was given and not the region that holds
+// it.** This is `virtual.c:2039`, where `set_protection( view, base, size,
+// new_prot )` walks `[base, base + size)` page by page, and it is the
+// difference between a runtime that answers `NtProtectVirtualMemory` and one
+// that answers a question nobody asked.
+//
+// The failure mode the whole-region form has is not a crash. It is a program
+// that made one page read-only and finds that its neighbour, which it is
+// still writing to, faults -- because the runtime changed memory the caller
+// never named. The assertions below are about the *neighbour*, which is the
+// page a whole-region implementation gets wrong.
+void test_a_protect_acts_on_its_range_and_not_on_the_region() {
+    Fixture f;
+    // Four pages of writable memory, so there is room for a head, a middle and
+    // a tail -- which is what makes the three-way cut observable rather than a
+    // two-way split at an edge.
+    //
+    // The allocation is rounded up to the 64 KiB granularity, so the region is
+    // `0x10000` bytes rather than the `0x4000` asked for. The assertions below
+    // read the real size rather than assuming it, because a runtime that
+    // handed back `0x4000` would be violating the granularity rule and a test
+    // that assumed `0x4000` would pass against that bug for the wrong reason.
+    const std::uint64_t base = allocate(f, 0x4000, 0x04);
+    if (base == 0) {
+        return;
+    }
+    const Region* whole = f.space.find(base);
+    if (whole == nullptr) {
+        return;
+    }
+    const std::uint64_t span = whole->size;
+    check(span >= 0x4000,
+          "partial protect: the allocation covers at least the four pages "
+          "asked for, so the head and tail below have somewhere to be");
+
+    // The middle two pages become read-only. The first and last stay writable,
+    // and that is the assertion: the pages the caller did not name must not
+    // have moved.
+    {
+        std::uint64_t addr = base + 0x1000;
+        std::uint64_t size = 0x2000;
+        std::uint32_t old = 0xdeadbeef;
+        const auto r =
+            nt_protect_virtual_memory(f.ctx, &addr, &size, 0x02, &old);
+        check(r.ok(), "partial protect: a change to two pages inside a larger "
+                      "region succeeds");
+        check(addr == base + 0x1000,
+              "partial protect: the address is reported as the caller sent it, "
+              "already page-aligned");
+        check(size == 0x2000,
+              "partial protect: and the size is exactly what was asked for, "
+              "because an aligned size goes through ROUND_SIZE untouched");
+        check(old == 0x04,
+              "partial protect: and the old protection is the first page's, "
+              "which is what Wine reports from a single vprot value and the "
+              "only answer a heterogeneous range can give through one field");
+
+        // The three pieces. The head and tail keep the writable protection
+        // they had; the middle is read-only.
+        const Region* head = f.space.find(base);
+        check(head != nullptr && head->base == base && head->size == 0x1000 &&
+                  head->protection == PageProtection::ReadWrite,
+              "partial protect: the page before the range is a region of its "
+              "own and is still writable, which is the page a whole-region "
+              "protect would have made read-only");
+        const Region* middle = f.space.find(base + 0x1000);
+        check(middle != nullptr && middle->base == base + 0x1000 &&
+                  middle->size == 0x2000 &&
+                  middle->protection == PageProtection::ReadOnly,
+              "partial protect: the range is a region of its own and is "
+              "read-only");
+        const Region* tail = f.space.find(base + 0x3000);
+        check(tail != nullptr && tail->base == base + 0x3000 &&
+                  tail->size == span - 0x3000 &&
+                  tail->protection == PageProtection::ReadWrite,
+              "partial protect: and everything after the range is a region of "
+              "its own and is still writable, for the same reason as the head");
+
+        // The change is counted against the piece that changed and not against
+        // the others, which is what makes the counter mean "this range has
+        // been re-protected N times".
+        check(middle != nullptr && middle->protection_changes == 1,
+              "partial protect: the change is counted against the range that "
+              "changed");
+        check(head != nullptr && head->protection_changes == 0 &&
+                  tail != nullptr && tail->protection_changes == 0,
+              "partial protect: and not against the pieces that were only cut "
+              "to make room for it, because they were not changed");
+
+        // The protection a later commit would restore is untouched, which is
+        // the same rule the whole-region protect follows.
+        check(middle != nullptr &&
+                  middle->initial_protection == PageProtection::ReadWrite,
+              "partial protect: the initial protection still says the range "
+              "was made writable, so a reader can tell 'made read-only' from "
+              "'made writable and then read-only' -- the cut must not lose "
+              "that history");
+    }
+
+    // **The page outside the range is really still writable.** The ledger
+    // saying so is not enough: a runtime that read the ledger and skipped the
+    // mprotect would pass every assertion above. Touching the page is the only
+    // check that reaches the kernel. The bytes are written through a volatile
+    // pointer so the store is not optimised away against a page the compiler
+    // cannot know is either way.
+    {
+        volatile char* tail_page =
+            reinterpret_cast<volatile char*>(base + 0x3000);
+        tail_page[0] = 0x5a;
+        check(tail_page[0] == 0x5a,
+              "partial protect: and the untouched page is really still "
+              "writable, so the ledger's claim is backed by a page the kernel "
+              "agrees with");
+    }
+
+    // A protect of a range that already is exactly one region is not cut. The
+    // pieces would rebuild the one region that is already there, and the
+    // ledger growing by three entries for a no-op would be a change to the
+    // address space that the caller did not ask for.
+    //
+    // The middle piece is one region now, so protecting it whole must be a
+    // no-op in the ledger's shape. Its protection is already `ReadOnly` and
+    // is set to `ReadOnly` again, which changes the protection *value* and
+    // therefore still counts as a change -- so the entry count is the
+    // assertion, not the change counter.
+    {
+        const std::size_t before = f.space.regions().size();
+        std::uint64_t addr = base + 0x1000;
+        std::uint64_t size = 0x2000;
+        std::uint32_t old = 0;
+        const auto r =
+            nt_protect_virtual_memory(f.ctx, &addr, &size, 0x02, &old);
+        check(r.ok(), "partial protect: a protect of exactly one region "
+                      "succeeds");
+        check(f.space.regions().size() == before,
+              "partial protect: and the ledger holds the same number of "
+              "entries, because the range already was a region and a protect "
+              "changes protection and never merges or re-cuts");
+    }
+
+    std::uint64_t free_addr = base;
+    std::uint64_t free_size = 0;
+    (void)nt_free_virtual_memory(f.ctx, &free_addr, &free_size, mem::kRelease);
+}
+
+// **A protect is not a commit.** Windows refuses the whole call with
+// `STATUS_NOT_COMMITTED` when any page in the range is reserved, and refuses
+// it *before* changing anything -- a caller that saw half its range protected
+// would be looking at memory it believes it can write.
+//
+// Wine reaches the same status through `get_committed_size( view, base, size,
+// &vprot, VPROT_COMMITTED ) >= size && (vprot & VPROT_COMMITTED)`
+// (`virtual.c:5629`), which is a per-view test; the check here is per-page so
+// that the same rule holds for a range this runtime cut into pieces.
+void test_a_protect_over_a_reserved_page_is_not_committed() {
+    Fixture f;
+    const std::uint64_t base = allocate(f, 0x4000, 0x02); // read-only
+    if (base == 0) {
+        return;
+    }
+    const Region* whole = f.space.find(base);
+    if (whole == nullptr) {
+        return;
+    }
+    const std::uint64_t span = whole->size;
+
+    // Decommit the second page, so a protect that spans from the base reaches
+    // a reserved page without being at the very end of the region -- which is
+    // the shape that distinguishes "the range includes a reserved page" from
+    // "the range runs past the region".
+    {
+        std::uint64_t d_addr = base + 0x1000;
+        std::uint64_t d_size = 0x1000;
+        const auto d = nt_free_virtual_memory(f.ctx, &d_addr, &d_size,
+                                              mem::kDecommit);
+        check(d.ok(), "not committed: the second page decommits");
+    }
+
+    {
+        std::uint64_t addr = base;
+        std::uint64_t size = 0x2000;
+        std::uint32_t old = 0xdeadbeef;
+        const auto r =
+            nt_protect_virtual_memory(f.ctx, &addr, &size, 0x04, &old);
+        check(!r.ok() && r.status == Status::NotCommitted,
+              "not committed: a range that includes a reserved page is "
+              "STATUS_NOT_COMMITTED, because a protection change is not a "
+              "commit and Windows will not silently commit pages to satisfy "
+              "one");
+
+        // **Nothing moved.** The first page is still read-only and the ledger
+        // still holds the pieces the decommit cut: the check is before the
+        // change, for the whole call and not per page. A per-page check would
+        // have protected the committed page and then failed on the reserved
+        // one, leaving the caller with memory it believes it protected and a
+        // call that said it did not.
+        const Region* first = f.space.find(base);
+        check(first != nullptr && first->base == base && first->size == 0x1000 &&
+                  first->protection == PageProtection::ReadOnly,
+              "not committed: and the page before the reserved one was not "
+              "changed either, because a refusal with a side effect is not a "
+              "refusal");
+        check(f.space.find(base + 0x1000) != nullptr,
+              "not committed: and the region was not cut, because the check "
+              "precedes the ledger change as well as the mprotect");
+
+        // The output pointers are untouched on failure, the same rule the
+        // no-region case follows.
+        check(addr == base && size == 0x2000 && old == 0xdeadbeef,
+              "not committed: and the outputs are left alone, so a caller that "
+              "retries after committing the page goes where it asked");
+    }
+
+    // After the page is committed again, the same protect goes through. This
+    // is the half that proves the refusal above was about the commit state and
+    // not about the range being unusable.
+    //
+    // **And the commit commits one page, not the region.** The reservation is
+    // the whole allocation -- 64 KiB, because the granularity rounded it up --
+    // and the commit names one page of it. A commit that committed the region
+    // would hand the caller 63 KiB it never asked for, and the assertions below
+    // read the *other* pages to catch exactly that: the page after the one
+    // committed must still be reserved. This is the mutant
+    // `a-commit-commits-the-whole-region`, and the first version of this test
+    // did not catch it because it only looked at the page that changed.
+    {
+        std::uint64_t c_addr = base + 0x1000;
+        std::uint64_t c_size = 0x1000;
+        const auto c = nt_allocate_virtual_memory(f.ctx, &c_addr, &c_size, 0,
+                                                  mem::kCommit, 0x02);
+        check(c.ok(), "not committed: the page commits again");
+        check(c.value == base + 0x1000 && c_size == 0x1000,
+              "not committed: and the call reports the one page it committed, "
+              "at the address it was given -- a commit is page-granular and "
+              "does not move to the granularity or widen to the region");
+
+        // The page that was committed is committed; the pages around it that
+        // were not named did not move. The decommit below covers 0x1000, so
+        // there is exactly one reserved page before this commit and the rest of
+        // the reservation was never decommitted -- which means the interesting
+        // assertion is on a page that must still be *reserved*, and that needs
+        // a second decommit. It is made here rather than assumed.
+        std::uint64_t d2_addr = base + 0x2000;
+        std::uint64_t d2_size = 0x2000;
+        const auto d2 = nt_free_virtual_memory(f.ctx, &d2_addr, &d2_size,
+                                               mem::kDecommit);
+        check(d2.ok(), "not committed: two more pages decommit");
+
+        // One of the two, committed back. The other must still be reserved
+        // after a call that named only the first -- this is the assertion the
+        // whole-region mutant fails.
+        std::uint64_t c2_addr = base + 0x2000;
+        std::uint64_t c2_size = 0x1000;
+        const auto c2 = nt_allocate_virtual_memory(f.ctx, &c2_addr, &c2_size, 0,
+                                                   mem::kCommit, 0x04);
+        check(c2.ok(), "not committed: one of the two commits back");
+
+        const Region* committed_page = f.space.find(base + 0x2000);
+        check(committed_page != nullptr && committed_page->committed,
+              "not committed: the page that was committed reads as committed");
+        const Region* still_reserved = f.space.find(base + 0x3000);
+        check(still_reserved != nullptr && !still_reserved->committed,
+              "not committed: **and the page the commit did not name is still "
+              "reserved** -- a commit that committed the whole region would "
+              "have handed the caller memory it never asked for, and this is "
+              "the page that catches it, because it is the page the caller "
+              "deliberately left alone");
+
+        // The two halves are separate regions, which is the other thing the
+        // range commit has to get right: the reservation was cut by the
+        // decommit, and a commit that committed the whole region would have
+        // merged them back -- or, worse, reported the whole region committed
+        // through the one piece it was asked about.
+        check(still_reserved != nullptr && committed_page != nullptr &&
+                  still_reserved->base == base + 0x3000 &&
+                  committed_page->base == base + 0x2000,
+              "not committed: and the two pages are separate regions, so the "
+              "commit recorded against the range and not against the region "
+              "that holds it");
+    }
+
+    (void)span;
+    std::uint64_t free_addr = base;
+    std::uint64_t free_size = 0;
+    (void)nt_free_virtual_memory(f.ctx, &free_addr, &free_size, mem::kRelease);
+}
+
+// **A range may span more than one region, and on Windows it does.** This is
+// the place this runtime is deliberately more correct than Wine: Wine's
+// `find_view` returns a single view and `NtProtectVirtualMemory` fails if the
+// range crosses into the next one, but the protection of a page on Windows is
+// a property of the page and not of the kernel's bookkeeping. Two contiguous
+// committed ranges are one range to a caller.
+//
+// The shape a caller reaches this from is ordinary: a program decommits the
+// tail of a reservation and commits it later, or maps two views adjacently,
+// and then re-protects across the seam.
+void test_a_protect_may_span_two_regions() {
+    Fixture f;
+    const std::uint64_t base = allocate(f, 0x4000, 0x04);
+    if (base == 0) {
+        return;
+    }
+
+    // Cut the allocation in two by decommitting and recommitting the second
+    // half -- which leaves two regions where the caller sees one range, and
+    // both committed.
+    {
+        std::uint64_t d_addr = base + 0x2000;
+        std::uint64_t d_size = 0x2000;
+        const auto d = nt_free_virtual_memory(f.ctx, &d_addr, &d_size,
+                                              mem::kDecommit);
+        check(d.ok(), "spanning: the second half decommits");
+        std::uint64_t c_addr = base + 0x2000;
+        std::uint64_t c_size = 0x2000;
+        const auto c = nt_allocate_virtual_memory(f.ctx, &c_addr, &c_size, 0,
+                                                  mem::kCommit, 0x04);
+        check(c.ok(), "spanning: and commits again, leaving two regions");
+    }
+
+    const std::size_t regions_before = f.space.regions().size();
+    check(regions_before >= 2,
+          "spanning: there really are two regions to span, so the assertion "
+          "below is about a seam and not about a single region");
+
+    // One protect across the seam.
+    {
+        std::uint64_t addr = base;
+        std::uint64_t size = 0x4000;
+        std::uint32_t old = 0xdeadbeef;
+        const auto r =
+            nt_protect_virtual_memory(f.ctx, &addr, &size, 0x02, &old);
+        check(r.ok(),
+              "spanning: a protect that crosses a seam between two committed "
+              "regions succeeds, because the caller gave one range and the "
+              "kernel's bookkeeping is not the caller's business");
+        check(size == 0x4000,
+              "spanning: reporting the whole range it covered");
+        check(old == 0x04,
+              "spanning: and the first page's old protection");
+    }
+
+    // Both halves changed, and the ledger still holds two regions rather than
+    // one -- a protect changes protection and never merges.
+    {
+        const Region* first = f.space.find(base);
+        const Region* second = f.space.find(base + 0x2000);
+        check(first != nullptr &&
+                  first->protection == PageProtection::ReadOnly,
+              "spanning: the first region is read-only");
+        check(second != nullptr &&
+                  second->protection == PageProtection::ReadOnly,
+              "spanning: and so is the second, which is the half a Wine-shaped "
+              "implementation would have refused to touch");
+        check(f.space.regions().size() == regions_before,
+              "spanning: and the ledger holds the same number of regions, "
+              "because each half was already a region of its own and a protect "
+              "does not merge");
+    }
+
+    std::uint64_t free_addr = base;
+    std::uint64_t free_size = 0;
+    (void)nt_free_virtual_memory(f.ctx, &free_addr, &free_size, mem::kRelease);
+}
+
 // ------------------------------------------------------------------------
 // Read and write
 // ------------------------------------------------------------------------
@@ -1893,18 +2338,29 @@ void test_the_calls_wine_stubs_are_actually_implemented() {
             f.ctx.events = nullptr;
             check(again3.ok(),
                   "flush buffers: a second flush succeeds as the first did");
+            // The counter is the record of the syscall itself rather than of
+            // the code's opinion about it: a stub that fakes the return value
+            // moves the events and not this, and that difference is the whole
+            // reason the counter is here.
             check(f.mapper.syscalls_made() > counted_before,
-                  "flush buffers: and the mapper's syscall counter moved, "
-                  "which is the record of the syscall itself rather than of "
-                  "the code's opinion about it -- a stub that fakes the "
-                  "return value moves the events and not this, and that "
-                  "difference is the whole reason the counter is here");
+                  "flush buffers: and the mapper's syscall counter moved");
 
 
             // A region with no write access has no dirty pages, so it is not
             // handed to the kernel at all. Read-only-after-allocation is the
-            // only way to get one here, and it must *reduce* the count rather
-            // than add a call that does nothing.
+            // only way to get one here.
+            //
+            // **The count goes up by one fewer than the number of regions the
+            // protect created, and that is the assertion.** A protect now
+            // changes the range it was given and not the whole region
+            // (`virtual.c:2039`), so making the first page read-only turns one
+            // writable region into *two*: the read-only page and the writable
+            // remainder. A flush walks every writable region, so it now reaches
+            // the remainder -- which the old whole-region behaviour did not,
+            // because there was no remainder. The two regions are 0x1000 and
+            // 0x1f000 bytes, so exactly one of them is skipped; the old test
+            // asserted the count did not move at all, and it could only do so
+            // because the protect had changed memory the caller never named.
             const std::size_t before = rec.count_of("msync");
             std::uint64_t ro_addr = base;
             std::uint64_t ro_size = 0x1000;
@@ -1913,16 +2369,49 @@ void test_the_calls_wine_stubs_are_actually_implemented() {
                 f.ctx, &ro_addr, &ro_size,
                 static_cast<std::uint32_t>(PageProtection::ReadOnly),
                 &old_protect);
+
+            const Region* ro_page = f.space.find(base);
+            check(ro_page != nullptr &&
+                      ro_page->base == base && ro_page->size == 0x1000 &&
+                      ro_page->protection == PageProtection::ReadOnly,
+                  "flush buffers: the protect cut the region and the first page "
+                  "is now a read-only region of its own -- a runtime that "
+                  "changed the whole region would have left one region here "
+                  "with a size of 0x20000");
+            const Region* remainder = f.space.find(base + 0x1000);
+            check(remainder != nullptr && remainder->base == base + 0x1000 &&
+                      remainder->protection == PageProtection::ReadWrite,
+                  "flush buffers: and the rest of the region is still writable, "
+                  "which is the pages the caller did not name and which a "
+                  "whole-region protect would have made read-only too");
+
             f.ctx.events = &rec;
             const auto again = nt_flush_process_write_buffers(f.ctx);
             f.ctx.events = nullptr;
             check(again.ok(), "flush buffers: and succeeds again after a "
                               "region has been made read-only");
-            check(rec.count_of("msync") == before,
-                  "flush buffers: a read-only region is not handed to msync "
-                  "at all -- it cannot have dirty pages, and the call would be "
-                  "a syscall that does nothing, made once per region per "
-                  "flush");
+            // Every writable region is still flushed, and the read-only one is
+            // still not. The count is what proves both halves: it moved (the
+            // writable remainder was reached) and it moved by exactly the
+            // regions that are writable.
+            const std::size_t writable_regions = [&] {
+                std::size_t n = 0;
+                for (const Region& reg : f.space.regions()) {
+                    if (reg.protection != PageProtection::ReadOnly &&
+                        reg.protection != PageProtection::NoAccess) {
+                        ++n;
+                    }
+                }
+                return n;
+            }();
+            check(rec.count_of("msync") == before + writable_regions,
+                  "flush buffers: exactly the writable regions are handed to "
+                  "msync, so a read-only region is not -- it cannot have dirty "
+                  "pages, and the call would be a syscall that does nothing");
+            check(writable_regions >= 1,
+                  "flush buffers: and at least the region the protect left "
+                  "writable is among them, so the assertion above is not "
+                  "satisfied by a flush that skipped everything");
 
             std::uint64_t free_addr = base;
             std::uint64_t free_size = 0;
@@ -2780,6 +3269,9 @@ int main() {
     test_decommit_keeps_the_reservation();
     test_decommit_refuses_what_it_cannot_do();
     test_protect_reports_the_old_protection_and_leaves_it_alone_on_failure();
+    test_a_protect_acts_on_its_range_and_not_on_the_region();
+    test_a_protect_over_a_reserved_page_is_not_committed();
+    test_a_protect_may_span_two_regions();
     test_read_and_write_report_a_bad_buffer_differently();
     test_handles_are_reused_and_a_double_close_is_visible();
     test_query_reports_a_region_and_a_free_run();

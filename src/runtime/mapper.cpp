@@ -310,6 +310,72 @@ Result<std::uint64_t> Mapper::map_below(std::uint64_t ceiling,
     return fail<std::uint64_t>(Status::NoMemory, 0, 0);
 }
 
+Result<std::uint64_t> Mapper::map_above(std::uint64_t floor,
+                                        std::uint64_t size,
+                                        PageProtection protection,
+                                        RegionKind kind) noexcept {
+    if (size == 0) {
+        return fail<std::uint64_t>(Status::InvalidParameter, 0, 0);
+    }
+
+    // **The ascending twin of `map_below`, and it exists because the two
+    // directions place differently at the same ceiling.** `map_below` starts at
+    // the ceiling and walks down, which is what a caller asking for "below
+    // this" wants; `map_above` starts at the floor and walks up, which is what
+    // a caller asking for "at or above this" wants and what an *unconstrained*
+    // placement wants -- Windows hands out section views from the bottom of the
+    // user window upward, not from its top downward, and a view placed at the
+    // very top of the window is one no caller can grow past.
+    //
+    // The reason this is not `map_below` with a low ceiling is the search, not
+    // the answer: `map_below(kUserMax, ...)` returns an address a few granules
+    // below `kUserMax`, and a caller that then asks for "at or above that plus
+    // 2 MiB" is asking for an address above the user window. Windows places an
+    // unconstrained view low and leaves the top of the window free, and a
+    // runtime that placed it at the top made the ordinary "above this" request
+    // unsatisfiable.
+    //
+    // The offset is an optimisation, not a policy: starting at the floor
+    // itself walks the `0..64 KiB` region first, where `mmap_min_addr` refuses
+    // everything with EACCES, and the loop would report that refusal rather
+    // than searching. Starting one granule up is the first address the kernel
+    // will consider at all, which is also where Windows starts.
+    std::uint64_t candidate = AddressSpace::round_up(floor,
+                                                     AddressSpace::kGranularity);
+    if (candidate < AddressSpace::kUserMin) {
+        candidate = AddressSpace::kUserMin;
+    }
+
+    // The bound on attempts, the same number and the same reasoning as
+    // `map_below`: sixteen thousand granules is a gigabyte of search, and the
+    // cap has to exist because a space with no hole in it does not fail on its
+    // own -- it walks the whole 47-bit window one granule at a time.
+    //
+    // A hit here is a *refusal*, not a walk: `map` with a named base is a
+    // single `MAP_FIXED_NOREPLACE`, so the loop is one syscall per granule and
+    // a conflict is what sends it on. Anything else is reported rather than
+    // stepped past, for the reason `map_below` reports it.
+    constexpr std::uint64_t kMaxAttempts = 16384;
+    for (std::uint64_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (candidate > AddressSpace::kUserMax ||
+            !in_the_user_window(candidate, size)) {
+            break;
+        }
+        const Result<std::uint64_t> at = map(candidate, size, protection, kind);
+        if (at.ok()) {
+            return at;
+        }
+        if (at.status != Status::ConflictingAddresses) {
+            return at;
+        }
+        if (candidate > AddressSpace::kUserMax - AddressSpace::kGranularity) {
+            break;
+        }
+        candidate += AddressSpace::kGranularity;
+    }
+    return fail<std::uint64_t>(Status::NoMemory, 0, 0);
+}
+
 Result<std::uint64_t> Mapper::sync(std::uint64_t base,
                                    std::uint64_t size) noexcept {
     // The alignment check, because `msync` answers a misaligned range with
@@ -512,6 +578,98 @@ Result<std::uint32_t> Mapper::protect(std::uint64_t base,
     }
 
     const Result<std::uint32_t> changed = space_->set_protection(base, protection);
+    if (!changed.ok()) {
+        return fail<std::uint32_t>(changed.status, 0, base);
+    }
+
+    Result<std::uint32_t> out;
+    out.value = changed.value;
+    out.status = Status::Success;
+    return out;
+}
+
+Result<std::uint32_t> Mapper::protect_in_range(std::uint64_t base,
+                                               std::uint64_t size,
+                                               PageProtection protection) noexcept {
+    if (size == 0) {
+        return fail<std::uint32_t>(Status::InvalidParameter, 0, base);
+    }
+
+    // The modifier bits are refused for the reason protect() refuses them: a
+    // modifier that arrives as ordinary memory is a buffer overflow that does
+    // not fault, and saying so is better than a smaller promise.
+    if (static_cast<std::uint32_t>(protection) & 0xf00U) {
+        return fail<std::uint32_t>(Status::NotImplemented, 0, base);
+    }
+
+    // **The range must be one private region and every page in it committed,
+    // and both are checked before the kernel is touched.** Windows reports
+    // STATUS_NOT_COMMITTED for a range that includes a reserved page and
+    // leaves the protection unchanged; a check after the mprotect would have
+    // already changed the pages the caller was told it could not change.
+    //
+    // The region lookup is by `base` and the range must not run past the
+    // region's end, which is the geometry `split()` also requires -- asked
+    // here first so that the status is produced before anything is recorded.
+    const Region* r = space_->find(base);
+    if (r == nullptr || !r->contains(base)) {
+        return fail<std::uint32_t>(Status::InvalidAddress, 14 /* EFAULT */,
+                                   base);
+    }
+    if (r->kind != RegionKind::Private) {
+        return fail<std::uint32_t>(Status::InvalidParameter, 0, base);
+    }
+    if (base + size > r->end()) {
+        return fail<std::uint32_t>(Status::InvalidParameter, 0, base);
+    }
+
+    // Every page the range covers must be committed. The check walks the
+    // regions the range spans rather than assuming one, because a range that
+    // covers a committed region and a reserved one is exactly the case
+    // Windows refuses -- and it is a case this ledger can produce, since a
+    // decommit of a neighbouring range leaves two regions where the caller
+    // sees one.
+    {
+        std::uint64_t cursor = base;
+        while (cursor < base + size) {
+            const Region* piece = space_->find(cursor);
+            if (piece == nullptr || !piece->contains(cursor) ||
+                piece->kind != RegionKind::Private) {
+                return fail<std::uint32_t>(Status::InvalidAddress, 14, base);
+            }
+            if (!piece->committed) {
+                return fail<std::uint32_t>(Status::NotCommitted, 0, base);
+            }
+            const std::uint64_t step_end = std::min(piece->end(), base + size);
+            if (step_end <= cursor) {
+                // A region of length zero cannot be stepped over; refusing
+                // rather than looping is the only safe answer.
+                return fail<std::uint32_t>(Status::InvalidAddress, 14, base);
+            }
+            cursor = step_end;
+        }
+    }
+
+    ++syscalls_made_;
+    const sys::Result p = sys::mprotect(reinterpret_cast<void*>(base),
+                                        static_cast<std::size_t>(size),
+                                        protection_to_prot(protection));
+    if (p.failed()) {
+        return fail<std::uint32_t>(Status::InvalidAddress, p.error, base);
+    }
+
+    // The ledger is cut only after the kernel agreed, so a refused mprotect
+    // leaves the ledger exactly as it was. `split()` re-checks the geometry
+    // the loop above already checked, which is redundant and cheap; it
+    // returns the index of the piece that was cut, and the change is recorded
+    // against that index rather than by address because the cut rebuilt the
+    // vector.
+    const Result<std::size_t> cut = space_->split(base, size);
+    if (!cut.ok()) {
+        return fail<std::uint32_t>(cut.status, 0, base);
+    }
+    const Result<std::uint32_t> changed =
+        space_->set_protection_at(cut.value, protection);
     if (!changed.ok()) {
         return fail<std::uint32_t>(changed.status, 0, base);
     }

@@ -728,13 +728,35 @@ the obvious implementation is wrong:
     access. Linux's closest equivalent is `PROT_NONE` plus a signal handler,
     which is a mechanism this runtime does not have a place for yet.
 
-`unmap` and `protect` address a whole region and refuse an address in the
-middle of one. This is stricter than `NtUnmapViewOfSection` and
-`NtProtectVirtualMemory`, which both take a range and split, and it is
-strict on purpose: a split makes "the region covering this address" a
+`Mapper::unmap` addresses a whole region and refuses an address in the middle
+of one. `Mapper::protect` does the same, for the callers for which a whole
+region is the right answer. This is stricter than `NtUnmapViewOfSection`, and
+it is strict on purpose: a split makes "the region covering this address" a
 different answer before and after a call a reader would call the same call.
-It is also the limit that lets `Region::protection_changes` mean what its
-comment says — a per-region count is only a per-region count.
+
+`NtProtectVirtualMemory` is **not** limited that way, because Windows is not.
+It takes a range and changes exactly the pages in it (`virtual.c:2039`,
+`set_protection( view, base, size, new_prot )`), so a program that makes one
+page read-only keeps its neighbour writable. The ledger is cut to match — the
+same three-way split a `MEM_DECOMMIT` makes — so the region the ledger reports
+covers the range that changed and nothing more. Two rules come with it:
+
+  * **Every page in the range must be committed**, or the whole call is
+    `STATUS_NOT_COMMITTED` and nothing changes. A protection is not a commit;
+    a caller that protected half a reservation would believe it had memory it
+    does not. This is Wine's check at `virtual.c:5629` and it is Windows'.
+  * **The range may span more than one region.** Wine refuses this —
+    `find_view` returns a single view — but on Windows the protection of a
+    page is a property of the page, not of the kernel's bookkeeping, and two
+    contiguous committed ranges are one range to a caller. This runtime walks
+    the regions the range spans and gives the Windows answer, which is one of
+    the places it is deliberately more correct than Wine.
+
+`Mapper::protect_in_range` is the primitive behind it: it checks the range,
+calls `mprotect` on the range, and only then cuts the ledger, so a refused
+`mprotect` leaves the ledger exactly as it was. `Mapper::protect` remains the
+whole-region operation, and keeping the two separate under two names is what
+lets `Region::protection_changes` keep the meaning its comment claims.
 
 `tests/test_mapper.cpp` holds every mapping case to one rule: a case that
 claims a mapping works must prove it by writing to the bytes and reading
@@ -1172,6 +1194,21 @@ and let the kernel's refusal be the answer. The ledger lookup before each
 attempt is a cheap skip and *not* the safety check — only the kernel knows what
 anything has mapped, and a pre-check is the TOCTOU shape.
 
+**A view with no address asked for comes from the bottom, and that is the
+opposite direction.** A `zero_bits` request has a ceiling and so is searched
+downward; a view that names no address at all has none, and Windows places it
+low, above the image and below everything a program has mapped for itself. The
+first version of this runtime asked for it the way a `mmap(NULL, ...)` asks —
+`map(0, ...)`, let the kernel choose — and that is wrong twice over. Windows
+places unconstrained views from the bottom of the user window *upward*, so a
+program that maps a file and then asks for `plain` memory at a fixed offset
+above it depends on the view being low; and `mmap(NULL, size, ...)` promises
+page alignment and nothing more, where a view that must be reported by
+`NtQueryVirtualMemory` as an allocation-granularity base has to actually be one.
+`map_above(kUserMin, ...)` is the search, ascending in granularity steps, the
+mirror of `map_below` and for the same reason: only the kernel's refusal is
+evidence that a candidate is free.
+
 **The 22-to-31 hole is copied, including the clause that cannot fire.**
 `virtual.c:4581-4582` refuses `zero_bits` between 22 and 31 and accepts 21 and
 32, and the second clause compares against a constant that makes it unreachable.
@@ -1192,6 +1229,56 @@ through to one `unmap()`, which took the whole reservation away and returned
 success — the addresses went back to the system, a later commit failed with
 `MEMORY_NOT_ALLOCATED`, and a pointer the program had kept dangled. Nothing in
 the return value said so.
+
+**`MEM_COMMIT` takes a range, not a reservation.** A program reserves an arena
+and commits it a page at a time as it needs it, and an implementation that only
+accepted a whole reservation from its base would make every caller commit memory
+it is not going to use. The commit is the exact inverse of the decommit: the
+same `split` cuts the range out of its region, the same outward page rounding
+applies, and the only difference is which way the `committed` flag is flipped.
+Two roundings in this path are easy to swap and both are Windows':
+
+  * **The address rounds to a page, not to the granularity.** The 64 KiB
+    granularity is a rule about where a *reservation* starts; a commit names
+    pages inside one. Rounding a commit to the granularity would move it to the
+    start of the reservation, committing pages the caller did not name. The
+    reserve path rounds down to the granularity and the commit path rounds down
+    to a page, and the `base` computation branches on `MEM_RESERVE` for exactly
+    that reason.
+  * **The size is `ROUND_SIZE(addr, size, page_mask)`**, not the
+    granularity-rounded size the reservation was made with. Using the
+    granularity-rounded size makes a commit of the last page of a reservation
+    whose length is not a multiple of 64 KiB reach past the region and fail as
+    if it were extending the reservation.
+
+A commit of a range that is already committed is a success and not an error —
+Windows lets a program commit twice — and it changes nothing, so the ledger is
+not cut and the change counter does not move. A commit is not a protection
+change.
+
+**`AddressSpace::split` is the cut, and it is written once.** A decommit, a
+commit and a partial `NtProtectVirtualMemory` all need the same thing: the range
+they act on must stop sharing a ledger entry with its neighbours, or the change
+they make cannot be recorded as belonging to the range rather than to the whole
+region. `split(base, size)` cuts the containing region into up to three pieces —
+a head, the range, a tail — copies every field across, and returns the index of
+the middle piece. The caller then flips the one field it came to flip and touches
+nothing else, which is what keeps a decommit from changing a protection and a
+protection change from committing a reservation.
+
+**The index it returns is into the ledger, not into its own piece list, and
+that distinction was a real bug.** The pieces are built in a local vector and
+spliced in at the position the original region occupied, so the middle piece's
+index *within the pieces* equals its index in the ledger only when the cut
+happened at the front of the ledger. Reporting the pieces index addresses a
+region the caller never named, and the symptom is silent: a decommit of the
+second half of a reservation cleared the commit of the *first* half, so memory
+the caller never touched faulted while the memory it had decommitted did not.
+The fix is `insert_at - regions_.begin() + middle_index`, computed before the
+insert invalidates the iterator, and the test that catches it is
+`not committed: the page the commit did not name is still reserved` — which
+exists because the mutant `a-commit-commits-the-whole-region` survived a suite
+that only ever looked at the page that changed.
 
 **`ROUND_SIZE` is not `round_up(size)`.** `virtual.c:189` adds the address's
 offset *within its page* to the size before rounding:
@@ -1305,8 +1392,8 @@ question about the object rather than about a view of it.
 
 ### What the tests are actually asserting
 
-`tests/test_ntdll.cpp` is 208 assertions in thirteen functions, and the shape of
-it is that each one is named after a rule rather than after a function. Five of
+`tests/test_ntdll.cpp` is 298 checks in twenty functions, and the shape of
+it is that each one is named after a rule rather than after a function. Six of
 them exist because the first version asserted something Windows does not do, and
 in each case the runtime was right and the test was wrong:
 
@@ -1323,6 +1410,27 @@ in each case the runtime was right and the test was wrong:
 - a forged handle is now three forgeries rather than one, because there are
   three distinct mistakes: an index moved by a slot, an index with the low bit
   clear, and an index from this table under another table's cookie.
+- the flush-buffers case asserted that making a page read-only did **not** change
+  the number of `msync` calls, which was true only while a protect changed the
+  whole region. The old assertion described the old bug: with the whole region
+  read-only there was no writable page left to reach. A range protect leaves the
+  rest of the region writable, so the count now moves by exactly the regions
+  that are writable, and the test computes that number from the ledger rather
+  than hard-coding it.
+
+Three more exist for the range-protect work itself, and each asserts the page
+the caller did **not** name:
+
+- `test_a_protect_acts_on_its_range_and_not_on_the_region` — the head and tail
+  keep their protection and their change count, the range gets the new one, and
+  the untouched page is written through to prove the kernel agrees. A runtime
+  that only edited the ledger would pass the ledger assertions and fail this one.
+- `test_a_protect_over_a_reserved_page_is_not_committed` — a range that includes
+  a decommitted page is refused with `STATUS_NOT_COMMITTED`, *and nothing moved*:
+  the committed page before it is still read-only and the region is not cut. A
+  per-page check would have changed the head and then failed on the tail.
+- `test_a_protect_may_span_two_regions` — a protect that crosses a seam between
+  two committed regions succeeds, which is the Windows answer and not Wine's.
 
 The other thing the tests assert is that the layer *refuses* rather than
 faulting, and that is where the two most valuable findings came from.
@@ -1426,11 +1534,15 @@ validation is normally cheap; redundant validation that makes a check
 *unobservable* is not, because a suite that cannot detect a check being removed
 is not evidence the check was ever there.
 
-**208 checks, 28 mutations, none surviving.** Four of the 28 are rejected by
+**300 checks, 46 mutations, none surviving.** Five of the 46 are rejected by
 the compiler and counted separately rather than as coverage. The harness runs
 every mutant under two builds and requires both to fail, and the second build
 is not redundancy: three of the findings above are memory faults that a plain
-run gets away with.
+run gets away with. It runs the mapper and placement suites alongside ntdll's
+for each mutant, for the reason the `SURVIVED` below records: a mutant that
+lives in `mapper.cpp` is not observable from a binary that only reaches the
+calls, and a survivor from the wrong binary reads exactly like a survivor from
+a blind suite.
 
 **And the harness counts its own failures, which is the part worth copying.**
 An earlier version reported a mutant as un-caught when its anchor did not match
@@ -1443,6 +1555,35 @@ detect: the placement search gave up after 4 MiB, and the mutant that would
 have caught it never ran. Anchor failures are now a separate list with a
 separate exit code, because a broken anchor is not a weaker result — it is not
 a result, and it invalidates the numbers printed beside it.
+
+**An anchor is not just text that matched once; it is text that matches
+*once*.** The harness's apply step counts the occurrences and refuses at two,
+and that guard earned itself the moment the range work landed. `map_above` was
+added beside `map_below` and both carry a `kMaxAttempts = 16384` with an
+identical three-line loop header under it; `commit()` was written as a range
+and its empty-range guard came out byte-identical to `decommit`'s. Two mutants
+whose anchors had been unique for as long as they existed stopped being unique
+in one commit, without either mutant being touched. The report caught both as
+`ANCHOR-FAIL count=2`, and the fix is the one the guard forces: widen the
+anchor until it names the branch and not the shape — the loop header's own
+`if (candidate < floor_ || ...)` for `map_below`, the trailing
+`// A decommit of a range that is already reserved` for the decommit. A
+narrower anchor would have silently mutated the first match, which for
+`kMaxAttempts` is `map_below` and not the function the mutant is named after —
+a mutant that measures the wrong function and reports `caught` is worse than a
+survivor, because nothing about the output says to look.
+
+**The suite a mutant is run against is part of the mutant.** The `SURVIVED` on
+`a-protect-recommits-a-reservation` was not a gap in the assertions; it was a
+gap in the reach. The mutant flips `updated.committed = at->committed;` — the
+line that keeps a protection change from *committing* a reserved range — and
+the only tests that call `Mapper::protect` are in `occ_test_mapper`, while the
+harness ran `occ_test_ntdll`. The binary that owns the semantics had never been
+asked. The assertion it needed did not exist either, and both halves were
+fixed: the harness now runs the mapper and placement suites alongside ntdll's
+for every mutant, and `test_a_protect_does_not_commit_a_reserved_range` pins
+the field in both directions. A survivor has to mean the suite is blind, not
+that the wrong suite was reading.
 
 ### M3 — mini-CRT and imports
 
