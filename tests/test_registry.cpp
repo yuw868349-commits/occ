@@ -249,8 +249,13 @@ void test_the_start_time_is_the_targets_own() {
     check(occ::obs::process_start_ticks(::getpid(), self_ticks),
           "this process's start time is readable");
     check(child_ticks != 0, "the child's start time is not zero");
-    check(child_ticks <= self_ticks,
-          "the child started after the process that forked it");
+    // The child was forked after this process began, so its start time is
+    // later -- or equal, when the fork landed in the same clock tick as this
+    // process's own start. Both are consistent with the ordering; a child's
+    // start time *before* its parent's would mean the field does not
+    // describe what it claims to.
+    check(child_ticks >= self_ticks,
+          "the child started no earlier than the process that forked it");
 
     // A pid that does not exist has no start time, which is a different
     // answer from a start time of zero and has to be reported as one.

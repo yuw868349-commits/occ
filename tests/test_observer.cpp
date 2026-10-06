@@ -755,6 +755,21 @@ void test_listener_binds_loopback() {
         std::fprintf(stderr, "  note: rebinding an in-use port was allowed\n");
     } else {
         check(!second_error.empty(), "a refused bind names its reason");
+        // The busy-port case is told apart from every other bind failure,
+        // because the two call for different responses from whoever asked
+        // for the port: one means wait, the other means something is wrong
+        // with the address.
+        //
+        // The comparison this depends on is against the positive errno. A
+        // failed Result carries the errno negated in its value field, so
+        // comparing that against kEaddrinuse is never true -- the branch
+        // stays in the source, looks like it handles the busy port, and never
+        // runs. What the caller would see instead is the strerror of a
+        // negative number.
+        check(second_error.find("already in use") != std::string::npos,
+              "a bind refused because the port is busy says so specifically");
+        check(second_error.find("Unknown error") == std::string::npos,
+              "and does not report a negative errno as the reason");
     }
 
     listener.close();

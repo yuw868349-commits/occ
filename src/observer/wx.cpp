@@ -637,7 +637,23 @@ ArmReport WriteExecuteTracker::chase(Watchpoints& watchpoints, int pid,
     report.bytes_total = r->target.length;
 
     if (r->armed) {
+        // Already covered from a previous chase. The coverage is reported
+        // the way arm reports it, partial and unwatched entries included: a
+        // caller comparing the two reports would otherwise see a region as
+        // complete here and partial there purely because of which entry
+        // point reached it, and would conclude it is fully watched when only
+        // its first few bytes are.
         report.bytes_covered = r->covered;
+        if (r->covered < r->target.length) {
+            WatchTarget t;
+            t.base = r->target.base;
+            t.length = r->target.length;
+            if (r->covered == 0) {
+                report.unwatched.push_back(t);
+            } else {
+                report.partial.push_back(ArmReport::Partial{t, r->covered});
+            }
+        }
         return report;
     }
 
