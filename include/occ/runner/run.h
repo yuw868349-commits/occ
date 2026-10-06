@@ -141,15 +141,27 @@ struct RunOptions {
     std::vector<std::string> env;
 
     // A directory this run owns, created if it does not exist and removed
-    // when the run ends. An engine that keeps state on disk -- a Wine
-    // prefix -- needs one, and the runner is what knows when the run is
-    // over. Empty means the runner picks one under /run, named after the
-    // process so two concurrent runs cannot collide.
+    // when the run ends. An engine that keeps state on disk needs one, and
+    // the runner is what knows when the run is over. Empty means the runner
+    // picks one under /run, named after the process so two concurrent runs
+    // cannot collide.
     //
     // A caller that names a directory here is responsible for it being
     // somewhere the target's writes cannot outlive the run, which in
     // practice means not a directory the target can reach twice.
     std::string scratch_dir;
+
+    // The engine the caller asked for, by the name an engine reports, or
+    // "occ" for whichever engine this build routes the format to. Empty
+    // means the caller did not say, and the detection decides.
+    //
+    // This is an assertion the run verifies rather than a second routing
+    // table: the detection still picks the engine, and a caller who named
+    // one that would not have been picked is told so instead of silently
+    // getting what the detection chose. `occ run --engine=occ hello.exe` is
+    // the form a caller writes when they want to say out loud that the run
+    // is this build's own runtime and not something found on the host.
+    std::string engine;
 };
 
 // Whether a run should try to place probes, given the flag and the mode.

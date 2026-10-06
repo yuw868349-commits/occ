@@ -208,12 +208,27 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         why += " image; occ runs Linux executables";
         if (detection.format == parser::Format::Pe) {
             why +=
-                ", and a Windows image needs the pe engine, which needs a "
-                "Wine loader on this host";
+                ", and a Windows image needs the pe engine, which is built "
+                "into this binary";
         }
         return refuse(std::move(out), events, why);
     }
     out.engine = chosen->name();
+
+    // The caller's named engine is an assertion the run checks, not a
+    // second routing table. The detection picked an engine; a caller who
+    // named another is told the two disagree rather than silently run
+    // under the one they did not ask for. "occ" is the caller's word for
+    // "whatever this build routes the format to", and every engine in this
+    // build is exactly that, so it matches anything the detection chose.
+    if (!options.engine.empty() && options.engine != "occ" &&
+        options.engine != chosen->name()) {
+        return refuse(std::move(out), events,
+                      "the caller asked for the " + options.engine +
+                          " engine and the detection chose " + chosen->name() +
+                          "; the two disagree, and the run stops rather than "
+                          "answering a question that was not asked");
+    }
 
     const std::string preflight = chosen->preflight(detection);
     if (!preflight.empty()) {

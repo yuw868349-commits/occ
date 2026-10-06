@@ -1,17 +1,12 @@
 #include "occ/engine/engine.h"
 
-#include "occ/observer/ntdll_probes.h"
-#include "occ/parser/elf.h"
 #include "occ/parser/pe.h"
+#include "occ/runner/pe_runner.h"
 #include "occ/util/fs.h"
 
-#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <string>
 #include <vector>
-
-#include <unistd.h>
 
 namespace occ::engine {
 
@@ -55,313 +50,6 @@ void report_section(obs::Writer& events, const parser::PeSection& s,
                                          ? s.raw_size - s.virtual_size
                                          : 0));
     events.commit();
-}
-
-// The Wine loaders this host has.
-//
-// The two names are not the same program. wine64 loads 64-bit images and
-// wine loads 32-bit ones, and a 32-bit image handed to a 64-bit-only loader
-// fails in the loader with a message that does not mention bitness. So
-// both are looked for and the plan picks by the image's own width.
-struct WineSearch {
-    std::string wine64;
-    std::string wine;
-};
-
-// Records dir/name as a loader if it is one. Executability is tested
-// rather than existence: a distribution can leave a wrapper script that is
-// not executable next to the real binary, and exec'ing that produces an
-// error naming the file rather than the missing capability.
-//
-// The slot is only filled once. A second wine64 earlier or later in PATH
-// does not replace the first, because which one wins is a property of the
-// host's configuration and either answer is defensible -- what is not
-// defensible is a search whose result depends on directory order in a way
-// nobody can see.
-void consider(WineSearch* out, const std::string& dir, const char* name,
-              bool is64) noexcept {
-    if (out == nullptr) {
-        return;
-    }
-    std::string& slot = is64 ? out->wine64 : out->wine;
-    if (!slot.empty()) {
-        return;
-    }
-    std::string candidate = dir;
-    if (candidate.back() != '/') {
-        candidate += '/';
-    }
-    candidate += name;
-    if (!fs::exists(candidate)) {
-        return;
-    }
-    if (::access(candidate.c_str(), X_OK) != 0) {
-        return;
-    }
-    slot = candidate;
-}
-
-// Searches PATH for a loader. The search is a search rather than a fixed
-// path because the path is a property of the host, and a hard-coded one
-// would make this engine work on exactly the machine it was written on.
-//
-// Cached because the answer cannot change within a process and a run asks
-// once. The function-local static is constructed on first use rather than
-// at load time so that a program that never runs a PE never walks PATH.
-WineSearch find_wine() noexcept {
-    // An explicit loader, if the caller named one.
-    //
-    // This branch is read on every call rather than cached with the search,
-    // and the difference is deliberate. The search's answer is a property of
-    // the host and cannot change within a process; the named loader is a
-    // property of the request, and a process that plans two runs against two
-    // installations has two answers. Caching it would make the second plan
-    // silently use the first one's Wine.
-    //
-    // The name is the loader itself and is used as given, including the
-    // executable bit being checked: a path that is named and not executable
-    // is a configuration mistake, and falling back to a search would run a
-    // different Wine than the one that was asked for.
-    if (const char* explicit_loader = ::getenv("OCC_WINE_LOADER")) {
-        if (explicit_loader[0] != '\0') {
-            WineSearch named_out;
-            const std::string named(explicit_loader);
-            if (fs::exists(named) && ::access(named.c_str(), X_OK) == 0) {
-                // Both slots hold it. The plan picks by the image's width
-                // rather than by which slot is filled, so a named loader has
-                // to be reachable from both or a 32-bit image would be told
-                // there is no 32-bit Wine when the caller said there is.
-                named_out.wine64 = named;
-                named_out.wine = named;
-            }
-            return named_out;
-        }
-    }
-
-    static const WineSearch found = [] {
-        WineSearch out;
-        const char* path = ::getenv("PATH");
-        if (path == nullptr || path[0] == '\0') {
-            path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"
-                   "/sbin:/bin";
-        }
-
-        // Split on ':' inline rather than through a helper. There is no
-        // path-splitting function in the tree, and adding one for a single
-        // caller would be a larger change than the loop.
-        std::string rest(path);
-        std::size_t start = 0;
-        for (;;) {
-            const std::size_t colon = rest.find(':', start);
-            const std::size_t end =
-                colon == std::string::npos ? rest.size() : colon;
-            if (end > start) {
-                // An empty PATH element means the current directory, which
-                // is what the shell does with one. It is skipped rather
-                // than honoured: a loader is a program that runs with the
-                // privileges occ was given, and the working directory is
-                // the least trustworthy directory in the set.
-                consider(&out, rest.substr(start, end - start), "wine64",
-                         true);
-                consider(&out, rest.substr(start, end - start), "wine",
-                         false);
-            }
-            if (colon == std::string::npos) {
-                break;
-            }
-            start = colon + 1;
-        }
-        return out;
-    }();
-    return found;
-}
-
-// The directory a Wine prefix is created in, and where the loader's
-// libraries are found.
-//
-// A prefix is a directory tree Wine populates on first use: a registry
-// hive, a drive_c, a set of DLLs it builds or copies. It has to be writable
-// and it has to be per-run, because two runs sharing a prefix share a
-// wineserver and a target's writes to its own drive_c.
-//
-// The location is derived from the loader's own path rather than
-// hard-coded, because that is the only thing that identifies which
-// installation this is. A Wine in /usr/lib/wine has its libraries in
-// ../lib/wine; one in /opt/wine-stable has them beside it. Getting this
-// wrong produces a loader that starts and then cannot load anything.
-struct WineLayout {
-    // The library directory, empty when it could not be located.
-    std::string lib_dir;
-};
-
-WineLayout wine_layout(const std::string& loader) noexcept {
-    WineLayout out;
-    if (loader.empty()) {
-        return out;
-    }
-
-    const std::size_t slash = loader.rfind('/');
-    const std::string bin_dir =
-        slash == std::string::npos ? std::string(".") : loader.substr(0, slash);
-    const std::string prefix_dir =
-        slash == std::string::npos ? bin_dir : bin_dir.substr(0, bin_dir.rfind('/'));
-
-    // The layouts in use, most specific first. A layout is a candidate
-    // directory that is accepted only if it actually exists, so listing one
-    // that is absent costs a stat and never produces a wrong bind.
-    for (const char* candidate : {"/lib/wine", "/lib64/wine", "/lib/x86_64-linux-gnu/wine"}) {
-        const std::string path = prefix_dir + candidate;
-        if (fs::is_dir(path)) {
-            out.lib_dir = path;
-            break;
-        }
-    }
-    if (out.lib_dir.empty() && fs::is_dir("/usr/lib/wine")) {
-        out.lib_dir = "/usr/lib/wine";
-    }
-
-    return out;
-}
-
-// Wine's Unix-side ntdll, which is the file the probes go into.
-//
-// It is the host-native ELF, not the PE ntdll.dll. A Windows program's
-// NtCreateFile is a thunk into __wine_syscall_dispatcher, which indexes a
-// table of Unix functions; the one with a body to place a probe on is the
-// Unix function, and it lives in the .so.
-//
-// The search order is the layout Wine installs under on the distributions
-// that ship it, most specific first. The host's uname machine is not
-// consulted: the directory name is the target ISA Wine was built for, which
-// is the image's ISA and not necessarily the running kernel's -- a 32-bit
-// Wine on a 64-bit kernel lives under i386-unix and still runs.
-struct NtdllLocation {
-    // The file, empty when it could not be found.
-    std::string path;
-    // Why it could not be found, for the degradation note.
-    std::string reason;
-};
-
-NtdllLocation find_ntdll(const std::string& lib_dir,
-                         std::uint32_t address_bits) noexcept {
-    NtdllLocation out;
-
-    // The loader's own directory tree first, because that is the one
-    // installation the plan is already committed to. A Wine in /opt has its
-    // ntdll beside it, and a search that preferred /usr would place probes
-    // in a different Wine than the one being run.
-    //
-    // lib_dir is already the Wine library directory -- wine_layout returns
-    // .../lib/wine, not .../lib -- so the ISA directory goes directly under
-    // it. A second "wine" component here would be a path that does not exist
-    // on any installation, and the search would then fall through to the
-    // packaged locations and probe a different Wine than the one planned.
-    std::vector<std::string> dirs;
-    if (!lib_dir.empty()) {
-        const std::string isa = address_bits == 32 ? "i386" : "x86_64";
-        dirs.push_back(lib_dir + "/" + isa + "-unix");
-        dirs.push_back(lib_dir + "/" + isa + "-windows");
-    }
-    // The packaged locations, which are where a distribution puts it when
-    // the loader is a shim in /usr/bin that exec's these.
-    const std::string isa = address_bits == 32 ? "i386" : "x86_64";
-    for (const char* root : {"/usr/lib/x86_64-linux-gnu/wine",
-                             "/usr/lib64/wine",
-                             "/usr/lib/wine",
-                             "/usr/lib/i386-linux-gnu/wine"}) {
-        dirs.push_back(std::string(root) + "/" + isa + "-unix");
-    }
-
-    for (const std::string& dir : dirs) {
-        for (std::string_view name : obs::ntdll_sonames()) {
-            const std::string candidate = dir + "/" + std::string(name);
-            if (fs::exists(candidate)) {
-                out.path = candidate;
-                return out;
-            }
-        }
-    }
-
-    out.reason =
-        "Wine's Unix-side ntdll was not found, so no function-level probes "
-        "could be placed; the run continues with syscall-level observation, "
-        "which sees Wine's own library traffic mixed with the target's";
-    return out;
-}
-
-// Reads the probes out of the table and drops the ones whose symbols the
-// ntdll on this host does not have.
-//
-// The table was checked against a real Wine when it was written, but a host
-// may have a different Wine: a version that renamed a function, or a build
-// configured without one. Placing a probe needs an address, and a symbol
-// that is not in this file has none -- so the ones that are missing are
-// counted and reported rather than attempted. Attempting them would make
-// the kernel refuse a line the engine wrote, and the failure would be
-// attributed to the run rather than to the version mismatch that caused it.
-struct ProbePlan {
-    std::vector<ProbeRequest> requests;
-    std::size_t dropped = 0;
-    std::size_t total = 0;
-    std::string first_dropped;
-};
-
-ProbePlan build_probes(const std::string& ntdll_path) noexcept {
-    ProbePlan out;
-    out.total = obs::ntdll_probe_count();
-
-    auto bytes = fs::read_file_bytes(ntdll_path);
-    if (!bytes || bytes->empty()) {
-        // The file exists and cannot be read. That is a different problem
-        // from the symbol being absent and it costs every probe rather than
-        // some, so everything is counted as dropped and the reason is not
-        // about any one symbol.
-        out.dropped = out.total;
-        out.first_dropped = "the module could not be read";
-        return out;
-    }
-
-    const parser::ElfImage image =
-        parser::ElfImage::parse(ByteSpan{bytes->data(), bytes->size()});
-    if (!image.ok()) {
-        out.dropped = out.total;
-        out.first_dropped = "the module is not an ELF this build can read";
-        return out;
-    }
-    if (!image.has_symbols()) {
-        // A stripped ntdll keeps its dynamic symbols or it could not be
-        // loaded by the linker, so this means the symbol table is damaged
-        // rather than absent. Either way there are no addresses.
-        out.dropped = out.total;
-        out.first_dropped =
-            "the module has no readable dynamic symbol table";
-        return out;
-    }
-
-    for (const obs::NtdllProbe& p : obs::ntdll_probes()) {
-        const parser::Symbol* s = image.find_symbol(p.symbol);
-        if (s == nullptr || !s->probeable()) {
-            ++out.dropped;
-            if (out.first_dropped.empty()) {
-                out.first_dropped = std::string(p.symbol);
-            }
-            continue;
-        }
-        ProbeRequest req;
-        req.module = ntdll_path;
-        req.symbol = std::string(p.symbol);
-        req.label = std::string(p.symbol);
-        req.note = std::string(p.note);
-        // Unconditional, because arg() already answers an empty view for a
-        // position the entry does not name. A loop guarded by a count would
-        // be a second place that has to know how many names there are, and
-        // the two would drift the first time an entry names a sixth.
-        for (std::size_t i = 0; i < 6; ++i) {
-            req.arg_names[i] = p.arg(i);
-        }
-        out.requests.push_back(std::move(req));
-    }
-    return out;
 }
 
 class PeEngine final : public Engine {
@@ -502,270 +190,66 @@ LaunchPlan PeEngine::plan(const EngineRequest& request,
         return out;
     }
 
-    // Wine supplies the loader and the Win32 API. Occ does not implement
-    // either -- see docs/DESIGN.md for why the boundary falls there. So the
-    // question this function answers is not "what does the API do" but
-    // "which loader, with which arguments, in which prefix, seeing which
-    // libraries", and every one of those is a host property rather than a
-    // target property.
-    const WineSearch wine = find_wine();
-
-    // The loader is chosen by the image's width, and the widths are
-    // exclusive because a host with only one loader can only run one of
-    // them. A refusal here names both facts, because "no Wine" and "only
-    // the 32-bit Wine" call for different installs and a user who is told
-    // only the first will install the wrong one.
-    const bool wants64 = image.address_bits == 64;
-    std::string loader = wants64 ? wine.wine64 : wine.wine;
-    if (loader.empty()) {
-        // The other width is a fallback rather than a refusal. A 64-bit
-        // loader running a 32-bit image is a supported configuration --
-        // WoW64 is exactly that -- so using one is correct where it is the
-        // only one there is. It is reported as a degradation because the
-        // fidelity notes in DESIGN.md apply, and a run whose fidelity
-        // differs should say so rather than look identical to one that does
-        // not.
-        loader = wants64 ? wine.wine : wine.wine64;
-        if (loader.empty()) {
-            out.refusal =
-                wants64
-                    ? "no Wine loader was found on PATH; a PE needs Wine to "
-                      "supply the loader and the Win32 API, and occ "
-                      "implements neither"
-                    : "no 32-bit Wine loader was found on PATH and no 64-bit "
-                      "one either; a 32-bit PE needs a loader that can run "
-                      "it, and occ implements neither";
-            return out;
-        }
-        out.degradations.emplace_back(
-            std::string("no ") + (wants64 ? "64" : "32") +
-            "-bit Wine loader was found; using the " +
-            (wants64 ? "32" : "64") + "-bit one");
-    }
-
-    const WineLayout layout = wine_layout(loader);
-    if (layout.lib_dir.empty()) {
+    // The runtime this build carries executes PE32+ -- the x64 shape. A
+    // 32-bit image is not a smaller problem the same code solves: every
+    // thunk, every TEB offset and every register width in it is the 64-bit
+    // one, and running a 32-bit image would mean carrying a second runtime
+    // beside it. The refusal names the widths, because a user who sees one
+    // should know which side of the split they are on.
+    if (image.address_bits != 64) {
         out.refusal =
-            "the Wine loader at " + loader +
-            " has no library directory beside it, so the loader would start "
-            "and then fail to load anything; point occ at an installation "
-            "that has one";
+            "this build executes PE32+ (x64) images itself; a " +
+            std::to_string(image.address_bits) +
+            "-bit image needs a runtime this build does not carry";
         return out;
     }
 
-    // The prefix. It is a directory tree Wine writes on first use, so it
-    // has to be writable and per-run. The run's own scratch directory is
-    // the only location that satisfies both without the engine inventing a
-    // path outside the run's lifetime.
-    if (request.scratch_dir.empty()) {
-        out.refusal =
-            "running a PE needs a writable Wine prefix, and this run has no "
-            "scratch directory to put one in";
-        return out;
-    }
-    const std::string prefix = request.scratch_dir + "/wineprefix";
-    if (!fs::mkdir_p(prefix, 0700)) {
-        out.refusal = "the Wine prefix directory " + prefix +
-                      " could not be created";
-        return out;
-    }
-    out.scratch_dir = prefix;
+    // The process is occ itself, re-exec'd.
+    //
+    // The plan names `/proc/self/exe` with `__pe-runner` after it, and the
+    // container exec's that: the runner is this binary again, inside the
+    // namespaces the container has entered, dispatching on the token to the
+    // code in `runner/pe_runner.cpp`. The exec is the seam that makes both
+    // halves of the design work -- the container can seal a process it
+    // exec's, and a guest that corrupts its own state corrupts a process
+    // that was started for it rather than the one the caller is sitting in.
+    // Naming this binary through `/proc/self/exe` rather than a PATH search
+    // is part of the same argument: the runner has to be the binary whose
+    // registry this build audited, and a PATH search is a way to run
+    // somebody else's.
+    //
+    // Everything the old plan arranged -- a Wine install, a prefix tree, a
+    // writable /tmp, the loader's libraries -- is absent because nothing on
+    // this side consumes any of it. The API the guest imports is the host's
+    // own code, resolved through the registry the runner builds; the
+    // filesystem the guest sees is the container's read-only bind of the
+    // host's; and the scratch directory this run owns stays empty, because
+    // the runtime is from this binary and the process keeps no state on
+    // disk.
+    out.program = runner::kPeRunnerProgram;
+    out.argv.push_back(runner::kPeRunnerProgram);
+    out.argv.push_back(runner::kPeRunnerCommand);
 
-    // argv[0] is the loader, then the target, then the caller's arguments
-    // with the target removed from the front. The caller's argv[0] was the
-    // target as it was named; keeping it would make the loader see the
-    // target twice.
-    out.program = loader;
-    out.argv.push_back(loader);
+    // The image, as an absolute path, then the caller's arguments with the
+    // target removed from the front -- the caller's argv[0] named the
+    // target as it was typed, and the runner's own argv[0] slot is the
+    // image path. The guest's command line is built from these by the
+    // Microsoft rules, which is why the arguments travel as separate argv
+    // entries and not as a pre-quoted string: the quoting is the runtime's
+    // job, done once, where the split that reads it back can be tested
+    // against it.
     out.argv.push_back(fs::absolute_path(request.path));
     for (std::size_t i = 1; i < request.argv.size(); ++i) {
         out.argv.push_back(request.argv[i]);
     }
 
-    // WINEPREFIX is set unconditionally rather than only when the caller
-    // did not set it, because the run's scratch directory has to be where
-    // the prefix is: a prefix in the caller's home would be a second
-    // program's state, and a run that is supposed to leave nothing behind
-    // would leave a wineserver's registry there.
-    out.env.emplace_back("WINEPREFIX=" + prefix);
-
-    // WINEDEBUG=-all because a loader that prints to stderr corrupts the
-    // target's own output, and the diagnostics it would print are not
-    // something occ can act on.
-    out.env.emplace_back("WINEDEBUG=-all");
-
-    // WINEDLLOVERRIDES=mscoree,mshtml= turns off the two libraries whose
-    // only effect on a run this tool observes is to start a service that
-    // outlives the target. Left alone they add processes to a session that
-    // is supposed to be about one target.
-    out.env.emplace_back("WINEDLLOVERRIDES=mscoree,mshtml=");
-
-    // The loader's libraries, read-only. Without them the exec succeeds and
-    // the target dies in the dynamic linker, which is a worse report than a
-    // refusal: it looks like the target's problem and is not.
-    isolation::ContainerConfig::BindMount libs;
-    libs.source = layout.lib_dir;
-    libs.target = layout.lib_dir;
-    libs.writable = false;
-    out.binds.push_back(libs);
-
-    // The prefix, writable.
-    //
-    // The path in WINEPREFIX is the host path, and the container's root is
-    // a read-only bind of the host's, so without this line Wine finds its
-    // own prefix directory read-only and dies creating the lock file inside
-    // it: "creat($WINEPREFIX/wineserver)" returns EROFS before the loader
-    // has looked at the target. The failure names a path the caller never
-    // wrote and a lock file they never asked for, which is the least
-    // useful shape a failure can have.
-    //
-    // It is bound at the same path it already has rather than moved
-    // somewhere writable, because WINEPREFIX is an absolute path Wine
-    // echoes back in its own messages and in the registry it writes; a
-    // prefix that is at one path in the environment and another in the
-    // filesystem makes every one of those messages wrong.
-    isolation::ContainerConfig::BindMount prefix_bind;
-    prefix_bind.source = prefix;
-    prefix_bind.target = prefix;
-    prefix_bind.writable = true;
-    out.binds.push_back(prefix_bind);
-
-    // A writable /tmp, because Wine's ntdll creates its server directory
-    // there.
-    //
-    // The container's root is a read-only bind of the host's, so the /tmp
-    // inside it is the host's /tmp with the write bit taken away. Wine
-    // builds "$TMPDIR/wine-<uid>" before it starts its server, and being
-    // unable to is not a degradation it recovers from: the loader prints
-    // "unable to create wineserver tmpdir" and the process exits before the
-    // target's entry point is reached. That is a run which fails for a
-    // reason that has nothing to do with the target, which is exactly the
-    // report this engine exists not to produce.
-    //
-    // The directory is under the run's scratch, so it is per-run and the
-    // runner removes it with everything else. Naming it /tmp rather than
-    // passing it in TMPDIR alone is deliberate: Wine is not the only thing
-    // in the run that wants a temp directory, and a target that calls
-    // GetTempPath must not be handed a path that does not exist.
-    const std::string tmp = request.scratch_dir + "/tmp";
-    if (!fs::mkdir_p(tmp, 01777)) {
-        out.refusal = "the Wine run's temporary directory " + tmp +
-                      " could not be created";
-        return out;
-    }
-    isolation::ContainerConfig::BindMount tmps;
-    tmps.source = tmp;
-    tmps.target = "/tmp";
-    tmps.writable = true;
-    out.binds.push_back(tmps);
-
-    // TMPDIR, TEMP and TMP are deliberately NOT set, and the reason is worth
-    // writing down because the naive thing to do here is exactly what they
-    // look like.
-    //
-    // Wine 9.0 aborts during startup whenever TMPDIR is present in the
-    // environment, with any value including /tmp:
-    //
-    //     $ env -i PATH=/usr/bin:/bin HOME=/root WINEPREFIX=/tmp/p
-    //                TMPDIR=/tmp wine64 cmd.exe /c
-    //     free(): invalid pointer
-    //
-    // The example is one env invocation wrapped over two lines. It carries
-    // no shell continuation on purpose: a trailing backslash inside a line
-    // comment is a line splice, and GCC reports that under -Wcomment where
-    // Clang does not. One variable per line keeps this file clean under
-    // both compilers, and the wrap is only for width.
-    //
-    // The freed pointer is a stack address -- the value half of the
-    // "TMPDIR=/tmp" entry in the environment block -- and the abort comes
-    // from ntdll's server-connect path, which walks the environment, keeps
-    // pointers into it, and frees some of them as though they were heap
-    // allocations from asprintf. Removing the variable is the only fix
-    // available from outside: the bug is in the loader and it is not ours
-    // to patch.
-    //
-    // What makes this safe is the bind above. With TMPDIR unset Wine falls
-    // back to /tmp, and /tmp inside the container is now the run's own
-    // writable directory, which is the directory TMPDIR would have named
-    // anyway. The variable only said out loud what the bind already
-    // guarantees, so dropping it costs nothing and the run stops dying
-    // before the target's entry point.
-    //
-    // TEMP and TMP are left alone for the same reason even though neither
-    // one is touched by that loader path: they are read from the Windows
-    // environment side, where Wine derives them from the fallback, and a
-    // value occ set here would be a second copy of the same path that could
-    // disagree with the first.
-
-    // A wineserver that outlives the run holds the prefix open, and the next
-    // run against the same prefix would find a server it did not start.
-    //
-    // WINESERVER is not set, and that is a deliberate negative. Wine's
-    // loader.c tries bin_dir/wineserver first and consults WINESERVER only
-    // if that path does not exec, so a value here would be inert in the
-    // normal layout -- and it is not inert when it is the empty string,
-    // which aborts Wine 9.0 in the same startup path TMPDIR does. A variable
-    // that does nothing when it is right and breaks the run when it is
-    // wrong is not worth setting.
-    //
-    // The sharing is instead prevented by construction: every run gets its
-    // own WINEPREFIX under its own scratch directory, so a server bound to
-    // that prefix has nothing to hand to a later run. Retiring a server that
-    // is still alive after the run is the runner's job and it can do it by
-    // prefix, which is a fact about this run; asking the loader to skip a
-    // step is a fact about the host.
-    //
-    // What replaces this is not another environment variable. The
-    // distribution's launcher, /usr/lib/wine/wineserver, ends in
-    // "exec $wineserver -p0": -p0 is a zero-second master socket timeout,
-    // so the server connects once and exits. That is the model Wine 9.0's
-    // client expects -- server.c's server_connect forks the server, waits
-    // for it with waitpid, and then connects to the socket it left behind --
-    // and it is measured working, three runs out of three, both on the host
-    // and inside a container shaped like the one this engine builds.
-    // Anything that keeps the server alive longer makes that waitpid block,
-    // so -p0 stays and none of it is this file's business.
-
-    // The probes.
-    //
-    // A syscall trace of a Wine run is a trace of the target and the loader
-    // together, and the loader's file traffic is most of it. Placing probes
-    // on the Nt* entry points of Wine's Unix-side ntdll is what separates
-    // them: a hit at NtCreateFile is the Windows program asking for a file,
-    // and it fires whether the request ends in a host open, in a wineserver
-    // round trip, or nowhere at all.
-    //
-    // Failing to find the ntdll or the symbols is a degradation and not a
-    // refusal. The run still happens and is still observed at the syscall
-    // level; it is only coarser, and SECURITY.md says why that trade is made
-    // rather than refusing a target that runs perfectly well without probes.
-    const NtdllLocation ntdll = find_ntdll(layout.lib_dir, image.address_bits);
-    if (ntdll.path.empty()) {
-        out.degradations.push_back(ntdll.reason);
-        return out;
-    }
-
-    const ProbePlan probes = build_probes(ntdll.path);
-    if (probes.requests.empty()) {
-        out.degradations.push_back(
-            "no ntdll probe could be placed on " + ntdll.path +
-            ": " + probes.first_dropped +
-            "; the run continues with syscall-level observation");
-        return out;
-    }
-
-    if (probes.dropped != 0) {
-        // Named rather than counted, because the count says how many and the
-        // name says which, and a run reporting "62 of 73" leaves a reader
-        // wondering whether the missing ones were the ones they cared about.
-        out.degradations.push_back(
-            std::to_string(probes.requests.size()) + " of " +
-            std::to_string(probes.total) + " ntdll probes were placed; the "
-            "first symbol this Wine does not export is " +
-            probes.first_dropped);
-    }
-
-    out.probes = probes.requests;
+    // No probes are requested, and that is a fact about the mechanism
+    // rather than a gap in it. The probes this format once asked for went
+    // into Wine's Unix-side ntdll, to separate the target's syscalls from
+    // the loader's; the loader is gone, and every syscall a container sees
+    // from a runner process is the target's own. The noise those probes
+    // existed to separate no longer exists, and a request that asked for
+    // them would be a memory of the thing this engine replaced.
 
     return out;
 }

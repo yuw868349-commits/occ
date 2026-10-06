@@ -1,4 +1,5 @@
 #include "occ/commands.h"
+#include "occ/runner/pe_runner.h"
 #include "occ/util/log.h"
 
 #include <cstdio>
@@ -76,6 +77,17 @@ int main(int argc, char** argv) {
     }
     if (cmd == "stop") {
         return occ::cmd_stop(argc - 2, argv + 2);
+    }
+
+    // The PE runner, reached only by occ's own exec of itself: the engine's
+    // plan names this binary with this token, the container exec's the pair,
+    // and control arrives here with the image and its arguments behind it.
+    // It is deliberately not in the usage text -- a runner a caller could
+    // invoke by hand is a runner whose isolation they could bypass, and the
+    // only legitimate way in is through the plan that names the container
+    // around it.
+    if (cmd == occ::runner::kPeRunnerCommand) {
+        return occ::runner::run_pe_runner(argc - 1, argv + 1);
     }
 
     occ::log::error("unknown command");

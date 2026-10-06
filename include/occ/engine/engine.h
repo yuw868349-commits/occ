@@ -8,14 +8,15 @@
 //
 // The separation also decides where the format-specific knowledge stops.
 // An ELF is exec'd directly, so the program is the target and the arguments
-// are the caller's. A PE is not exec'd directly: the program is Wine and the
-// target becomes the first argument, with a prefix directory and a loader
-// path that have to exist before anything runs. An APK is a zip, so running
-// one means running something that reads it. Each of those is a different
-// answer to "what is the argv of the process this run is about", and the
-// honest place to put the answer is a data structure the runner already
-// knows how to execute -- not a branch inside the spawn path that has to be
-// re-decided for every option the caller can pass.
+// are the caller's. A PE is not exec'd directly either, but not because
+// somebody else's loader is needed: the program is occ itself re-exec'd
+// with an internal dispatch token, and the target becomes the argument that
+// follows. An APK is a zip, so running one means running something that
+// reads it. Each of those is a different answer to "what is the argv of the
+// process this run is about", and the honest place to put the answer is a
+// data structure the runner already knows how to execute -- not a branch
+// inside the spawn path that has to be re-decided for every option the
+// caller can pass.
 //
 // So an engine produces a LaunchPlan and the runner executes it. Everything
 // after the plan is format-independent: the same container, the same
@@ -44,7 +45,7 @@ namespace occ::engine {
 // cannot run never gets the chance to explain why.
 enum class EngineKind : std::uint8_t {
     Elf, // A Linux executable or shared object, exec'd by the kernel.
-    Pe,  // A Windows image, run under Wine.
+    Pe,  // A Windows image, executed by occ's own runtime.
     Apk, // An Android package.
 };
 
@@ -145,18 +146,18 @@ struct ProbeRequest {
 struct LaunchPlan {
     // The program to exec, and the arguments with argv[0] first. For a
     // direct run these are the target and the caller's argv; for a PE they
-    // are the loader and the target among its arguments.
+    // are occ itself with its internal runner token, then the target.
     std::string program;
     std::vector<std::string> argv;
 
     // Environment entries this engine needs that the caller's options do
     // not produce. Added to the caller's environment rather than replacing
-    // it, so a caller who set WINEPREFIX deliberately keeps theirs.
+    // it, so a caller who set a variable deliberately keeps theirs.
     std::vector<std::string> env;
 
-    // Binds the engine needs mounted into the container. A PE needs the
-    // loader's libraries; without them the exec succeeds and the target
-    // dies in the dynamic linker, which is a worse report than a refusal.
+    // Binds the engine needs mounted into the container. A PE needs none:
+    // the runtime it runs on is the binary the plan names, and the
+    // filesystem the guest sees is the container's own root bind.
     std::vector<isolation::ContainerConfig::BindMount> binds;
 
     // The functions the engine wants observed from inside the target.
@@ -172,22 +173,21 @@ struct LaunchPlan {
     // that runs as itself.
     std::vector<ProbeRequest> probes;
 
-    // The root this run needs, empty when the caller's is right. A PE
-    // engine that builds a prefix needs somewhere the prefix can be
-    // written, which a read-only bind of the host's root is not.
+    // The root this run needs, empty when the caller's is right. Empty for
+    // every engine in this build: the read-only bind of the host's root is
+    // what each of them runs against.
     std::string root_dir;
 
     // A directory the engine created that the runner must remove when the
     // run ends. Named rather than left for the engine to clean up, because
     // the engine's plan is made before the run and has no callback into its
-    // end: a prefix that outlives its run holds a wineserver's state and
-    // the target's own writes, and the next run would inherit both.
+    // end. No engine in this build creates one.
     std::string scratch_dir;
 
     // What the engine could not do, in a form a person reads. Not a
-    // failure: a PE engine that found a Wine with no dynamic symbols
-    // reports that here and the run continues at a lower resolution. An
-    // empty string means the engine did everything it knows how to do.
+    // failure: an engine that could place part of what it planned reports
+    // that here and the run continues at a lower resolution. An empty
+    // string means the engine did everything it knows how to do.
     std::vector<std::string> degradations;
 
     // Set when the engine will not proceed. Non-empty means the run stops
@@ -198,12 +198,11 @@ struct LaunchPlan {
 };
 
 // What an engine is asked to plan. A struct rather than three parameters
-// because the third one did not exist when the first two did: an engine
-// that keeps state on disk -- a Wine prefix, a directory unpacked into --
-// needs somewhere to put it, and the only place that is correct is the
-// directory the runner made for this run. Threading a path in is how that
-// dependency gets expressed without the engine having to know what a
-// session is.
+// because the third one exists for engines that keep state on disk -- a
+// directory unpacked into, a cache warmed -- and need somewhere to put it.
+// The only place that is correct is the directory the runner made for this
+// run. No engine in this build keeps state on disk, and the field stays:
+// the next one to need it should not have to re-thread the dependency.
 struct EngineRequest {
     // The target, as the caller named it. Not resolved: an engine that
     // wants the resolved path asks fs::absolute_path, so that the fact

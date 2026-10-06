@@ -35,6 +35,9 @@ void print_run_usage() {
         "  --cpu <percent>    cpu bandwidth, 1..100\n"
         "  --cgroup <dir>     create the run's cgroup under <dir>\n"
         "  --env <K=V>        set an environment variable for the target\n"
+        "  --engine <name>    run under the named engine; 'occ' is this\n"
+        "                     build's own runtime, and the detection's\n"
+        "                     choice must agree\n"
         "  --observe          trace the target with ptrace as it runs\n"
         "  --probe            place the probes the engine asks for and\n"
         "                     report a hit per call (implies --observe)\n"
@@ -64,16 +67,16 @@ void print_run_usage() {
         "until a debugger connects, which is what makes 'break main' work\n"
         "instead of racing the program's first instructions\n"
         "\n"
-        "--probe places uprobes on the functions the engine named -- for a\n"
-        "Windows image, the Nt* entry points of Wine's Unix-side ntdll --\n"
-        "and writes a probe_hit record each time the target enters one.\n"
-        "This is what separates the target's requests from the loader's:\n"
-        "a syscall trace of a Wine run is a trace of both together. The\n"
-        "probe layer needs a mounted tracefs and a permitted\n"
-        "perf_event_open; when it has neither the run continues with\n"
-        "syscall-level observation and says so in probe_attached records.\n"
-        "OCC_PROBE=0 forces the layer off and OCC_PROBE=1 forces it on\n"
-        "even where the engine's own plan would not ask for it\n");
+        "--probe places uprobes on the functions the engine named and\n"
+        "writes a probe_hit record each time the target enters one. A\n"
+        "Windows image run by this build's own runtime makes no foreign\n"
+        "loader calls, so the pe engine asks for none and the flag answers\n"
+        "only when an engine asks. The probe layer needs a mounted tracefs\n"
+        "and a permitted perf_event_open; when it has neither the run\n"
+        "continues with syscall-level observation and says so in\n"
+        "probe_attached records. OCC_PROBE=0 forces the layer off and\n"
+        "OCC_PROBE=1 forces it on even where the engine's own plan would\n"
+        "not ask for it\n");
 }
 
 // Parses an unsigned decimal, or a hexadecimal number written with a 0x
@@ -292,6 +295,34 @@ int cmd_run(int argc, char** argv) {
                 return 2;
             }
             options.env.emplace_back(v);
+        } else if (arg == "--engine" || arg.rfind("--engine=", 0) == 0) {
+            // The value either follows the flag as the next argument or
+            // arrives glued to it with an '='. Both spellings are accepted
+            // because a caller scripting the run writes whichever reads
+            // better on that line, and an option whose spelling is a coin
+            // flip is an option scripts get wrong half the time.
+            std::string_view name;
+            if (arg.size() > 9 && arg[8] == '=') {
+                name = arg.substr(9);
+            } else {
+                const char* v = value("--engine");
+                if (v == nullptr) {
+                    return 2;
+                }
+                name = v;
+            }
+            if (name.empty()) {
+                std::fprintf(stderr,
+                             "occ run: --engine needs a name ('occ' is this "
+                             "build's own runtime)\n");
+                return 2;
+            }
+            // Not validated here: the accepted names are the engines'
+            // own, and the run checks the caller's name against the one
+            // the detection chose -- one place, with the real names,
+            // rather than a second table this loop would have to keep
+            // current.
+            options.engine = std::string(name);
         } else if (arg == "--observe") {
             options.observe = true;
         } else if (arg == "--probe") {
