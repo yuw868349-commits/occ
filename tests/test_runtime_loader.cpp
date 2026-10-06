@@ -47,6 +47,11 @@ void check(bool ok, const char* what) {
     }
 }
 
+// Defined far below with the fixtures that map. Declared here because the
+// loader cases reach it before its definition, and the file is organized
+// around the loader rather than around the helper.
+std::uint64_t claim_a_base(std::uint64_t bytes) noexcept;
+
 // ---------------------------------------------------------- PE fixture
 
 void put16(std::vector<std::uint8_t>& b, std::size_t off, std::uint16_t v) {
@@ -1011,6 +1016,123 @@ void test_loader_refuses_a_damaged_relocation_block() {
 }
 
 
+// A relocation whose field does not fit where it names.
+// `space.find(va)` answers one question -- is the byte at `va` mapped -- and
+// the loader used to treat that as the answer to the question that matters,
+// which is whether the *field* is mapped. The two differ by the field's
+// width minus one, and the gap is not hypothetical: the address comes out of
+// a file, and a file is free to name the last byte of a region.
+//
+// Reaching the region check needs a `Mapper`, because the write pass only
+// runs when the loader is actually placing the image. Without one the loader
+// runs the plan and stops, and the plan's bound is against SizeOfImage --
+// which cannot see a section gap and cannot see a field that leaves a region
+// while staying inside the image. The fixtures here therefore map.
+void test_loader_refuses_a_relocation_that_overruns_its_region() {
+    // A DIR64 at the last byte of the image.
+    //
+    // .text is one page at 0x1000 and .reloc is the table. The image is
+    // 0x2000. An RVA of 0x1FFF is the image's last byte, so the field's
+    // first byte is inside the image and its last seven are not.
+    //
+    // This is the plan's case, and it is the plan that refuses it: the plan
+    // bounds an RVA by SizeOfImage, and the bound is against the field's
+    // width rather than a fixed eight. A plan that used the DIR64 width for
+    // every type would refuse a HIGH at the same address, which fits; one
+    // that used one byte would admit this. The region check behind it is
+    // what catches a field that leaves a *region* while staying inside the
+    // image, which is the case below.
+    //
+    // The image is asked for at a base other than its own, because the write
+    // pass only runs when the image has to move -- an image placed where it
+    // asked to be has no delta and nothing to write. The plan runs either
+    // way, so this fixture would take the same path at either base; the
+    // second one needs the move and is written to be explicit about it.
+    {
+        const std::uint64_t load_at = claim_a_base(0x4000);
+        const std::vector<std::uint8_t> table = reloc_block(0x1000, {0xAFFF});
+        Spec s = reloc_spec(table, 0x2000, 0x2000);
+        const Built b = build(s);
+        const PeImage p = parse_image(b.bytes);
+        check(p.ok(), "reloc-width: the overrun fixture parses");
+
+        AddressSpace sp;
+        Mapper m(sp);
+        LoadContext ctx;
+        ctx.placement = &m;
+
+        const auto r = load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()},
+                                  load_at, sp, ctx);
+        check(!r.ok, "reloc-width: a DIR64 whose field leaves the image is "
+                     "refused");
+        check(r.error == LoadError::BadRelocation,
+              "reloc-width: the plan refuses it as a bad relocation");
+        check(r.detail.find("64-bit") != std::string::npos,
+              "reloc-width: the refusal names the field's width");
+        check(r.detail.find("outside the image") != std::string::npos,
+              "reloc-width: and says the field leaves the image");
+    }
+
+    // A relocation into a section gap, which is the case the region check
+    // exists for and the plan check cannot see.
+    //
+    // Sections are mapped whole pages, so the space between two of them is
+    // open only when they are more than a page apart. This fixture puts
+    // .text at 0x1000 and .reloc at 0x3000, leaving 0x2000 to 0x3000 mapped
+    // by nothing, and names an RVA inside it while SizeOfImage covers it.
+    {
+        const std::uint64_t load_at = claim_a_base(0x4000);
+        const std::vector<std::uint8_t> table = reloc_block(0x2000, {0xA100});
+        Spec s = reloc_spec(table, 0x3000, 0x4000);
+        const Built b = build(s);
+        const PeImage p = parse_image(b.bytes);
+        check(p.ok(), "reloc-width: the gap fixture parses");
+
+        AddressSpace sp;
+        Mapper m(sp);
+        LoadContext ctx;
+        ctx.placement = &m;
+
+        const auto r = load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()},
+                                  load_at, sp, ctx);
+        check(!r.ok, "reloc-width: a relocation into a gap between the mapped "
+                     "regions and the declared image is refused");
+        check(r.error == LoadError::RelocationNotWritable,
+              "reloc-width: the gap refusal names the missing bytes");
+        check(r.detail.find("does not cover") != std::string::npos,
+              "reloc-width: the gap refusal says the region does not cover "
+              "the field");
+    }
+
+    // The width is the field's, not a constant.
+    //
+    // A 32-bit relocation at the last four bytes of a region fits, and a
+    // check that used the DIR64 width for every type would refuse it. The
+    // converse -- a DIR64 at the same address -- is the first case above.
+    {
+        const std::uint64_t load_at = claim_a_base(0x4000);
+        // RVA 0x1FFC is four bytes wide and ends exactly at 0x2000. HIGHLOW
+        // is type 3, so the entry's high nibble is 3.
+        const std::vector<std::uint8_t> table = reloc_block(0x1000, {0x3FFC});
+        Spec s = reloc_spec(table, 0x2000, 0x2000);
+        const Built b = build(s);
+        const PeImage p = parse_image(b.bytes);
+        check(p.ok(), "reloc-width: the fitting-field fixture parses");
+
+        AddressSpace sp;
+        Mapper m(sp);
+        LoadContext ctx;
+        ctx.placement = &m;
+
+        const auto r = load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()},
+                                  load_at, sp, ctx);
+        check(r.ok, "reloc-width: a 32-bit field that ends at the region's "
+                    "last byte is accepted");
+        check(r.module.relocations_applied == 1,
+              "reloc-width: and it is counted as applied");
+    }
+}
+
 // The section range check.
 //
 // A section whose address leaves the window has to be refused, and the
@@ -1419,6 +1541,104 @@ void test_loader_reads_an_ordinal_import() {
     check(seen.called, "ordinal: the resolver is called");
     check(seen.by_ordinal, "ordinal: the resolver is told it is an ordinal");
     check(seen.ordinal == 0x37, "ordinal: the ordinal value reaches the resolver");
+}
+
+// An IAT slot whose eight bytes do not fit in the region it names.
+//
+// The slot address comes from the import descriptor's FirstThunk, which is
+// the file's to choose, and the loader writes the resolved address there as
+// a 64-bit value. A slot at the last four bytes of a region passes a check
+// made against its first byte and then takes eight -- four past the end.
+//
+// The slot is placed at the end of a writable `.data` section rather than in
+// the headers, for two reasons. The write is the point, and the header region
+// is read-only, so a slot there would be refused for the wrong reason and the
+// width would not be what was tested. And the header region is whatever
+// SizeOfHeaders says, rounded to a page, which makes its end a moving target
+// that grows with the fixture.
+//
+// `.data` is mapped whole pages at 0x2000, so its last mapped byte is 0x2FFF
+// whatever the file says its size is.
+void test_loader_refuses_an_iat_slot_that_overruns_its_region() {
+    // The layout is fixed by the sections, and the builder puts a tail
+    // immediately after their file parts. Two sections of 0x200 raw bytes
+    // after a 0x200 header area put the tail at 0x600. The names and the
+    // descriptor are addressed by RVAs that, below SizeOfHeaders, are file
+    // offsets -- so this constant has to agree with the layout, and the
+    // checks below are what say whether it does.
+    const std::uint32_t tail_rva = 0x600;
+
+    std::vector<std::uint8_t> tail(0x200, 0);
+    const std::uint32_t name0 = 0x10;
+    const std::uint32_t dll_at = 0x40;
+    const std::uint32_t thunk_at = 0x60;
+    // Five bytes from the end of `.data`: 0x2000..0x3000 mapped, so 0x2FFB
+    // has five bytes of room and the DWORD takes eight.
+    const std::uint32_t iat_rva = 0x2FFB;
+    const std::uint32_t desc_at = 0xA0;
+
+    put16(tail, name0, 0);
+    std::memcpy(&tail[name0 + 2], "CreateFileW", 12);
+    std::memcpy(&tail[dll_at], "kernel32.dll", 13);
+
+    put64(tail, thunk_at + 0, static_cast<std::uint64_t>(tail_rva + name0));
+    put64(tail, thunk_at + 8, 0);
+    put32(tail, desc_at + 0, tail_rva + thunk_at);   // OriginalFirstThunk
+    put32(tail, desc_at + 12, tail_rva + dll_at);    // Name
+    put32(tail, desc_at + 16, iat_rva);              // FirstThunk, into .data
+
+    Spec s;
+    s.sections.push_back({".text", 0x1000, 0x1000, 0x200,
+                          kScnExecute | kScnRead});
+    // A writable section, so the write is not refused as read-only before the
+    // width is ever considered.
+    s.sections.push_back({".data", 0x2000, 0x1000, 0x200, kScnRead | kScnWrite});
+    s.headers_size_override =
+        tail_rva + static_cast<std::uint32_t>(tail.size());
+    s.image_size_override = 0x10000;
+    s.tail = tail;
+
+    Built b = build(s);
+    check(b.tail_at == tail_rva,
+          "iat-width: the layout put the tail where the fixture assumes");
+
+    const std::size_t coff = kDosSize + 4;
+    const std::size_t opt = coff + 4 + kCoffSize;
+    const std::size_t dirs = opt + 112;
+    put32(b.bytes, dirs + 1 * 8, tail_rva + desc_at);
+    put32(b.bytes, dirs + 1 * 8 + 4, 40);
+
+    const PeImage p = parse_image(b.bytes);
+    check(p.ok(), "iat-width: the fixture parses");
+    check(p.imports().size() == 1,
+          "iat-width: the fixture's import descriptor is read");
+
+    // The resolving path is the one that writes, so it is the one that has to
+    // refuse. Without a resolver the slot keeps the file's RVA and nothing
+    // lands, which is why the first load below succeeds and says so.
+    AddressSpace sp;
+    LoadContext plain;
+    const auto r = load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()}, 0,
+                              sp, plain);
+    check(r.ok, "iat-width: an unresolved load does not write and so does not "
+                "care where the slot is");
+
+    AddressSpace sp2;
+    Mapper m2(sp2);
+    LoadContext ctx;
+    ctx.placement = &m2;
+    ctx.resolve = [](void*, const std::string&, const std::string&,
+                     std::uint16_t, bool) noexcept -> std::uint64_t {
+        return 0x7FFE0001ull;
+    };
+    const auto rr = load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()}, 0,
+                               sp2, ctx);
+    check(!rr.ok, "iat-width: a resolving load refuses a slot with no room "
+                  "for its eight bytes");
+    check(rr.error == LoadError::RelocationNotWritable,
+          "iat-width: the refusal names the missing bytes");
+    check(rr.detail.find("eight bytes") != std::string::npos,
+          "iat-width: the refusal says the width is what is missing");
 }
 
 // Loading twice at the same base is refused by the address space rather
@@ -2987,6 +3207,85 @@ void test_tls_refuses_an_index_that_is_not_writable() {
           "read-only index: and the high-water mark went back with it");
 }
 
+// A TLS index whose four bytes do not fit in the region it names.
+//
+// `AddressOfIndex` is the file's to choose and the loader writes a DWORD
+// there. A directory that names the second-to-last byte of a writable
+// section passes a check made against the first byte only, and the write
+// that follows lands two bytes past the region. The check has to be against
+// the field, and the case that separates the two is an index at the region's
+// end rather than inside it.
+//
+// The section is `.data`, mapped whole pages: it is declared 0x1000 at
+// 0x2000, so its last mapped byte is 0x2FFF. An index of 0x2FFE has two of
+// its four bytes inside and two outside.
+void test_tls_refuses_an_index_whose_field_does_not_fit() {
+    Spec s = a_tls_spec(0x20);
+    s.sections[0].virtual_address = 0x1000;
+    // .data is 0x2000..0x3000 and writable. The index goes at its end.
+    s.tls_fields = [&] {
+        Spec::TlsFields f;
+        f.start = kTlsTemplateRva;
+        f.end = kTlsTemplateRva + 0x20;
+        f.index = 0x2FFE;   // two bytes of the DWORD fall past .data
+        f.zero_fill = 0;
+        f.callbacks = 0;
+        return f;
+    }();
+    const Built b = build(s);
+    const PeImage p = parse_image(b.bytes);
+
+    AddressSpace sp;
+    Mapper m(sp);
+    LoadContext ctx;
+    TlsTable table;
+    ctx.placement = &m;
+    ctx.tls = &table;
+
+    const LoadResult r =
+        load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()}, 0, sp, ctx);
+    check(!r.ok, "short index field: the load is refused");
+    check(r.error == LoadError::TlsRefused,
+          "short index field: refused as a TLS problem");
+    check(r.detail.find("four bytes") != std::string::npos,
+          "short index field: the refusal says the field's width is what is "
+          "missing, not the address");
+    check(table.slots_allocated == 0,
+          "short index field: and no slot number is left behind");
+
+    // The same address with the field inside the region loads, which is what
+    // makes this a test of the width rather than of the address. 0x2FFC is
+    // four bytes ending exactly at 0x3000.
+    Spec ok_spec = a_tls_spec(0x20);
+    ok_spec.sections[0].virtual_address = 0x1000;
+    ok_spec.tls_fields = [&] {
+        Spec::TlsFields f;
+        f.start = kTlsTemplateRva;
+        f.end = kTlsTemplateRva + 0x20;
+        f.index = 0x2FFC;   // ends at the region's last byte
+        f.zero_fill = 0;
+        f.callbacks = 0;
+        return f;
+    }();
+    const Built ok_b = build(ok_spec);
+    const PeImage ok_p = parse_image(ok_b.bytes);
+    check(ok_p.ok(), "short index field: the fitting fixture parses");
+
+    AddressSpace ok_sp;
+    Mapper ok_m(ok_sp);
+    LoadContext ok_ctx;
+    TlsTable ok_table;
+    ok_ctx.placement = &ok_m;
+    ok_ctx.tls = &ok_table;
+
+    const LoadResult ok_r = load_image(
+        ok_p, ByteSpan{ok_b.bytes.data(), ok_b.bytes.size()}, 0, ok_sp, ok_ctx);
+    check(ok_r.ok, "short index field: an index whose four bytes end at the "
+                   "region's last byte is accepted");
+    check(ok_table.slots_allocated == 1,
+          "short index field: and it is given a slot");
+}
+
 // Without a mapper the directory is still read and still reported.
 //
 // This is `occ check`'s path and it is the reason the file-reading branch
@@ -4082,11 +4381,13 @@ int main() {
     test_loader_refuses_another_machine();
     test_loader_relocation_requirement();
     test_loader_refuses_a_damaged_relocation_block();
+    test_loader_refuses_a_relocation_that_overruns_its_region();
     test_loader_refuses_a_section_out_of_range();
     test_loader_section_protections();
     test_loader_maps_a_section_with_no_file_data();
     test_loader_rounds_section_sizes_to_the_page();
     test_loader_walks_imports();
+    test_loader_refuses_an_iat_slot_that_overruns_its_region();
     test_loader_reads_an_ordinal_import();
     test_loader_drops_an_import_whose_slot_is_unmapped();
     test_loader_refuses_a_second_load_at_the_same_base();
@@ -4108,6 +4409,7 @@ int main() {
     test_tls_refuses_a_reversed_template();
     test_tls_refuses_a_template_outside_the_image();
     test_tls_refuses_an_index_that_is_not_writable();
+    test_tls_refuses_an_index_whose_field_does_not_fit();
     test_tls_without_a_mapper_decides_without_writing();
     test_a_refused_load_leaves_the_space_as_it_was();
     test_tls_reads_the_callback_array_to_its_terminator();

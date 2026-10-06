@@ -578,6 +578,42 @@ void test_wx_chase_prefers_new_mapping() {
     check(again.watches_installed == 0,
           "re-chasing an armed region installs nothing new");
 
+    // ...and the second report has to describe that region the way arm
+    // describes it. The armed early return used to fill bytes_covered and
+    // nothing else, so a region covering 32 of its 4096 bytes came back
+    // looking whole: a caller reading this report concludes the whole region
+    // is watched when only its first few bytes are, which is the one claim
+    // the report exists to make honestly.
+    //
+    // The check is on the union rather than on which list the region lands
+    // in, because both answers are correct -- zero coverage is unwatched and
+    // partial coverage is partial -- and which one applies depends on
+    // whether the machine has debug registers to spend. A machine without
+    // them arms nothing and is not wrong to say so.
+    if (again.watches_installed == 0 && again.bytes_covered > 0) {
+        bool reported_partial = false;
+        for (const auto& partial : again.partial) {
+            if (partial.target.base == 0x300000) {
+                reported_partial = true;
+                check(partial.bytes_covered == again.bytes_covered,
+                      "the partial entry carries the coverage the report "
+                      "claims");
+                check(partial.bytes_covered < partial.target.length,
+                      "a partially covered region says it is partial");
+            }
+        }
+        bool reported_unwatched = false;
+        for (const auto& u : again.unwatched) {
+            if (u.base == 0x300000) {
+                reported_unwatched = true;
+            }
+        }
+        check(reported_partial || reported_unwatched,
+              "a re-chased partial region is not reported as complete");
+        check(!again.complete(),
+              "the report does not claim full coverage it does not have");
+    }
+
     // A region that has been written is never evicted: it holds the only
     // evidence a transition can still be built from.
     tracker.note_write(pid, 0x300000, 8, 0x401000);
