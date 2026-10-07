@@ -387,18 +387,27 @@ mutate "the-range-end-wrap-check-is-removed" "$SRC" \
 "    if (range_end < base || range_end > AddressSpace::kUserMax + 1) {" \
 "    if (range_end > AddressSpace::kUserMax + 1) {"
 
-# **The commit's bound restored to the addition form.** `base + commit_size >
-# reservation_end` is the obvious way to write "the range reaches past the
-# reservation" and it is defeated by the wrap exactly as the protect's is: the
-# folded sum lands below the reservation's end, the check passes, and the call
-# goes on to commit and then to protect a range reaching past the top of the
-# address space. What the caller got was the kernel's refused `mprotect`
-# reported as INVALID_ADDRESS -- a status naming the wrong problem, produced by
-# a check that had been satisfied. Rewriting it as the subtraction is the fix,
-# and restoring the addition is the mutant.
-mutate "the-commit-bound-is-a-sum-that-can-wrap" "$SRC" \
-"        if (commit_size > reservation_end - base) {" \
-"        if (base + commit_size > reservation_end) {"
+# **The commit's widening, and why there is no mutant here.**
+#
+# The commit path computes `commit_size` through `round_size_from_checked`,
+# and the obvious mutant -- restoring the unchecked `round_size_from` -- was
+# written, run, and survived on both builds. It survived because it is
+# *equivalent*: an exhaustive check of the sizes that make `round_size_from`
+# wrap against the `want = round_up(requested_size, kGranularity)` guard a few
+# lines above found zero sizes that pass the guard and still wrap the widening.
+# The guard is not the same expression, which is why the wrap is worth
+# refusing where it happens rather than where the guard is; but it is a
+# *stronger* bound on the reachable sizes than the widening needs, so no input
+# the suite can construct reaches the difference.
+#
+# The mutant is therefore not here. A mutant that is equivalent to the original
+# is not a mutant, and leaving one in produces a permanent SURVIVED that says
+# "the suite has a hole" when the truth is "this change cannot be observed by
+# any input". That is the same failure the anchor-failure list exists to avoid:
+# a report whose counts no longer describe what they claim. What guards the
+# checked call is the comment at it, which says the guard upstairs is what
+# makes the difference unreachable today and that the call does not lean on
+# that argument.
 
 # **The write-watch sweep's end guard removed.** The sweep breaks on the first
 # region at or past `end`, so a wrapped `end` stops it before it has looked at
@@ -433,6 +442,60 @@ mutate "the-flush-covers-a-range-it-never-checked" "$SRC" \
 "        (void)size_overflowed;"
 
 # ------------------------------------------------ the read and write paths
+
+# ------------------------------------------------------ the mapper's wrapping
+#
+# The three sums in mapper.cpp written the way the wrap defeats them. They are
+# here rather than in a mapper-only harness because the harness already mutates
+# mapper.cpp for its own rules and because the suite it runs -- `occ_test_mapper`
+# among them -- is the one that reaches these calls. The bugs they restore are
+# all the same shape as the ones above: a `base + size` that carries the sum past
+# the top of the 64-bit range, so a check that compares the sum against a bound
+# is satisfied by a value below it, and the call goes on to name a range that
+# does not exist. What differs is the damage: the protect walks no page and
+# reports the kernel's refusal as a status about the memory, the range protect
+# reports a success that did nothing, and the map sends `mmap(NULL, 0)` to the
+# kernel for a request it was supposed to refuse itself.
+
+# **The protect-in-range bound restored to the addition form.** `base + size >
+# r->end()` folds below the region's end for a wrapping size, so the bound passes
+# and the committed walk below it -- `while (cursor < base + size)` -- runs zero
+# times as well. The only thing left to notice is the kernel refusing an
+# `mprotect` that reaches off the address space, which this file reports as
+# InvalidAddress: a statement about the memory, produced by a check that had been
+# satisfied. Rewriting it as the subtraction is the fix; restoring the addition
+# is the mutant.
+mutate "the-protect-range-bound-is-a-sum-that-can-wrap" "$MAPPER" \
+"    if (size > r->end() - base) {" \
+"    if (base + size > r->end()) {"
+
+# **The range protect's wrap guard removed.** With the guard gone, a wrapped
+# `span_end` rounds down to a `last` below `first`, and `first >= last` is the
+# function's *"no whole page in the range"* answer -- a success that did nothing,
+# which is the right answer for a range that genuinely lies inside one page and
+# the wrong one for a range that reaches off the end of the address space. The
+# two are distinguished by the sum, so removing the sum's guard is what collapses
+# them. This is the mutant that shows the guard is load-bearing rather than
+# decorative.
+mutate "the-range-protect-wrap-check-is-removed" "$MAPPER" \
+"    const std::uint64_t span_end = base + size;
+    if (span_end < base) {
+        return fail<std::uint64_t>(Status::InvalidParameter, 0, base);
+    }" \
+"    const std::uint64_t span_end = base + size;"
+
+# **The rounded-size wrap check removed from `map` with an unspecified base.**
+# `page_round_up(size)` wraps only within a page of the top of the range, and it
+# yields exactly zero there -- a value below the window's span, so the window
+# comparison that follows is satisfied and the zero goes to the kernel as
+# `mmap(NULL, 0)`. The kernel rejects that with EINVAL and the refusal is
+# reported as NoMemory: the right status for the wrong reason, from a guard that
+# was supposed to make the decision here. The mutant is the check without its
+# wrap half; the suite's evidence is that the refusal happens *before* the
+# syscall counter moves.
+mutate "the-map-size-wrap-check-is-removed" "$MAPPER" \
+"        if (rounded < size || rounded > AddressSpace::kUserMax - AddressSpace::kUserMin) {" \
+"        if (rounded > AddressSpace::kUserMax - AddressSpace::kUserMin) {"
 
 # The read's unmapped-source status changed to INVALID_ADDRESS. This and the
 # next one are the same mistake in opposite directions, and they are here
@@ -788,10 +851,19 @@ mutate "a-commit-commits-the-whole-region" "$SRC" \
 # reservation whose length is not a multiple of 64 KiB -- so a commit of the
 # last page of such a reservation is refused as running past it.
 mutate "a-commit-size-rounds-to-the-granularity" "$SRC" \
-"        const std::uint64_t commit_size =
+"        bool commit_overflowed = false;
+        const std::uint64_t commit_size =
             requested_size == 0
                 ? AddressSpace::kPageSize
-                : round_size_from(*addr, requested_size);" \
+                : round_size_from_checked(*addr, requested_size,
+                                          commit_overflowed);
+        if (commit_overflowed) {
+            return refuse<std::uint64_t>(
+                Status::InvalidParameter,
+                \"a size of \" + std::to_string(requested_size) +
+                    \" is larger than the rounding of it can represent: the \"
+                    \"committed range does not fit in a 64-bit size\");
+        }" \
 "        const std::uint64_t commit_size =
             AddressSpace::round_up(requested_size, AddressSpace::kGranularity);"
 

@@ -731,10 +731,29 @@ Result<std::uint64_t> nt_allocate_virtual_memory(NtContext& ctx,
         // Wine's `virtual.c` commit path computes exactly that, and using the
         // granularity-rounded size instead would make a commit of the second
         // page of a reservation reach past the region and fail.
+        // **The widening is the checked one, even though the `want` guard
+        // above already refuses every size that could make it wrap.**
+        // `want = round_up(requested_size, kGranularity)` with `want <
+        // requested_size` rejected covers exactly the sizes that make
+        // `round_size_from` overflow, so this call cannot wrap today. It is
+        // written through `round_size_from_checked` anyway because that is an
+        // argument about a check two screens up rather than a property of this
+        // expression, and the two are not the same thing to the next person
+        // who moves the guard. The refusal is the commit's own status: a range
+        // that does not fit a 64-bit size is a range this call cannot name.
+        bool commit_overflowed = false;
         const std::uint64_t commit_size =
             requested_size == 0
                 ? AddressSpace::kPageSize
-                : round_size_from(*addr, requested_size);
+                : round_size_from_checked(*addr, requested_size,
+                                          commit_overflowed);
+        if (commit_overflowed) {
+            return refuse<std::uint64_t>(
+                Status::InvalidParameter,
+                "a size of " + std::to_string(requested_size) +
+                    " is larger than the rounding of it can represent: the "
+                    "committed range does not fit in a 64-bit size");
+        }
         const Region* r = ctx.space->find(base);
         if (r == nullptr) {
             return refuse<std::uint64_t>(
@@ -2106,9 +2125,13 @@ Result<std::uint64_t> nt_query_virtual_memory(NtContext& ctx,
         }
 
         return refuse<std::uint64_t>(
-            info_class == MemoryInformationClass::WorkingSetExInformation
-                ? Status::NotImplemented
-                : Status::NotImplemented,
+            // Both classes that reach here answer the same status. It was
+            // written as a ternary with the same value on both arms, which
+            // reads as though the two were meant to differ and hides which
+            // class was asked for. The class is named in the message below,
+            // which is where a reader needs it; the status is one value
+            // because it is one refusal.
+            Status::NotImplemented,
             std::string("this class needs information occ does not have: the ") +
                 "working set is the kernel's and the mapped filename would "
                 "come from a file this layer does not open. Wine answers it "

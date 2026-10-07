@@ -1013,6 +1013,148 @@ void test_sync_counts_and_reports() {
           "allocation");
 }
 
+// A size that carries a range past the top of the 64-bit address space.
+//
+// The three cases below are the three sums in this file written the way that
+// is defeated by the wrap -- `base + size` -- and each one failed differently
+// before it was written as a difference:
+//
+//   - `protect_in_range` walked no page of the range and then asked the kernel
+//     to protect a span reaching off the address space, and reported the
+//     kernel's refusal as InvalidAddress. That is a status about the memory,
+//     produced by a check that had been satisfied, and a caller reading it
+//     concludes the pages are not mapped when in fact it named a range that
+//     does not exist.
+//   - `protect_range` rounded the wrapped sum and found `last < first`, which
+//     is its "no whole page in the range" answer -- a success that did
+//     nothing -- over a range that reaches off the end of the address space.
+//     A decommit built on that success would leave the ledger holding pages
+//     the kernel still has.
+//   - `map(0, size)` rounded the size for its window check, and
+//     `page_round_up` wraps to exactly zero for a size within a page of the
+//     top, which is below the window's span and so passed the check. The zero
+//     went to the kernel as `mmap(NULL, 0)`.
+//
+// The sizes are chosen to sit in the window where the wrap happens, which is
+// narrower than it looks: `page_round_up` only wraps within one page of the
+// top of the range, and a sum only wraps past the top. The failures are
+// asserted with the status the fixed code produces, and each case additionally
+// asserts that nothing was left behind, because a refusal that recorded half
+// its work would be a different bug wearing the right status.
+void test_a_size_that_wraps_is_refused_rather_than_folded() {
+    AddressSpace space;
+    Mapper m(space);
+
+    // ---------------------------------------------- protect_in_range
+
+    const Result<std::uint64_t> r =
+        m.map(0, 64 * 1024, PageProtection::ReadWrite, RegionKind::Private);
+    check(r.ok(), "wrap: the region the protect cases need exists");
+    if (!r.ok()) {
+        return;
+    }
+    const std::uint64_t base = r.value;
+
+    // `0xFFFFFFFFFFFFF001` is `0 - 0xFFF`, so `base + size` lands `0xFFF`
+    // below `base` -- inside the region's own span, which is why the
+    // difference-form bound catches it and the sum-form bound did not.
+    const std::uint64_t wrap = 0xFFFFFFFFFFFFF001ULL;
+
+    const std::uint32_t before_changes =
+        space.find(base) != nullptr ? space.find(base)->protection_changes : 0;
+    const std::uint64_t before_syscalls = m.syscalls_made();
+
+    const Result<std::uint32_t> p =
+        m.protect_in_range(base, wrap, PageProtection::ReadOnly);
+    check(!p.ok(), "wrap: a protect of a wrapping range is refused");
+    check(p.status == Status::InvalidParameter,
+          "wrap: the refusal is a parameter error, which is a statement "
+          "about the request rather than about the memory");
+    check(m.syscalls_made() == before_syscalls,
+          "wrap: the refusal came before the kernel was asked, so no "
+          "mprotect was counted");
+    {
+        const Region* after = space.find(base);
+        check(after != nullptr && after->protection == PageProtection::ReadWrite,
+              "wrap: the refused protect left the protection alone");
+        check(after != nullptr && after->protection_changes == before_changes,
+              "wrap: and did not count as a change");
+        check(after != nullptr && after->kind == RegionKind::Private,
+              "wrap: and did not cut the region");
+    }
+
+    // The same call with a size that genuinely fits still works, so the guard
+    // refused the wrap rather than the operation.
+    const Result<std::uint32_t> ok =
+        m.protect_in_range(base, 4096, PageProtection::ReadOnly);
+    check(ok.ok(), "wrap: a protect of a fitting range still succeeds");
+    (void)m.protect_in_range(base, 4096, PageProtection::ReadWrite);
+
+    // ---------------------------------------------- protect_range
+
+    const std::uint64_t before_range_syscalls = m.syscalls_made();
+    const Result<std::uint64_t> pr =
+        m.protect_range(base, wrap, PageProtection::ReadOnly);
+    check(!pr.ok(),
+          "wrap: a range protect whose sum wraps is refused rather than "
+          "reported as an empty range");
+    check(pr.status == Status::InvalidParameter,
+          "wrap: and the refusal is a parameter error, not a bare success "
+          "over a range that reaches off the address space");
+    check(m.syscalls_made() == before_range_syscalls,
+          "wrap: the range protect did not reach the kernel either");
+
+    // A range that genuinely lies inside one page is still the success that
+    // does nothing -- that answer is the one a real empty range gets and it
+    // has to survive the guard above, or the guard turned a valid case into a
+    // refusal.
+    const Result<std::uint64_t> empty =
+        m.protect_range(base + 8, 8, PageProtection::ReadOnly);
+    check(empty.ok() && empty.value == 0,
+          "wrap: a range inside a single page is still the success that does "
+          "nothing");
+
+    // ---------------------------------------------- map(0, wrapping size)
+
+    // `0xFFFFFFFFFFFFF001` is within a page of the top, so `page_round_up`
+    // wraps -- to zero, which is the value that slipped past the window check.
+    const std::uint64_t map_syscalls = m.syscalls_made();
+    const std::uint64_t regions_before = space.regions().size();
+    const Result<std::uint64_t> big =
+        m.map(0, wrap, PageProtection::ReadWrite, RegionKind::Private);
+    check(!big.ok(), "wrap: a map of a size that rounds to zero is refused");
+    check(big.status == Status::NoMemory,
+          "wrap: and it is reported as out of memory, which is what the "
+          "address space says when no base can hold the request");
+    check(m.syscalls_made() == map_syscalls,
+          "wrap: the map refusal came before the kernel was asked, so the "
+          "zero-length mmap was never made");
+    check(space.regions().size() == regions_before,
+          "wrap: and no region was recorded for it");
+
+    // A mapping with an unspecified base still works, so the guard refused
+    // the wrapped size rather than mappings with base zero.
+    const Result<std::uint64_t> fine =
+        m.map(0, 64 * 1024, PageProtection::ReadWrite, RegionKind::Private);
+    check(fine.ok(), "wrap: a map of an ordinary size with base zero works");
+
+    // Cleanup. The successful protects above cut the region into pieces, and
+    // `unmap` names one region by its base, so each piece is unmapped by the
+    // base the ledger reports for it rather than by assuming the mapping is
+    // still one region. The final assertion is the point of the case: nothing
+    // either refused call touched is in the ledger, so the refusals left no
+    // region and no split behind them.
+    while (!space.regions().empty()) {
+        const std::uint64_t piece_base = space.regions().front().base;
+        check(m.unmap(piece_base).ok(), "wrap: a remaining piece unmaps");
+    }
+    check(space.regions().empty(),
+          "wrap: and the ledger is empty, so nothing refused was recorded");
+    check(space.allocation_count() == 2,
+          "wrap: two mappings were made and both were unmapped, and the "
+          "refused calls added nothing to the count");
+}
+
 } // namespace
 
 int main() {
@@ -1027,6 +1169,7 @@ int main() {
     test_guard_is_refused_rather_than_ignored();
     test_the_counter_counts_syscalls();
     test_sync_counts_and_reports();
+    test_a_size_that_wraps_is_refused_rather_than_folded();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

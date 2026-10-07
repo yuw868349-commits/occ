@@ -125,8 +125,20 @@ Result<std::uint64_t> Mapper::map(std::uint64_t base, std::uint64_t size,
         // check is against the window's top because the kernel will place it
         // somewhere inside the window and a size that does not fit anywhere in
         // it cannot be satisfied anywhere in it.
-        if (AddressSpace::page_round_up(size) >
-            AddressSpace::kUserMax - AddressSpace::kUserMin) {
+        //
+        // **The rounded size is checked for having wrapped, and the guard is
+        // not cosmetic.** `page_round_up(size)` overflows for a size within a
+        // page of the top of the 64-bit range, and it yields either zero or
+        // `0xFFFFFFFFFFFFF000` -- never a small nonzero value, which is the
+        // only reason the window comparison below survives the wrap in one of
+        // the two cases and not the other. The `0xFFFFFFFFFFFFF000` case is
+        // caught by the comparison; the zero case is not, because zero is
+        // less than the span. It then went to the kernel as `mmap(NULL, 0)`,
+        // which fails with EINVAL and is reported as NoMemory -- the right
+        // status for the wrong reason, from a guard that was supposed to
+        // refuse here.
+        const std::uint64_t rounded = AddressSpace::page_round_up(size);
+        if (rounded < size || rounded > AddressSpace::kUserMax - AddressSpace::kUserMin) {
             return fail<std::uint64_t>(Status::NoMemory, 0, 0);
         }
     } else if (!AddressSpace::is_page_aligned(base)) {
@@ -619,9 +631,23 @@ Result<std::uint32_t> Mapper::protect_in_range(std::uint64_t base,
     if (r->kind != RegionKind::Private) {
         return fail<std::uint32_t>(Status::InvalidParameter, 0, base);
     }
-    if (base + size > r->end()) {
+    // **The bound is a difference and not a sum.** `base + size > r->end()` is
+    // the obvious way to write this and it is defeated by the wrap: a `size`
+    // chosen to carry the sum past the top of the 64-bit range lands it below
+    // the region's end, the check passes, and the function goes on to
+    // `mprotect` a span that reaches off the end of the address space. The
+    // committed walk below is defeated by the same wrapped sum -- `while
+    // (cursor < base + size)` is false on entry, so no page is checked at all
+    // -- and the only thing that then notices is the kernel refusing the
+    // `mprotect`, which this file reports as INVALID_ADDRESS: a status about
+    // the memory rather than about the request, produced by a check that had
+    // been satisfied.
+    if (size > r->end() - base) {
         return fail<std::uint32_t>(Status::InvalidParameter, 0, base);
     }
+    // The end of the range, computed once and from the checked value, so that
+    // the walk below runs on a bound that cannot have wrapped.
+    const std::uint64_t range_end = base + size;
 
     // Every page the range covers must be committed. The check walks the
     // regions the range spans rather than assuming one, because a range that
@@ -631,7 +657,7 @@ Result<std::uint32_t> Mapper::protect_in_range(std::uint64_t base,
     // sees one.
     {
         std::uint64_t cursor = base;
-        while (cursor < base + size) {
+        while (cursor < range_end) {
             const Region* piece = space_->find(cursor);
             if (piece == nullptr || !piece->contains(cursor) ||
                 piece->kind != RegionKind::Private) {
@@ -640,7 +666,7 @@ Result<std::uint32_t> Mapper::protect_in_range(std::uint64_t base,
             if (!piece->committed) {
                 return fail<std::uint32_t>(Status::NotCommitted, 0, base);
             }
-            const std::uint64_t step_end = std::min(piece->end(), base + size);
+            const std::uint64_t step_end = std::min(piece->end(), range_end);
             if (step_end <= cursor) {
                 // A region of length zero cannot be stepped over; refusing
                 // rather than looping is the only safe answer.
@@ -700,10 +726,23 @@ Result<std::uint64_t> Mapper::protect_range(std::uint64_t base,
     // the two roundings normally meet exactly on whole pages and this is a
     // no-op. Writing it out anyway means the function is correct on its own
     // rather than correct because of who calls it.
+    // **The sum is checked before it is rounded, because the wrap and the
+    // legitimate empty range are not the same thing.** `first >= last` below
+    // is the "no whole page in the range" answer and it is a success that did
+    // nothing -- correct for a range that genuinely lies inside one page.
+    // A `base + size` that wraps also lands `last` below `first`, so it takes
+    // the same branch and reports a success over a range that reaches off the
+    // end of the address space. The two are distinguished by the sum, not by
+    // the roundings: a wrapped sum is below `base`, and a real range's sum
+    // never is.
+    const std::uint64_t span_end = base + size;
+    if (span_end < base) {
+        return fail<std::uint64_t>(Status::InvalidParameter, 0, base);
+    }
     const std::uint64_t first =
         AddressSpace::round_up(base, AddressSpace::kPageSize);
     const std::uint64_t last =
-        AddressSpace::round_down(base + size, AddressSpace::kPageSize);
+        AddressSpace::round_down(span_end, AddressSpace::kPageSize);
     if (first >= last) {
         // No whole page in the range. There is nothing to protect and the
         // caller's ledger cut is empty as well, so this is a success that did

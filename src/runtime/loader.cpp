@@ -213,12 +213,22 @@ void store_u64(std::uint64_t va, std::uint64_t v) noexcept {
 // tell "the address held this" from "the address was not readable".
 //
 // The counterpart to the stores above, and it exists for the same reason they
-// do and with the same caveat: no bounds check, because the caller checked
-// the address against the space. The difference is that a store cannot
-// report -- writing to an unmapped address kills the process, which is a
-// perfectly clear way of finding out -- while a load can come back as
-// anything at all, and a caller that treats that as data produces an answer
-// from whatever the kernel left there.
+// do: a store cannot report -- writing to an unmapped address kills the
+// process, which is a perfectly clear way of finding out -- while a load can
+// come back as anything at all, and a caller that treats that as data produces
+// an answer from whatever the kernel left there.
+//
+// **The bound is written as a difference and not as `r->end() < va + bytes`.**
+// The obvious sum is defeated by the wrap: a `va` within `bytes` of the top of
+// the 64-bit range carries `va + bytes` past it, the sum lands below the
+// region's end, the check passes, and the `memcpy` below reads `bytes` from an
+// address the region does not reach. Every caller today passes an address that
+// is small by construction -- a TLS template inside its image, a directory
+// field a fixed offset into one -- and the check is written this way so that
+// the safety is a property of this function rather than of an argument about
+// its callers. The form is the one `region_for_write` uses, for the same
+// reason: `r->size - bytes` cannot wrap because `bytes > r->size` has already
+// been refused.
 //
 // `space` is the authority rather than a size, because a TLS template is
 // read from an image that was placed rather than from the file, and "inside
@@ -228,7 +238,11 @@ void store_u64(std::uint64_t va, std::uint64_t v) noexcept {
 [[nodiscard]] bool load_from(const AddressSpace& space, std::uint64_t va,
                              void* dst, std::size_t bytes) noexcept {
     const Region* r = space.find(va);
-    if (r == nullptr || r->end() < va + bytes) {
+    if (r == nullptr) {
+        return false;
+    }
+    const std::uint64_t wide = static_cast<std::uint64_t>(bytes);
+    if (wide > r->size || va - r->base > r->size - wide) {
         return false;
     }
     std::memcpy(dst, reinterpret_cast<const void*>(va), bytes);
