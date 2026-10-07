@@ -94,8 +94,11 @@ struct SeccompArgTest {
 struct SeccompRule {
     std::uint32_t nr;
     SeccompAction action;
-    // Used only by Action::Errno. The kernel negates this, so passing 1 here
-    // makes the syscall return EPERM to the caller.
+    // Used only by Action::Errno, and it is the errno itself: the kernel
+    // puts SECCOMP_RET_ERRNO's payload into the syscall's return register
+    // unchanged, so a value of 1 comes back to the caller as EPERM. It is
+    // not negated on the way -- the caller reads a positive errno from the
+    // register the kernel filled, which is exactly the value written here.
     int error;
     std::vector<SeccompArgTest> args;
 };

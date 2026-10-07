@@ -122,7 +122,6 @@ struct ContainerConfig {
         bool writable = false;
     };
     std::vector<BindMount> extra_mounts;
-
     // Stop the target at the exec boundary instead of letting it run.
     //
     // The child calls PTRACE_TRACEME before exec, so the kernel stops it on
@@ -222,5 +221,35 @@ struct SpawnResult {
 // Enumerates the controllers available in the root cgroup. Reported by
 // occ doctor and used here to check a requested limit can be applied.
 [[nodiscard]] std::vector<std::string> cgroup2_controllers() noexcept;
+
+// The host path a bind mount's target names, given the directory the new
+// root is built in.
+//
+// A target is a path inside the container, and the directory the root is
+// assembled in is a path on the host, so the two are joined. Joining them
+// by concatenation is only correct when the target is absolute: a target
+// of `mnt` appended to a root at `/tmp/run/root` is `/tmp/run/rootmnt`, a
+// sibling of the root rather than a path in it. The caller's `mkdir` and
+// `mount` would then act on a host path nobody named as a mount point --
+// a hole in the isolation that no message reports, because the run comes
+// up and the mount is simply in the wrong place.
+//
+// So the target is read the way the container would read it: `target` is
+// resolved against the container's root, which means a leading `/` is
+// supplied when the target has none, and the `..` components are then
+// folded against the names before them. The fold is lexical and does not
+// follow symlinks, for the same reason the container's own resolution is:
+// the root is about to change, and a symlink resolved now would be
+// resolved against the tree that is about to be replaced.
+//
+// `out` receives `root` followed by the folded target, which always names
+// a path under the root: the fold resolves `..` against the names before
+// it and drops a `..` that has none, so no target can reach above the
+// root however it is spelled -- `/../x` and `/x` are the same path, and a
+// `..` at the root stays at the root, which is what the kernel does too.
+// Returns false only when `target` is empty, which names nothing to join.
+[[nodiscard]] bool mount_target_in_root(const std::string& root,
+                                        const std::string& target,
+                                        std::string& out) noexcept;
 
 } // namespace occ::isolation

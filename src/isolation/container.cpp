@@ -386,6 +386,33 @@ CloneOutcome clone_child(const ContainerConfig& config) noexcept {
 
 } // namespace
 
+// ------------------------------------------------------------ mount target
+
+bool mount_target_in_root(const std::string& root, const std::string& target,
+                          std::string& out) noexcept {
+    if (target.empty()) {
+        return false;
+    }
+    // A target with no leading slash is still read as a path inside the
+    // container, not one relative to the host's working directory, so the
+    // root is spelled as `/` before the fold. This is the half of the rule
+    // that a plain concatenation gets wrong.
+    const std::string spelling = target.front() == '/' ? target : "/" + target;
+    const std::string folded = fs::absolute_path(spelling);
+    if (folded.empty() || folded.front() != '/') {
+        return false;
+    }
+    // The fold is total for this purpose: `absolute_path` resolves `..`
+    // against the names before it and drops a `..` that has none, which is
+    // what the kernel does with one -- `/../x` and `/x` name the same path,
+    // and a `..` at the root stays at the root. So a target can never fold
+    // to a path above the root, whatever it contains, and the result below
+    // is always a path under `root`. The one shape the fold cannot express
+    // is the empty path, which the caller above already refused.
+    out = root + folded;
+    return true;
+}
+
 // ----------------------------------------------------------- namespace set
 
 std::uint64_t NamespaceSet::flags() const noexcept {
@@ -709,7 +736,11 @@ int seal_root(const ContainerConfig& config, const std::string& target,
         if (!m.writable) {
             continue;
         }
-        const std::string at = target + m.target;
+        std::string at;
+        if (!mount_target_in_root(target, m.target, at)) {
+            detail = "bind target " + m.target + " is not inside the root";
+            return sys::kEinval;
+        }
         if (!fs::exists(at)) {
             continue;
         }
@@ -942,7 +973,10 @@ bool apply_extra_mounts(const ContainerConfig& config,
         if (!fs::exists(m.source)) {
             continue;
         }
-        const std::string target = root + m.target;
+        std::string target;
+        if (!mount_target_in_root(root, m.target, target)) {
+            return false;
+        }
         if (!fs::exists(target)) {
             if (!fs::mkdir_p(target, 0755)) {
                 return false;

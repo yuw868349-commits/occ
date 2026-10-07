@@ -233,23 +233,75 @@ void test_spawn_reports_child_failure() {
     spawn_reports_child_failure(false);
 }
 
-// The pid namespace has to be one the target can see. A container that asked
-// for a pid namespace and got a process carrying a host pid has created the
-// namespace and not used it: /proc inside the container shows the host's
-// process list, and a target that inspects its own pid sees a number that
-// means something outside.
+// A bind target is a path inside the new root, and the string the caller
+// writes is joined onto that root's directory on the host. Joining them by
+// concatenation is only correct when the target is absolute and has no
+// component that walks upward, and neither half of that is true of what a
+// caller can write:
 //
-// This is why the assertion is on the pid the target observes rather than on
-// anything occ can see from outside: from outside, a container whose pid
-// namespace was never entered looks exactly like one that was, because the
-// process is a direct child either way and its pid is the same number either
-// way. The difference is only visible from inside.
+//   * a target with no leading slash appends to the root's own *name*, so
+//     with the root at `/tmp/run/root`, `mnt` becomes `/tmp/run/rootmnt`
+//     -- a sibling of the root, in the caller's own directory, a host path
+//     nobody named as a mount point;
 //
-// The helper re-executes this binary, reads its own pid, and writes it to a
-// descriptor the test passed down. A descriptor rather than a path, because a
-// container with a read-only root cannot create a file: the root is sealed
-// before the target runs, so a helper asked to write to /tmp fails for a
-// reason that has nothing to do with the pid it was asked to report.
+//   * a target that folds above the root names a path outside it, and the
+//     `mkdir` and `mount` that follow would act there.
+//
+// Either one puts the mount somewhere the container cannot see and the
+// isolation never covered, and nothing reports it: the run comes up and
+// the bind is simply in the wrong place. The function under test is the
+// single place that decides where a target lands, which is why the cases
+// below are spelled as calls to it rather than as container runs -- a run
+// would assert on a path inside a directory the runtime makes up, and the
+// property being pinned is the join itself.
+void test_mount_target_is_resolved_under_the_root() {
+    const std::string root = "/tmp/run/root";
+    std::string out;
+
+    // The absolute case, which is the one that always worked.
+    check(mount_target_in_root(root, "/etc", out) && out == root + "/etc",
+          "an absolute target lands under the root");
+
+    // The relative case, which is the defect: `mnt` is read under the root
+    // and not appended to the root's name.
+    check(mount_target_in_root(root, "mnt", out) && out == root + "/mnt",
+          "a relative target lands under the root, not beside it");
+    check(out != root + "mnt",
+          "a relative target is not concatenated onto the root's name");
+
+    // A `..` that cancels against a name before it is an ordinary path and
+    // is folded, not refused: `/mnt/../usr` is `/usr`.
+    check(mount_target_in_root(root, "/mnt/../usr", out) &&
+              out == root + "/usr",
+          "a .. that cancels against a name folds away");
+
+    // A relative target with the same shape folds the same way.
+    check(mount_target_in_root(root, "a/../b", out) && out == root + "/b",
+          "a relative .. that cancels folds the same way");
+
+    // A name that merely starts with two dots is not the parent: `..x` is
+    // an ordinary file name and has to survive the fold.
+    check(mount_target_in_root(root, "/..x", out) && out == root + "/..x",
+          "a name beginning with two dots is not a parent component");
+
+    // A `..` with nothing before it to cancel against does not escape: the
+    // fold drops it at the root the way the kernel does, so `/../x` names
+    // `/x` inside the container and the join stays under the root. This is
+    // the case that would be an escape under a concatenation, and is the
+    // reason the fold is done rather than a scan for `..`.
+    check(mount_target_in_root(root, "/../x", out) && out == root + "/x",
+          "a .. above the root folds to the root, not outside it");
+    check(mount_target_in_root(root, "/a/../../x", out) &&
+              out == root + "/x",
+          ".. components that outrun their names stop at the root");
+    check(mount_target_in_root(root, "..", out) && out == root + "/",
+          "a bare .. folds to the root itself");
+
+    // The empty target names nothing and is refused rather than joined.
+    check(!mount_target_in_root(root, "", out),
+          "an empty target is refused");
+}
+
 void test_target_is_pid_one() {
     const auto linked = read_link("/proc/self/exe");
     if (!linked || linked->empty() || linked->front() != '/') {
@@ -449,6 +501,7 @@ int main(int argc, char** argv) {
     test_namespace_flags();
     test_overlay_needs_dirs();
     test_spawn_reports_child_failure();
+    test_mount_target_is_resolved_under_the_root();
     test_target_is_pid_one();
     test_exit_code_round_trip();
     test_signal_reporting();
