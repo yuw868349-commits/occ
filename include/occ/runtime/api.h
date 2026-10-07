@@ -136,6 +136,49 @@ void add_string_kernelbase(ExportList& out);
 // the host's answer reads as a Windows one; the decisions are in the file.
 void add_file_kernel32(ExportList& out);
 
+// -------------------------------------------------------------------- time
+
+// The time family: the two Windows clocks, the conversions between them and
+// the host's, and the zone query. Every conversion here is between a tick
+// count from the start of 1601, a broken-down calendar date, and the host's
+// own count from the start of 1970.
+void add_time_kernel32(ExportList& out);
+
+extern "C" __attribute__((ms_abi)) void k32t_GetSystemTime(
+    std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) void k32t_GetLocalTime(
+    std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) void k32t_GetSystemTimeAsFileTime(
+    std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_SetSystemTime(
+    const std::uint8_t* in) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_SetLocalTime(
+    const std::uint8_t* in) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_SystemTimeToFileTime(
+    const std::uint8_t* in, std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_FileTimeToSystemTime(
+    const std::uint8_t* in, std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_FileTimeToLocalFileTime(
+    const std::uint8_t* in, std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_LocalFileTimeToFileTime(
+    const std::uint8_t* in, std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_CompareFileTime(
+    const std::uint8_t* a, const std::uint8_t* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32t_GetTickCount() noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t k32t_GetTickCount64() noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32t_GetTimeZoneInformation(
+    std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t
+k32t_SystemTimeToTzSpecificLocalTime(const std::uint8_t* zone,
+                                     const std::uint8_t* utc,
+                                     std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t
+k32t_TzSpecificLocalTimeToSystemTime(const std::uint8_t* zone,
+                                     const std::uint8_t* local,
+                                     std::uint8_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_GetSystemTimes(
+    std::uint8_t* idle, std::uint8_t* kernel, std::uint8_t* user) noexcept;
+
 extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetFileAttributesA(
     const char* path) noexcept;
 extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetFileAttributesW(
