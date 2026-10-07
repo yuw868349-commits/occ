@@ -772,6 +772,174 @@ void test_crt_computational() {
           "wcstombs turns one wide unit into its UTF-8 spelling");
 }
 
+// ----------------------------------------------------- the CRT's stdio
+
+void test_crt_stdio_buffers() {
+    // The buffer spellings run the stream format with no text mode after
+    // it: a buffer has no mode, and a newline in one stays a newline.
+    char buffer[64];
+    check(winabi::cr_sprintf(buffer, "n=%d s=%s", 42, "hi") == 9 &&
+              std::string(buffer) == "n=42 s=hi",
+          "sprintf answers the format's own count");
+    check(winabi::cr_sprintf(buffer, "line\nnext") == 9 &&
+              std::string(buffer) == "line\nnext",
+          "a newline in a buffer stays a newline");
+
+    // The slot layout the stream bridge reads is the one the variadic
+    // spellings hand over -- an int in the low half, the rest by slot --
+    // which the variadic call itself assembles.
+    check(winabi::cr_sprintf(buffer, "%lld|%f|%x",
+                             5000000000LL, 1.5, 0x1234ABCDu) == 28 &&
+              std::string(buffer) == "5000000000|1.500000|1234abcd",
+          "the variadic slots carry what the slots carry");
+
+    // C99's snprintf: truncation is part of the answer, the terminator
+    // always lands, and the count is the whole text's length.
+    char small[8];
+    const int whole = winabi::cr_snprintf(small, sizeof(small), "%s-%d",
+                                          "truncate", 9);
+    check(whole == 10 && std::string(small) == "truncat" &&
+              small[7] == '\0',
+          "snprintf truncates, terminates, and counts the whole text");
+    check(winabi::cr_snprintf(small, sizeof(small), "fits") == 4 &&
+              std::string(small) == "fits",
+          "a text that fits comes back whole");
+
+    // The Microsoft spelling keeps the dangerous contract C99 fixed: a
+    // text that fills its count leaves no terminator at all.
+    const int ms = winabi::cr__snprintf(small, sizeof(small), "%s-%d",
+                                        "truncate", 9);
+    check(ms == 10 && std::memcmp(small, "truncat", 7) == 0,
+          "_snprintf filling its count writes no terminator");
+    check(winabi::cr__snprintf(small, sizeof(small), "ok") == 2 &&
+              std::string(small) == "ok",
+          "_snprintf with room terminates the way MS does");
+
+    // The vs spellings take the descriptor straight.
+    Slots slots;
+    slots.u32(7).u64(reinterpret_cast<std::uint64_t>("seven"));
+    const std::vector<std::uint64_t> args = slots.get();
+    check(winabi::cr_vsprintf(buffer, "n=%d s=%s",
+                              const_cast<std::uint64_t*>(args.data())) == 11 &&
+              std::string(buffer) == "n=7 s=seven",
+          "vsprintf reads the descriptor it is handed");
+}
+
+void test_crt_stdio_files() {
+    // The DOS path the guest spells is the file the host opens.
+    const char* dos_path = "Z:\\tmp\\occ_winabi_io_test.dat";
+    std::remove("/tmp/occ_winabi_io_test.dat");
+
+    char* handle = static_cast<char*>(winabi::cr_fopen(dos_path, "w"));
+    check(handle != nullptr, "fopen opens the DOS path the guest spells");
+
+    // The write side of the text mode: what the guest writes with a
+    // newline is what the Windows CRT would put in the file.
+    const std::int32_t put =
+        winabi::cr_fwrite("a\nb\n", 1, 4, handle) == 4 ? 0 : 1;
+    check(put == 0, "fwrite delivers its count through the text mode");
+    check(winabi::cr_fclose(handle) == 0, "fclose closes what fopen opened");
+
+    std::FILE* raw = ::fopen("/tmp/occ_winabi_io_test.dat", "rb");
+    check(raw != nullptr, "the file the guest named holds what a host sees");
+    if (raw != nullptr) {
+        char bytes[16] = {};
+        const std::size_t got = ::fread(bytes, 1, sizeof(bytes), raw);
+        ::fclose(raw);
+        check(got == 6 && std::string(bytes, got) == "a\r\nb\r\n",
+              "the text mode expanded every newline on the way in");
+    }
+
+    // The read side presses the pair back into one newline.
+    handle = static_cast<char*>(winabi::cr_fopen(dos_path, "r"));
+    check(handle != nullptr, "the file opens again for reading");
+    char readback[16] = {};
+    check(winabi::cr_fread(readback, 1, sizeof(readback), handle) == 4 &&
+              std::string(readback) == "a\nb\n",
+          "fread presses the carriage returns back into newlines");
+
+    // One byte at a time, where the pair straddles two reads: the return
+    // that lost its newline waits for the read that brings it.
+    char one[4];
+    check(winabi::cr_fseek(handle, 0, 0) == 0, "fseek returns to the start");
+    check(winabi::cr_fread(one, 1, 1, handle) == 1 && one[0] == 'a',
+          "the first byte comes back first");
+    check(winabi::cr_fread(one, 1, 1, handle) == 1 && one[0] == '\r',
+          "a return before its newline goes out as it is");
+    check(winabi::cr_fread(one, 1, 1, handle) == 1 && one[0] == '\n',
+          "the newline that closed the pair comes back as one");
+    check(winabi::cr_ftell(handle) == 3,
+          "ftell answers the offset the reads have walked to");
+
+    // fgets hands the guest the line Windows' fgets would: one newline,
+    // whatever the file held.
+    check(winabi::cr_fseek(handle, 0, 0) == 0, "fseek returns for the line");
+    char line[16] = {};
+    check(winabi::cr_fgets(line, sizeof(line), handle) == line &&
+              std::string(line) == "a\n",
+          "fgets hands back the line with one newline");
+    check(winabi::cr_feof(handle) == 0,
+          "a line that ended in a newline is not the end");
+
+    // A binary mode names itself: nothing expands, nothing presses back.
+    check(winabi::cr_fclose(handle) == 0, "the read side closes");
+    handle = static_cast<char*>(winabi::cr_fopen(dos_path, "wb"));
+    check(handle != nullptr, "the binary mode opens");
+    check(winabi::cr_fwrite("x\ny", 1, 3, handle) == 3,
+          "binary fwrite delivers its bytes");
+    check(winabi::cr_fclose(handle) == 0, "the binary write closes");
+    handle = static_cast<char*>(winabi::cr_fopen(dos_path, "rb"));
+    char binary[8] = {};
+    check(handle != nullptr && winabi::cr_fread(binary, 1, 8, handle) == 3 &&
+              std::string(binary, 3) == "x\ny",
+          "binary fread hands back the bytes the file holds");
+    check(winabi::cr_fclose(handle) == 0, "the binary read closes");
+
+    check(winabi::cr_remove(dos_path) == 0, "remove clears the file away");
+    check(winabi::cr_fopen(dos_path, "r") == nullptr,
+          "a file that is gone does not open");
+
+    // The rename that moves one DOS name to another.
+    char* made = static_cast<char*>(winabi::cr_fopen(dos_path, "w"));
+    check(made != nullptr && winabi::cr_fclose(made) == 0,
+          "the rename's source opens and closes");
+    check(winabi::cr_rename(dos_path, "Z:\\tmp\\occ_winabi_io_moved.dat") == 0,
+          "rename answers across the DOS spellings");
+    check(winabi::cr_fopen(dos_path, "r") == nullptr,
+          "the old name is gone");
+    char* moved = static_cast<char*>(
+        winabi::cr_fopen("Z:\\tmp\\occ_winabi_io_moved.dat", "r"));
+    check(moved != nullptr, "the new name opens");
+    check(winabi::cr_fclose(moved) == 0, "the moved file closes");
+    check(winabi::cr_remove("Z:\\tmp\\occ_winabi_io_moved.dat") == 0,
+          "the moved file is cleared away too");
+
+    // The wide spelling of open, over the same UTF-16 the guest's
+    // wchar_t strings carry.
+    char* opened = static_cast<char*>(
+        winabi::cr__wfopen(u"Z:\\tmp\\occ_winabi_io_wide.dat", u"w"));
+    check(opened != nullptr, "_wfopen reads the wide spelling");
+    check(winabi::cr_fclose(opened) == 0, "the wide open closes");
+    check(winabi::cr_remove("Z:\\tmp\\occ_winabi_io_wide.dat") == 0,
+          "the wide-named file clears away");
+
+    // ungetc hands the byte back before the next read takes it.
+    handle = static_cast<char*>(
+        winabi::cr_fopen("Z:\\tmp\\occ_winabi_ungetc.dat", "wb"));
+    check(handle != nullptr && winabi::cr_fwrite("AB", 1, 2, handle) == 2 &&
+              winabi::cr_fclose(handle) == 0,
+          "the ungetc fixture writes two bytes");
+    handle = static_cast<char*>(
+        winabi::cr_fopen("Z:\\tmp\\occ_winabi_ungetc.dat", "rb"));
+    check(handle != nullptr && winabi::cr_fgetc(handle) == 'A',
+          "the first byte reads");
+    check(winabi::cr_ungetc('A', handle) == 'A', "ungetc hands the byte back");
+    check(winabi::cr_fgetc(handle) == 'A', "the handed-back byte reads again");
+    check(winabi::cr_fclose(handle) == 0, "the ungetc fixture closes");
+    check(winabi::cr_remove("Z:\\tmp\\occ_winabi_ungetc.dat") == 0,
+          "the ungetc file clears away");
+}
+
 // --------------------------------------------------------------- registry
 
 void test_every_fixture_import_resolves() {
@@ -891,6 +1059,8 @@ int main() {
     test_heap_semantics();
     test_translate_stream();
     test_crt_computational();
+    test_crt_stdio_buffers();
+    test_crt_stdio_files();
     test_every_fixture_import_resolves();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);

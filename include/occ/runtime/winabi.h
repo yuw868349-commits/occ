@@ -230,6 +230,15 @@ void register_host_modules(ExportRegistry& registry);
 int host_vfprintf(std::FILE* stream, const char* fmt,
                   const void* ms_slots) noexcept;
 
+// The format without the stream: the same rebuild and descriptor assembly
+// `host_vfprintf` runs, delivered into `text` with no text-mode expansion,
+// which is what the buffer spellings -- `sprintf` and friends -- answer
+// through, because a buffer has no mode and a newline in one stays a
+// newline. Returns what `vfprintf` returns, and -1 for a format this
+// bridge does not translate.
+int host_vformat(std::string& text, const char* fmt,
+                 const void* ms_slots) noexcept;
+
 // Maps a stream pointer the guest passes -- an address inside the iob table
 // this state hands out -- to the host `FILE*` it means. Anything outside the
 // table is already a host pointer and goes through unchanged.
@@ -423,6 +432,70 @@ extern "C" __attribute__((ms_abi)) std::uint64_t cr_mbstowcs(
     char16_t* target, const char* source, std::uint64_t units) noexcept;
 extern "C" __attribute__((ms_abi)) std::uint64_t cr_wcstombs(
     char* target, const char16_t* source, std::uint64_t bytes) noexcept;
+
+// The buffer spellings of printf: the same format the stream spellings
+// run, with no text mode after it -- a buffer has no mode. The C99 and
+// Microsoft snprintf spellings differ in the one place C99 improved on
+// the contract: a text that fills its count leaves no terminator under
+// `_snprintf`, and both answer with the whole text's length.
+extern "C" __attribute__((ms_abi)) std::int32_t cr_vsprintf(
+    char* buffer, const char* fmt, void* ms_slots) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_sprintf(
+    char* buffer, const char* fmt, ...) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_vsnprintf(
+    char* buffer, std::uint64_t count, const char* fmt,
+    void* ms_slots) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_snprintf(
+    char* buffer, std::uint64_t count, const char* fmt, ...) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr__vsnprintf(
+    char* buffer, std::uint64_t count, const char* fmt,
+    void* ms_slots) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr__snprintf(
+    char* buffer, std::uint64_t count, const char* fmt, ...) noexcept;
+
+// The file spellings: DOS paths in, host files underneath, and the text
+// mode the Windows CRT reads and writes files through in both directions.
+extern "C" __attribute__((ms_abi)) void* cr_fopen(
+    const char* path, const char* mode) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr__wfopen(
+    const char16_t* path, const char16_t* mode) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fclose(
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_fread(
+    void* buffer, std::uint64_t size, std::uint64_t count,
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_fwrite(
+    const void* buffer, std::uint64_t size, std::uint64_t count,
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fgetc(
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_fgets(
+    char* buffer, std::int32_t count, void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fputc(
+    std::int32_t c, void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fseek(
+    void* stream, std::int64_t offset, std::int32_t origin) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fseeki64(
+    void* stream, std::int64_t offset, std::int32_t origin) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr_ftell(
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr_ftelli64(
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fflush(
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_feof(void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ferror(
+    void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) void cr_clearerr(void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_setvbuf(
+    void* stream, char* buffer, std::int32_t mode, std::uint64_t size) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ungetc(
+    std::int32_t c, void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_rename(
+    const char* from, const char* to) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_remove(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_tmpfile() noexcept;
 
 // --------------------------------------------------------------------------
 // The heap
