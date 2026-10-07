@@ -568,6 +568,7 @@ add_library(occ_core STATIC
     src/runtime/exports.cpp
     src/runtime/ntdll.cpp
     src/runtime/pe_process.cpp
+    src/runtime/seh.cpp
     src/runtime/winabi.cpp
 )
 

@@ -23,6 +23,7 @@
 #include "occ/runtime/address_space.h"
 #include "occ/runtime/mapper.h"
 #include "occ/runtime/ntdll.h"
+#include "occ/runtime/seh.h"
 
 namespace occ::runtime::winabi {
 
@@ -2687,21 +2688,6 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr___mb_cur_max_func() noexcept 
     return 1;
 }
 
-extern "C" __attribute__((ms_abi)) std::uint64_t cr___C_specific_handler(
-    void* exception_record, void* establisher_frame, void* context_record,
-    void* dispatcher_context) noexcept {
-    // The scope-table walker a guest with __try reaches. No current guest
-    // path dispatches an exception through here -- the fault handler decides
-    // before the unwind starts -- so the honest answer is the one that says
-    // "not handled": the search continues, and a report that looked for this
-    // function would find it rather than a claim.
-    (void)exception_record;
-    (void)establisher_frame;
-    (void)context_record;
-    (void)dispatcher_context;
-    return 1;  // ExceptionContinueSearch
-}
-
 // ---- stdio and the C library -------------------------------------------
 
 extern "C" __attribute__((ms_abi)) std::int32_t cr_vfprintf(
@@ -4316,6 +4302,166 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_QueryPerformanceCounter(
     return 1;
 }
 
+// ---- exceptions ----------------------------------------------------------
+
+// The body of `RaiseException`, reached from the assembly stub below. It
+// builds the record the Windows call builds, runs the search pass over the
+// guest's own frames, and ends the way Windows ends each outcome: a frame
+// that resumes runs on, and an exception nobody caught ends the process
+// with the exception's code.
+extern "C" void k32_raise_dispatch(std::uint64_t code, std::uint64_t flags,
+                                   std::uint64_t nargs,
+                                   std::uint64_t args_address,
+                                   std::uint8_t* context) noexcept {
+    winabi::GuestState* guest = guest_state();
+    if (guest == nullptr) {
+        // No guest, no frames to walk and nowhere the exception could
+        // land; the stub's own return is the only honest way back.
+        return;
+    }
+    alignas(16) std::uint8_t record[seh::kRecordSize];
+    std::memset(record, 0, sizeof(record));
+    {
+        const std::uint32_t narrow = static_cast<std::uint32_t>(code);
+        std::memcpy(record + seh::kRecordCode, &narrow, sizeof(narrow));
+        const std::uint32_t wide = static_cast<std::uint32_t>(flags);
+        std::memcpy(record + seh::kRecordFlags, &wide, sizeof(wide));
+        std::uint64_t address = 0;
+        std::memcpy(&address, context + seh::kContextRip, sizeof(address));
+        std::memcpy(record + 0x10, &address, sizeof(address));
+        const std::uint32_t copied =
+            nargs > 15 ? 15u : static_cast<std::uint32_t>(nargs);
+        std::memcpy(record + 0x18, &copied, sizeof(copied));
+        for (std::uint32_t i = 0; i < copied; ++i) {
+            const void* slot = reinterpret_cast<const void*>(
+                args_address + static_cast<std::size_t>(i) * 8);
+            std::memcpy(record + 0x20 + static_cast<std::size_t>(i) * 8,
+                        slot, sizeof(std::uint64_t));
+        }
+    }
+
+    const bool resume = seh::dispatch(
+        record, context,
+        reinterpret_cast<const std::uint8_t*>(guest->pdata_va),
+        static_cast<std::size_t>(guest->pdata_bytes), guest->image_base,
+        guest->image_end, guest->stack_low, guest->stack_high);
+    if (resume) {
+        // A filter answered EXCEPTION_CONTINUE_EXECUTION: the guest
+        // resolved the condition and the interrupted code runs on.
+        seh::seh_restore_context(context);
+    }
+
+    // Windows gives the unhandled-exception filter its say before the
+    // process ends; its verdicts both end the run, and the code the run
+    // ends with is the exception's.
+    if (guest->unhandled_filter != 0) {
+        alignas(8) const void* pointers[2] = {record, context};
+        const auto tell = reinterpret_cast<std::int32_t(
+            __attribute__((ms_abi))*)(const void*)>(guest->unhandled_filter);
+        (void)tell(pointers);
+    }
+    terminate(static_cast<std::uint32_t>(code));
+}
+
+// `RaiseException`, spelled as the stub the ABI needs: the guest's call
+// arrives with its registers live -- the non-volatile ones still belong to
+// the guest's caller, which a C prolog would destroy -- so the stub keeps
+// no prolog, captures the caller's state, corrects the context to the
+// call site the guest sees, and hands the rest to the body above.
+extern "C" __attribute__((naked, ms_abi)) void k32_RaiseException(
+    std::uint64_t, std::uint64_t, std::uint64_t,
+    const std::uint64_t*) noexcept {
+    __asm__(
+        "subq $0x4f8, %rsp\n\t"           // keeps the calls below aligned
+        "movq %rcx, 0x500(%rsp)\n\t"      // the caller's shadow slots,
+        "movq %rdx, 0x508(%rsp)\n\t"      // which a callee may write
+        "movq %r8, 0x510(%rsp)\n\t"
+        "movq %r9, 0x518(%rsp)\n\t"
+        "leaq 0x20(%rsp), %rcx\n\t"
+        "call seh_capture_context\n\t"    // captures this stub's own state
+        "leaq 0x500(%rsp), %rax\n\t"
+        "movq %rax, 0xb8(%rsp)\n\t"       // context.Rsp: the caller's own,
+                                          // pointing at the return address
+        "movq 0x4f8(%rsp), %rax\n\t"
+        "movq %rax, 0x118(%rsp)\n\t"      // context.Rip: the return address
+        "movq 0x500(%rsp), %rax\n\t"
+        "movq %rax, 0xa0(%rsp)\n\t"       // context.Rcx: the code, which
+                                          // the capture overwrote
+        "movq 0x500(%rsp), %rdi\n\t"      // the body runs on the host's own
+        "movq 0x508(%rsp), %rsi\n\t"      // calling convention
+        "movq 0x510(%rsp), %rdx\n\t"
+        "movq 0x518(%rsp), %rcx\n\t"
+        "leaq 0x20(%rsp), %r8\n\t"
+        "call k32_raise_dispatch\n\t"
+        "addq $0x4f8, %rsp\n\t"
+        "ret\n\t");
+}
+
+// The lookup the guest's own unwind support reaches for: the table's own
+// row for the control point, with the base it belongs to, or nothing --
+// chains left for the walk to follow.
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_RtlLookupFunctionEntry(
+    std::uint64_t control_pc, std::uint64_t* image_base_out,
+    void* history_table) noexcept {
+    (void)history_table;  // answered by search every time; the cache is
+                          // the caller's to keep
+    winabi::GuestState* guest = guest_state();
+    if (guest == nullptr) {
+        if (image_base_out != nullptr) {
+            *image_base_out = 0;
+        }
+        return 0;
+    }
+    const seh::FunctionEntry* entry = seh::find_function_entry(
+        guest->image_base,
+        reinterpret_cast<const std::uint8_t*>(guest->pdata_va),
+        static_cast<std::size_t>(guest->pdata_bytes), control_pc);
+    if (image_base_out != nullptr) {
+        *image_base_out = entry != nullptr ? guest->image_base : 0;
+    }
+    return reinterpret_cast<std::uint64_t>(entry);
+}
+
+// The one-frame reversal the guest's own unwind support reaches for: the
+// same walk the search pass runs, one frame at a time, with the handler
+// the frame carries -- or zero -- as the answer.
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_RtlVirtualUnwind(
+    std::uint32_t handler_type, std::uint64_t image_base,
+    std::uint64_t control_pc, const void* function_entry, void* context,
+    void** handler_data_out, std::uint64_t* establisher_frame_out,
+    void* history_table) noexcept {
+    (void)history_table;
+    std::uint64_t frame = 0;
+    const void* handler_data = nullptr;
+    std::uint64_t handler = 0;
+    const bool ok = seh::virtual_unwind(
+        handler_type, image_base, control_pc,
+        static_cast<const seh::FunctionEntry*>(function_entry),
+        static_cast<std::uint8_t*>(context), &handler_data, &frame,
+        &handler);
+    if (!ok) {
+        // A table this runtime cannot read: the Windows call marks the
+        // context with a zero rip and answers no handler.
+        std::memset(static_cast<std::uint8_t*>(context) + seh::kContextRip, 0,
+                    sizeof(std::uint64_t));
+        if (handler_data_out != nullptr) {
+            *handler_data_out = nullptr;
+        }
+        if (establisher_frame_out != nullptr) {
+            *establisher_frame_out = frame;
+        }
+        return 0;
+    }
+    if (handler_data_out != nullptr) {
+        *handler_data_out = const_cast<void*>(handler_data);
+    }
+    if (establisher_frame_out != nullptr) {
+        *establisher_frame_out = frame;
+    }
+    return handler;
+}
+
+
 extern "C" __attribute__((ms_abi)) std::int32_t k32_QueryPerformanceFrequency(
     std::uint64_t* out) noexcept {
     // The frequency the counter above advances at: 10 MHz, one tick per 100
@@ -4421,6 +4567,13 @@ void add_kernel32(ExportModule& module) {
           reinterpret_cast<void*>(&k32_QueryPerformanceCounter)),
         e("QueryPerformanceFrequency",
           reinterpret_cast<void*>(&k32_QueryPerformanceFrequency)),
+        e("RaiseException", reinterpret_cast<void*>(&k32_RaiseException)),
+        e("RtlCaptureContext",
+          reinterpret_cast<void*>(&seh::seh_capture_context)),
+        e("RtlLookupFunctionEntry",
+          reinterpret_cast<void*>(&k32_RtlLookupFunctionEntry)),
+        e("RtlUnwindEx", reinterpret_cast<void*>(&seh::seh_RtlUnwindEx)),
+        e("RtlVirtualUnwind", reinterpret_cast<void*>(&k32_RtlVirtualUnwind)),
     };
 }
 
@@ -4463,7 +4616,7 @@ void add_msvcrt(ExportModule& module) {
         e("__set_app_type", reinterpret_cast<void*>(&cr___set_app_type)),
         e("__setusermatherr", reinterpret_cast<void*>(&cr___setusermatherr)),
         e("__C_specific_handler",
-          reinterpret_cast<void*>(&cr___C_specific_handler)),
+          reinterpret_cast<void*>(&seh::seh_C_specific_handler)),
         e("___lc_codepage_func",
           reinterpret_cast<void*>(&cr___lc_codepage_func)),
         e("___mb_cur_max_func",

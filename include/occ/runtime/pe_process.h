@@ -179,6 +179,13 @@ struct ProcessImage {
     };
     std::vector<ExportRecord> own_exports;
 
+    // The exception directory, mapped. A raise inside the guest walks this
+    // table to find each frame's unwind information; an image with no
+    // exception directory leaves both zero, which the walk reads as "no
+    // frame has unwind information" -- the leaf-function rule.
+    std::uint64_t pdata_va = 0;
+    std::uint64_t pdata_bytes = 0;
+
     // The TEB and the PEB, as addresses in this space.
     std::uint64_t teb = 0;
     std::uint64_t peb = 0;

@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "occ/util/fs.h"
+#include "occ/runtime/seh.h"
 #include "occ/runtime/winabi.h"
 
 namespace occ::runtime {
@@ -537,6 +538,24 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
 
     // --- 8. where the thread starts --------------------------------------
 
+    // The exception directory, as the loaded image holds it. The section is
+    // named `.pdata` by every x64 linker that emits one, and the table's
+    // bytes are the file's own -- the RUNTIME_FUNCTIONs live in raw data,
+    // so the table's length is the smaller of what the section declares
+    // and what the file carries.
+    for (const parser::PeSection& section : image.sections()) {
+        if (section.name == ".pdata") {
+            image_out.pdata_va =
+                image_out.module.base + section.virtual_address;
+            image_out.pdata_bytes =
+                static_cast<std::uint64_t>(section.virtual_size <
+                                                   section.raw_size
+                                               ? section.virtual_size
+                                               : section.raw_size);
+            break;
+        }
+    }
+
     // The image's own exports, at absolute addresses, for `GetProcAddress`
     // on the image's module. The parser has already walked the directory and
     // named the forwarders; this is the same walk, once, at the width the
@@ -621,43 +640,40 @@ constexpr unsigned long kArchGetGs = 0x1004;
 
 // ---------------------------------------------------------------- context
 
-// The Windows x64 CONTEXT, as offsets into a 1232-byte buffer. The struct is
-// 16-byte aligned on Windows and so is the buffer it is built into.
-constexpr std::size_t kContextSize = 0x4D0;  // 1232 bytes
-static_assert(kContextSize % 16 == 0,
-              "the CONTEXT must fill whole 16-byte rows");
-
-constexpr std::uint32_t kContextAmd64 = 0x100000u;
-constexpr std::uint32_t kContextFull =
-    kContextAmd64 | 0x1u | 0x2u | 0x4u | 0x8u;  // CONTROL | INTEGER |
-                                                // SEGMENTS | FLOATING_POINT
-constexpr std::size_t kContextFlags = 0x30;
-constexpr std::size_t kContextMxCsr = 0x34;
-constexpr std::size_t kContextSegCs = 0x38;
-constexpr std::size_t kContextSegDs = 0x3A;
-constexpr std::size_t kContextSegEs = 0x3C;
-constexpr std::size_t kContextSegFs = 0x3E;
-constexpr std::size_t kContextSegGs = 0x40;
-constexpr std::size_t kContextSegSs = 0x42;
-constexpr std::size_t kContextEFlags = 0x44;
-constexpr std::size_t kContextRax = 0x78;
-constexpr std::size_t kContextRcx = 0x80;
-constexpr std::size_t kContextRdx = 0x88;
-constexpr std::size_t kContextRbx = 0x90;
-constexpr std::size_t kContextRsp = 0x98;
-constexpr std::size_t kContextRbp = 0xA0;
-constexpr std::size_t kContextRsi = 0xA8;
-constexpr std::size_t kContextRdi = 0xB0;
-constexpr std::size_t kContextR8 = 0xB8;
-constexpr std::size_t kContextR9 = 0xC0;
-constexpr std::size_t kContextR10 = 0xC8;
-constexpr std::size_t kContextR11 = 0xD0;
-constexpr std::size_t kContextR12 = 0xD8;
-constexpr std::size_t kContextR13 = 0xE0;
-constexpr std::size_t kContextR14 = 0xE8;
-constexpr std::size_t kContextR15 = 0xF0;
-constexpr std::size_t kContextRip = 0xF8;
-constexpr std::size_t kContextFltSave = 0x100;  // XSAVE_FORMAT, 512 bytes
+// The Windows x64 CONTEXT, as offsets into a 1232-byte buffer. The offsets
+// are the seh layer's own constants, imported rather than repeated: the
+// raise-and-unwind path reads the buffers this file builds, and one copy
+// of the layout is the only thing keeping the two in step.
+using occ::runtime::seh::kContextAmd64;
+using occ::runtime::seh::kContextEFlags;
+using occ::runtime::seh::kContextFlags;
+using occ::runtime::seh::kContextFltSave;
+using occ::runtime::seh::kContextFull;
+using occ::runtime::seh::kContextMxCsr;
+using occ::runtime::seh::kContextR10;
+using occ::runtime::seh::kContextR11;
+using occ::runtime::seh::kContextR12;
+using occ::runtime::seh::kContextR13;
+using occ::runtime::seh::kContextR14;
+using occ::runtime::seh::kContextR15;
+using occ::runtime::seh::kContextR8;
+using occ::runtime::seh::kContextR9;
+using occ::runtime::seh::kContextRax;
+using occ::runtime::seh::kContextRbp;
+using occ::runtime::seh::kContextRbx;
+using occ::runtime::seh::kContextRcx;
+using occ::runtime::seh::kContextRdi;
+using occ::runtime::seh::kContextRdx;
+using occ::runtime::seh::kContextRip;
+using occ::runtime::seh::kContextRsi;
+using occ::runtime::seh::kContextRsp;
+using occ::runtime::seh::kContextSegCs;
+using occ::runtime::seh::kContextSegDs;
+using occ::runtime::seh::kContextSegEs;
+using occ::runtime::seh::kContextSegFs;
+using occ::runtime::seh::kContextSegGs;
+using occ::runtime::seh::kContextSegSs;
+using occ::runtime::seh::kContextSize;
 
 // The registers inside the floating-point save area, relative to its start.
 constexpr std::size_t kFltControlWord = 0x00;
@@ -1023,6 +1039,39 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     const std::uint32_t code =
         exception_code_for(sig, info != nullptr ? *info : ::siginfo_t{},
                            g_run_frame, address);
+
+    // The frame walk comes first, which is the order Windows keeps: the
+    // exception dispatches through the frames whose language handlers ask
+    // for it, and only an exception every frame declines reaches the
+    // process filter below. A handler that decides to handle starts its
+    // own unwind and never returns; a filter that answers
+    // EXCEPTION_CONTINUE_EXECUTION lands on the restore below.
+    if (state != nullptr && state->pdata_va != 0) {
+        static_assert(sizeof(::sigset_t) <=
+                          winabi::GuestState::kSignalMaskBytes,
+                      "the saved mask must fit the state's slot");
+        alignas(16) std::uint8_t context[kContextSize];
+        fill_guest_context(context, *uc);
+        GuestExceptionRecord record;
+        fill_exception_record(record, code, address, sig, *uc);
+        std::memcpy(state->resume_mask, &uc->uc_sigmask, sizeof(::sigset_t));
+        state->resume_mask_valid = true;
+        const bool resume = seh::dispatch(
+            reinterpret_cast<std::uint8_t*>(&record), context,
+            reinterpret_cast<const std::uint8_t*>(state->pdata_va),
+            static_cast<std::size_t>(state->pdata_bytes), state->image_base,
+            state->image_end, state->stack_low, state->stack_high);
+        if (resume) {
+            // The guest resolved the condition. The mask the fault
+            // blocked comes back before the state it interrupted does,
+            // or the guest that caught the fault could not fault again.
+            ::sigset_t mask;
+            std::memcpy(&mask, state->resume_mask, sizeof(mask));
+            ::sigprocmask(SIG_SETMASK, &mask, nullptr);
+            seh::seh_restore_context(context);
+        }
+    }
+
     const std::uint64_t filter = state != nullptr ? state->unhandled_filter : 0;
     if (filter != 0) {
         alignas(16) std::uint8_t context[kContextSize];
@@ -1124,6 +1173,16 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
             g_run_frame.stack_high = region.base + region.size;
         }
     }
+
+    // The exception walk's facts. The table and the image end travel with
+    // the state because the walk reads the guest's memory and a corrupt
+    // table is trusted only inside these bounds; the stack bounds come
+    // from the same regions the fault path uses.
+    state.pdata_va = image.pdata_va;
+    state.pdata_bytes = image.pdata_bytes;
+    state.image_end = image.module.base + image.module.size;
+    state.stack_low = g_run_frame.stack_low;
+    state.stack_high = g_run_frame.stack_high;
 
     winabi::set_guest_state(&state);
     winabi::install_terminate_path(&guest_terminate);

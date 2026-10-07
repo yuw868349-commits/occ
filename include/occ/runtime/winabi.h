@@ -156,6 +156,26 @@ struct GuestState {
     // handler reads this before deciding that a fault is unhandled.
     std::uint64_t unhandled_filter = 0;
 
+    // The signal mask the fault arrived under, saved by the fault handler
+    // before the exception walk starts and restored before the guest
+    // resumes: the signal that delivered the fault stays blocked while the
+    // handler runs, and a guest that catches the exception must be able to
+    // fault again. Sized for the largest `sigset_t` the kernel hands over.
+    static constexpr std::size_t kSignalMaskBytes = 128;
+    std::uint8_t resume_mask[kSignalMaskBytes] = {};
+    bool resume_mask_valid = false;
+
+    // The exception walk's facts about the image and the stack: where the
+    // `.pdata` table landed, where the image ends, and the span the
+    // guest's stack occupies. A frame or a table outside these bounds is
+    // not walked -- the bounds are what keep a corrupt unwind table from
+    // becoming the runtime's own fault.
+    std::uint64_t pdata_va = 0;
+    std::uint64_t pdata_bytes = 0;
+    std::uint64_t image_end = 0;
+    std::uint64_t stack_low = 0;
+    std::uint64_t stack_high = 0;
+
     // What killed the guest, when something did. Filled by the fault
     // handler, read by the code that reports the run.
     bool faulted = false;
