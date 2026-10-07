@@ -3260,6 +3260,281 @@ void test_a_views_address_requirements_constrain_the_placement() {
     }
 }
 
+// A size that survives the rounding is not a size that survives being added
+// to an address.
+//
+// Every range-producing call in this file widens the caller's `size` to cover
+// the pages the range touches and then uses the result twice: once in a
+// comparison that bounds the range, and once in a sum that locates its end.
+// Both are arithmetic on a 64-bit value the program chose, and both wrap --
+// and the direction the wrap fails in is the quiet one. A wrapped size is
+// *smaller*, so `x < effective_size` bounds are satisfied rather than
+// violated, and a wrapped end is *below* the start, so a walk loop and a sweep
+// loop both terminate immediately having examined nothing.
+//
+// The cases below are one per call that computes such a range. Each drives a
+// size chosen so the arithmetic wraps and asserts three things: the call
+// refuses, the status is the one the call's own parameter checks use, and the
+// ledger is unchanged -- because a refusal that has already moved the ledger
+// is the failure mode that is worse than the one being fixed.
+void test_a_size_that_wraps_is_refused_rather_than_folded() {
+    // `0xFFFFFFFFFFFFF001` is the value that makes `ROUND_SIZE`'s own sum wrap:
+    // for a page-aligned address it adds `0xFFF` and folds all the way to
+    // zero. An effective size of zero is the extreme case of the quiet
+    // direction -- the range becomes empty, so every check that walks it
+    // passes vacuously -- and it is the one to start with because it is the
+    // one a reader will believe is impossible.
+    const std::uint64_t folds_to_zero = 0xFFFFFFFFFFFFF001ull;
+
+    // **NtProtectVirtualMemory, where the folded-to-zero range was accepted
+    // outright.** `*old_protect` is filled in with the protection the range
+    // never had, which is the part of the answer a caller reads without
+    // checking the status; the assertion on it is here rather than in the
+    // refusal case below because a runtime that refuses must leave an output
+    // it never wrote alone.
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        std::uint64_t addr = base;
+        std::uint64_t size = folds_to_zero;
+        std::uint32_t old = 0xdeadbeef;
+        const auto r =
+            nt_protect_virtual_memory(f.ctx, &addr, &size, 0x02, &old);
+        check(!r.ok(),
+              "wrapped size: a protect whose size folds to zero is refused, "
+              "not answered with a success that protected nothing");
+        check(r.status == Status::InvalidParameter,
+              "wrapped size: and the refusal is the one a range past the end "
+              "of the space produces, which is the status the walk would have "
+              "given had the size been representable");
+        check(old == 0xdeadbeef,
+              "wrapped size: and the old-protection output is left alone, "
+              "because a caller reading it after a failure must not be told "
+              "the range was PAGE_NOACCESS");
+        check(f.space.regions().size() == 1,
+              "wrapped size: and the ledger is not split, which is the "
+              "difference between refusing and cutting a region for a range "
+              "nobody named");
+    }
+
+    // **The same call with a size that is representable but whose end is
+    // not.** This is a second, independent wrap: `size` here is honest --
+    // `ROUND_SIZE` returns it unchanged -- and it is the sum `base + size`
+    // that folds. It is the case a check on the widening alone would miss, and
+    // it is why the two are asserted separately.
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        std::uint64_t addr = base;
+        std::uint64_t size = 0xFFFFFFFFFFFFF000ull;
+        std::uint32_t old = 0xdeadbeef;
+        const auto r =
+            nt_protect_virtual_memory(f.ctx, &addr, &size, 0x02, &old);
+        check(!r.ok(),
+              "wrapped size: a representable size whose end wraps is refused, "
+              "because `base + size` is the expression the walk runs on and "
+              "not the size alone");
+        check(r.status == Status::InvalidParameter,
+              "wrapped size: and with the same status, so the two wraps answer "
+              "alike");
+        check(f.space.regions().size() == 1,
+              "wrapped size: and nothing was changed on the way to refusing");
+    }
+
+    // **The commit inside a reservation.** `base + commit_size > end` is a
+    // comparison of a sum that wraps, so a size chosen to fold the sum below
+    // the reservation's end passes the bound and reaches the kernel. What the
+    // caller then got was the kernel's `mprotect` refusal reported as
+    // INVALID_ADDRESS -- a status naming the wrong problem, produced by a
+    // check that had been satisfied.
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        // The size that carries `base + commit_size` back down to a single
+        // page, which is below the reservation's own end.
+        const std::uint64_t wraps_below = 0ull - base + 0x1000;
+        const std::size_t before = f.space.regions().size();
+        std::uint64_t addr = base;
+        std::uint64_t size = wraps_below;
+        const auto r =
+            nt_allocate_virtual_memory(f.ctx, &addr, &size, 0,
+                                       mem::kCommit, 0x04);
+        check(!r.ok(),
+              "wrapped size: a commit whose range end wraps below the "
+              "reservation is refused rather than passed to the kernel");
+        check(r.status == Status::InvalidParameter,
+              "wrapped size: and the status names the size rather than the "
+              "kernel's refused protection change");
+        check(f.space.regions().size() == before,
+              "wrapped size: and the ledger is not cut, which a commit that "
+              "reached `split()` would have done");
+    }
+
+    // **NtFreeVirtualMemory.** This call's own bound is `region->end() - base
+    // < effective_size`, which a folded size satisfies -- so it refused
+    // nothing and answered with the wrong status for a range it should have
+    // rejected outright. The status here is the one the bound uses, so the
+    // two refusals are indistinguishable to a caller.
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        std::uint64_t addr = base;
+        std::uint64_t size = folds_to_zero;
+        const auto r =
+            nt_free_virtual_memory(f.ctx, &addr, &size, mem::kDecommit);
+        check(!r.ok(),
+              "wrapped size: a decommit whose size folds to zero is refused "
+              "instead of answering a size it never acted on");
+        check(r.status == Status::UnableToFreeVm,
+              "wrapped size: with the status this call uses for a range that "
+              "does not fit");
+        check(f.space.regions().size() == 1,
+              "wrapped size: and the reservation survives, which is the whole "
+              "point of a decommit as against a release");
+        check(f.space.find(base) != nullptr &&
+                  f.space.find(base)->committed,
+              "wrapped size: and it is still committed, so nothing was "
+              "decommitted on the way to the refusal");
+    }
+
+    // **NtFlushInstructionCache, where the existing overflow guard was on the
+    // wrong expression.** `addr + size < addr` was already there to catch a
+    // range running off the end, and it was checked while the range actually
+    // flushed is the *rounded* one -- up to two pages larger. The two
+    // expressions are not interchangeable: the rounding adds
+    // `(addr & mask) + mask` to the size before masking, so for an address
+    // with a nonzero in-page offset there are sizes where the direct sum fits
+    // and the rounded one does not. The guard passed, the rounding wrapped to
+    // zero, and `range_is_mapped` answers `true` for a zero size whatever the
+    // address -- so a flush of a range outside the address space was accepted.
+    {
+        Fixture f;
+        // An address with a nonzero in-page offset, which is what opens the
+        // gap between the two expressions; the size is the smallest one whose
+        // rounding wraps from there.
+        const std::uint64_t addr = 0x800;
+        const std::uint64_t size = 0xFFFFFFFFFFFFE801ull;
+        check(addr + size >= addr,
+              "wrapped size: the case is set up so the existing `addr + size` "
+              "guard does not fire, because the guard and the range asked "
+              "about are different expressions");
+        const auto r = nt_flush_instruction_cache(f.ctx, addr, size);
+        check(!r.ok(),
+              "wrapped size: an instruction-cache flush whose rounded range "
+              "runs off the end is refused even though `addr + size` fits");
+        check(r.status == Status::InvalidAddress,
+              "wrapped size: with the status this call uses for a range "
+              "outside the space");
+    }
+
+    // **NtGetWriteWatch, where a wrapped end made the sweep answer "none".**
+    // The sweep breaks on the first region at or past the end, so an end below
+    // the start stops it before it has looked at anything, and the caller is
+    // told its correctly-named range holds no regions at all.
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        std::uint64_t addresses[4] = {};
+        std::uint64_t count = 4;
+        std::uint32_t granularity = 0;
+        const std::uint64_t size = 0xFFFFFFFFFFFFF000ull;
+        const auto r = nt_get_write_watch(f.ctx, 0, base, size, addresses,
+                                          &count, &granularity);
+        check(!r.ok(),
+              "wrapped size: a write-watch query whose end wraps is refused "
+              "rather than answered with an empty set");
+        check(r.status == Status::InvalidParameter,
+              "wrapped size: with the status this call uses for a range it "
+              "cannot ask about");
+        check(count == 4,
+              "wrapped size: and the count output is left alone, so a caller "
+              "that reads it after a failure does not see a zero it never "
+              "earned");
+    }
+
+    // **NtLockVirtualMemory, where the folded size reached the kernel.** The
+    // zero test below the rounding catches the fold that lands on zero and
+    // misses every other one, and a fold landing on a page reaches `mlock`
+    // with it -- pinning pages the caller never named, which is memory the
+    // kernel accounts for rather than a number in a ledger.
+    //
+    // **The address carries an in-page offset on purpose.** A page-aligned
+    // address cannot fold a large size onto a nonzero page: the rounding adds
+    // nothing for the offset, so the only large sizes that wrap are the ones
+    // that wrap all the way to zero, and those are caught by the zero test. An
+    // address with `0x800` in its low bits is what makes the fold land on
+    // `0x1000` -- a page that passes the zero test and reaches the kernel.
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        std::uint64_t addr = base + 0x800;
+        std::uint64_t size = 0xFFFFFFFFFFFFF801ull;
+        const auto r = nt_lock_virtual_memory(f.ctx, &addr, &size);
+        check(!r.ok(),
+              "wrapped size: a lock whose size folds onto a single page is "
+              "refused rather than passed to the kernel as a one-page pin");
+        check(r.status == Status::InvalidParameter,
+              "wrapped size: and with the parameter status, not the "
+              "ACCESS_DENIED the kernel's own failure would produce");
+    }
+
+    // **NtUnlockVirtualMemory, which is the same shape as the lock.**
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        std::uint64_t addr = base + 0x800;
+        std::uint64_t size = 0xFFFFFFFFFFFFF801ull;
+        const auto r = nt_unlock_virtual_memory(f.ctx, &addr, &size);
+        check(!r.ok(),
+              "wrapped size: an unlock whose size folds onto a single page is "
+              "refused for the same reason the lock is");
+        check(r.status == Status::InvalidParameter,
+              "wrapped size: with the same status");
+    }
+
+    // **NtFlushVirtualMemory.** `msync` on a zero length is a no-op rather
+    // than a fault, so this one is the quietest of the set: the answer was a
+    // success reporting a size the caller did not name, over a range that was
+    // never examined.
+    {
+        Fixture f;
+        const std::uint64_t base = allocate(f, 0x10000, 0x04);
+        if (base == 0) {
+            return;
+        }
+        std::uint64_t addr = base;
+        std::uint64_t size = folds_to_zero;
+        const auto r = nt_flush_virtual_memory(f.ctx, &addr, &size);
+        check(!r.ok(),
+              "wrapped size: a flush whose size folds to zero is refused "
+              "rather than reported as a flush of zero bytes");
+        check(r.status == Status::InvalidParameter,
+              "wrapped size: with the status this call uses for a range it "
+              "cannot flush");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -3283,6 +3558,7 @@ int main() {
     test_prefetch_names_the_parameter_that_is_wrong();
     test_a_section_query_carries_no_host_address();
     test_a_views_address_requirements_constrain_the_placement();
+    test_a_size_that_wraps_is_refused_rather_than_folded();
 
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

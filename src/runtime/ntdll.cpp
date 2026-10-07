@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 
 namespace occ::runtime {
 
@@ -53,6 +54,42 @@ namespace {
     return (size + (addr & (AddressSpace::kPageSize - 1)) +
             (AddressSpace::kPageSize - 1)) &
            ~(AddressSpace::kPageSize - 1);
+}
+
+// The same rounding, with the overflow reported instead of wrapped.
+//
+// **`round_size_from` widens a program-supplied 64-bit value and the widening
+// can wrap, and a wrapped size is smaller rather than larger.** That is the
+// direction that defeats the checks rather than tripping them: every caller
+// below bounds the range with `region->end() - base < effective_size`, a
+// comparison that a too-small size passes. So a `size` of `0xFFFFFFFFFFFFF001`
+// folds to an effective size of zero, and an effective size of zero is a range
+// of no pages -- a protect that walks nothing, looks up no region, asks the
+// kernel for nothing, and returns success.
+//
+// Wine has the same arithmetic and is not exposed to it in the same way,
+// because its `size` arrives as a `SIZE_T` from a caller whose range is then
+// walked page by page until it leaves the address space. This runtime takes a
+// full 64-bit `size` from the program and its callers bound the range with one
+// comparison, so the wrap has to be refused where it happens rather than
+// relied on to be caught later.
+//
+// The two results are the widened size and whether the sum fit. A caller that
+// sees `false` must refuse the call with `InvalidParameter`: that is the
+// status the walk would have produced on its own had the size not wrapped,
+// because a range that honestly reached past the last mapped address fails at
+// the first address past it.
+[[nodiscard]] constexpr std::uint64_t round_size_from_checked(
+    std::uint64_t addr, std::uint64_t size, bool& overflowed) noexcept {
+    constexpr std::uint64_t kMask = AddressSpace::kPageSize - 1;
+    // The amount the rounding adds before masking: the distance to the end of
+    // the page `addr` lands on, plus the whole page that covers the size. The
+    // sum is computed against the maximum the same way `check_region_extent`
+    // computes its window -- by asking whether `size` can absorb the addend,
+    // rather than by letting the addends meet and inspecting the result.
+    const std::uint64_t addend = (addr & kMask) + kMask;
+    overflowed = size > std::numeric_limits<std::uint64_t>::max() - addend;
+    return round_size_from(addr, size);
 }
 
 // `ROUND_ADDR` from `virtual.c:188`.
@@ -726,7 +763,18 @@ Result<std::uint64_t> nt_allocate_virtual_memory(NtContext& ctx,
         // and reading `r->end()` after the call is a use-after-free that a
         // plain run usually gets away with.
         const std::uint64_t reservation_end = r->end();
-        if (base + commit_size > reservation_end) {
+        // **The comparison is against a sum that can wrap, so the wrap is
+        // checked along with it.** `base + commit_size > reservation_end` is
+        // the obvious bound and it is defeated by the wrap for the same reason
+        // the protect's `range_end` was: a `commit_size` large enough to carry
+        // the sum past the top of the 64-bit range lands the sum *below* the
+        // reservation, the check passes, and the call goes on to commit a
+        // range that reaches past the end of the address space. Nothing
+        // downstream catches it -- `commit()` is asked for the same wrapped
+        // amount and the `mprotect` that follows is the only thing that
+        // notices, so the caller is told the kernel refused a protection
+        // change rather than that its own size was impossible.
+        if (commit_size > reservation_end - base) {
             return refuse<std::uint64_t>(
                 Status::InvalidParameter,
                 "the range " + std::to_string(base) + "+" +
@@ -1062,8 +1110,26 @@ Result<std::uint64_t> nt_free_virtual_memory(NtContext& ctx,
     // distinction is the whole reason this function is not the same code as
     // `nt_flush_virtual_memory`, where a zero size means "everything".
     std::uint64_t effective_size = given_size;
+    bool size_overflowed = false;
     if (effective_size != 0) {
-        effective_size = round_size_from(given_addr, effective_size);
+        effective_size =
+            round_size_from_checked(given_addr, effective_size,
+                                    size_overflowed);
+    }
+    // **The check that has to come before the bound check below, not after.**
+    // `region->end() - base < effective_size` is the guard that catches a size
+    // too large for the region, and it catches every honest one -- but a size
+    // whose rounding wraps folds *down*, so it is not too large and the guard
+    // passes. The refusals below would then run against a range the caller
+    // never named. This is the same refusal `NtProtectVirtualMemory` makes and
+    // for the same reason: there is no representable range to act on.
+    if (size_overflowed) {
+        return refuse<std::uint64_t>(
+            Status::UnableToFreeVm,
+            "a size of " + std::to_string(given_size) +
+                " is larger than the rounding of it can represent: the "
+                "covered range does not fit in a 64-bit size, so there is no "
+                "range to free");
     }
     const std::uint64_t base = round_addr(given_addr);
 
@@ -1336,15 +1402,59 @@ Result<std::uint64_t> nt_protect_virtual_memory(NtContext& ctx,
     // The rule is written out rather than left to the macro because the macro
     // cannot express it: `ROUND_SIZE`'s whole job is to widen a size to cover
     // the pages the *range* touches, and a range of length zero touches none.
+    //
+    // **The widening is checked, and the check is not decoration.** A size
+    // chosen to make the sum wrap folds down to a smaller effective size, and
+    // a smaller effective size is a range the two walks below step over
+    // without looking at anything: an effective size of zero makes `range_end`
+    // equal to `base`, both loops run zero times, and the call returns success
+    // having looked up no region, checked no commit, asked the kernel for
+    // nothing and reported an old protection the range never had. The refusal
+    // is `InvalidParameter` because that is what the walk produces on its own
+    // for a size that is honestly too large -- the first address past the last
+    // mapped one has no region, and that is the same status by the same
+    // branch.
+    bool size_overflowed = false;
     const std::uint64_t effective_size =
         *size == 0 ? AddressSpace::kPageSize
-                   : round_size_from(given_addr, *size);
+                   : round_size_from_checked(given_addr, *size,
+                                             size_overflowed);
+    if (size_overflowed) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "a size of " + std::to_string(*size) +
+                " is larger than the rounding of it can represent: the "
+                "covered range does not fit in a 64-bit size, so there is no "
+                "range to protect");
+    }
     const std::uint64_t base = round_addr(given_addr);
 
     if (base == 0) {
         return refuse<std::uint64_t>(
             Status::InvalidAddress,
             "a null address: there is no region at address zero to protect");
+    }
+
+    // **The second wrap, and the one that does not need a dishonest size.**
+    // `range_end` is `base + effective_size`, and a perfectly representable
+    // effective size can still wrap when it is added to the base -- a request
+    // for seventeen exabytes starting at any ordinary address does it. When it
+    // wraps, `range_end` lands below `base` and both walks below run zero
+    // times: the call returns success having done nothing, and reports back a
+    // size that describes a range which does not exist.
+    //
+    // This is the same failure the size check above prevents and it arrives by
+    // a different route, so it is checked in the same place and with the same
+    // status. The two together are what make the walk's inputs honest; neither
+    // alone is enough, which is why they are adjacent rather than merged.
+    const std::uint64_t range_end = base + effective_size;
+    if (range_end < base || range_end > AddressSpace::kUserMax + 1) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "the range " + std::to_string(base) + "+" +
+                std::to_string(effective_size) +
+                " does not fit the address window, so there is no range to "
+                "protect");
     }
 
     const Region* region = ctx.space->find(base);
@@ -1382,7 +1492,9 @@ Result<std::uint64_t> nt_protect_virtual_memory(NtContext& ctx,
     // the head and then failing. Windows refuses the whole call, and a caller
     // that saw half its range change would be looking at memory it believes
     // it protected.
-    const std::uint64_t range_end = base + effective_size;
+    // `range_end` was computed and checked above, together with the effective
+    // size -- the two are the bounds the walk below runs on and they are
+    // validated where they are made rather than here.
     std::uint64_t cursor = base;
     std::uint32_t previous = 0;
     bool first_piece = true;
@@ -2049,8 +2161,25 @@ Result<std::uint64_t> nt_flush_virtual_memory(NtContext& ctx,
     // opposite of what zero means in nt_free_virtual_memory, where it means
     // "at the base". Both are Wine's readings and a caller has to know which
     // function it called, so the difference is in the comment at both ends.
+    //
+    // The widening is checked for the same reason the protect's is: the bound
+    // check below refuses a range that is too large, and a size whose rounding
+    // wrapped is a range that is too *small*, so it passes the bound and the
+    // flush runs over a range the caller did not name. `msync` on zero bytes
+    // is a no-op rather than a fault, which is what makes this site the quiet
+    // one -- the answer is wrong, not the memory.
+    bool size_overflowed = false;
     const std::uint64_t effective_size =
-        *size != 0 ? round_size_from(*addr, *size) : region->size;
+        *size != 0 ? round_size_from_checked(*addr, *size, size_overflowed)
+                   : region->size;
+    if (size_overflowed) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "a size of " + std::to_string(*size) +
+                " is larger than the rounding of it can represent: the "
+                "covered range does not fit in a 64-bit size, so there is no "
+                "range to flush");
+    }
     if (region->end() - base < effective_size) {
         return refuse<std::uint64_t>(
             Status::InvalidParameter,
@@ -2098,7 +2227,9 @@ Result<std::uint64_t> nt_get_write_watch(NtContext& ctx,
     }
 
     const std::uint64_t given_base = base;
-    const std::uint64_t effective_size = round_size_from(given_base, size);
+    bool size_overflowed = false;
+    const std::uint64_t effective_size =
+        round_size_from_checked(given_base, size, size_overflowed);
     const std::uint64_t rounded = round_addr(given_base);
 
     if (*count == 0 || effective_size == 0) {
@@ -2106,6 +2237,20 @@ Result<std::uint64_t> nt_get_write_watch(NtContext& ctx,
             Status::InvalidParameter,
             "a zero count or a zero size: there is no range to ask about and "
             "no room to answer in");
+    }
+    // **The overflow is refused here rather than left to the zero test
+    // above.** That test catches the wrap that folds all the way to zero and
+    // misses every other one: a size that folds to 0x1000 passes, and the
+    // sweep below then stops at `rounded + 0x1000` and reports the regions in
+    // a window the caller never named as the whole answer to its query. The
+    // count would be short and nothing in the answer would say so.
+    if (size_overflowed) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "a size of " + std::to_string(size) +
+                " is larger than the rounding of it can represent: the "
+                "covered range does not fit in a 64-bit size, so there is no "
+                "range to ask about");
     }
     constexpr std::uint32_t kWriteWatchFlagReset = 1;
     if ((flags & ~kWriteWatchFlagReset) != 0) {
@@ -2129,7 +2274,22 @@ Result<std::uint64_t> nt_get_write_watch(NtContext& ctx,
     // pages it has to divide.
     std::uint64_t found = 0;
     const std::uint64_t wanted = *count;
+    // The end of the window the sweep works in, and the sum that makes it can
+    // wrap -- the same shape the protect's `range_end` and the commit's bound
+    // have. A wrapped end lands below `rounded`, `r.base >= end` is true for
+    // the very first region, and the loop breaks before it has looked at
+    // anything: the caller is told there are no regions in a range it named
+    // correctly. The overflow is refused rather than swept, because the answer
+    // the sweep would give is short by an amount nothing in it records.
     const std::uint64_t end = rounded + effective_size;
+    if (end < rounded) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "the range " + std::to_string(rounded) + "+" +
+                std::to_string(effective_size) +
+                " does not fit the address window, so there is no range to "
+                "ask about");
+    }
     for (const Region& r : ctx.space->regions()) {
         if (r.end() <= rounded) {
             continue;
@@ -2169,7 +2329,9 @@ Result<std::uint64_t> nt_reset_write_watch(NtContext& ctx,
         return guard;
     }
 
-    const std::uint64_t effective_size = round_size_from(base, size);
+    bool size_overflowed = false;
+    const std::uint64_t effective_size =
+        round_size_from_checked(base, size, size_overflowed);
     const std::uint64_t rounded = round_addr(base);
 
     // `virtual.c:5873`: a zero size is refused here. It is legal in
@@ -2180,6 +2342,20 @@ Result<std::uint64_t> nt_reset_write_watch(NtContext& ctx,
                                      "a zero size: a reset has to name the "
                                      "pages to clear, and a zero size names "
                                      "none");
+    }
+    // The wrap is refused for the same reason the other four refuse it. This
+    // call has no range to walk -- there is no watch state to clear -- so the
+    // wrapped size only affects the number it returns, and a program that
+    // reflects that number back into a call about its own buffer would be
+    // given a length it never asked about. Refusing keeps the answer honest
+    // rather than approximately right.
+    if (size_overflowed) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "a size of " + std::to_string(size) +
+                " is larger than the rounding of it can represent: the "
+                "covered range does not fit in a 64-bit size, so there are no "
+                "pages to clear");
     }
     if (rounded == 0) {
         return refuse<std::uint64_t>(Status::InvalidParameter,
@@ -2224,8 +2400,28 @@ Result<std::uint64_t> nt_lock_virtual_memory(NtContext& ctx,
     // variables before the syscall, and that is Wine's order: a successful
     // pin reports the range it actually pinned, which is the page-aligned
     // range rather than the one asked for.
+    //
+    // **The `*size == 0` test below is not the overflow check, and on this
+    // call that gap has a cost the other four do not.** A size whose rounding
+    // wraps folds down, and the fold that lands on zero is refused while
+    // every other fold is not -- so a size folding to a page would reach
+    // `mlock` and pin real pages the caller never named. Pinning is a
+    // resource the kernel accounts for, so the divergence is not a wrong
+    // number in a ledger, it is memory held down on the strength of a size
+    // nobody wrote.
     const std::uint64_t given_addr = *addr;
-    *size = round_size_from(given_addr, *size);
+    bool size_overflowed = false;
+    const std::uint64_t effective_size =
+        round_size_from_checked(given_addr, *size, size_overflowed);
+    if (size_overflowed) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "a size of " + std::to_string(*size) +
+                " is larger than the rounding of it can represent: the "
+                "covered range does not fit in a 64-bit size, so there is "
+                "nothing to pin");
+    }
+    *size = effective_size;
     *addr = round_addr(given_addr);
 
     if (*size == 0) {
@@ -2262,8 +2458,23 @@ Result<std::uint64_t> nt_unlock_virtual_memory(NtContext& ctx,
         return guard;
     }
 
+    // The same checked widening the lock does, and for the same reason: a
+    // wrapped size folds down, passes the zero test, and reaches `munlock`
+    // with a range the caller never named -- and unlocking pages that were
+    // never locked is a divergence in the other direction from the lock's.
     const std::uint64_t given_addr = *addr;
-    *size = round_size_from(given_addr, *size);
+    bool size_overflowed = false;
+    const std::uint64_t effective_size =
+        round_size_from_checked(given_addr, *size, size_overflowed);
+    if (size_overflowed) {
+        return refuse<std::uint64_t>(
+            Status::InvalidParameter,
+            "a size of " + std::to_string(*size) +
+                " is larger than the rounding of it can represent: the "
+                "covered range does not fit in a 64-bit size, so there is "
+                "nothing to unpin");
+    }
+    *size = effective_size;
     *addr = round_addr(given_addr);
 
     if (*size == 0) {
@@ -2400,9 +2611,27 @@ Result<std::uint64_t> nt_set_information_virtual_memory(
         for (std::uint64_t i = 0; i < count; ++i) {
             const std::uint64_t base =
                 round_addr(addresses[i].virtual_address);
+            bool size_overflowed = false;
             const std::uint64_t range =
-                round_size_from(addresses[i].virtual_address,
-                                addresses[i].number_of_bytes);
+                round_size_from_checked(addresses[i].virtual_address,
+                                        addresses[i].number_of_bytes,
+                                        size_overflowed);
+            // The zero-size check above catches the fold that lands on zero
+            // and misses the rest, and a prefetch is the one caller here
+            // where a wrong range is not a wrong number in the ledger: it is
+            // advice to the kernel about pages. The advice is not
+            // load-bearing, so this refuses rather than prefetches a range
+            // nobody named, which is the direction that keeps the call's
+            // answer consistent with the rest of this file.
+            if (size_overflowed) {
+                return refuse<std::uint64_t>(
+                    Status::InvalidParameter4,
+                    "range " + std::to_string(i) + " declares " +
+                        std::to_string(addresses[i].number_of_bytes) +
+                        " bytes, which is larger than the rounding of it can "
+                        "represent: the covered range does not fit in a "
+                        "64-bit size");
+            }
             // `virtual.c:5996`: `madvise` with `MADV_WILLNEED`, whose failure
             // is ignored -- Wine does not check the return, and this does not
             // either, because a prefetch that did not happen is not a failure
@@ -2504,8 +2733,28 @@ Result<std::uint64_t> nt_flush_instruction_cache(NtContext& ctx,
                     " runs off the end of the address space, so there is no "
                     "instruction cache in it to flush");
         }
+        // **The guard above is on `addr + size` and the range asked about
+        // below is the *rounded* one, which is up to two pages larger.** The
+        // two are not the same test: an address in the last page before the
+        // space ends can pass `addr + size < addr` while the widening of the
+        // size wraps, and a wrapped size folds to a small one that
+        // `range_is_mapped` answers `true` for when it is zero. The range
+        // would then be accepted although it runs off the end -- which is the
+        // exact refusal this guard exists to make.
+        bool size_overflowed = false;
+        const std::uint64_t covered =
+            round_size_from_checked(addr, size, size_overflowed);
+        if (size_overflowed) {
+            return refuse<std::uint64_t>(
+                Status::InvalidAddress,
+                "the range " + std::to_string(addr) + "+" +
+                    std::to_string(size) +
+                    " runs off the end of the address space once the size is "
+                    "widened to the pages the range touches, so there is no "
+                    "instruction cache in it to flush");
+        }
         const std::uint64_t base = round_addr(addr);
-        if (!range_is_mapped(*ctx.space, base, round_size_from(addr, size))) {
+        if (!range_is_mapped(*ctx.space, base, covered)) {
             return refuse<std::uint64_t>(
                 Status::InvalidAddress,
                 "the range at " + std::to_string(base) +

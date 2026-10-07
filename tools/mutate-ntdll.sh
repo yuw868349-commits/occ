@@ -353,6 +353,85 @@ mutate "round-size-loses-its-mask-term" "$SRC" \
 "    return (size + (addr & (AddressSpace::kPageSize - 1))) &
            ~(AddressSpace::kPageSize - 1);"
 
+# ------------------------------------------- the wrap that folds a size down
+
+# **The overflow report in `round_size_from_checked` neutered, which puts the
+# widening back to its unchecked form.** This is the mutant that matters most
+# in this file, because the bug it restores was not a wrong answer: it was a
+# wrong answer that looked like the right one. A size chosen to make the
+# widening wrap folds *down* -- to zero at the extreme -- and every bound the
+# callers write is `something < effective_size`, so a folded size satisfies
+# every one of them. The call then walks an empty range, skips its region
+# lookup, skips its commit check, asks the kernel for nothing, and returns
+# success. `NtProtectVirtualMemory` reported an old protection the range never
+# had, and `NtGetWriteWatch` answered "no regions" for a range full of them.
+#
+# A suite that only ever passes well-formed sizes cannot catch this, because
+# the arithmetic is correct for every size that does not approach the top of
+# the 64-bit range. The cases that catch it are the ones asserting on a size
+# of `0xFFFFFFFFFFFFF001` and on the ledger it left behind.
+mutate "the-rounding-overflow-report-is-dropped" "$SRC" \
+"    overflowed = size > std::numeric_limits<std::uint64_t>::max() - addend;" \
+"    (void)addend;
+    overflowed = false;"
+
+# **The second wrap, and it needs no dishonest size.** `range_end` is
+# `base + effective_size`, and an `effective_size` that survives its own
+# rounding can still carry the sum past the top of the 64-bit range when it is
+# added to the base. The wrapped end lands *below* the start, so `while (cursor
+# < range_end)` is false on entry and both walk loops run zero times -- the
+# same silent success as the mutant above, reached by a different door. The two
+# are separate mutants because they are separate guards: a suite that pinned
+# only one would pass a runtime that still had the other.
+mutate "the-range-end-wrap-check-is-removed" "$SRC" \
+"    if (range_end < base || range_end > AddressSpace::kUserMax + 1) {" \
+"    if (range_end > AddressSpace::kUserMax + 1) {"
+
+# **The commit's bound restored to the addition form.** `base + commit_size >
+# reservation_end` is the obvious way to write "the range reaches past the
+# reservation" and it is defeated by the wrap exactly as the protect's is: the
+# folded sum lands below the reservation's end, the check passes, and the call
+# goes on to commit and then to protect a range reaching past the top of the
+# address space. What the caller got was the kernel's refused `mprotect`
+# reported as INVALID_ADDRESS -- a status naming the wrong problem, produced by
+# a check that had been satisfied. Rewriting it as the subtraction is the fix,
+# and restoring the addition is the mutant.
+mutate "the-commit-bound-is-a-sum-that-can-wrap" "$SRC" \
+"        if (commit_size > reservation_end - base) {" \
+"        if (base + commit_size > reservation_end) {"
+
+# **The write-watch sweep's end guard removed.** The sweep breaks on the first
+# region at or past `end`, so a wrapped `end` stops it before it has looked at
+# anything and the caller is told its correctly-named range holds no regions.
+# The answer is short by an amount nothing in it records, which is why this is
+# a survivor-in-waiting: there is no wrong status and no wrong pointer, only a
+# count that is too small.
+mutate "the-write-watch-end-wrap-check-is-removed" "$SRC" \
+"    if (end < rounded) {" \
+"    if (false) {"
+
+# **The instruction-cache flush's coverage check removed, leaving only the
+# guard on `addr + size`.** The two are different expressions: the flush's
+# range is the *rounded* one, up to two pages larger than `addr + size`, and
+# for an address with a nonzero in-page offset there are sizes where the direct
+# sum fits and the rounded one wraps to zero. `range_is_mapped` answers `true`
+# for a zero size whatever the address, so the range was accepted although it
+# lies outside the address space -- which is the exact refusal the `addr + size`
+# guard was written to make. This mutant is here rather than folded into the
+# overflow one because the bug is a *missing second check*, not a missing
+# report: the first guard is intact and passing.
+mutate "the-flush-covers-a-range-it-never-checked" "$SRC" \
+"        if (size_overflowed) {
+            return refuse<std::uint64_t>(
+                Status::InvalidAddress,
+                \"the range \" + std::to_string(addr) + \"+\" +
+                    std::to_string(size) +
+                    \" runs off the end of the address space once the size is \"
+                    \"widened to the pages the range touches, so there is no \"
+                    \"instruction cache in it to flush\");
+        }" \
+"        (void)size_overflowed;"
+
 # ------------------------------------------------ the read and write paths
 
 # The read's unmapped-source status changed to INVALID_ADDRESS. This and the
