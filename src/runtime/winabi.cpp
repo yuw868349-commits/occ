@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "occ/runtime/address_space.h"
+#include "occ/runtime/dos_path.h"
 #include "occ/runtime/api.h"
 #include "occ/runtime/mapper.h"
 #include "occ/runtime/ntdll.h"
@@ -131,10 +132,6 @@ void store_teb_u32(std::uint64_t offset, std::uint32_t value) noexcept {
     return value;
 }
 
-void set_last_error(std::uint32_t error) noexcept {
-    store_teb_u32(kTebLastError, error);
-}
-
 [[nodiscard]] std::uint32_t guest_thread_id() noexcept {
     return load_teb_u32(kTebThreadId);
 }
@@ -202,43 +199,14 @@ void install_terminate_path(TerminateFn* fn) noexcept {
 // Paths and the command line
 // --------------------------------------------------------------------------
 
-std::string to_dos_path(std::string_view unix_path) {
-    if (unix_path.empty() || unix_path.front() != '/') {
-        return std::string(unix_path);
-    }
-    std::string out;
-    out.reserve(unix_path.size() + 2);
-    out += "Z:";
-    for (const char c : unix_path) {
-        out += (c == '/') ? '\\' : c;
-    }
-    return out;
-}
 
-// The guest spells paths the DOS way, and the host's own open does not know
-// what "Z:\" is. The drive the runtime mounts the working tree on is Z:,
-// mapped at the root -- the same mapping to_dos_path writes -- so the inverse
-// is the same two rules run backwards.
-std::string from_dos_path(std::string_view dos_path) noexcept {
-    if (dos_path.size() < 2 || dos_path[1] != ':') {
-        return std::string(dos_path);
-    }
-    if ((dos_path[0] | 0x20) != 'z') {
-        // A drive the runtime does not mount is not a file the host can
-        // name; the path goes through and the open fails, which is the
-        // truthful answer for a volume that is not there.
-        return std::string(dos_path);
-    }
-    std::string out;
-    out.reserve(dos_path.size());
-    for (std::size_t i = 2; i < dos_path.size(); ++i) {
-        const char c = dos_path[i];
-        out += (c == '\\' || c == '/') ? '/' : c;
-    }
-    if (out.empty() || out.front() != '/') {
-        out.insert(out.begin(), '/');
-    }
-    return out;
+
+// The DOS spelling of a host path. The mapping itself lives in
+// `runtime/dos_path.cpp`, beside the inverse and the reasoning for both; this
+// is the name the rest of this layer already calls it by, and it stays so
+// that a caller does not have to know where the pair moved to.
+std::string to_dos_path(std::string_view unix_path) {
+    return ::occ::runtime::to_dos_path(unix_path);
 }
 
 std::string build_command_line(const std::string& program,
@@ -1058,6 +1026,13 @@ namespace {
     return g_guest;
 }
 
+// The error a host caller reads when there is no guest thread to store it
+// in. A test, or a tool that reaches the same thunks, has no TEB, and
+// without this the pair would be a write nothing reads followed by a read
+// that always answers zero -- which is a worse answer than a process-wide
+// slot, because it looks like a real error code of zero.
+std::uint32_t g_host_last_error = 0;
+
 // The stream a CRT file function receives is the host's own FILE* when it
 // came from the host's fopen, and a position in the guest's iob table when
 // the guest spells one of its three standard streams. With a guest running
@@ -1675,6 +1650,11 @@ extern "C" __attribute__((ms_abi)) void k32_GetStartupInfoW(
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetLastError() noexcept {
+    // The same two paths as the writer, so that a guest and a host caller
+    // each read back what they set.
+    if (require_state() == nullptr) {
+        return g_host_last_error;
+    }
     return load_teb_u32(kTebLastError);
 }
 
@@ -4927,6 +4907,9 @@ void add_kernel32(ExportModule& module) {
         e("RtlUnwindEx", reinterpret_cast<void*>(&seh::seh_RtlUnwindEx)),
         e("RtlVirtualUnwind", reinterpret_cast<void*>(&k32_RtlVirtualUnwind)),
     };
+    // The families that outgrew this list live in their own domains, and
+    // their names are appended rather than typed here.
+    add_file_kernel32(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {
@@ -5179,6 +5162,23 @@ void register_host_modules(ExportRegistry& registry) {
         }
         registry.add(std::move(module));
     }
+}
+
+// The error a guest reads back through `GetLastError`.
+//
+// It lives outside the anonymous namespace because the API domains, which
+// are separate translation units, report failures through it. A second copy
+// in one of them would be a second answer to the same question, and a guest
+// that read one while the other was written would read a stale code. The
+// thread-local store it writes belongs to this translation unit and is used
+// from here only, which is why the definition can sit at the end of the file
+// and still reach it.
+void set_last_error(std::uint32_t error) noexcept {
+    if (require_state() == nullptr) {
+        g_host_last_error = error;
+        return;
+    }
+    store_teb_u32(kTebLastError, error);
 }
 
 }  // namespace occ::runtime::winabi

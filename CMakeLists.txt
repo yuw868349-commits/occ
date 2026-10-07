@@ -563,6 +563,7 @@ add_library(occ_core STATIC
     src/runner/run.cpp
     src/runner/pe_runner.cpp
     src/runtime/address_space.cpp
+    src/runtime/dos_path.cpp
     src/runtime/mapper.cpp
     src/runtime/loader.cpp
     src/runtime/exports.cpp
@@ -573,6 +574,7 @@ add_library(occ_core STATIC
     src/runtime/winabi.cpp
     src/runtime/api/path.cpp
     src/runtime/api/string.cpp
+    src/runtime/api/file.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

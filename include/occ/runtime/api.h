@@ -128,6 +128,66 @@ extern "C" __attribute__((ms_abi)) char16_t* sw_PathCombineW(
 void add_string_shlwapi(ExportList& out);
 void add_string_kernelbase(ExportList& out);
 
+// ------------------------------------------------------------------- files
+
+// The file and directory family: attributes, directories, the current
+// directory, full paths, the temporary directory, copies and moves. These
+// answer through the host's own file system, so what each one decides is how
+// the host's answer reads as a Windows one; the decisions are in the file.
+void add_file_kernel32(ExportList& out);
+
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetFileAttributesA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetFileAttributesW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_SetFileAttributesA(
+    const char* path, std::uint32_t attributes) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_SetFileAttributesW(
+    const char16_t* path, std::uint32_t attributes) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_GetFileAttributesExA(
+    const char* path, std::int32_t level, void* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_GetFileAttributesExW(
+    const char16_t* path, std::int32_t level, void* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_CreateDirectoryA(
+    const char* path, void* security) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_CreateDirectoryW(
+    const char16_t* path, void* security) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_RemoveDirectoryA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_RemoveDirectoryW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetCurrentDirectoryA(
+    std::uint32_t capacity, char* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetCurrentDirectoryW(
+    std::uint32_t capacity, char16_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_SetCurrentDirectoryA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_SetCurrentDirectoryW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetFullPathNameA(
+    const char* path, std::uint32_t capacity, char* out,
+    char** file_part) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetFullPathNameW(
+    const char16_t* path, std::uint32_t capacity, char16_t* out,
+    char16_t** file_part) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetTempPathA(
+    std::uint32_t capacity, char* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32b_GetTempPathW(
+    std::uint32_t capacity, char16_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_CopyFileA(
+    const char* from, const char* to, std::int32_t fail_if_exists) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_CopyFileW(
+    const char16_t* from, const char16_t* to,
+    std::int32_t fail_if_exists) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_MoveFileA(
+    const char* from, const char* to) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_MoveFileW(
+    const char16_t* from, const char16_t* to) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_MoveFileExA(
+    const char* from, const char* to, std::uint32_t flags) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32b_MoveFileExW(
+    const char16_t* from, const char16_t* to, std::uint32_t flags) noexcept;
+
 // The `Str*` entry points. The signatures are the headers', and the ones
 // worth reading twice are the two where a plausible guess is wrong:
 // `StrChr` takes the character as a 16-bit value and not an `int`, and

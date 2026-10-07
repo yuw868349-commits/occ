@@ -229,6 +229,15 @@ void register_host_modules(ExportRegistry& registry);
 // one string is how a path grows a second drive letter.
 [[nodiscard]] std::string to_dos_path(std::string_view unix_path);
 
+// The error a guest reads back through `GetLastError`.
+//
+// A domain that reports a failure needs to leave the code the caller will
+// read, and the storage is this layer's rather than the domain's: a second
+// copy would be a second answer to the same question, and a guest that read
+// one while the other was written would see a stale code.
+void set_last_error(std::uint32_t code) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetLastError() noexcept;
+
 // Builds the command line a guest would have received: the program path
 // first, then the arguments, each quoted when and only when the Microsoft
 // rules require it. `split_command_line` of this output returns the input,
