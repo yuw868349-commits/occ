@@ -14,10 +14,12 @@
 #include <vector>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "occ/runtime/address_space.h"
@@ -78,12 +80,17 @@ constexpr std::uint32_t kTlsOutOfRange = 0xFFFFFFFFu;
 constexpr std::uint64_t kStdInputHandle = 0x1001;
 constexpr std::uint64_t kStdOutputHandle = 0x1002;
 constexpr std::uint64_t kStdErrorHandle = 0x1003;
+// File handles this runtime issues sit at the base: the value is the host
+// descriptor plus it, a range the standard handles and the pseudo-handles
+// never enter.
+constexpr std::uint64_t kFileHandleBase = 0x2000;
 constexpr std::uint64_t kCurrentProcessHandle = 0xFFFFFFFFFFFFFFFFULL;
 
 constexpr std::uint32_t kHeapZeroMemory = 0x00000008u;
 
 // Win32 errors this layer reports, as Windows spells them.
 constexpr std::uint32_t kErrorInvalidHandle = 6;
+constexpr std::uint32_t kErrorFileNotFound = 2;
 constexpr std::uint32_t kErrorNotSupported = 50;
 constexpr std::uint32_t kErrorInsufficientBuffer = 122;
 constexpr std::uint32_t kErrorNoMoreItems = 381;
@@ -198,6 +205,32 @@ std::string to_dos_path(std::string_view unix_path) {
     out += "Z:";
     for (const char c : unix_path) {
         out += (c == '/') ? '\\' : c;
+    }
+    return out;
+}
+
+// The guest spells paths the DOS way, and the host's own open does not know
+// what "Z:\" is. The drive the runtime mounts the working tree on is Z:,
+// mapped at the root -- the same mapping to_dos_path writes -- so the inverse
+// is the same two rules run backwards.
+std::string from_dos_path(std::string_view dos_path) noexcept {
+    if (dos_path.size() < 2 || dos_path[1] != ':') {
+        return std::string(dos_path);
+    }
+    if ((dos_path[0] | 0x20) != 'z') {
+        // A drive the runtime does not mount is not a file the host can
+        // name; the path goes through and the open fails, which is the
+        // truthful answer for a volume that is not there.
+        return std::string(dos_path);
+    }
+    std::string out;
+    out.reserve(dos_path.size());
+    for (std::size_t i = 2; i < dos_path.size(); ++i) {
+        const char c = dos_path[i];
+        out += (c == '\\' || c == '/') ? '/' : c;
+    }
+    if (out.empty() || out.front() != '/') {
+        out.insert(out.begin(), '/');
     }
     return out;
 }
@@ -987,6 +1020,11 @@ namespace {
     case kStdErrorHandle:
         return 2;
     default:
+        // A file handle this runtime issued: the descriptor it names rides
+        // above a base the standard handles never reach.
+        if (handle >= kFileHandleBase && handle < kFileHandleBase + 0x100000) {
+            return static_cast<int>(handle - kFileHandleBase);
+        }
         return -1;
     }
 }
@@ -1790,13 +1828,156 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_WriteFile(
     return 1;
 }
 
+// The handle table for the file handles this runtime issued. A handle that
+// is on it names a descriptor `CreateFile` opened, and `CloseHandle` ends
+// it; a handle that is not is the console's or the pseudo-handles, which
+// outlive the call.
+std::mutex g_file_handle_mutex;
+std::set<std::uint64_t> g_k32_file_handles;
+
+[[nodiscard]] bool take_file_handle(std::uint64_t handle) noexcept {
+    const std::lock_guard<std::mutex> held(g_file_handle_mutex);
+    return g_k32_file_handles.erase(handle) != 0;
+}
+
+void add_file_handle(std::uint64_t handle) noexcept {
+    const std::lock_guard<std::mutex> held(g_file_handle_mutex);
+    g_k32_file_handles.insert(handle);
+}
+
+// `CreateFileA`. The disposition maps onto the host's open flags, the
+// access onto the read/write bits, and the name through the same DOS-path
+// translation the CRT spellings use. Share modes, security attributes and
+// the template file are a single-open-at-a-time world's absent features,
+// and a disposition this table does not name is a call that fails with the
+// error Windows would give a malformed one.
+extern "C" __attribute__((ms_abi)) void* k32_CreateFileA(
+    const char* name, std::uint32_t access, std::uint32_t share,
+    void* security, std::uint32_t disposition, std::uint32_t flags,
+    void* template_file) noexcept {
+    (void)share;
+    (void)security;
+    (void)flags;
+    (void)template_file;
+    if (name == nullptr) {
+        set_last_error(kErrorInvalidParameter);
+        return reinterpret_cast<void*>(kCurrentProcessHandle);
+    }
+    const bool want_read =
+        (access & 0x80000000u) != 0;  // GENERIC_READ
+    const bool want_write =
+        (access & 0x40000000u) != 0;  // GENERIC_WRITE
+    int host_flags = 0;
+    switch (disposition) {
+    case 1:  // CREATE_NEW
+        host_flags = O_CREAT | O_EXCL;
+        break;
+    case 2:  // CREATE_ALWAYS
+        host_flags = O_CREAT | O_TRUNC;
+        break;
+    case 3:  // OPEN_EXISTING
+        break;
+    case 4:  // OPEN_ALWAYS
+        host_flags = O_CREAT;
+        break;
+    case 5:  // TRUNCATE_EXISTING
+        host_flags = O_TRUNC;
+        break;
+    default:
+        set_last_error(kErrorInvalidParameter);
+        return reinterpret_cast<void*>(kCurrentProcessHandle);
+    }
+    if (want_read && want_write) {
+        host_flags |= O_RDWR;
+    } else if (want_write) {
+        host_flags |= O_WRONLY;
+    } else {
+        host_flags |= O_RDONLY;
+    }
+    const int fd = ::open(from_dos_path(name).c_str(), host_flags, 0666);
+    if (fd < 0) {
+        set_last_error(errno == ENOENT ? kErrorFileNotFound
+                                       : kErrorInvalidParameter);
+        return reinterpret_cast<void*>(kCurrentProcessHandle);
+    }
+    const std::uint64_t handle = kFileHandleBase + static_cast<std::uint64_t>(fd);
+    add_file_handle(handle);
+    return reinterpret_cast<void*>(handle);
+}
+
+// `ReadFile`. A read at the end of the file is Windows' own success: TRUE
+// with nothing transferred, which is what lets a caller loop until `got`
+// comes back zero.
+extern "C" __attribute__((ms_abi)) std::int32_t k32_ReadFile(
+    std::uint64_t handle, void* buffer, std::uint32_t to_read,
+    std::uint32_t* read_out, void* overlapped) noexcept {
+    if (overlapped != nullptr) {
+        set_last_error(kErrorNotSupported);
+        return 0;
+    }
+    const int fd = fd_for_handle(handle);
+    if (fd < 0 || buffer == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    ::ssize_t got = 0;
+    do {
+        got = ::read(fd, buffer, to_read);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        set_last_error(kErrorInvalidHandle);
+        if (read_out != nullptr) {
+            *read_out = 0;
+        }
+        return 0;
+    }
+    if (read_out != nullptr) {
+        *read_out = static_cast<std::uint32_t>(got);
+    }
+    return 1;
+}
+
+// `GetFileSizeEx`: the descriptor's own size, with the position the read
+// left untouched.
+extern "C" __attribute__((ms_abi)) std::int32_t k32_GetFileSizeEx(
+    std::uint64_t handle, void* size_out) noexcept {
+    const int fd = fd_for_handle(handle);
+    if (fd < 0 || size_out == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    struct ::stat info;
+    if (::fstat(fd, &info) != 0) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    __builtin_memcpy(size_out, &info.st_size, sizeof(info.st_size));
+    return 1;
+}
+
+// `DeleteFileA`: the unlink, through the same path translation. A file the
+// caller still holds open elsewhere is this filesystem's business, not the
+// call's.
+extern "C" __attribute__((ms_abi)) std::int32_t k32_DeleteFileA(
+    const char* name) noexcept {
+    if (name == nullptr || ::unlink(from_dos_path(name).c_str()) != 0) {
+        set_last_error(errno == ENOENT ? kErrorFileNotFound
+                                       : kErrorInvalidParameter);
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t k32_CloseHandle(
     std::uint64_t handle) noexcept {
-    // The standard handles belong to the console and outlive the call. There
-    // is no object table yet for anything else, and closing a handle that
+    // A file handle this runtime issued ends its descriptor. The standard
+    // handles belong to the console and outlive the call, and a handle that
     // names nothing is answered as Windows answers a valid handle with no
     // resources behind it: successfully.
-    (void)handle;
+    if (take_file_handle(handle)) {
+        const int fd = static_cast<int>(handle - kFileHandleBase);
+        ::close(fd);
+    }
     return 1;
 }
 
@@ -3005,32 +3186,6 @@ char* write_itoa32(std::int32_t value, unsigned base, char* buffer) noexcept {
 std::int32_t compare_bridge(const void* a, const void* b,
                             void* context) noexcept {
     return (*static_cast<GuestCompare*>(context))(a, b);
-}
-
-// The guest spells paths the DOS way, and the host's own fopen does not
-// know what "Z:\" is. The drive the runtime mounts the working tree on is
-// Z:, mapped at the root -- the same mapping to_dos_path writes -- so the
-// inverse is the same two rules run backwards.
-std::string from_dos_path(std::string_view dos_path) noexcept {
-    if (dos_path.size() < 2 || dos_path[1] != ':') {
-        return std::string(dos_path);
-    }
-    if ((dos_path[0] | 0x20) != 'z') {
-        // A drive the runtime does not mount is not a file the host's
-        // fopen can name; the path goes through and the open fails, which
-        // is the truthful answer for a volume that is not there.
-        return std::string(dos_path);
-    }
-    std::string out;
-    out.reserve(dos_path.size());
-    for (std::size_t i = 2; i < dos_path.size(); ++i) {
-        const char c = dos_path[i];
-        out += (c == '\\' || c == '/') ? '/' : c;
-    }
-    if (out.empty() || out.front() != '/') {
-        out.insert(out.begin(), '/');
-    }
-    return out;
 }
 
 // Windows' `,ccs=<encoding>` extension names the stream's encoding, and
@@ -4489,6 +4644,10 @@ void add_kernel32(ExportModule& module) {
     module.host_exports = {
         e("GetStdHandle", reinterpret_cast<void*>(&k32_GetStdHandle)),
         e("WriteFile", reinterpret_cast<void*>(&k32_WriteFile)),
+        e("ReadFile", reinterpret_cast<void*>(&k32_ReadFile)),
+        e("CreateFileA", reinterpret_cast<void*>(&k32_CreateFileA)),
+        e("GetFileSizeEx", reinterpret_cast<void*>(&k32_GetFileSizeEx)),
+        e("DeleteFileA", reinterpret_cast<void*>(&k32_DeleteFileA)),
         e("CloseHandle", reinterpret_cast<void*>(&k32_CloseHandle)),
         e("ExitProcess", reinterpret_cast<void*>(&k32_ExitProcess)),
         e("TerminateProcess", reinterpret_cast<void*>(&k32_TerminateProcess)),
