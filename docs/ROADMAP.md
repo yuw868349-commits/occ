@@ -250,6 +250,35 @@ kernel that has to accept them is the part that depends on the host.
 **Hardware watchpoints are four.** W^X tracking over a region larger than the
 debug registers can express is partial by construction.
 
+## Planned
+
+**The clock a guest can move without moving the machine's.**
+
+`SetSystemTime`, `SetLocalTime` and `SetTimeZoneInformation` answer
+`ERROR_PRIVILEGE_NOT_HELD` today, and the reason is that there is nothing
+between the guest and the host's clock: the two read the same source, so
+accepting the call would move the time for everything else on the machine.
+That is the one side effect a container exists to prevent, and the refusal is
+the error Windows gives a caller without the privilege, so a program already
+has a path for it.
+
+The better answer is the one this runtime can give and a compatibility layer
+cannot. Wine accepts these calls and changes the machine's clock, because
+Wine runs directly on the host's clock and has nowhere to put an offset. A
+runtime with an isolation layer does have somewhere: a per-process offset,
+held by the runtime, added by every function that reads the clock. Then
+`SetSystemTime` succeeds -- it really does change the time the guest reads --
+and the host's clock is untouched. The call is not refused, it is answered,
+and it is answered better.
+
+The work is the offset and the seven functions that have to read it:
+`GetSystemTime`, `GetLocalTime`, `GetSystemTimeAsFileTime`,
+`GetSystemTimePreciseAsFileTime`, `SystemTimeToTzSpecificLocalTime`,
+`FileTimeToLocalFileTime`, and the zone query. `GetTickCount` and
+`GetTickCount64` stay on the host's monotonic clock: they measure elapsed
+time rather than name a date, and a program that moved the date has not asked
+for its stopwatch to move with it.
+
 ## Known rough edges
 
 **PE fidelity is bounded by this runtime.** The image runs in an address

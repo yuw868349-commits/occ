@@ -4911,6 +4911,8 @@ void add_kernel32(ExportModule& module) {
     // their names are appended rather than typed here.
     add_file_kernel32(module.host_exports);
     add_time_kernel32(module.host_exports);
+    add_memory_kernel32(module.host_exports);
+    add_console_kernel32(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {

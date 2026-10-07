@@ -576,6 +576,8 @@ add_library(occ_core STATIC
     src/runtime/api/string.cpp
     src/runtime/api/file.cpp
     src/runtime/api/time.cpp
+    src/runtime/api/memory.cpp
+    src/runtime/api/console.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

@@ -144,6 +144,76 @@ void add_file_kernel32(ExportList& out);
 // own count from the start of 1970.
 void add_time_kernel32(ExportList& out);
 
+// ----------------------------------------------------------------- memory
+
+// The memory family: the three allocators that all mean the process heap,
+// the virtual-memory calls that answer through the host's own mappings, and
+// the two process-memory calls that are a copy because the guest's address
+// space is this process's.
+void add_memory_kernel32(ExportList& out);
+
+// ---------------------------------------------------------------- console
+
+// The console family and the handle family. A run this runtime performs has
+// its standard handles redirected, so the console calls answer the way
+// Windows answers a redirected process rather than inventing a console;
+// `GetFileType` reads the descriptor and reports what it actually is, which
+// is what decides which path a caller takes.
+void add_console_kernel32(ExportList& out);
+
+extern "C" __attribute__((ms_abi)) void* k32m_VirtualAlloc(
+    void* address, std::uint64_t size, std::uint32_t type,
+    std::uint32_t protect) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32m_VirtualFree(
+    void* address, std::uint64_t size, std::uint32_t type) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32m_VirtualProtect(
+    void* address, std::uint64_t size, std::uint32_t protect,
+    std::uint32_t* old) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t k32m_VirtualQuery(
+    const void* address, std::uint8_t* out, std::uint64_t out_size) noexcept;
+extern "C" __attribute__((ms_abi)) void* k32m_GlobalAlloc(
+    std::uint32_t flags, std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32m_GlobalFree(
+    void* block) noexcept;
+extern "C" __attribute__((ms_abi)) void* k32m_LocalAlloc(
+    std::uint32_t flags, std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32m_LocalFree(
+    void* block) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t k32m_GlobalSize(
+    const void* block) noexcept;
+extern "C" __attribute__((ms_abi)) void* k32m_HeapAlloc(
+    std::uint64_t heap, std::uint32_t flags, std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32m_HeapFree(
+    std::uint64_t heap, std::uint32_t flags, void* block) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32m_ReadProcessMemory(
+    std::uint64_t process, const void* address, void* buffer,
+    std::uint64_t bytes, std::uint64_t* read) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32m_WriteProcessMemory(
+    std::uint64_t process, void* address, const void* buffer,
+    std::uint64_t bytes, std::uint64_t* written) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32c_GetFileType(
+    std::uint64_t handle) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32c_GetConsoleMode(
+    std::uint64_t handle, std::uint32_t* mode) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32c_WriteConsoleA(
+    std::uint64_t handle, const void* buffer, std::uint32_t length,
+    std::uint32_t* written, void* reserved) noexcept;
+extern "C" __attribute__((ms_abi)) void* k32c_GetConsoleWindow() noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32c_SetConsoleCtrlHandler(
+    std::uint64_t handler, std::int32_t add) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32c_DuplicateHandle(
+    std::uint64_t from_process, std::uint64_t source, std::uint64_t to_process,
+    std::uint64_t* target, std::uint32_t access, std::int32_t inherit,
+    std::uint32_t options) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32c_GetHandleInformation(
+    std::uint64_t handle, std::uint32_t* flags) noexcept;
+
+// The control routines a guest registered through `SetConsoleCtrlHandler`.
+// Exposed so that the registration is a fact something reads rather than one
+// that is recorded and dropped.
+[[nodiscard]] std::size_t console_ctrl_handler_count() noexcept;
+[[nodiscard]] std::uint64_t console_ctrl_handler(std::size_t index) noexcept;
+
 extern "C" __attribute__((ms_abi)) void k32t_GetSystemTime(
     std::uint8_t* out) noexcept;
 extern "C" __attribute__((ms_abi)) void k32t_GetLocalTime(
