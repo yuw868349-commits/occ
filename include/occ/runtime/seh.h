@@ -173,6 +173,29 @@ const FunctionEntry* lookup_function_entry(std::uint64_t image_base,
                                            std::size_t pdata_bytes,
                                            std::uint64_t pc) noexcept;
 
+// The unwind data a row's `unwind_rva` names. The walk bounds every read
+// of a header and of the code slots that follow it by this range, because
+// those numbers are guest bytes: a row pointing outside the section is a
+// crafted image, and an unbounded read of it is a read of whatever this
+// process holds at that address -- or the signal an unmapped address
+// raises, which ends the run without an exception to report.
+struct UnwindRange {
+    std::uint64_t base = 0;
+    std::uint64_t bytes = 0;
+
+    // True when `[at, at + n)` sits inside the section, with the addition
+    // done in the way that cannot wrap: an `at` near the top of the
+    // address space would otherwise carry a small `n` around to a small
+    // sum and pass a check written as `at + n <= base + bytes`.
+    [[nodiscard]] bool holds(std::uint64_t at, std::uint64_t n) const noexcept {
+        if (bytes == 0 || at < base) {
+            return false;
+        }
+        const std::uint64_t offset = at - base;
+        return offset <= bytes && n <= bytes - offset;
+    }
+};
+
 // Reverses one frame. The context comes in as the state at the control
 // point and goes out as the state the caller of that frame would have seen
 // -- the registers the prolog saved restored from their slots, the stack
@@ -187,13 +210,25 @@ const FunctionEntry* lookup_function_entry(std::uint64_t image_base,
 // frame carries none this pass should call -- which includes a control
 // point inside the prolog, where the format answers no handler.
 //
-// False means the table was bad in a way the format does not allow; the
-// caller treats that as a frame with no handler rather than as a reason to
-// guess.
+// `xdata` is the section the frame's unwind info lives in, and every read
+// of it is bounded by it. `stack_low`/`stack_high` bound the guest's own
+// stack, and every read the reversal makes through `Rsp` or through a
+// saved slot is checked against them: the context a reversal works on came
+// in as a guest-visible record, so its `Rsp` is a number the guest chose,
+// and a reversal that trusted it would read this process's memory at
+// whatever address the guest named. A zero-high range asks for no check,
+// which is what the handler-initiated unwinds inside `c_specific_handler`
+// pass, the frames they cross having been vetted by the pass that found
+// them.
+//
+// False means the table was bad in a way the format does not allow, or a
+// read would have left the stack; the caller treats that as a frame with
+// no handler rather than as a reason to guess.
 bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                     std::uint64_t pc, const FunctionEntry* entry,
-                    std::uint8_t* context, const void** data_out,
-                    std::uint64_t* frame_out,
+                    std::uint8_t* context, const UnwindRange& xdata,
+                    std::uint64_t stack_low, std::uint64_t stack_high,
+                    const void** data_out, std::uint64_t* frame_out,
                     std::uint64_t* handler_out) noexcept;
 
 // The search pass. Walks the frames from the control point upward, calling
@@ -207,8 +242,9 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
 // this function returns -- the shape an unhandled exception takes.
 bool dispatch(std::uint8_t* record, const std::uint8_t* context,
               const std::uint8_t* pdata, std::size_t pdata_bytes,
-              std::uint64_t image_base, std::uint64_t image_end,
-              std::uint64_t stack_low, std::uint64_t stack_high) noexcept;
+              const UnwindRange& xdata, std::uint64_t image_base,
+              std::uint64_t image_end, std::uint64_t stack_low,
+              std::uint64_t stack_high) noexcept;
 
 // The unwind pass. Runs the termination handlers from the frame the
 // context names up to `end_frame`, marking the record with the target
@@ -226,7 +262,8 @@ bool dispatch(std::uint8_t* record, const std::uint8_t* context,
                             std::uint8_t* context, std::uint64_t image_base,
                             std::uint64_t image_end,
                             const std::uint8_t* pdata,
-                            std::size_t pdata_bytes, std::uint64_t stack_low,
+                            std::size_t pdata_bytes, const UnwindRange& xdata,
+                            std::uint64_t stack_low,
                             std::uint64_t stack_high) noexcept;
 
 // Captures the caller's registers into a CONTEXT, exactly as the Windows

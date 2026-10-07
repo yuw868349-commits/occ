@@ -143,6 +143,20 @@ std::size_t int_reg_offset(std::uint8_t reg) noexcept {
     return kContextRax + static_cast<std::size_t>(reg) * 8;
 }
 
+// The header a row points at, or nullptr when the row points outside the
+// section. The four bytes are read only after the range says they are
+// there, so the memcpy cannot be the read that faults.
+[[nodiscard]] const UnwindHeader* unwind_header_at(
+    const UnwindRange& xdata, std::uint64_t image_base,
+    std::uint32_t unwind_rva) noexcept {
+    const std::uint64_t at =
+        image_base + static_cast<std::uint64_t>(unwind_rva & ~1u);
+    if (!xdata.holds(at, sizeof(UnwindHeader))) {
+        return nullptr;
+    }
+    return reinterpret_cast<const UnwindHeader*>(at);
+}
+
 // The handler data that follows the code slots: a chained entry, or the
 // handler RVA with the bytes the handler reads after it.
 const std::uint8_t* handler_data_slot(const std::uint8_t* info,
@@ -223,22 +237,75 @@ const FunctionEntry* lookup_function_entry(std::uint64_t image_base,
     // at most a bounded number of times, because a chain that cycles is a
     // corrupt table and a corrupt table gets no second chance to loop the
     // runtime.
+    //
+    // The offset is a value the row itself carries, so the entry it names
+    // is inside the table only when the table says so: an offset past the
+    // end is a crafted row, and a walk that followed it would read this
+    // process's own memory past the section -- or take the signal that
+    // memory was not mapped to give. The bound is on the offset, so a
+    // chain can only ever name rows the table the caller handed in holds.
     for (int steps = 0; found != nullptr && (found->unwind_rva & 1) != 0;
          ++steps) {
         if (steps > 8) {
             return nullptr;
         }
-        found = reinterpret_cast<const FunctionEntry*>(
-            pdata + (found->unwind_rva & ~1u));
+        const std::uint32_t offset = found->unwind_rva & ~1u;
+        if (offset > pdata_bytes ||
+            pdata_bytes - offset < sizeof(FunctionEntry)) {
+            return nullptr;
+        }
+        found = reinterpret_cast<const FunctionEntry*>(pdata + offset);
     }
     return found;
 }
 
+// A stack range the reversal may read through.
+//
+// The context a reversal works on arrives as a record the guest can see,
+// so its `Rsp` and the slots a prolog saved are numbers the guest chose.
+// A read through one of them without a bound is a read of this process's
+// memory at that address -- the walk runs in the same address space the
+// image is mapped into -- or the signal an unmapped address raises. A
+// zero-height range asks for no check at all, which is the shape an
+// unwind started by a handler uses: those frames were vetted by the pass
+// that found them, and re-vetting them against a stack the handler's own
+// call may have moved would refuse a read that is fine.
+struct StackRange {
+    std::uint64_t low;
+    std::uint64_t high;
+
+    [[nodiscard]] bool holds(std::uint64_t at, std::uint64_t n) const noexcept {
+        if (high == 0) {
+            return true;
+        }
+        if (at < low) {
+            return false;
+        }
+        const std::uint64_t offset = at - low;
+        const std::uint64_t span = high - low;
+        return offset <= span && n <= span - offset;
+    }
+};
+
+// The eight bytes at `at`, or zero when the stack does not reach them.
+// Callers that need to tell a zero from a refusal check `holds` first;
+// the reads whose answer only feeds a register the frame is about to
+// overwrite take the zero.
+[[nodiscard]] std::uint64_t load_stack_u64(const StackRange& stack,
+                                           std::uint64_t at) noexcept {
+    if (!stack.holds(at, sizeof(std::uint64_t))) {
+        return 0;
+    }
+    return load_u64(reinterpret_cast<const void*>(at));
+}
+
 bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                     std::uint64_t pc, const FunctionEntry* entry,
-                    std::uint8_t* context, const void** data_out,
-                    std::uint64_t* frame_out,
+                    std::uint8_t* context, const UnwindRange& xdata,
+                    std::uint64_t stack_low, std::uint64_t stack_high,
+                    const void** data_out, std::uint64_t* frame_out,
                     std::uint64_t* handler_out) noexcept {
+    const StackRange stack{stack_low, stack_high};
     // The establisher frame starts as the RSP the frame runs its body
     // with. A frame register, when the info records one, replaces it: the
     // register holds a fixed anchor, and the recorded offset is the
@@ -254,10 +321,15 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
 
     if (entry == nullptr) {
         // A leaf function: no prolog, no saves. The caller's state is the
-        // return address the `call` pushed and the stack above it.
+        // return address the `call` pushed and the stack above it -- and
+        // the `Rsp` naming it came in with the context, so a leaf whose
+        // stack pointer is not on the stack has no caller to answer with
+        // and the walk stops rather than reading where the number points.
         const std::uint64_t rsp = get_int_reg(context, kContextRsp);
-        set_int_reg(context, kContextRip,
-                    load_u64(reinterpret_cast<const void*>(rsp)));
+        if (!stack.holds(rsp, sizeof(std::uint64_t))) {
+            return false;
+        }
+        set_int_reg(context, kContextRip, load_stack_u64(stack, rsp));
         set_int_reg(context, kContextRsp, rsp + 8);
         return true;
     }
@@ -271,11 +343,19 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
         if (steps > 8) {
             return false;
         }
-        const std::uint8_t* info =
-            reinterpret_cast<const std::uint8_t*>(image_base +
-                                                  (entry->unwind_rva & ~1u));
+        // The row's own RVA, vetted before a byte of it is read. A row
+        // that names an address outside `.xdata` is a crafted image, and
+        // the frame it claims to describe has no unwind information --
+        // which the leaf rule below already answers for.
+        const UnwindHeader* header_ptr =
+            unwind_header_at(xdata, image_base, entry->unwind_rva);
+        if (header_ptr == nullptr) {
+            return false;
+        }
         UnwindHeader header{};
-        std::memcpy(&header, info, sizeof(header));
+        std::memcpy(&header, header_ptr, sizeof(header));
+        const std::uint8_t* info =
+            reinterpret_cast<const std::uint8_t*>(header_ptr);
         const std::uint32_t version = header.byte0 & kVersionMask;
         const std::uint32_t flags =
             (header.byte0 & kFlagsMask) >> kFlagsShift;
@@ -301,18 +381,42 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
         }
 
         const std::uint8_t* codes = info + 4;
+        // The code slots run off the end of the header, and every length
+        // in them is guest data: `count` is one byte the row supplies, and
+        // each opcode's `opcode_size` says how many slot pairs it takes.
+        // Both are counted in the same pairs this loop walks, so a `count`
+        // that overruns the section walks out of it. The slot pair is
+        // therefore checked against `.xdata` before it is read, and a pair
+        // that is not there ends the code -- the unwind the walk has
+        // already applied stands, and the rest of a table that does not
+        // exist is not read.
+        const std::uint64_t codes_at =
+            reinterpret_cast<std::uint64_t>(codes);
         for (std::size_t i = 0; i < header.count;) {
+            if (!xdata.holds(codes_at + i * 2, 2)) {
+                break;
+            }
             // The walk counts in slot pairs, the encoding's own unit: the
             // first byte of a pair is the prolog offset, the second is the
             // opcode and its info nibble, and the payload pairs follow.
             const std::uint8_t offset = codes[i * 2];
             const std::uint8_t slot = codes[i * 2 + 1];
+            // The opcode's own size says how many pairs it occupies, and
+            // the payload readers below walk to the end of them. The whole
+            // opcode is checked here, once, so no payload read can reach
+            // past what `count` claimed: `opcode_size` is at most three
+            // pairs, and its widest payload is the four bytes that start
+            // one pair in -- six bytes from the pair's own start.
+            const std::size_t op_pairs = opcode_size(slot);
+            if (!xdata.holds(codes_at + i * 2, op_pairs * 2)) {
+                break;
+            }
             // The codes are stored by prolog offset in descending order,
             // and one whose offset is past the control point names an
             // effect the prolog had not produced yet -- skipped, not
             // reversed.
             if (prolog_offset != ~0u && prolog_offset < offset) {
-                i += opcode_size(slot);
+                i += op_pairs;
                 continue;
             }
 
@@ -323,7 +427,7 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                 // stack effects still to be undone.
                 const std::uint64_t rsp = get_int_reg(context, kContextRsp);
                 set_int_reg(context, int_reg_offset(opcode_info(slot)),
-                            load_u64(reinterpret_cast<const void*>(rsp)));
+                            load_stack_u64(stack, rsp));
                 set_int_reg(context, kContextRsp, rsp + 8);
                 break;
             }
@@ -356,13 +460,13 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                     frame + static_cast<std::uint64_t>(
                                 payload_u16(codes, i)) * 8;
                 set_int_reg(context, int_reg_offset(opcode_info(slot)),
-                            load_u64(reinterpret_cast<const void*>(slot_va)));
+                            load_stack_u64(stack, slot_va));
                 break;
             }
             case kUwopSaveNonvolFar: {
                 const std::uint64_t slot_va = frame + payload_u32(codes, i);
                 set_int_reg(context, int_reg_offset(opcode_info(slot)),
-                            load_u64(reinterpret_cast<const void*>(slot_va)));
+                            load_stack_u64(stack, slot_va));
                 break;
             }
             case kUwopSaveXmm128: {
@@ -390,10 +494,10 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                 }
                 const std::uint64_t rsp = get_int_reg(context, kContextRsp);
                 set_int_reg(context, kContextRip,
-                            load_u64(reinterpret_cast<const void*>(rsp)));
+                            load_stack_u64(stack, rsp));
                 set_int_reg(
                     context, kContextRsp,
-                    load_u64(reinterpret_cast<const void*>(rsp + 24)));
+                    load_stack_u64(stack, rsp + 24));
                 mach_frame = true;
                 break;
             }
@@ -403,7 +507,7 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                 // and the walk continues with them.
                 break;
             }
-            i += opcode_size(slot);
+            i += op_pairs;
         }
 
         if (!mach_frame) {
@@ -413,15 +517,25 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
             // rather than popping again.
             const std::uint64_t rsp = get_int_reg(context, kContextRsp);
             set_int_reg(context, kContextRip,
-                        load_u64(reinterpret_cast<const void*>(rsp)));
+                        load_stack_u64(stack, rsp));
             set_int_reg(context, kContextRsp, rsp + 8);
         }
 
         if ((flags & kUnwFlagChainInfo) == 0) {
             if (handler_out != nullptr && (flags & type) != 0 &&
                 prolog_offset == ~0u) {
+                // The handler RVA and its data follow the code slots, and
+                // their position is the code slot count a guest byte set.
+                // The slot is checked the same way the codes were, so a
+                // `count` that named a position outside the section ends
+                // the frame with no handler rather than a read of whatever
+                // is there.
                 const std::uint8_t* data =
                     handler_data_slot(info, header.count);
+                if (!xdata.holds(reinterpret_cast<std::uint64_t>(data),
+                                 sizeof(std::uint32_t))) {
+                    return true;
+                }
                 std::uint32_t handler_rva = 0;
                 std::memcpy(&handler_rva, data, sizeof(handler_rva));
                 *handler_out = image_base + handler_rva;
@@ -435,16 +549,22 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
         // A chained entry: the pieces reversed so far belong to the tail
         // of a function whose real prolog is described elsewhere. The
         // chain names the next entry in place, which is the format's own
-        // instruction.
+        // instruction -- and the position it names is read from the same
+        // guest-set count, so it is checked before the next round uses it.
         const std::uint8_t* data = handler_data_slot(info, header.count);
+        if (!xdata.holds(reinterpret_cast<std::uint64_t>(data),
+                         sizeof(UnwindHeader))) {
+            return false;
+        }
         entry = reinterpret_cast<const FunctionEntry*>(data);
     }
 }
 
 bool dispatch(std::uint8_t* record, const std::uint8_t* context,
               const std::uint8_t* pdata, std::size_t pdata_bytes,
-              std::uint64_t image_base, std::uint64_t image_end,
-              std::uint64_t stack_low, std::uint64_t stack_high) noexcept {
+              const UnwindRange& xdata, std::uint64_t image_base,
+              std::uint64_t image_end, std::uint64_t stack_low,
+              std::uint64_t stack_high) noexcept {
     alignas(16) std::uint8_t walked[kContextSize];
     std::memcpy(walked, context, kContextSize);
     alignas(16) std::uint8_t dispatcher[sizeof(DispatcherContext)];
@@ -457,7 +577,8 @@ bool dispatch(std::uint8_t* record, const std::uint8_t* context,
         std::uint64_t frame = 0;
         std::uint64_t handler = 0;
         if (!virtual_unwind(kUnwFlagEHandler, image_base, pc, entry, walked,
-                            &handler_data, &frame, &handler)) {
+                            xdata, stack_low, stack_high, &handler_data,
+                            &frame, &handler)) {
             return false;
         }
         if (frame < stack_low || frame >= stack_high) {
@@ -504,7 +625,8 @@ bool dispatch(std::uint8_t* record, const std::uint8_t* context,
                             std::uint8_t* context, std::uint64_t image_base,
                             std::uint64_t image_end,
                             const std::uint8_t* pdata,
-                            std::size_t pdata_bytes, std::uint64_t stack_low,
+                            std::size_t pdata_bytes, const UnwindRange& xdata,
+                            std::uint64_t stack_low,
                             std::uint64_t stack_high) noexcept {
     // The walk starts from the context the caller handed in -- the state
     // at the exception point, which is what the dispatcher context's
@@ -548,7 +670,8 @@ bool dispatch(std::uint8_t* record, const std::uint8_t* context,
         std::uint64_t frame = 0;
         std::uint64_t handler = 0;
         if (!virtual_unwind(kUnwFlagUHandler, image_base, pc, entry, walked,
-                            &handler_data, &frame, &handler)) {
+                            xdata, stack_low, stack_high, &handler_data,
+                            &frame, &handler)) {
             break;
         }
         if (bounded && (frame < stack_low || frame >= stack_high)) {
@@ -793,7 +916,9 @@ extern "C" __attribute__((ms_abi)) std::uint64_t seh_C_specific_handler(
                       static_cast<const std::uint8_t*>(dc.context_record)),
                   base, guest->image_end,
                   reinterpret_cast<const std::uint8_t*>(guest->pdata_va),
-                  guest->pdata_bytes, guest->stack_low, guest->stack_high);
+                  guest->pdata_bytes, UnwindRange{guest->xdata_va,
+                                                  guest->xdata_bytes},
+                  guest->stack_low, guest->stack_high);
     }
     return kExceptionContinueSearch;
 }
@@ -829,6 +954,7 @@ extern "C" __attribute__((ms_abi, noreturn)) void seh_RtlUnwindEx(
               guest->image_end,
               reinterpret_cast<const std::uint8_t*>(guest->pdata_va),
               static_cast<std::size_t>(guest->pdata_bytes),
+              UnwindRange{guest->xdata_va, guest->xdata_bytes},
               guest->stack_low, guest->stack_high);
 }
 

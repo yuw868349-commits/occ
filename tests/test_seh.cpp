@@ -100,6 +100,20 @@ struct TableFixture {
         put32(pdata, 8, 0x1000);
         pc = base + 0x1050;
     }
+
+    // The range the walk bounds its reads by. The fixture's info buffer is
+    // where its rows point, so that is the section: the same relationship
+    // a real image has between `.pdata` and `.xdata`, spelled with one
+    // buffer instead of two sections.
+    seh::UnwindRange xdata() const {
+        return seh::UnwindRange{reinterpret_cast<std::uint64_t>(info),
+                                sizeof(info)};
+    }
+
+    // The row the fixture's pc lands in, as the walk looks it up.
+    const seh::FunctionEntry* entry() const {
+        return seh::lookup_function_entry(base, pdata, sizeof(pdata), pc);
+    }
 };
 
 // ---------------------------------------------------------------- lookup
@@ -150,6 +164,34 @@ void test_lookup_follows_the_chain() {
           "a chained row answers with the row it names");
 }
 
+void test_lookup_rejects_a_chain_that_leaves_the_table() {
+    // A row whose chain offset names a byte past the table's last entry:
+    // following it would read whatever this process holds beyond the
+    // caller's buffer, so the lookup answers nullptr instead. The offset
+    // is the row's own guest byte, and a table crafted to carry one is
+    // the case this bound exists for.
+    alignas(8) std::uint8_t table[2 * 12];
+    put32(table, 0, 0x1000);
+    put32(table, 4, 0x1100);
+    put32(table, 8, 0x40 | 1);  // chained, 0x40 bytes past a 24-byte table
+    put32(table, 12, 0x2000);
+    put32(table, 16, 0x2100);
+    put32(table, 20, 0x776);
+    const std::uint64_t base = 0x140000000ULL;
+    check(seh::lookup_function_entry(base, table, sizeof(table),
+                                     base + 0x1050) == nullptr,
+          "a chain past the end of the table is refused");
+
+    // The offset exactly one entry's worth short of the end is the last
+    // row the table holds, and reading it is what the bound must still
+    // allow: the check is a range, not a blanket refusal.
+    put32(table, 8, 12 | 1);
+    const auto* last = seh::lookup_function_entry(
+        base, table, sizeof(table), base + 0x1050);
+    check(last != nullptr && last->unwind_rva == 0x776,
+          "the last row the table holds is still reachable by chain");
+}
+
 // --------------------------------------------------------- the reversal
 
 void test_leaf_unwind_pops_the_return_address() {
@@ -167,7 +209,8 @@ void test_leaf_unwind_pops_the_return_address() {
     std::uint64_t handler = 0;
     const bool ok =
         seh::virtual_unwind(seh::kUnwFlagEHandler, 0x140000000ULL,
-                            0x140000FFFULL, nullptr, context, &data, &frame,
+                            0x140000FFFULL, nullptr, context,
+                            seh::UnwindRange{}, 0, 0, &data, &frame,
                             &handler);
     check(ok, "a leaf unwinds without a table row");
     check(get64(context, seh::kContextRip) == return_address,
@@ -176,6 +219,113 @@ void test_leaf_unwind_pops_the_return_address() {
           "the leaf's caller's stack pointer is past the return address");
     check(frame == rsp && handler == 0,
           "a leaf carries no handler and frames itself at its own rsp");
+}
+
+void test_leaf_unwind_refuses_a_stack_pointer_off_the_stack() {
+    // A context whose Rsp the guest set past the top of the stack this run
+    // owns. The address is a real one -- the buffer's own memory -- so the
+    // bounded reversal refuses it by the range rather than by faulting,
+    // while the unbounded shape the handler-initiated unwinds use reads it
+    // as it always would.
+    alignas(16) std::uint8_t context[seh::kContextSize];
+    std::memset(context, 0, sizeof(context));
+    alignas(8) std::uint8_t stack[256];
+    std::memset(stack, 0, sizeof(stack));
+    const std::uint64_t stack_base = reinterpret_cast<std::uint64_t>(stack);
+    const std::uint64_t return_address = 0x140001000ULL;
+    // The return address sits at +128, inside the buffer but past the
+    // 64-byte span the bound below hands the walk.
+    put64(stack, 128, return_address);
+    put64(context, seh::kContextRsp, stack_base + 128);
+
+    const void* data = nullptr;
+    std::uint64_t frame = 0;
+    std::uint64_t handler = 0;
+    const bool ok =
+        seh::virtual_unwind(seh::kUnwFlagEHandler, 0x140000000ULL,
+                            0x140000FFFULL, nullptr, context,
+                            seh::UnwindRange{}, stack_base, stack_base + 64,
+                            &data, &frame, &handler);
+    check(!ok, "a leaf whose rsp is past the stack's top is refused");
+
+    // A zero-high range is the handler-initiated shape: no check at all,
+    // and the same rsp reads the return address it names.
+    std::memset(context, 0, sizeof(context));
+    put64(context, seh::kContextRsp, stack_base + 128);
+    const bool unbounded =
+        seh::virtual_unwind(seh::kUnwFlagEHandler, 0x140000000ULL,
+                            0x140000FFFULL, nullptr, context,
+                            seh::UnwindRange{}, 0, 0, &data, &frame,
+                            &handler);
+    check(unbounded && get64(context, seh::kContextRip) == return_address,
+          "a zero-high range stands the stack check down");
+}
+
+void test_body_unwind_refuses_a_row_pointing_outside_xdata() {
+    // A row whose `unwind_rva` names an address the `.xdata` section does
+    // not hold. Reading the header there would fault or read a stranger's
+    // bytes; the range turns it into the false that ends the walk.
+    TableFixture fixture;
+    UnwindInfoBytes info(0, 7, 0, 0);
+    info.code(0, 0, 5);  // PUSH_NONVOL rbp
+    fixture.place(info.bytes);
+    // The fixture's row points at 0x1000, inside its info buffer. A row
+    // rewritten to point a megabyte further on is the crafted case.
+    put32(fixture.pdata, 8, 0x100000);
+
+    alignas(16) std::uint8_t context[seh::kContextSize];
+    std::memset(context, 0, sizeof(context));
+    put64(context, seh::kContextRsp,
+          reinterpret_cast<std::uint64_t>(&context));
+
+    const void* data = nullptr;
+    std::uint64_t frame = 0;
+    std::uint64_t handler = 0;
+    const bool ok = seh::virtual_unwind(
+        seh::kUnwFlagEHandler, fixture.base, fixture.pc, fixture.entry(),
+        context, fixture.xdata(), 0, 0, &data, &frame, &handler);
+    check(!ok, "a row pointing outside .xdata is refused");
+}
+
+void test_unwind_stops_when_the_code_count_overruns_the_section() {
+    // A header claiming far more code slots than the section holds. The
+    // reversal applies what it can read and stops at the edge rather than
+    // walking out of the section: the count is one guest byte, and a
+    // crafted header sets it to anything.
+    TableFixture fixture;
+    UnwindInfoBytes info(0, 7, 0, 0);
+    info.code(0, 0, 5);   // PUSH_NONVOL rbp, the one real code
+    info.code(1, 2, 4);   // ALLOC_SMALL, 0x28
+    fixture.place(info.bytes);
+    // The place() wrote the header's count as the codes set it; raise it
+    // past what the section holds.
+    fixture.info[2] = 0x7F;
+
+    alignas(16) std::uint8_t context[seh::kContextSize];
+    std::memset(context, 0, sizeof(context));
+    alignas(8) std::uint8_t stack[256];
+    std::memset(stack, 0, sizeof(stack));
+    const std::uint64_t stack_base = reinterpret_cast<std::uint64_t>(stack);
+    const std::uint64_t saved_rbp = 0x5555555555555555ULL;
+    // The push's own slot: the code below undoes it by reading here.
+    put64(stack, 64, saved_rbp);
+    put64(context, seh::kContextRsp, stack_base + 64);
+
+    const auto* entry = seh::lookup_function_entry(
+        fixture.base, fixture.pdata, sizeof(fixture.pdata), fixture.pc);
+    const void* data = nullptr;
+    std::uint64_t frame = 0;
+    std::uint64_t handler = 0;
+    const bool ok = seh::virtual_unwind(seh::kUnwFlagEHandler, fixture.base,
+                                        fixture.pc, entry, context,
+                                        fixture.xdata(), stack_base,
+                                        stack_base + sizeof(stack), &data,
+                                        &frame, &handler);
+    check(ok, "a table that overruns its section still unwinds");
+    check(get64(context, seh::kContextRbp) == saved_rbp,
+          "the code inside the section was applied");
+    check(get64(context, seh::kContextRsp) > stack_base + 64,
+          "the stack moved by the codes that were read");
 }
 
 void test_body_unwind_reverses_push_and_alloc() {
@@ -213,7 +363,8 @@ void test_body_unwind_reverses_push_and_alloc() {
     std::uint64_t frame = 0;
     std::uint64_t handler = 0;
     const bool ok = seh::virtual_unwind(seh::kUnwFlagEHandler, fixture.base,
-                                        fixture.pc, entry, context, &data,
+                                        fixture.pc, entry, context,
+                                        fixture.xdata(), 0, 0, &data,
                                         &frame, &handler);
     check(ok, "a body control point unwinds");
     check(get64(context, seh::kContextRsp) == body_rsp + 0x28 + 24,
@@ -260,7 +411,8 @@ void test_prolog_middle_skips_the_codes_not_reached() {
     std::uint64_t frame = 0;
     std::uint64_t handler = 0;
     const bool ok = seh::virtual_unwind(seh::kUnwFlagEHandler, fixture.base,
-                                        pc_in_prolog, entry, context, &data,
+                                        pc_in_prolog, entry, context,
+                                        fixture.xdata(), 0, 0, &data,
                                         &frame, &handler);
     check(ok, "a prolog control point unwinds");
     check(get64(context, seh::kContextRsp) == rsp_at_three + 0x28 + 16,
@@ -303,7 +455,8 @@ void test_frame_register_anchors_the_save_slots() {
     std::uint64_t frame = 0;
     std::uint64_t handler = 0;
     const bool ok = seh::virtual_unwind(seh::kUnwFlagEHandler, fixture.base,
-                                        fixture.pc, entry, context, &data,
+                                        fixture.pc, entry, context,
+                                        fixture.xdata(), 0, 0, &data,
                                         &frame, &handler);
     check(ok, "a frame-registered control point unwinds");
     check(frame == anchor - 16,
@@ -357,6 +510,13 @@ struct DispatchFixture {
         put64(context, seh::kContextRip, pc);
         put64(context, seh::kContextRsp, rsp);
     }
+
+    // The same relationship TableFixture keeps: the rows point at `info`,
+    // so `info` is the section the walk bounds its reads by.
+    seh::UnwindRange xdata() const {
+        return seh::UnwindRange{reinterpret_cast<std::uint64_t>(info),
+                                sizeof(info)};
+    }
 };
 
 void test_dispatch_reports_the_handler_that_will_handle() {
@@ -376,8 +536,8 @@ void test_dispatch_reports_the_handler_that_will_handle() {
         reinterpret_cast<std::uint64_t>(&probe) + 0x800;
     const bool resume =
         seh::dispatch(record, fixture.context, fixture.pdata,
-                      sizeof(fixture.pdata), fixture.base, fixture.image_end,
-                      low, high);
+                      sizeof(fixture.pdata), fixture.xdata(), fixture.base,
+                      fixture.image_end, low, high);
     check(resume,
           "a handler that answers continue-execution leaves the run alive");
 }
@@ -396,8 +556,8 @@ void test_dispatch_walks_off_when_no_one_declines() {
         reinterpret_cast<std::uint64_t>(&probe) + 0x800;
     const bool resume =
         seh::dispatch(record, fixture.context, fixture.pdata,
-                      sizeof(fixture.pdata), fixture.base, fixture.image_end,
-                      low, high);
+                      sizeof(fixture.pdata), fixture.xdata(), fixture.base,
+                      fixture.image_end, low, high);
     check(!resume,
           "a search every frame declines ends as an unhandled exception");
 }
@@ -412,8 +572,8 @@ void test_dispatch_without_a_table_is_unhandled() {
     std::memset(record, 0, sizeof(record));
     std::uint64_t probe = 0;
     const bool resume =
-        seh::dispatch(record, context, nullptr, 0, 0x140000000ULL,
-                      0x150000000ULL,
+        seh::dispatch(record, context, nullptr, 0, seh::UnwindRange{},
+                      0x140000000ULL, 0x150000000ULL,
                       reinterpret_cast<std::uint64_t>(&probe) - 0x100000,
                       reinterpret_cast<std::uint64_t>(&probe) + 0x800);
     check(!resume, "an image with no exception table has nothing to handle");
@@ -578,7 +738,11 @@ void test_capture_and_restore_round_trip() {
 int main() {
     test_lookup_finds_the_row_holding_the_pc();
     test_lookup_follows_the_chain();
+    test_lookup_rejects_a_chain_that_leaves_the_table();
     test_leaf_unwind_pops_the_return_address();
+    test_leaf_unwind_refuses_a_stack_pointer_off_the_stack();
+    test_body_unwind_refuses_a_row_pointing_outside_xdata();
+    test_unwind_stops_when_the_code_count_overruns_the_section();
     test_body_unwind_reverses_push_and_alloc();
     test_prolog_middle_skips_the_codes_not_reached();
     test_frame_register_anchors_the_save_slots();

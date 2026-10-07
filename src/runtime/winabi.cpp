@@ -2430,7 +2430,13 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_MultiByteToWideChar(
     if (target == nullptr) {
         return static_cast<std::int32_t>(needed);
     }
-    if (static_cast<std::size_t>(target_length) < needed) {
+    // A negative target length is not a small buffer and not a large one:
+    // Windows refuses the call outright. Widening it to unsigned would
+    // turn it into the larger number of the two, which reads as a buffer
+    // big enough for anything -- and the copy below would then write past
+    // the end of whatever the caller really had.
+    if (target_length < 0 ||
+        static_cast<std::size_t>(target_length) < needed) {
         set_last_error(kErrorInsufficientBuffer);
         return 0;
     }
@@ -2476,7 +2482,12 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_WideCharToMultiByte(
         }
         return static_cast<std::int32_t>(needed);
     }
-    if (static_cast<std::size_t>(target_length) < needed) {
+    // The same refusal the other direction makes: a negative length is
+    // Windows' "the buffer is not usable", and reading it as unsigned
+    // would make it the largest value of the type, which no buffer is
+    // shorter than.
+    if (target_length < 0 ||
+        static_cast<std::size_t>(target_length) < needed) {
         set_last_error(kErrorInsufficientBuffer);
         return 0;
     }
@@ -4498,8 +4509,10 @@ extern "C" void k32_raise_dispatch(std::uint64_t code, std::uint64_t flags,
     const bool resume = seh::dispatch(
         record, context,
         reinterpret_cast<const std::uint8_t*>(guest->pdata_va),
-        static_cast<std::size_t>(guest->pdata_bytes), guest->image_base,
-        guest->image_end, guest->stack_low, guest->stack_high);
+        static_cast<std::size_t>(guest->pdata_bytes),
+        seh::UnwindRange{guest->xdata_va, guest->xdata_bytes},
+        guest->image_base, guest->image_end, guest->stack_low,
+        guest->stack_high);
     if (resume) {
         // A filter answered EXCEPTION_CONTINUE_EXECUTION: the guest
         // resolved the condition and the interrupted code runs on.
@@ -4589,10 +4602,20 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_RtlVirtualUnwind(
     std::uint64_t frame = 0;
     const void* handler_data = nullptr;
     std::uint64_t handler = 0;
+    // The unwind data this call may read is the guest's own, so the range
+    // comes from the state the runtime keeps rather than from an argument:
+    // the guest's `RtlVirtualUnwind` has no way to name a section, and the
+    // table its rows point into is the one the loader mapped.
+    const winabi::GuestState* guest = winabi::guest_state();
+    const seh::UnwindRange xdata =
+        guest != nullptr ? seh::UnwindRange{guest->xdata_va, guest->xdata_bytes}
+                         : seh::UnwindRange{};
     const bool ok = seh::virtual_unwind(
         handler_type, image_base, control_pc,
         static_cast<const seh::FunctionEntry*>(function_entry),
-        static_cast<std::uint8_t*>(context), &handler_data, &frame,
+        static_cast<std::uint8_t*>(context), xdata,
+        guest != nullptr ? guest->stack_low : 0,
+        guest != nullptr ? guest->stack_high : 0, &handler_data, &frame,
         &handler);
     if (!ok) {
         // A table this runtime cannot read: the Windows call marks the

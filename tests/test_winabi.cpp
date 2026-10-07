@@ -231,6 +231,81 @@ void test_utf_conversion() {
           "a lone surrogate going the other way is refused too");
 }
 
+// The two conversions as the guest calls them. The guest reaches them
+// through the export table, so the test takes the address the same way a
+// guest would and calls through it: a name in the table that is not the
+// function is a fault the fixture could not report from where it sits.
+using MultiByteToWideCharFn = std::int32_t(__attribute__((ms_abi))*)(
+    std::uint32_t, std::uint32_t, const char*, std::int32_t, char16_t*,
+    std::int32_t);
+using WideCharToMultiByteFn = std::int32_t(__attribute__((ms_abi))*)(
+    std::uint32_t, std::uint32_t, const char16_t*, std::int32_t, char*,
+    std::int32_t, const char*, std::int32_t*);
+
+void test_multibyte_wide_lengths() {
+    ExportRegistry registry;
+    winabi::register_host_modules(registry);
+    const auto mb = registry.find_by_name("kernel32.dll",
+                                          "MultiByteToWideChar", 0);
+    const auto wc = registry.find_by_name("kernel32.dll",
+                                          "WideCharToMultiByte", 0);
+    check(mb.address != 0 && wc.address != 0,
+          "both conversions resolve through the export table");
+    if (mb.address == 0 || wc.address == 0) {
+        return;
+    }
+    const auto to_wide =
+        reinterpret_cast<MultiByteToWideCharFn>(mb.address);
+    const auto to_narrow =
+        reinterpret_cast<WideCharToMultiByteFn>(wc.address);
+
+    char16_t wide[16];
+    char narrow[16];
+
+    // A negative target length is Windows' "this buffer is not usable".
+    // Reading it as unsigned would make it the largest value of the type,
+    // which every buffer passes -- and the copy would run off the end of
+    // whatever the caller really had. The call must be refused instead.
+    std::memset(wide, 0xAB, sizeof(wide));
+    check(to_wide(0, 0, "abc", 3, wide, -1) == 0,
+          "a negative target length is refused on the widen side");
+    std::memset(narrow, 0xAB, sizeof(narrow));
+    check(to_narrow(0, 0, u"abc", 3, narrow, -1, nullptr, nullptr) == 0,
+          "a negative target length is refused on the narrow side");
+
+    // The refusals must not have written a byte, which is what the memset
+    // above makes visible.
+    bool wide_untouched = true;
+    bool narrow_untouched = true;
+    for (char16_t unit : wide) {
+        wide_untouched = wide_untouched && (unit & 0xFF) == 0xAB;
+    }
+    for (char byte : narrow) {
+        narrow_untouched = narrow_untouched && (byte & 0xFF) == 0xAB;
+    }
+    check(wide_untouched, "the refused widen wrote nothing");
+    check(narrow_untouched, "the refused narrow wrote nothing");
+
+    // A target that really is too small is refused the same way, and the
+    // size query a null target asks for still answers the need.
+    check(to_wide(0, 0, "abc", -1, nullptr, 0) == 4,
+          "the widen size query answers the count a null target asks for");
+    check(to_wide(0, 0, "abc", 3, wide, 2) == 0,
+          "a widen target one unit short is refused");
+    check(to_narrow(0, 0, u"abc", 3, narrow, 2, nullptr, nullptr) == 0,
+          "a narrow target one byte short is refused");
+
+    // The conversion itself, once the length is honest. `caf\xC3\xA9` is
+    // five bytes: the é is the two-byte sequence, and a length that cut it
+    // in half would be the truncated input the forward direction refuses.
+    check(to_wide(0, 0, "caf\xC3\xA9", 5, wide, 16) == 4 &&
+              wide[0] == u'c' && wide[3] == 0x00E9,
+          "a well-sized widen converts the text");
+    check(to_narrow(0, 0, u"caf\x00E9", 4, narrow, 16, nullptr, nullptr) == 5 &&
+              std::strncmp(narrow, "caf\xC3\xA9", 5) == 0,
+          "a well-sized narrow converts the text back");
+}
+
 // ------------------------------------------------------------- vfprintf
 
 // Prints through the bridge into memory. Returns what the bridge returns,
@@ -1246,6 +1321,7 @@ int main() {
     test_round_trip();
     test_to_dos_path();
     test_utf_conversion();
+    test_multibyte_wide_lengths();
     test_vfprintf_conversions();
     test_heap_semantics();
     test_translate_stream();

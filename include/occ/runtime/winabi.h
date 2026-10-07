@@ -166,12 +166,15 @@ struct GuestState {
     bool resume_mask_valid = false;
 
     // The exception walk's facts about the image and the stack: where the
-    // `.pdata` table landed, where the image ends, and the span the
-    // guest's stack occupies. A frame or a table outside these bounds is
-    // not walked -- the bounds are what keep a corrupt unwind table from
-    // becoming the runtime's own fault.
+    // `.pdata` table landed, where the unwind data its rows point into
+    // lives, where the image ends, and the span the guest's stack
+    // occupies. A frame or a table outside these bounds is not walked --
+    // the bounds are what keep a corrupt unwind table from becoming the
+    // runtime's own fault.
     std::uint64_t pdata_va = 0;
     std::uint64_t pdata_bytes = 0;
+    std::uint64_t xdata_va = 0;
+    std::uint64_t xdata_bytes = 0;
     std::uint64_t image_end = 0;
     std::uint64_t stack_low = 0;
     std::uint64_t stack_high = 0;

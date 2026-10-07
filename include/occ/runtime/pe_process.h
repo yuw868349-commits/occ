@@ -186,6 +186,15 @@ struct ProcessImage {
     std::uint64_t pdata_va = 0;
     std::uint64_t pdata_bytes = 0;
 
+    // The unwind data the exception directory's rows point into. The rows
+    // are guest bytes, so an `unwind_rva` in one of them is a number the
+    // guest chose; the walk bounds every read of a header and of the code
+    // slots that follow it by this range, because a row pointing outside
+    // the section is a crafted image rather than an unwind this runtime
+    // should follow off the end of a mapping.
+    std::uint64_t xdata_va = 0;
+    std::uint64_t xdata_bytes = 0;
+
     // The TEB and the PEB, as addresses in this space.
     std::uint64_t teb = 0;
     std::uint64_t peb = 0;

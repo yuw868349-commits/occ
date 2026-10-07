@@ -542,7 +542,10 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     // named `.pdata` by every x64 linker that emits one, and the table's
     // bytes are the file's own -- the RUNTIME_FUNCTIONs live in raw data,
     // so the table's length is the smaller of what the section declares
-    // and what the file carries.
+    // and what the file carries. `.xdata` is recorded the same way: it is
+    // where the rows' `unwind_rva` values point, and the walk needs its
+    // extent to tell a row that names unwind data from one that names
+    // whatever byte happens to follow the section in this address space.
     for (const parser::PeSection& section : image.sections()) {
         if (section.name == ".pdata") {
             image_out.pdata_va =
@@ -552,7 +555,14 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
                                                    section.raw_size
                                                ? section.virtual_size
                                                : section.raw_size);
-            break;
+        } else if (section.name == ".xdata") {
+            image_out.xdata_va =
+                image_out.module.base + section.virtual_address;
+            image_out.xdata_bytes =
+                static_cast<std::uint64_t>(section.virtual_size <
+                                                   section.raw_size
+                                               ? section.virtual_size
+                                               : section.raw_size);
         }
     }
 
@@ -1059,8 +1069,10 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         const bool resume = seh::dispatch(
             reinterpret_cast<std::uint8_t*>(&record), context,
             reinterpret_cast<const std::uint8_t*>(state->pdata_va),
-            static_cast<std::size_t>(state->pdata_bytes), state->image_base,
-            state->image_end, state->stack_low, state->stack_high);
+            static_cast<std::size_t>(state->pdata_bytes),
+            seh::UnwindRange{state->xdata_va, state->xdata_bytes},
+            state->image_base, state->image_end, state->stack_low,
+            state->stack_high);
         if (resume) {
             // The guest resolved the condition. The mask the fault
             // blocked comes back before the state it interrupted does,
@@ -1180,6 +1192,8 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // from the same regions the fault path uses.
     state.pdata_va = image.pdata_va;
     state.pdata_bytes = image.pdata_bytes;
+    state.xdata_va = image.xdata_va;
+    state.xdata_bytes = image.xdata_bytes;
     state.image_end = image.module.base + image.module.size;
     state.stack_low = g_run_frame.stack_low;
     state.stack_high = g_run_frame.stack_high;
