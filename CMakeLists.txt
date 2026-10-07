@@ -578,6 +578,20 @@ add_library(occ_core STATIC
     src/runtime/api/time.cpp
     src/runtime/api/memory.cpp
     src/runtime/api/console.cpp
+    src/runtime/api/modules.cpp
+    src/runtime/api/kernel32_extra.cpp
+    src/runtime/api/kernelbase_extra.cpp
+    src/runtime/api/user32_extra.cpp
+    src/runtime/api/ntdll_rtl.cpp
+    src/runtime/api/ntdll_nt.cpp
+    src/runtime/api/gdi32.cpp
+    src/runtime/api/advapi32.cpp
+    src/runtime/api/rpcrt4.cpp
+    src/runtime/api/setupapi.cpp
+    src/runtime/api/shell32.cpp
+    src/runtime/api/crypt32.cpp
+    src/runtime/api/ole32.cpp
+    src/runtime/api/crt.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

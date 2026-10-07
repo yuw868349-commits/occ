@@ -4913,6 +4913,7 @@ void add_kernel32(ExportModule& module) {
     add_time_kernel32(module.host_exports);
     add_memory_kernel32(module.host_exports);
     add_console_kernel32(module.host_exports);
+    add_kernel32_extra(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {
@@ -4931,6 +4932,7 @@ void add_user32(ExportModule& module) {
         e("wsprintfA", reinterpret_cast<void*>(&cr_wsprintfA)),
         e("wsprintfW", reinterpret_cast<void*>(&cr_wsprintfW)),
     };
+    add_user32_extra(module.host_exports);
 }
 
 void add_kernelbase(ExportModule& module) {
@@ -4943,6 +4945,7 @@ void add_kernelbase(ExportModule& module) {
     // registering it twice would be a duplicate the index silently resolves
     // to whichever came first.
     add_string_kernelbase(module.host_exports);
+    add_kernelbase_extra(module.host_exports);
 }
 
 void add_shlwapi(ExportModule& module) {
@@ -5124,6 +5127,9 @@ void add_msvcrt(ExportModule& module) {
         e("wcsstr", reinterpret_cast<void*>(&cr_wcsstr)),
         e("wcstombs", reinterpret_cast<void*>(&cr_wcstombs)),
     };
+    // The C runtime this module is named for, appended from
+    // the one table the whole family shares.
+    add_crt(module.host_exports, "msvcrt.dll");
 }
 
 }  // namespace
@@ -5144,6 +5150,27 @@ void register_host_modules(ExportRegistry& registry) {
         {"msvcrt.dll", &add_msvcrt},
         {"USER32.dll", &add_user32},
         {"SHLWAPI.dll", &add_shlwapi},
+        {"NTDLL.dll", &add_module_ntdll},
+        {"GDI32.dll", &add_module_gdi32},
+        {"ADVAPI32.dll", &add_module_advapi32},
+        {"RPCRT4.dll", &add_module_rpcrt4},
+        {"SETUPAPI.dll", &add_module_setupapi},
+        {"SHELL32.dll", &add_module_shell32},
+        {"CRYPT32.dll", &add_module_crypt32},
+        {"OLE32.dll", &add_module_ole32},
+        {"UCRTBASE.dll", &add_module_ucrtbase},
+        {"MSVCR70.dll", &add_module_msvcr70},
+        {"MSVCR71.dll", &add_module_msvcr71},
+        {"MSVCR80.dll", &add_module_msvcr80},
+        {"MSVCR90.dll", &add_module_msvcr90},
+        {"MSVCR100.dll", &add_module_msvcr100},
+        {"MSVCR110.dll", &add_module_msvcr110},
+        {"MSVCR120.dll", &add_module_msvcr120},
+        {"MSVCR120_APP.dll", &add_module_msvcr120_app},
+        {"MSVCRTD.dll", &add_module_msvcrtd},
+        {"MSVCRT20.dll", &add_module_msvcrt20},
+        {"MSVCRT40.dll", &add_module_msvcrt40},
+        {"MSVCIRT.dll", &add_module_msvcirt},
     };
 
     auto& index = own_export_index();

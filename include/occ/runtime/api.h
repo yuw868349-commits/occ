@@ -424,6 +424,81 @@ extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToInt64ExA(
 extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToInt64ExW(
     const char16_t* text, std::int32_t flags, std::int64_t* out) noexcept;
 
+// ------------------------------------------------------- the domains
+
+// A module whose whole surface is domains is built by one function per
+// module, in `runtime/api/modules.cpp`, and named in the table in
+// `winabi.cpp`. A domain that extends a module this file already builds is
+// named the same way and is appended by that module's own function, so the
+// list of names a module exports is the union of the domains it is made of
+// and nothing else.
+// The KERNEL32 names that are not file, path, time, memory or console.
+void add_kernel32_extra(ExportList& out);
+
+// The KERNELBASE names a guest imports from it directly.
+void add_kernelbase_extra(ExportList& out);
+
+// The USER32 surface beyond the two printf-style names already here.
+void add_user32_extra(ExportList& out);
+
+// The Rtl* half of ntdll: memory, strings, bits, sections, version.
+void add_ntdll_rtl(ExportList& out);
+
+// The Nt* and Zw* half of ntdll. In user mode the two are one function.
+void add_ntdll_nt(ExportList& out);
+
+// The GDI32 surface.
+void add_gdi32(ExportList& out);
+
+// The ADVAPI32 surface: registry, tokens, services, events.
+void add_advapi32(ExportList& out);
+
+// The RPCRT4 surface.
+void add_rpcrt4(ExportList& out);
+
+// The SETUPAPI surface.
+void add_setupapi(ExportList& out);
+
+// The SHELL32 surface.
+void add_shell32(ExportList& out);
+
+// The CRYPT32 surface.
+void add_crypt32(ExportList& out);
+
+// The OLE32 surface.
+void add_ole32(ExportList& out);
+
+// The C runtime. One implementation serves every module that exports it:
+// `ucrtbase` is the modern base and the `msvcr*` names re-export the same
+// functions, so the module argument selects which subset is registered
+// rather than which implementation is used. Splitting the family into
+// fourteen copies of the same table is how the family is built on Windows
+// and how it would be built here, and it is not what a reader needs.
+void add_crt(ExportList& out, const char* module);
+
+// The modules built from domains, named once each.
+void add_module_ntdll(ExportModule& module);
+void add_module_gdi32(ExportModule& module);
+void add_module_advapi32(ExportModule& module);
+void add_module_rpcrt4(ExportModule& module);
+void add_module_setupapi(ExportModule& module);
+void add_module_shell32(ExportModule& module);
+void add_module_crypt32(ExportModule& module);
+void add_module_ole32(ExportModule& module);
+void add_module_ucrtbase(ExportModule& module);
+void add_module_msvcr70(ExportModule& module);
+void add_module_msvcr71(ExportModule& module);
+void add_module_msvcr80(ExportModule& module);
+void add_module_msvcr90(ExportModule& module);
+void add_module_msvcr100(ExportModule& module);
+void add_module_msvcr110(ExportModule& module);
+void add_module_msvcr120(ExportModule& module);
+void add_module_msvcr120_app(ExportModule& module);
+void add_module_msvcrtd(ExportModule& module);
+void add_module_msvcrt20(ExportModule& module);
+void add_module_msvcrt40(ExportModule& module);
+void add_module_msvcirt(ExportModule& module);
+
 }  // namespace occ::runtime::winabi
 
 #endif  // OCC_RUNTIME_API_H
