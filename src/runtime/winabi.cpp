@@ -3509,6 +3509,315 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr__snprintf(
     return result;
 }
 
+// --- user32's wsprintf ----------------------------------------------------
+//
+// The simplified printf the window layer carries: integers and text, no
+// floating point, and a wide spelling whose `%s` reads a UTF-16 string
+// from the slot. The conversion walk runs here rather than through the
+// rebuilt-format bridge, because the slots a wide `%s` reads point at
+// UTF-16 text the narrow bridge would misread.
+
+namespace {
+
+// The output accumulator wsprintfW writes through. The contract the guest
+// accepted when it chose this call is sprintf's -- the buffer is big
+// enough -- so the writing is unbounded, the way the real call is.
+struct WideOut {
+    char16_t* cursor;
+    std::size_t count = 0;
+
+    void put(char16_t unit) noexcept {
+        *cursor++ = unit;
+        ++count;
+    }
+
+    void put_narrow(const char* text) noexcept {
+        for (; *text != '\0'; ++text) {
+            put(static_cast<char16_t>(*text));
+        }
+    }
+};
+
+// One conversion's field assembly: the digits it produced, the padding
+// the width asks for, and the two fill styles -- a zero fill that lands
+// after the minus sign, and blanks that land either side depending on the
+// left-align flag.
+void pad_field(WideOut& out, const std::string& digits, bool negative,
+               int width, bool left, bool zero) noexcept {
+    std::size_t body = digits.size() + (negative ? 1U : 0U);
+    if (left) {
+        if (negative) {
+            out.put(u'-');
+        }
+        out.put_narrow(digits.c_str());
+        while (body < static_cast<std::size_t>(width)) {
+            out.put(u' ');
+            ++body;
+        }
+    } else if (zero && static_cast<std::size_t>(width) > body) {
+        if (negative) {
+            out.put(u'-');
+        }
+        for (std::size_t i = body; i < static_cast<std::size_t>(width);
+             ++i) {
+            out.put(u'0');
+        }
+        out.put_narrow(digits.c_str());
+    } else {
+        while (body < static_cast<std::size_t>(width)) {
+            out.put(u' ');
+            ++body;
+        }
+        if (negative) {
+            out.put(u'-');
+        }
+        out.put_narrow(digits.c_str());
+    }
+}
+
+} // namespace
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wsprintfW(
+    char16_t* buffer, const char16_t* fmt, ...) noexcept {
+    if (buffer == nullptr || fmt == nullptr) {
+        return 0;
+    }
+    __builtin_ms_va_list ap;
+    __builtin_ms_va_start(ap, fmt);
+    const std::uint64_t* slots = nullptr;
+    __builtin_memcpy(&slots, &ap, sizeof(slots));
+    std::size_t slot = 0;
+
+    WideOut out{buffer};
+    for (std::size_t i = 0; fmt[i] != u'\0';) {
+        if (fmt[i] != u'%') {
+            out.put(fmt[i]);
+            ++i;
+            continue;
+        }
+        ++i;
+        if (fmt[i] == u'%') {
+            out.put(u'%');
+            ++i;
+            continue;
+        }
+        // The flags, the width, the precision, and the length prefixes the
+        // simplified contract carries -- minus and zero, an optional digit
+        // run or a star, and l or the l64 spelling of a 64-bit argument.
+        bool left = false;
+        bool zero = false;
+        for (;;) {
+            if (fmt[i] == u'-') {
+                left = true;
+            } else if (fmt[i] == u'0') {
+                zero = true;
+            } else {
+                break;
+            }
+            ++i;
+        }
+        int width = 0;
+        if (fmt[i] == u'*') {
+            ++i;
+            width = static_cast<int>(slots[slot++] & 0xFFFFFFFFU);
+        } else {
+            while (fmt[i] >= u'0' && fmt[i] <= u'9') {
+                width = width * 10 + static_cast<int>(fmt[i] - u'0');
+                ++i;
+            }
+        }
+        int precision = -1;
+        if (fmt[i] == u'.') {
+            ++i;
+            precision = 0;
+            if (fmt[i] == u'*') {
+                ++i;
+                precision = static_cast<int>(slots[slot++] & 0xFFFFFFFFU);
+            } else {
+                while (fmt[i] >= u'0' && fmt[i] <= u'9') {
+                    precision = precision * 10 + static_cast<int>(fmt[i] - u'0');
+                    ++i;
+                }
+            }
+        }
+        bool sixty_four = false;
+        for (;;) {
+            if (fmt[i] == u'l') {
+                if (fmt[i + 1] == u'6' && fmt[i + 2] == u'4') {
+                    sixty_four = true;
+                    i += 2;
+                }
+            } else {
+                break;
+            }
+            ++i;
+        }
+        const char16_t conversion = fmt[i];
+
+        std::string text;
+        switch (conversion) {
+        case u'd':
+        case u'i': {
+            if (sixty_four) {
+                text = std::to_string(
+                    static_cast<std::int64_t>(slots[slot++]));
+            } else {
+                const std::int32_t value =
+                    static_cast<std::int32_t>(slots[slot] & 0xFFFFFFFFU);
+                ++slot;
+                text = std::to_string(value);
+            }
+            break;
+        }
+        case u'u': {
+            if (sixty_four) {
+                text = std::to_string(slots[slot++]);
+            } else {
+                text = std::to_string(slots[slot] & 0xFFFFFFFFU);
+                ++slot;
+            }
+            break;
+        }
+        case u'x':
+        case u'X': {
+            char raw[24] = {};
+            if (sixty_four) {
+                write_unsigned_radix(slots[slot++], 16, raw);
+            } else {
+                write_unsigned_radix(slots[slot] & 0xFFFFFFFFU, 16, raw);
+                ++slot;
+            }
+            text = raw;
+            if (conversion == u'X') {
+                for (char& c : text) {
+                    c = static_cast<char>(::toupper(static_cast<unsigned char>(c)));
+                }
+            }
+            break;
+        }
+        case u'p': {
+            char raw[24] = {};
+            write_unsigned_radix(slots[slot++], 16, raw);
+            text = raw;
+            break;
+        }
+        case u'c': {
+            const std::uint32_t value =
+                static_cast<std::uint32_t>(slots[slot++] & 0xFFFFFFFFU);
+            // The wide spelling of a character conversion answers the
+            // UTF-16 unit the slot carries.
+            const std::size_t width_used = static_cast<std::size_t>(width);
+            if (!left) {
+                for (std::size_t w = 1; w < width_used; ++w) {
+                    out.put(u' ');
+                }
+            }
+            out.put(static_cast<char16_t>(value));
+            if (left) {
+                for (std::size_t w = 1; w < width_used; ++w) {
+                    out.put(u' ');
+                }
+            }
+            ++i;
+            continue;
+        }
+        case u'C': {
+            const std::uint32_t value =
+                static_cast<std::uint32_t>(slots[slot++] & 0xFFFFFFFFU);
+            const std::size_t width_used = static_cast<std::size_t>(width);
+            if (!left) {
+                for (std::size_t w = 1; w < width_used; ++w) {
+                    out.put(u' ');
+                }
+            }
+            out.put(static_cast<char16_t>(value & 0xFFU));
+            if (left) {
+                for (std::size_t w = 1; w < width_used; ++w) {
+                    out.put(u' ');
+                }
+            }
+            ++i;
+            continue;
+        }
+        case u's': {
+            const std::uint64_t pointer = slots[slot++];
+            // In the wide spelling `%s` is a wide string: the slot points
+            // at UTF-16 text, whether or not an `l` prefix named it.
+            const auto* units = reinterpret_cast<const char16_t*>(pointer);
+            std::size_t length = 0;
+            if (units != nullptr) {
+                while (units[length] != u'\0') {
+                    ++length;
+                }
+            }
+            if (precision >= 0 &&
+                static_cast<std::size_t>(precision) < length) {
+                length = static_cast<std::size_t>(precision);
+            }
+            const std::size_t width_used = static_cast<std::size_t>(width);
+            if (!left) {
+                for (std::size_t w = length; w < width_used; ++w) {
+                    out.put(u' ');
+                }
+            }
+            for (std::size_t c = 0; c < length; ++c) {
+                out.put(units[c]);
+            }
+            if (left) {
+                for (std::size_t w = length; w < width_used; ++w) {
+                    out.put(u' ');
+                }
+            }
+            ++i;
+            continue;
+        }
+        case u'S': {
+            const std::uint64_t pointer = slots[slot++];
+            const char* narrow = reinterpret_cast<const char*>(pointer);
+            text = narrow == nullptr ? "" : std::string(narrow);
+            if (precision >= 0 &&
+                static_cast<std::size_t>(precision) < text.size()) {
+                text.resize(static_cast<std::size_t>(precision));
+            }
+            break;
+        }
+        default:
+            // A conversion this simplified contract does not carry prints
+            // as itself, the way the real one does.
+            out.put(u'%');
+            out.put(conversion);
+            ++i;
+            continue;
+        }
+
+        // The number conversions land here: sign, digits, padding.
+        bool negative = false;
+        if (!text.empty() && text.front() == '-') {
+            negative = true;
+            text.erase(text.begin());
+        }
+        pad_field(out, text, negative, width, left, zero);
+        ++i;
+    }
+    buffer[out.count] = u'\0';
+    __builtin_ms_va_end(ap);
+    return static_cast<std::int32_t>(out.count);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wsprintfA(
+    char* buffer, const char* fmt, ...) noexcept {
+    // The narrow spelling is the same contract cr_sprintf carries -- the
+    // simplified conversions are a subset of what the bridge reads -- and
+    // the answer is the character count in both.
+    __builtin_ms_va_list ap;
+    __builtin_ms_va_start(ap, fmt);
+    void* slots = nullptr;
+    __builtin_memcpy(&slots, &ap, sizeof(slots));
+    const std::int32_t result = cr_vsprintf(buffer, fmt, slots);
+    __builtin_ms_va_end(ap);
+    return result;
+}
+
 // --- the file spellings ---
 
 extern "C" __attribute__((ms_abi)) void* cr_fopen(
@@ -3864,6 +4173,24 @@ void add_kernel32(ExportModule& module) {
     };
 }
 
+void add_user32(ExportModule& module) {
+    module.name = "USER32.dll";
+    const auto e = [](const char* n, void* fn) {
+        HostExport out;
+        out.name = n;
+        out.address = reinterpret_cast<std::uint64_t>(fn);
+        return out;
+    };
+    module.host_exports = {
+        // The window layer's simplified printf. The narrow spelling and
+        // cr_sprintf carry the same contract -- the simplified conversions
+        // are a subset of what the bridge reads -- and the wide one runs
+        // its own walk over the slots, because its `%s` reads UTF-16.
+        e("wsprintfA", reinterpret_cast<void*>(&cr_wsprintfA)),
+        e("wsprintfW", reinterpret_cast<void*>(&cr_wsprintfW)),
+    };
+}
+
 void add_msvcrt(ExportModule& module) {
     module.name = "msvcrt.dll";
     const auto e = [](const char* n, void* fn) {
@@ -3895,9 +4222,11 @@ void add_msvcrt(ExportModule& module) {
         e("_atoi64", reinterpret_cast<void*>(&cr__atoi64)),
         e("_cexit", reinterpret_cast<void*>(&cr__cexit)),
         d("_commode", &g_commode),
+        e("_ctime64", reinterpret_cast<void*>(&cr_ctime)),
         e("_errno", reinterpret_cast<void*>(&cr__errno)),
         d("_environ", &g_environ_ptr),
         e("_fmode", &g_fmode),
+        e("_gmtime64", reinterpret_cast<void*>(&cr_gmtime)),
         e("_i64toa", reinterpret_cast<void*>(&cr__i64toa)),
         e("_initterm", reinterpret_cast<void*>(&cr__initterm)),
         e("_itoa", reinterpret_cast<void*>(&cr__itoa)),
@@ -3905,6 +4234,7 @@ void add_msvcrt(ExportModule& module) {
         e("_ltoa", reinterpret_cast<void*>(&cr__ltoa)),
         e("_localtime64", reinterpret_cast<void*>(&cr_localtime)),
         e("_mkgmtime", reinterpret_cast<void*>(&cr__mkgmtime)),
+        e("_mkgmtime64", reinterpret_cast<void*>(&cr__mkgmtime)),
         e("_mktime64", reinterpret_cast<void*>(&cr_mktime)),
         e("_onexit", reinterpret_cast<void*>(&cr__onexit)),
         e("_putenv", reinterpret_cast<void*>(&cr__putenv)),
@@ -3914,6 +4244,7 @@ void add_msvcrt(ExportModule& module) {
         e("_strnicmp", reinterpret_cast<void*>(&cr__strnicmp)),
         e("_strupr", reinterpret_cast<void*>(&cr__strupr)),
         e("_snprintf", reinterpret_cast<void*>(&cr__snprintf)),
+        e("_time64", reinterpret_cast<void*>(&cr_time)),
         e("_ui64toa", reinterpret_cast<void*>(&cr__ui64toa)),
         e("_ultoa", reinterpret_cast<void*>(&cr__ultoa)),
         e("_unlock", reinterpret_cast<void*>(&cr__unlock)),
@@ -4035,6 +4366,10 @@ void register_host_modules(ExportRegistry& registry) {
     ExportModule msvcrt;
     add_msvcrt(msvcrt);
     registry.add(std::move(msvcrt));
+
+    ExportModule user32;
+    add_user32(user32);
+    registry.add(std::move(user32));
 }
 
 }  // namespace occ::runtime::winabi

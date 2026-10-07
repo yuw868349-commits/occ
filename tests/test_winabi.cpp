@@ -823,6 +823,25 @@ void test_crt_stdio_buffers() {
                               const_cast<std::uint64_t*>(args.data())) == 11 &&
               std::string(buffer) == "n=7 s=seven",
           "vsprintf reads the descriptor it is handed");
+
+    // user32's wsprintf: the wide spelling walks its own format, and its
+    // `%s` reads a UTF-16 string the narrow bridge would misread.
+    char16_t wide_buffer[48] = {};
+    check(winabi::cr_wsprintfW(wide_buffer, u"n=%d|x=%X|s=%s|c=%c",
+                               41, 0xABCu, u"ok", u'Z') == 19 &&
+              std::u16string(wide_buffer) == u"n=41|x=ABC|s=ok|c=Z",
+          "wsprintfW reads the slots the wide format names");
+    check(winabi::cr_wsprintfW(wide_buffer, u"pad=[%5d][%-5d][%05d]",
+                               42, 42, 42) == 25 &&
+              std::u16string(wide_buffer) == u"pad=[   42][42   ][00042]",
+          "wsprintfW pads the fields the width asks for");
+    check(winabi::cr_wsprintfW(wide_buffer, u"neg=%05d l64=%l64u",
+                               -42, 5000000000ULL) == 24 &&
+              std::u16string(wide_buffer) == u"neg=-0042 l64=5000000000",
+          "wsprintfW fills after the sign and reads 64-bit slots");
+    check(winabi::cr_wsprintfA(buffer, "n=%d s=%s", 7, "seven") == 11 &&
+              std::string(buffer) == "n=7 s=seven",
+          "wsprintfA is the narrow bridge under its user32 name");
 }
 
 void test_crt_stdio_files() {
@@ -1165,6 +1184,9 @@ void test_every_fixture_import_resolves() {
         "wcsrchr",              "wcsstr",
         "wcstombs",
     };
+    const char* user32[] = {
+        "wsprintfA", "wsprintfW",
+    };
 
     ExportRegistry registry;
     winabi::register_host_modules(registry);
@@ -1190,6 +1212,14 @@ void test_every_fixture_import_resolves() {
             std::fprintf(stderr, "  msvcrt miss: %s\n", name);
         }
         check(found.address != 0, "every msvcrt import resolves");
+    }
+    for (const char* name : user32) {
+        const ExportLookup found =
+            registry.find_by_name("USER32.dll", name, 0);
+        if (found.address == 0) {
+            std::fprintf(stderr, "  user32 miss: %s\n", name);
+        }
+        check(found.address != 0, "every user32 import resolves");
     }
 
     // The data imports: `__initenv`, `_commode` and `_fmode` are variables

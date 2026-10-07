@@ -453,6 +453,13 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr__vsnprintf(
 extern "C" __attribute__((ms_abi)) std::int32_t cr__snprintf(
     char* buffer, std::uint64_t count, const char* fmt, ...) noexcept;
 
+// user32's simplified printf: integers and text, no floating point, and a
+// wide spelling whose `%s` reads a UTF-16 string from the slot.
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wsprintfA(
+    char* buffer, const char* fmt, ...) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_wsprintfW(
+    char16_t* buffer, const char16_t* fmt, ...) noexcept;
+
 // The file spellings: DOS paths in, host files underneath, and the text
 // mode the Windows CRT reads and writes files through in both directions.
 extern "C" __attribute__((ms_abi)) void* cr_fopen(
