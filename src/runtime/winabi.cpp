@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "occ/runtime/address_space.h"
+#include "occ/runtime/api.h"
 #include "occ/runtime/mapper.h"
 #include "occ/runtime/ntdll.h"
 #include "occ/runtime/objects.h"
@@ -1501,6 +1502,26 @@ own_export_index() noexcept {
     return index;
 }
 
+// A module name with its case folded, for use as a map key.
+//
+// Windows matches a module name without regard to case, so `kernel32.dll`,
+// `KERNEL32.DLL` and `Kernel32.Dll` are one name. `module_basename` strips
+// the path and leaves the case alone, which is right for the registry --
+// an import table is compared against the spelling the module declares --
+// and wrong for a key: a `std::map<std::string, ...>` built under
+// `KERNEL32.dll` does not answer a lookup for `kernel32.dll`, and the
+// `LoadLibraryA` below passes what the guest wrote rather than what the
+// table holds. Folding here is what makes the two meet.
+[[nodiscard]] std::string fold_module_name(std::string_view name) noexcept {
+    std::string folded(name);
+    for (char& c : folded) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return folded;
+}
+
 // The module name a LoadLibrary argument asks for: the bare name, folded
 // the way the registry folds, because `LoadLibraryW("KERNEL32.DLL")` and
 // `LoadLibraryW(L"C:\\Windows\\System32\\kernel32.dll")` are the same ask.
@@ -1529,7 +1550,7 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_LoadLibraryA(
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    const std::string bare = module_basename(name);
+    const std::string bare = fold_module_name(module_basename(name));
     // A module this runtime implements is a handle the registry could have
     // named; anything else is a file this runtime has no spelling for.
     if (own_export_index().count(bare) != 0) {
@@ -1551,7 +1572,7 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_LoadLibraryW(
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    const std::string bare = module_basename(narrow);
+    const std::string bare = fold_module_name(module_basename(narrow));
     if (own_export_index().count(bare) != 0) {
         return handle_for_library(*g, bare);
     }
@@ -4926,6 +4947,31 @@ void add_user32(ExportModule& module) {
     };
 }
 
+void add_kernelbase(ExportModule& module) {
+    module.name = "KERNELBASE.dll";
+    // Kernelbase is where the implementation of the kernel32 surface moved
+    // to, and a guest that imports it directly expects the same answers.
+    // This module holds the names that are exported *only* here: a name that
+    // both modules export belongs to kernel32, because that is the one an
+    // import table from a program written this century will name, and
+    // registering it twice would be a duplicate the index silently resolves
+    // to whichever came first.
+    add_string_kernelbase(module.host_exports);
+}
+
+void add_shlwapi(ExportModule& module) {
+    module.name = "SHLWAPI.dll";
+    // This module is the first whose exports come from a domain rather than
+    // from this file. `SHLWAPI` is where the shell's path and string
+    // helpers live, and both are whole families whose rules are about text
+    // rather than about this runtime, so they live beside each other in
+    // `runtime/api/` and are appended here. The list above and the lists
+    // there are the same list: an export is an export whether it was typed
+    // in this file or contributed by a domain.
+    add_path_shlwapi(module.host_exports);
+    add_string_shlwapi(module.host_exports);
+}
+
 void add_msvcrt(ExportModule& module) {
     module.name = "msvcrt.dll";
     const auto e = [](const char* n, void* fn) {
@@ -5097,42 +5143,42 @@ void add_msvcrt(ExportModule& module) {
 }  // namespace
 
 void register_host_modules(ExportRegistry& registry) {
-    ExportModule kernel32;
-    add_kernel32(kernel32);
-    registry.add(std::move(kernel32));
+    // The one place a module is named. The registry and the handle lookup
+    // are both built from this list, so a module cannot be reachable one
+    // way and missing the other -- which is what the pair of hand-written
+    // lists this replaces allowed, and what made adding a module a change
+    // in three places that had to agree.
+    struct ModuleSpec {
+        const char* name;
+        void (*add)(ExportModule&);
+    };
+    static const ModuleSpec kModules[] = {
+        {"KERNEL32.dll", &add_kernel32},
+        {"KERNELBASE.dll", &add_kernelbase},
+        {"msvcrt.dll", &add_msvcrt},
+        {"USER32.dll", &add_user32},
+        {"SHLWAPI.dll", &add_shlwapi},
+    };
 
-    ExportModule msvcrt;
-    add_msvcrt(msvcrt);
-    registry.add(std::move(msvcrt));
-
-    ExportModule user32;
-    add_user32(user32);
-    registry.add(std::move(user32));
-
-    // The same tables, indexed for `GetProcAddress`. This is the one moment
-    // where the registry and the handle lookup are guaranteed to agree: the
-    // index is built from the same add_* calls that just filled the
-    // registry, so a name either both answer or neither does. The modules
-    // above were moved into the registry, so the three are rebuilt here.
     auto& index = own_export_index();
     index.clear();
-    const auto index_module = [&index](const char* dll) {
+    for (const ModuleSpec& spec : kModules) {
         ExportModule module;
-        if (dll == std::string_view("kernel32.dll")) {
-            add_kernel32(module);
-        } else if (dll == std::string_view("msvcrt.dll")) {
-            add_msvcrt(module);
-        } else {
-            add_user32(module);
-        }
-        auto& names = index[module.name];
+        spec.add(module);
+        module.name = spec.name;
+        // The index is keyed by the folded name. A module name is matched
+        // without regard to case -- the registry's own `module_name_equal`
+        // says so -- and a map key that kept the module's spelling would
+        // make `LoadLibraryA("kernel32.dll")` miss a table filled under
+        // `KERNEL32.dll`. The registry keeps the spelling the module
+        // declares, because that is the name an import table is compared
+        // against; only the lookup key is folded.
+        auto& names = index[fold_module_name(module.name)];
         for (const HostExport& entry : module.host_exports) {
             names.emplace(entry.name, entry.address);
         }
-    };
-    index_module("kernel32.dll");
-    index_module("msvcrt.dll");
-    index_module("user32.dll");
+        registry.add(std::move(module));
+    }
 }
 
 }  // namespace occ::runtime::winabi

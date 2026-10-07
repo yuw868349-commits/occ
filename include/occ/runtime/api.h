@@ -1,0 +1,256 @@
+// The Windows API surface, split into domains.
+//
+// `winabi.cpp` holds the machinery that makes a guest's call arrive at a
+// host function: the ABI stubs, the calling convention, the argument
+// marshalling for the calls whose guest form differs from the host's. It
+// was also holding every handler, which was fine at two hundred of them and
+// is not at twenty thousand.
+//
+// A domain here owns one area of the API and contributes the names it
+// implements. A module is a name plus the domains that make it up:
+// KERNEL32 is the file domain and the path domain and the synchronization
+// domain, and no single translation unit has to know how many others there
+// are. Adding a name is adding a line to a domain's list; adding an area is
+// adding a file.
+//
+// What a domain does not do is decide whether a name exists. The list it
+// contributes is the module's export table, and a name absent from it is a
+// name the module does not export -- which the loader reports to the guest
+// the way the operating system does, rather than by answering a null
+// address.
+
+#ifndef OCC_RUNTIME_API_H
+#define OCC_RUNTIME_API_H
+
+#include "occ/runtime/exports.h"
+
+#include <cstdint>
+#include <vector>
+
+namespace occ::runtime::winabi {
+
+// One module's exports, as the domains fill it. Domains append, so that the
+// order they are called in decides the order of the table and nothing else;
+// two domains that export the same name are a mistake the registry reports
+// rather than one where the later quietly wins.
+using ExportList = std::vector<HostExport>;
+
+// -------------------------------------------------------------------- paths
+
+// The path grammar Windows uses, which is not the host's. A Windows path is
+// `C:\dir\name.ext`, a UNC path adds `\\server\share\`, and both are
+// handled here rather than by handing the string to the host and taking
+// whatever it makes of it -- `/tmp/a` is a path on this machine and a
+// relative path with a drive-less root on Windows, and a runtime that
+// conflates them reports the wrong thing about a guest that meant the
+// second.
+//
+// The rules these follow are Microsoft's, as Wine implements them:
+// `dlls/shlwapi/path.c` for the SHLWAPI family and `dlls/kernelbase/path.c`
+// for the Cch family that replaced it.
+void add_path_shlwapi(ExportList& out);
+void add_path_cch(ExportList& out);
+
+// The entry points themselves, so that a test can call what a guest calls
+// without going through a load. Each is the address the registry hands an
+// import, and the compiler bridges the convention on the way in, which is
+// what a guest's `call [iat]` does. They are declared here rather than in a
+// private header because the tests are the reason they are visible at all.
+extern "C" __attribute__((ms_abi)) char* sw_PathAddBackslashA(
+    char* path) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathAddBackslashW(
+    char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_PathRemoveBackslashA(
+    char* path) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathRemoveBackslashW(
+    char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathRemoveFileSpecA(
+    char* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathRemoveFileSpecW(
+    char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) void sw_PathStripPathA(char* path) noexcept;
+extern "C" __attribute__((ms_abi)) void sw_PathStripPathW(
+    char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_PathFindExtensionA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathFindExtensionW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_PathFindFileNameA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathFindFileNameW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_PathFindNextComponentA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathFindNextComponentW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathGetDriveNumberA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathGetDriveNumberW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_PathGetArgsA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathGetArgsW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_PathSkipRootA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathSkipRootW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathIsRootA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathIsRootW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathIsRelativeA(
+    const char* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathIsRelativeW(
+    const char16_t* path) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathCommonPrefixA(
+    const char* a, const char* b, char* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathCommonPrefixW(
+    const char16_t* a, const char16_t* b, char16_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathAppendA(
+    char* base, const char* more) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_PathAppendW(
+    char16_t* base, const char16_t* more) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_PathCombineA(char* out,
+                                                         const char* dir,
+                                                         const char* file)
+    noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_PathCombineW(
+    char16_t* out, const char16_t* dir, const char16_t* file) noexcept;
+
+// -------------------------------------------------------------------- strings
+
+// The string helpers SHLWAPI exports. These are the `Str*` family: bounded
+// copies, case-insensitive compares, substring searches, and the integer
+// parsers. They are CRT-adjacent but not CRT: the bounds are checked
+// differently, the failure answers are different, and `StrCmpLogicalW` sorts
+// the way Explorer sorts, which is unlike anything in any C library.
+void add_string_shlwapi(ExportList& out);
+void add_string_kernelbase(ExportList& out);
+
+// The `Str*` entry points. The signatures are the headers', and the ones
+// worth reading twice are the two where a plausible guess is wrong:
+// `StrChr` takes the character as a 16-bit value and not an `int`, and
+// `StrTrim` takes the set of characters to remove and not a flag.
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCSpnA(
+    const char* text, const char* set) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCSpnW(
+    const char16_t* text, const char16_t* set) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCSpnIA(
+    const char* text, const char* set) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCSpnIW(
+    const char16_t* text, const char16_t* set) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrChrA(
+    const char* text, std::uint16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrChrW(
+    const char16_t* text, char16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrChrIA(
+    const char* text, std::uint16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrChrIW(
+    const char16_t* text, char16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrChrNW(
+    const char16_t* text, char16_t match, std::uint32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrRChrA(
+    const char* text, const char* end, std::uint16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrRChrW(
+    const char16_t* text, const char16_t* end, char16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrRChrIA(
+    const char* text, const char* end, std::uint16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrRChrIW(
+    const char16_t* text, const char16_t* end, char16_t match) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrPBrkA(const char* text,
+                                                     const char* set) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrPBrkW(
+    const char16_t* text, const char16_t* set) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrSpnA(
+    const char* text, const char* set) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrSpnW(
+    const char16_t* text, const char16_t* set) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrStrA(const char* hay,
+                                                    const char* needle) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrStrW(
+    const char16_t* hay, const char16_t* needle) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrStrIA(
+    const char* hay, const char* needle) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrStrIW(
+    const char16_t* hay, const char16_t* needle) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrStrNW(
+    const char16_t* hay, const char16_t* needle, std::uint32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrStrNIW(
+    const char16_t* hay, const char16_t* needle, std::uint32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrRStrIA(
+    const char* hay, const char* last, const char* needle) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrRStrIW(
+    const char16_t* hay, const char16_t* last, const char16_t* needle) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpW(
+    const char16_t* a, const char16_t* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpIW(
+    const char16_t* a, const char16_t* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpCA(
+    const char* a, const char* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpCW(
+    const char16_t* a, const char16_t* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpICA(
+    const char* a, const char* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpICW(
+    const char16_t* a, const char16_t* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNA(
+    const char* a, const char* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNW(
+    const char16_t* a, const char16_t* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNCA(
+    const char* a, const char* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNCW(
+    const char16_t* a, const char16_t* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNIA(
+    const char* a, const char* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNIW(
+    const char16_t* a, const char16_t* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNICA(
+    const char* a, const char* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpNICW(
+    const char16_t* a, const char16_t* b, std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrCmpLogicalW(
+    const char16_t* a, const char16_t* b) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrIsIntlEqualA(
+    std::int32_t case_sensitive, const char* a, const char* b,
+    std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrIsIntlEqualW(
+    std::int32_t case_sensitive, const char16_t* a, const char16_t* b,
+    std::int32_t bound) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrCpyNW(
+    char16_t* dest, const char16_t* source, std::int32_t capacity) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrCpyNXA(
+    char* dest, const char* source, std::int32_t capacity) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrCpyNXW(
+    char16_t* dest, const char16_t* source, std::int32_t capacity) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrCatBuffA(
+    char* dest, const char* source, std::int32_t capacity) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrCatBuffW(
+    char16_t* dest, const char16_t* source, std::int32_t capacity) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t sw_StrCatChainW(
+    char16_t* dest, std::uint32_t capacity, std::uint32_t at,
+    const char16_t* source) noexcept;
+extern "C" __attribute__((ms_abi)) char* sw_StrDupA(const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) char16_t* sw_StrDupW(
+    const char16_t* text) noexcept;
+extern "C" __attribute__((ms_abi)) void sw_StrTrimA(char* text,
+                                                    const char* set) noexcept;
+extern "C" __attribute__((ms_abi)) void sw_StrTrimW(
+    char16_t* text, const char16_t* set) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToIntA(
+    const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToIntW(
+    const char16_t* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToIntExA(
+    const char* text, std::int32_t flags, std::int32_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToIntExW(
+    const char16_t* text, std::int32_t flags, std::int32_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToInt64ExA(
+    const char* text, std::int32_t flags, std::int64_t* out) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToInt64ExW(
+    const char16_t* text, std::int32_t flags, std::int64_t* out) noexcept;
+
+}  // namespace occ::runtime::winabi
+
+#endif  // OCC_RUNTIME_API_H

@@ -571,6 +571,8 @@ add_library(occ_core STATIC
     src/runtime/pe_process.cpp
     src/runtime/seh.cpp
     src/runtime/winabi.cpp
+    src/runtime/api/path.cpp
+    src/runtime/api/string.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)
