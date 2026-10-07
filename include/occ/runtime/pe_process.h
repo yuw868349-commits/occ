@@ -167,6 +167,18 @@ struct ProcessImage {
     std::uint64_t entry_point = 0;
     std::uint64_t initial_stack_pointer = 0;
 
+    // The image's own exports, at absolute addresses. `GetProcAddress` on
+    // the image's module answers from here, and the run hands the table to
+    // the guest state. An image that exports nothing leaves it empty.
+    struct ExportRecord {
+        std::string name;
+        std::uint32_t ordinal = 0;
+        std::uint64_t address = 0;
+        bool is_forwarder = false;
+        std::uint64_t forwarder_text = 0;
+    };
+    std::vector<ExportRecord> own_exports;
+
     // The TEB and the PEB, as addresses in this space.
     std::uint64_t teb = 0;
     std::uint64_t peb = 0;

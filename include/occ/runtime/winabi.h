@@ -44,6 +44,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -124,6 +125,32 @@ struct GuestState {
     // to be told about a math error has asked for an observable thing, even
     // though no current guest path reaches it.
     std::uint64_t matherr = 0;
+
+    // The guest image's own exports, as `GetProcAddress` on the image's
+    // module reads them: the name, the ordinal the outside world sees, and
+    // the absolute address the export lives at. A forwarder keeps the
+    // address of the forwarder text, which is what Windows answers for one
+    // -- the caller that reads the string finds the DLL and symbol there.
+    // Filled by the process builder from the parsed export directory, and
+    // empty for an image that exports nothing.
+    struct GuestExport {
+        std::string name;
+        std::uint32_t ordinal = 0;
+        std::uint64_t address = 0;
+        bool is_forwarder = false;
+        std::uint64_t forwarder_text = 0;
+    };
+    std::vector<GuestExport> own_exports;
+
+    // The libraries `LoadLibrary` has answered with, as pseudo handles and
+    // the module names they stand for. The handles are this runtime's own
+    // small numbers, never zero and never a guest address, which is what
+    // makes `GetProcAddress`'s handle check a map lookup rather than a
+    // guess about what a pointer means. The registry the resolver serves
+    // is the runner's, and answering a handle from here keeps the two in
+    // step: a handle exists only for a module the registry can name.
+    std::map<std::uint64_t, std::string> libraries;
+    std::uint64_t next_library_handle = 0;
 
     // The guest's `SetUnhandledExceptionFilter` callback, or zero. The fault
     // handler reads this before deciding that a fault is unhandled.

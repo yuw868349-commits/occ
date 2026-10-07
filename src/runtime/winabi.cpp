@@ -88,6 +88,8 @@ constexpr std::uint32_t kErrorInsufficientBuffer = 122;
 constexpr std::uint32_t kErrorNoMoreItems = 381;
 constexpr std::uint32_t kErrorInvalidParameter = 87;
 constexpr std::uint32_t kErrorEnvVarNotFound = 203;
+constexpr std::uint32_t kErrorProcNotFound = 127;
+constexpr std::uint32_t kErrorModNotFound = 126;
 
 // --------------------------------------------------------------------------
 // TEB access
@@ -1410,6 +1412,154 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetModuleHandleW(
     return 0;
 }
 
+// ---- LoadLibrary and GetProcAddress ---------------------------------------
+//
+// The handle a LoadLibrary answers is this runtime's own small number,
+// recorded beside the module name it stands for. The registry the guest's
+// imports resolve through is the runner's, and a handle issued here is
+// issued only for a module the same registry can name -- which is what
+// keeps `GetProcAddress(handle, ...)` a lookup in the same table the
+// import walk used, rather than a second answer that could disagree.
+//
+// The image's own module is its base, as `GetModuleHandle` already says,
+// and a lookup there reads the exports the process builder copied from
+// the image's own export directory.
+
+namespace {
+
+// The host modules this runtime implements, as the lookup `GetProcAddress`
+// answers for a handle `LoadLibrary` issued. Filled when the host modules
+// are registered, which is the one moment the same table is known to the
+// registry and to the handle lookup; a name registered later would not be
+// visible to either half of a load that already ran.
+std::map<std::string, std::map<std::string, std::uint64_t>>&
+own_export_index() noexcept {
+    static std::map<std::string, std::map<std::string, std::uint64_t>> index;
+    return index;
+}
+
+// The module name a LoadLibrary argument asks for: the bare name, folded
+// the way the registry folds, because `LoadLibraryW("KERNEL32.DLL")` and
+// `LoadLibraryW(L"C:\\Windows\\System32\\kernel32.dll")` are the same ask.
+// The same name hands back the same handle, which is what a program that
+// loads twice and compares the handles expects to see.
+[[nodiscard]] std::uint64_t handle_for_library(GuestState& g,
+                                               const std::string& bare) {
+    for (const auto& [handle, name] : g.libraries) {
+        if (name == bare) {
+            return handle;
+        }
+    }
+    const std::uint64_t handle =
+        0x00005E1700000000ULL + g.next_library_handle * 0x1000ULL;
+    ++g.next_library_handle;
+    g.libraries.emplace(handle, bare);
+    return handle;
+}
+
+}  // namespace
+
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_LoadLibraryA(
+    const char* name) noexcept {
+    GuestState* g = require_state();
+    if (g == nullptr || name == nullptr || name[0] == '\0') {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    const std::string bare = module_basename(name);
+    // A module this runtime implements is a handle the registry could have
+    // named; anything else is a file this runtime has no spelling for.
+    if (own_export_index().count(bare) != 0) {
+        return handle_for_library(*g, bare);
+    }
+    set_last_error(kErrorModNotFound);
+    return 0;
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_LoadLibraryW(
+    const char16_t* name) noexcept {
+    GuestState* g = require_state();
+    if (g == nullptr || name == nullptr || name[0] == u'\0') {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    std::string narrow;
+    if (!utf16_to_utf8(std::u16string_view(name), narrow)) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    const std::string bare = module_basename(narrow);
+    if (own_export_index().count(bare) != 0) {
+        return handle_for_library(*g, bare);
+    }
+    set_last_error(kErrorModNotFound);
+    return 0;
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_LoadLibraryExW(
+    const char16_t* name, void* file, std::uint32_t flags) noexcept {
+    // The flags name search-path and sharing decisions this runtime does
+    // not have; the module table is the whole of the answer either way.
+    (void)file;
+    (void)flags;
+    return k32_LoadLibraryW(name);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetProcAddress(
+    std::uint64_t module, const char* name) noexcept {
+    GuestState* g = require_state();
+    if (g == nullptr || module == 0) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    // An ordinal ask travels as MAKEINTRESOURCE: the value is the ordinal
+    // itself, and a real name is never that small.
+    if (reinterpret_cast<std::uint64_t>(name) <= 0xFFFFULL) {
+        const std::uint32_t ordinal =
+            static_cast<std::uint32_t>(reinterpret_cast<std::uint64_t>(name));
+        if (module == g->image_base) {
+            for (const auto& entry : g->own_exports) {
+                if (entry.ordinal == ordinal) {
+                    return entry.address;
+                }
+            }
+        }
+        set_last_error(kErrorProcNotFound);
+        return 0;
+    }
+
+    // The image's own module: the export directory the builder copied.
+    if (module == g->image_base) {
+        for (const auto& entry : g->own_exports) {
+            if (entry.name == name) {
+                return entry.is_forwarder ? entry.forwarder_text
+                                          : entry.address;
+            }
+        }
+        set_last_error(kErrorProcNotFound);
+        return 0;
+    }
+
+    // A handle LoadLibrary issued: the host table under the name it was
+    // issued for.
+    const auto held = g->libraries.find(module);
+    if (held == g->libraries.end()) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    const auto module_exports = own_export_index().find(held->second);
+    if (module_exports == own_export_index().end()) {
+        set_last_error(kErrorProcNotFound);
+        return 0;
+    }
+    const auto found = module_exports->second.find(name);
+    if (found == module_exports->second.end()) {
+        set_last_error(kErrorProcNotFound);
+        return 0;
+    }
+    return found->second;
+}
+
 extern "C" __attribute__((ms_abi)) void k32_GetStartupInfoA(
     void* info) noexcept {
     // The structure is 104 bytes on x64 and every field a console program
@@ -1463,6 +1613,18 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetCurrentProcess() noexcep
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetCurrentThread() noexcept {
     return 0xFFFFFFFFFFFFFFFEULL;
+}
+
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetThreadId(
+    std::uint64_t thread) noexcept {
+    // One thread runs the guest, so the handle's only interesting property
+    // is whether it names that thread: the current pseudo-handle does, and
+    // so does the answer `GetCurrentThread` gave. A null handle names
+    // nothing, which is the zero Windows answers.
+    if (thread == 0) {
+        return 0;
+    }
+    return guest_thread_id();
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32_IsDebuggerPresent() noexcept {
@@ -1778,6 +1940,44 @@ extern "C" __attribute__((ms_abi)) void k32_DeleteCriticalSection(
     // The futex has no kernel-side resource to release; the guest's memory
     // is the whole of the object and it is the guest's to free.
     (void)cs;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t k32_TryEnterCriticalSection(
+    void* cs) noexcept {
+    // Enter without the wait: the same fields, read once. Free means the
+    // exchange takes it; held by this thread means the recursion count
+    // climbs and the try succeeds, the way an Enter from the owner would;
+    // held by anyone else means the answer is no, without the sleep an
+    // Enter would reach.
+    if (cs == nullptr) {
+        return 0;
+    }
+    const std::uint64_t self = guest_thread_id();
+    std::uint64_t owner = 0;
+    __builtin_memcpy(&owner, static_cast<char*>(cs) + 16, sizeof(owner));
+    if (owner == self && owner != 0) {
+        std::uint32_t recursion = 0;
+        __builtin_memcpy(&recursion, static_cast<char*>(cs) + 12,
+                         sizeof(recursion));
+        ++recursion;
+        __builtin_memcpy(static_cast<char*>(cs) + 12, &recursion,
+                         sizeof(recursion));
+        return 1;
+    }
+    std::uint32_t state = 0;
+    __builtin_memcpy(&state, static_cast<char*>(cs) + 8, sizeof(state));
+    std::uint32_t desired = state | kCsLockedBit;
+    if ((state & kCsWakeupBit) == 0) {
+        desired |= kCsWakeupBit;
+    }
+    if (cs_compare_exchange(cs, state, desired) == state) {
+        std::uint64_t own = self;
+        __builtin_memcpy(static_cast<char*>(cs) + 16, &own, sizeof(own));
+        std::uint32_t one = 1;
+        __builtin_memcpy(static_cast<char*>(cs) + 12, &one, sizeof(one));
+        return 1;
+    }
+    return 0;
 }
 
 // ---- TLS ----------------------------------------------------------------
@@ -2656,6 +2856,31 @@ extern "C" __attribute__((ms_abi)) void* cr_calloc(
 
 extern "C" __attribute__((ms_abi)) void cr_free(void* block) noexcept {
     ::free(block);
+}
+
+extern "C" __attribute__((ms_abi)) void* cr_realloc(
+    void* block, std::uint64_t bytes) noexcept {
+    // The realloc contract is the C one: grow or shrink in place when the
+    // heap can, move when it cannot, and answer null for a zero-byte ask
+    // only because the host's own realloc does. A guest that treats the
+    // answer as "the block, possibly elsewhere" is the only caller this
+    // spelling has.
+    return ::realloc(block, static_cast<std::size_t>(bytes));
+}
+
+extern "C" __attribute__((ms_abi)) void* cr_memchr(const void* haystack,
+                                                   std::int32_t needle,
+                                                   std::uint64_t bytes) noexcept {
+    // The byte searched for is the low byte of the int, which is what both
+    // the C standard and the Microsoft spelling say, and the length is the
+    // whole of the argument -- a count the guest believes it owns. The
+    // answer loses the const the search came in with, which is the C
+    // function's own signature and the guest's own view of its memory.
+    if (haystack == nullptr || bytes == 0) {
+        return nullptr;
+    }
+    return const_cast<void*>(::memchr(haystack, static_cast<int>(needle),
+                                      static_cast<std::size_t>(bytes)));
 }
 
 extern "C" __attribute__((ms_abi)) void* cr_memcpy(
@@ -3864,6 +4089,25 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_fclose(
     return ::fclose(target);
 }
 
+extern "C" __attribute__((ms_abi)) std::int32_t cr__read(
+    std::int32_t fd, void* buffer, std::uint32_t count) noexcept {
+    // The low-level read under the CRT's own name. The three standard
+    // descriptors are the host's own -- the runtime never renumbers them --
+    // so the call is the host's read narrowed to the int the CRT returns.
+    // Anything else is a descriptor this file face never issued, and a
+    // caller that reaches one is reading a table that does not exist.
+    if (buffer == nullptr || fd < 0) {
+        return -1;
+    }
+    if (fd > 2) {
+        errno = EBADF;
+        return -1;
+    }
+    const ::ssize_t got =
+        ::read(fd, buffer, static_cast<std::size_t>(count));
+    return static_cast<std::int32_t>(got);
+}
+
 extern "C" __attribute__((ms_abi)) std::uint64_t cr_fread(
     void* buffer, std::uint64_t size, std::uint64_t count,
     void* stream) noexcept {
@@ -4110,6 +4354,11 @@ void add_kernel32(ExportModule& module) {
           reinterpret_cast<void*>(&k32_GetModuleFileNameW)),
         e("GetModuleHandleA", reinterpret_cast<void*>(&k32_GetModuleHandleA)),
         e("GetModuleHandleW", reinterpret_cast<void*>(&k32_GetModuleHandleW)),
+        e("GetProcAddress", reinterpret_cast<void*>(&k32_GetProcAddress)),
+        e("LoadLibraryA", reinterpret_cast<void*>(&k32_LoadLibraryA)),
+        e("LoadLibraryW", reinterpret_cast<void*>(&k32_LoadLibraryW)),
+        e("LoadLibraryExW", reinterpret_cast<void*>(&k32_LoadLibraryExW)),
+        e("GetThreadId", reinterpret_cast<void*>(&k32_GetThreadId)),
         e("GetStartupInfoA", reinterpret_cast<void*>(&k32_GetStartupInfoA)),
         e("GetStartupInfoW", reinterpret_cast<void*>(&k32_GetStartupInfoW)),
         e("GetCurrentProcessId",
@@ -4137,6 +4386,8 @@ void add_kernel32(ExportModule& module) {
           reinterpret_cast<void*>(&k32_LeaveCriticalSection)),
         e("DeleteCriticalSection",
           reinterpret_cast<void*>(&k32_DeleteCriticalSection)),
+        e("TryEnterCriticalSection",
+          reinterpret_cast<void*>(&k32_TryEnterCriticalSection)),
         e("SetUnhandledExceptionFilter",
           reinterpret_cast<void*>(&k32_SetUnhandledExceptionFilter)),
         e("Sleep", reinterpret_cast<void*>(&k32_Sleep)),
@@ -4264,6 +4515,8 @@ void add_msvcrt(ExportModule& module) {
         e("difftime", reinterpret_cast<void*>(&cr_difftime)),
         e("div", reinterpret_cast<void*>(&cr_div)),
         e("exit", reinterpret_cast<void*>(&cr_exit)),
+        e("memchr", reinterpret_cast<void*>(&cr_memchr)),
+        e("realloc", reinterpret_cast<void*>(&cr_realloc)),
         e("fclose", reinterpret_cast<void*>(&cr_fclose)),
         e("feof", reinterpret_cast<void*>(&cr_feof)),
         e("ferror", reinterpret_cast<void*>(&cr_ferror)),
@@ -4276,6 +4529,7 @@ void add_msvcrt(ExportModule& module) {
         e("fputs", reinterpret_cast<void*>(&cr_fputs)),
         e("fread", reinterpret_cast<void*>(&cr_fread)),
         e("free", reinterpret_cast<void*>(&cr_free)),
+        e("_read", reinterpret_cast<void*>(&cr__read)),
         e("fseek", reinterpret_cast<void*>(&cr_fseek)),
         e("fseeki64", reinterpret_cast<void*>(&cr_fseeki64)),
         e("ftell", reinterpret_cast<void*>(&cr_ftell)),
@@ -4370,6 +4624,31 @@ void register_host_modules(ExportRegistry& registry) {
     ExportModule user32;
     add_user32(user32);
     registry.add(std::move(user32));
+
+    // The same tables, indexed for `GetProcAddress`. This is the one moment
+    // where the registry and the handle lookup are guaranteed to agree: the
+    // index is built from the same add_* calls that just filled the
+    // registry, so a name either both answer or neither does. The modules
+    // above were moved into the registry, so the three are rebuilt here.
+    auto& index = own_export_index();
+    index.clear();
+    const auto index_module = [&index](const char* dll) {
+        ExportModule module;
+        if (dll == std::string_view("kernel32.dll")) {
+            add_kernel32(module);
+        } else if (dll == std::string_view("msvcrt.dll")) {
+            add_msvcrt(module);
+        } else {
+            add_user32(module);
+        }
+        auto& names = index[module.name];
+        for (const HostExport& entry : module.host_exports) {
+            names.emplace(entry.name, entry.address);
+        }
+    };
+    index_module("kernel32.dll");
+    index_module("msvcrt.dll");
+    index_module("user32.dll");
 }
 
 }  // namespace occ::runtime::winabi

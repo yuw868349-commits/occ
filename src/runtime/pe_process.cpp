@@ -537,6 +537,24 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
 
     // --- 8. where the thread starts --------------------------------------
 
+    // The image's own exports, at absolute addresses, for `GetProcAddress`
+    // on the image's module. The parser has already walked the directory and
+    // named the forwarders; this is the same walk, once, at the width the
+    // process will answer from. An export whose RVA is zero is the empty
+    // slot the format keeps, not an export at address zero.
+    for (const parser::PeExport& entry : image.exports()) {
+        if (entry.rva == 0) {
+            continue;
+        }
+        ProcessImage::ExportRecord record;
+        record.name = entry.name;
+        record.ordinal = entry.ordinal;
+        record.address = image_out.module.base + entry.rva;
+        record.is_forwarder = entry.is_forwarder;
+        record.forwarder_text = image_out.module.base + entry.rva;
+        image_out.own_exports.push_back(std::move(record));
+    }
+
     image_out.entry_point = image_out.module.entry_va;
     // **The stack a Windows entry point expects is not a bare stack top.**
     // The x64 ABI reserves 32 bytes of "shadow space" below the return
@@ -1068,6 +1086,15 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     state.command_line = options.command_line;
     (void)winabi::utf8_to_utf16(options.command_line, state.command_line_u16);
     state.image_path_dos = winabi::to_dos_path(options.image_path);
+    for (const ProcessImage::ExportRecord& entry : image.own_exports) {
+        winabi::GuestState::GuestExport copy;
+        copy.name = entry.name;
+        copy.ordinal = entry.ordinal;
+        copy.address = entry.address;
+        copy.is_forwarder = entry.is_forwarder;
+        copy.forwarder_text = entry.forwarder_text;
+        state.own_exports.push_back(std::move(copy));
+    }
 
     // The argv the C startup hands out, which is the command line parsed by
     // the Microsoft rules -- the same rules the guest would apply itself,
