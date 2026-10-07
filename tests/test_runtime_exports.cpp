@@ -1223,10 +1223,27 @@ void test_a_real_image_resolves_its_imports_through_the_registry() {
     // kernel32 is *placed* at a base of its own, which is what makes the
     // registry's answer an address rather than an RVA. Without `mapped` the
     // registry refuses every export, and this test would pass for the wrong
-    // reason if it did not notice.
+    // reason if it did not notice. The export table reaches ordinal 55
+    // because the fixture's second import is by ordinal 55, and a load that
+    // will run refuses the whole image when an import cannot be named -- an
+    // end-to-end walk that wants both imports answered needs a registry that
+    // can answer both, which is itself a fact worth building into a fixture.
     const std::uint64_t k32 = 0x7F0000000000ULL;
+    std::vector<Entry> wide;
+    wide.push_back(an_export("CreateFileW", 0x1100));
+    wide.push_back(an_export("CloseHandle", 0x1200));
+    wide.push_back(an_export("Sleep", 0x1300));
+    while (wide.size() < 54) {
+        wide.push_back(an_export("filler", 0x2000));
+    }
+    // The fifty-fifth entry. With a base of 1, ordinal 55 is index 54, and
+    // its RVA is what the second import's slot has to end up holding -- an
+    // RVA no other entry carries, so the assertion can tell the answer the
+    // index arithmetic produces from one a sloppier lookup would produce.
+    wide.push_back(an_export("Export55", 0x1400));
+    ExportModule placed = a_module("kernel32.dll", k32, std::move(wide));
     ExportRegistry reg;
-    reg.add(a_library("kernel32.dll", k32));
+    reg.add(std::move(placed));
 
     LoadContext ctx;
     ctx.resolver_state = &reg;
@@ -1278,18 +1295,21 @@ void test_a_real_image_resolves_its_imports_through_the_registry() {
               "which is the one thing a resolver wired to nothing could not "
               "produce");
 
-        // The ordinal import names 55 with a base of 1, so it is index 54 and
-        // no such slot exists. It stays unresolved, and *nothing is written*:
-        // a loader that answered an unresolvable ordinal with the module
-        // base would hand a program an address at the image's headers.
-        check(!r.module.imports[1].resolved,
-              "e2e: an ordinal past the end of the export table does not "
-              "resolve");
+        // The ordinal import names 55, which is index 54 against a base of
+        // 1 -- the table's last entry. The record keeps saying it was an
+        // ordinal, and the address is the base plus that entry's RVA: the
+        // index arithmetic the registry unit tests cover, seen end to end
+        // through a real image.
+        check(r.module.imports[1].resolved,
+              "e2e: the ordinal import resolves -- a load that will run "
+              "refuses an import nobody can name, so the registry's table "
+              "reaches it");
         check(r.module.imports[1].by_ordinal,
               "e2e: and the record still says it was an ordinal, because "
-              "refusing is not the same as misreading");
-        check(r.module.imports[1].target_va == 0,
-              "e2e: an unresolved import carries no address at all");
+              "answering by number is not the same as answering by name");
+        check(r.module.imports[1].target_va == k32 + 0x1400,
+              "e2e: the ordinal's answer is the base plus the table's "
+              "fifty-fifth entry, whose RVA no other entry carries");
     }
 
     if (r.ok) {
@@ -1309,11 +1329,58 @@ void test_a_real_image_resolves_its_imports_through_the_registry() {
               "e2e: the IAT slot in memory holds the registry's answer -- "
               "the loader's record and the bytes a program jumps through are "
               "the same fact, and only one of them is the program");
-        check(read_u64_at(ordinal_slot) == 0x8000000000000037ull,
-              "e2e: and the unresolved slot still holds its original thunk, "
-              "because a resolver that cannot answer writes nothing rather "
-              "than writing zero");
+        check(read_u64_at(ordinal_slot) == k32 + 0x1400,
+              "e2e: and the ordinal slot holds the registry's answer too -- "
+              "the two spellings reach the IAT through the same store");
     }
+}
+
+// The same image against a registry that cannot name the ordinal import: a
+// load that will run refuses. The slot keeps whatever the file put in it,
+// which is an address nowhere, and the crash the first call makes lands far
+// away from the cause -- so the refusal happens before anything is left
+// pointing at nothing, and the report names the import that dangles.
+void test_a_load_whose_import_nobody_can_name_refuses_to_run() {
+    constexpr std::uint64_t kImageBase = 0x1C0000000;
+    const ImageFixture f = an_image_importing_two_symbols(kImageBase);
+    const PeImage image =
+        PeImage::parse(ByteSpan{f.bytes.data(), f.bytes.size()});
+
+    // Three exports: enough to answer the named import and not the ordinal
+    // one, which is exactly the shape the refusal exists for.
+    const std::uint64_t k32 = 0x7F0000000000ULL;
+    ExportRegistry reg;
+    reg.add(a_library("kernel32.dll", k32));
+
+    LoadContext ctx;
+    ctx.resolver_state = &reg;
+    ctx.resolve = &ExportRegistry::resolve_thunk;
+
+    AddressSpace sp;
+    Mapper m(sp);
+    ctx.placement = &m;
+    const std::uint64_t free_base = a_free_base(0x10000);
+    if (free_base == 0) {
+        std::fprintf(stderr,
+                     "SKIP refuse: no free base to place the image at\n");
+        return;
+    }
+    const auto r = load_image_retrying(image,
+                                       ByteSpan{f.bytes.data(), f.bytes.size()},
+                                       free_base, sp, ctx);
+    check(!r.ok,
+          "refuse: a load with an import nobody can name does not run");
+    check(r.error == LoadError::MissingImport,
+          "refuse: and the error is the missing-import one, the shape a "
+          "caller tells a dangling import apart from every other refusal "
+          "with");
+    check(r.detail.find("kernel32.dll!#55") != std::string::npos,
+          "refuse: and the report names the import -- the ordinal rendered "
+          "as text under the record's own spelling, so the reader can see "
+          "which one dangles");
+    check(r.detail.find("CreateFileW") == std::string::npos,
+          "refuse: and it does not name the import that resolved -- the "
+          "report lists what dangles, not everything the table held");
 }
 
 // The same image against a context with no resolver: it loads, the imports
@@ -1433,6 +1500,7 @@ int main() {
     test_the_resolve_entry_point_matches_the_loaders_signature();
     test_a_context_wired_to_a_registry_resolves_and_writes_the_iat();
     test_a_real_image_resolves_its_imports_through_the_registry();
+    test_a_load_whose_import_nobody_can_name_refuses_to_run();
     test_an_image_without_a_resolver_records_its_imports_and_writes_nothing();
 
     std::printf("%d checks, %d failures\n", checks, failures);

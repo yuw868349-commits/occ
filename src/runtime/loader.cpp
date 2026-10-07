@@ -1697,6 +1697,34 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
         }
     }
 
+    // An import the resolver could not name is a load that will fault the
+    // first time the guest reaches the call: the IAT slot keeps the small
+    // number it read from the file, which is an address nowhere, and the
+    // crash it makes lands far away from the cause. A load that is going
+    // to run refuses here instead, and the refusal names every import it
+    // would have left pointing at nothing. A load without a placement -- a
+    // check, an inspection -- has no guest to fault; it keeps the records
+    // and lets the report say what the file wanted. And a load whose
+    // caller supplied no resolver never counts: an absence of answers
+    // nobody asked for is not a missing import.
+    if (placement != nullptr && context.resolve != nullptr) {
+        bool any_unresolved = false;
+        std::string names;
+        for (const auto& entry : module.imports) {
+            if (entry.resolved) {
+                continue;
+            }
+            any_unresolved = true;
+            names += "\n  " + entry.dll + "!" + entry.name;
+        }
+        if (any_unresolved) {
+            out.error = LoadError::MissingImport;
+            out.detail = "imports no registry could name:" + names;
+            rollback_placement(*placement, batch);
+            return out;
+        }
+    }
+
     // ----------------------------------------------------------------- TLS
     //
     // The directory is read here and the slot is handed out here, and the
@@ -1969,7 +1997,11 @@ LoadResult load_image_retrying(const parser::PeImage& image, ByteSpan bytes,
         // problem with a refusal that names the wrong one.
         if (out.error != LoadError::AddressConflict) {
             local.error = out.error;
-            local.detail = std::move(out.detail);
+            // A copy, not a move: `out` is the caller's answer and its
+            // detail is the report the caller reads. A move here emptied
+            // every refusal that reached this layer of exactly the words
+            // that named the problem.
+            local.detail = out.detail;
             local.attempts = attempts;
             if (report != nullptr) {
                 *report = std::move(local);
