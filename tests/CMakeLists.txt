@@ -57,12 +57,36 @@ endfunction()
 # where their assertions are about seccomp and namespaces rather than about a
 # sanitizer's shadow memory.
 #
+# occ_test_seh is the third of the family, and it is the one whose
+# incompatibility is subtlest and was invisible the longest. The SEH tests do
+# not have a guest stack to unfold -- the guest is a fixture, not a process --
+# so they hand `seh::dispatch` the *test's own* stack addresses as the
+# `stack_low`/`stack_high` window and point the fixture's RSP inside that
+# window. `dispatch` then reads the stack by design: `load_stack_u64` bounds
+# each read with `StackRange::holds`, which is a subtraction against the
+# window and does exactly what a real unwind does. AddressSanitizer cannot see
+# the window. It sees a read of an address that lies inside `dispatch`'s own
+# frame -- past the end of its `walked` buffer, or inside a frame whose
+# function has already returned -- and reports a stack-buffer-overflow or a
+# stack-use-after-return. Both are the sanitizer being right about the address
+# and wrong about the meaning: the address is a guest stack address that
+# happens to live in a host frame, which is the whole method.
+#
+# `detect_stack_use_after_return=0` removes the second report and not the
+# first, and the first cannot be turned off without turning off a core
+# overflow check for every binary in the build. So this one joins the other
+# two rather than being configured: the ordinary build runs it, where its
+# assertions are about unwinding and about a window, and a sanitized build
+# does not, because a sanitizer there would be testing its own shadow memory's
+# disagreement with a forged stack rather than this project's unwinder.
+#
 # The other five are instrumented in a sanitized build and should stay that
 # way: they parse untrusted bytes and build events, which is the work a
 # sanitizer is for.
 if(NOT OCC_SANITIZED_BUILD AND NOT OCC_ENABLE_FUZZ)
     occ_add_test(occ_test_seccomp test_seccomp.cpp)
     occ_add_test(occ_test_container test_container.cpp)
+    occ_add_test(occ_test_seh test_seh.cpp)
 endif()
 occ_add_test(occ_test_detect test_detect.cpp)
 occ_add_test(occ_test_elf test_elf.cpp)
@@ -78,7 +102,6 @@ occ_add_test(occ_test_probe_wiring test_probe_wiring.cpp)
 occ_add_test(occ_test_pe test_pe.cpp)
 occ_add_test(occ_test_runtime_loader test_runtime_loader.cpp)
 occ_add_test(occ_test_runtime_exports test_runtime_exports.cpp)
-occ_add_test(occ_test_seh test_seh.cpp)
 occ_add_test(occ_test_winabi test_winabi.cpp)
 occ_add_test(occ_test_mapper test_mapper.cpp)
 occ_add_test(occ_test_ntdll test_ntdll.cpp)

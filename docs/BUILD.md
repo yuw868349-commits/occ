@@ -256,6 +256,25 @@ child allow the small set of calls the sanitizer needs to die (`sigaltstack`,
 because a timeout in `ctest` reads as a failure of whatever ran last, and the
 thing that ran last is not the thing that broke.
 
+**`occ_test_seh` reports a stack overflow under ASan, and that too is
+structural.** The SEH tests have no guest process, so they hand
+`seh::dispatch` the test's own stack addresses as the unwinding window and put
+the fixture's RSP inside it. The unwinder then reads the stack by design, and
+`load_stack_u64` bounds every read with `StackRange::holds` -- a subtraction
+against the window, which is what a real unwind does. ASan cannot see the
+window: it sees a read of an address that lies past the end of `dispatch`'s
+`walked` buffer, or inside a frame whose function already returned, and calls
+it a `stack-buffer-overflow` or a `stack-use-after-return`. Both are the
+sanitizer being right about the address and wrong about the meaning -- the
+address is a guest stack address that happens to live in a host frame, which is
+the entire method. `detect_stack_use_after_return=0` removes the second report
+and not the first, and the first is a core check that cannot be turned off for
+one binary without turning it off for the build. So `occ_test_seh` is not built
+in a sanitized build, for the same reason the two above are not: a sanitizer
+there would be testing its own shadow memory's disagreement with a forged stack
+rather than this project's unwinder. The ordinary build runs it, and that is
+where its assertions about unwinding and the window belong.
+
 ## Sanitizer build of the test suite
 
 ```
