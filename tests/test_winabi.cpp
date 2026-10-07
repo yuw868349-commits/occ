@@ -24,14 +24,17 @@
 //     somewhere else.
 
 #include "occ/runtime/exports.h"
+#include "occ/runtime/objects.h"
 #include "occ/runtime/winabi.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace occ;
@@ -1185,6 +1188,116 @@ void test_crt_time_env() {
 
 // --------------------------------------------------------------- registry
 
+// The synchronization objects: what a wait does to the thing it waited on.
+//
+// The table answers handles and the waits block on them, so what is worth
+// asserting is not that a handle came back but what the wait did to the
+// object's state. The two event kinds differ in exactly that, and the
+// difference is what a program depends on: one `SetEvent` on a manual-reset
+// event releases every waiter and leaves the event signalled, and on an
+// auto-reset event it releases one and spends the signal.
+void test_synchronization_objects() {
+    const std::uint64_t before = objects::live_count();
+
+    // An event starts in the state the caller asked for, and its handle
+    // comes from the object namespace rather than the file one.
+    const std::uint64_t manual = objects::create_event(true, false);
+    check(manual != 0, "event: a manual-reset event is created");
+    check(manual >= objects::kHandleBase,
+          "event: the handle comes from the object namespace");
+    check(objects::is_object(manual), "event: and the table knows it");
+    check(objects::live_count() == before + 1,
+          "event: creating one leaves one more live object");
+
+    // Not signalled yet: a zero timeout asks now and is told so.
+    check(objects::wait_one(manual, 0) == objects::WaitOutcome::TimedOut,
+          "event: a non-signalled event times out a zero wait");
+
+    check(objects::set_event(manual), "event: setting it succeeds");
+    check(objects::wait_one(manual, 0) == objects::WaitOutcome::Signalled,
+          "event: and the wait finds it");
+    check(objects::wait_one(manual, 0) == objects::WaitOutcome::Signalled,
+          "event: a manual-reset event stays signalled for the next waiter");
+
+    check(objects::reset_event(manual), "event: resetting it succeeds");
+    check(objects::wait_one(manual, 0) == objects::WaitOutcome::TimedOut,
+          "event: and it is not signalled afterwards");
+
+    // The auto-reset kind spends its signal on the wait that finds it,
+    // which is what makes it a one-shot wakeup.
+    const std::uint64_t automatic = objects::create_event(false, false);
+    check(automatic != 0 && automatic != manual,
+          "event: an auto-reset event gets its own handle");
+    check(objects::set_event(automatic), "event: setting the auto-reset one");
+    check(objects::wait_one(automatic, 0) == objects::WaitOutcome::Signalled,
+          "event: the first wait is released");
+    check(objects::wait_one(automatic, 0) == objects::WaitOutcome::TimedOut,
+          "event: the second is not, because the first consumed the signal");
+
+    // A handle that names nothing is its own outcome rather than a timeout.
+    // A poll that found nothing and a handle that is not one are different
+    // answers and Windows gives them different statuses.
+    check(objects::wait_one(0xDEAD, 0) == objects::WaitOutcome::NoSuchObject,
+          "wait: a handle that names nothing is not a timeout");
+    check(!objects::set_event(0xDEAD), "event: setting one fails");
+    check(!objects::reset_event(0xDEAD), "event: resetting one fails");
+
+    // Closing releases the entry, and closing twice does not: the second
+    // call names a handle the table no longer has.
+    check(objects::close(manual), "event: closing a live object succeeds");
+    check(!objects::close(manual), "event: closing it twice does not");
+    check(!objects::is_object(manual), "event: and the table no longer has it");
+    check(objects::close(automatic), "event: closing the other one");
+    check(objects::live_count() == before,
+          "event: and the live count is back where it started");
+}
+
+// A wait with nothing to find blocks, and a `SetEvent` on another thread is
+// what releases it.
+//
+// This is the case the table exists for. It is separate from the state
+// transitions above because a release needs a second thread: everything
+// there can be answered on one, and this cannot. The wait is given a long
+// deadline and the signal arrives well inside it, so a machine slow enough
+// to make the two race still reports the release rather than a timeout --
+// and if the signal lands before the waiter starts waiting, the event is
+// signalled when the wait reads it and the answer is the same.
+void test_a_wait_is_released_by_another_thread() {
+    const std::uint64_t handle = objects::create_event(false, false);
+    check(handle != 0, "release: the event is created");
+
+    objects::WaitOutcome seen = objects::WaitOutcome::TimedOut;
+    std::thread waiter([&] { seen = objects::wait_one(handle, 5000); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(objects::set_event(handle), "release: the signal is sent");
+    waiter.join();
+
+    check(seen == objects::WaitOutcome::Signalled,
+          "release: the waiting thread is released by the signal");
+    check(objects::close(handle), "release: and the event is closed");
+}
+
+// A wait that nothing signals spends its whole timeout before answering.
+//
+// The assertion that matters is the second one: an implementation that
+// returned `TimedOut` without waiting would satisfy the first, and the
+// difference is a program that polls in a loop burning a core instead of
+// sleeping.
+void test_a_wait_that_times_out_takes_its_time() {
+    const std::uint64_t handle = objects::create_event(true, false);
+    const auto started = std::chrono::steady_clock::now();
+    const objects::WaitOutcome outcome = objects::wait_one(handle, 40);
+    const auto spent = std::chrono::steady_clock::now() - started;
+
+    check(outcome == objects::WaitOutcome::TimedOut,
+          "timeout: an unsignalled event reports the timeout");
+    check(spent >= std::chrono::milliseconds(30),
+          "timeout: and the wait spent its timeout rather than returning "
+          "early");
+    check(objects::close(handle), "timeout: the event is closed");
+}
+
 void test_every_fixture_import_resolves() {
     // The union of every import the three fixtures name, in the spelling
     // their import tables use. This list is the API contract: a name added
@@ -1330,6 +1443,9 @@ int main() {
     test_crt_stdio_buffers();
     test_crt_stdio_files();
     test_crt_time_env();
+    test_synchronization_objects();
+    test_a_wait_is_released_by_another_thread();
+    test_a_wait_that_times_out_takes_its_time();
     test_every_fixture_import_resolves();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);

@@ -25,6 +25,7 @@
 #include "occ/runtime/address_space.h"
 #include "occ/runtime/mapper.h"
 #include "occ/runtime/ntdll.h"
+#include "occ/runtime/objects.h"
 #include "occ/runtime/seh.h"
 
 namespace occ::runtime::winabi {
@@ -1993,15 +1994,124 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_DeleteFileA(
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32_CloseHandle(
     std::uint64_t handle) noexcept {
-    // A file handle this runtime issued ends its descriptor. The standard
-    // handles belong to the console and outlive the call, and a handle that
-    // names nothing is answered as Windows answers a valid handle with no
-    // resources behind it: successfully.
+    // A file handle this runtime issued ends its descriptor. An object
+    // handle ends its table entry. The standard handles belong to the
+    // console and outlive the call, and a handle that names nothing is
+    // answered as Windows answers a valid handle with no resources behind
+    // it: successfully.
     if (take_file_handle(handle)) {
         const int fd = static_cast<int>(handle - kFileHandleBase);
         ::close(fd);
+        return 1;
     }
+    (void)objects::close(handle);
     return 1;
+}
+
+// ---- the synchronization objects ----------------------------------------
+//
+// A handle from this section is an index into the object table in
+// `runtime/objects.cpp`, above every file handle, so the two namespaces
+// cannot be mistaken for one another and `CloseHandle` can tell which one a
+// value came from without consulting a table that holds both.
+//
+// What each function does with the handle is the Windows contract and
+// nothing more. `CreateEvent` with a null name is an anonymous event, one
+// nothing else can open; `SetEvent` marks an event signalled and releases a
+// waiter; `WaitForSingleObject` is the one call here that can block, and it
+// blocks on this runtime's own object table rather than on a kernel object,
+// because the object is this runtime's.
+
+constexpr std::uint32_t kWaitObject0 = 0x00000000u;
+constexpr std::uint32_t kWaitTimeout = 0x00000102u;
+constexpr std::uint32_t kWaitFailed = 0xFFFFFFFFu;
+
+// The two `CreateEvent` spellings differ in the type of the name and in
+// nothing else, and a named event is not implemented. A name is a
+// cross-process key -- it is how a program asks for an event another
+// process already made -- and this runtime has no namespace to put one in.
+// The refusal is the honest answer to a request for one: `ERROR_NOT_SUPPORTED`
+// and a null handle, rather than an anonymous event quietly standing in for
+// the named one that was asked for.
+[[nodiscard]] std::uint64_t create_event_checked(
+    std::int32_t manual_reset, std::int32_t initial_state,
+    bool named) noexcept {
+    if (named) {
+        set_last_error(kErrorNotSupported);
+        return 0;
+    }
+    const std::uint64_t handle =
+        objects::create_event(manual_reset != 0, initial_state != 0);
+    if (handle == 0) {
+        set_last_error(kErrorNotSupported);
+    }
+    return handle;
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_CreateEventA(
+    std::uint64_t attributes, std::int32_t manual_reset,
+    std::int32_t initial_state, const char* name) noexcept {
+    (void)attributes;
+    return create_event_checked(manual_reset, initial_state, name != nullptr);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t k32_CreateEventW(
+    std::uint64_t attributes, std::int32_t manual_reset,
+    std::int32_t initial_state, const char16_t* name) noexcept {
+    (void)attributes;
+    return create_event_checked(manual_reset, initial_state, name != nullptr);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t k32_SetEvent(
+    std::uint64_t handle) noexcept {
+    if (objects::set_event(handle)) {
+        return 1;
+    }
+    set_last_error(kErrorInvalidHandle);
+    return 0;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t k32_ResetEvent(
+    std::uint64_t handle) noexcept {
+    if (objects::reset_event(handle)) {
+        return 1;
+    }
+    set_last_error(kErrorInvalidHandle);
+    return 0;
+}
+
+// The status `WaitForSingleObject` answers with, from the outcome the object
+// table reports. The three outcomes are three different statuses rather
+// than one failure, because a program distinguishes them: a timeout is a
+// poll that found nothing, and an invalid handle is a bug in the caller.
+[[nodiscard]] std::uint32_t wait_status(objects::WaitOutcome outcome) noexcept {
+    switch (outcome) {
+    case objects::WaitOutcome::Signalled:
+        return kWaitObject0;
+    case objects::WaitOutcome::TimedOut:
+        return kWaitTimeout;
+    case objects::WaitOutcome::NoSuchObject:
+        break;
+    }
+    set_last_error(kErrorInvalidHandle);
+    return kWaitFailed;
+}
+
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_WaitForSingleObject(
+    std::uint64_t handle, std::uint32_t milliseconds) noexcept {
+    return wait_status(objects::wait_one(handle, milliseconds));
+}
+
+// The alertable variant. This runtime delivers no asynchronous procedure
+// calls, so there is nothing a wait could be alerted by, and a caller that
+// asked for alertable waiting gets the same wait. The alternative -- a
+// wait that returned `WAIT_IO_COMPLETION` for an APC this runtime cannot
+// run -- would be a status no program could act on.
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_WaitForSingleObjectEx(
+    std::uint64_t handle, std::uint32_t milliseconds,
+    std::int32_t alertable) noexcept {
+    (void)alertable;
+    return wait_status(objects::wait_one(handle, milliseconds));
 }
 
 extern "C" __attribute__((ms_abi)) void k32_Sleep(std::uint32_t ms) noexcept {
@@ -4703,6 +4813,14 @@ void add_kernel32(ExportModule& module) {
         e("GetFileSizeEx", reinterpret_cast<void*>(&k32_GetFileSizeEx)),
         e("DeleteFileA", reinterpret_cast<void*>(&k32_DeleteFileA)),
         e("CloseHandle", reinterpret_cast<void*>(&k32_CloseHandle)),
+        e("CreateEventA", reinterpret_cast<void*>(&k32_CreateEventA)),
+        e("CreateEventW", reinterpret_cast<void*>(&k32_CreateEventW)),
+        e("SetEvent", reinterpret_cast<void*>(&k32_SetEvent)),
+        e("ResetEvent", reinterpret_cast<void*>(&k32_ResetEvent)),
+        e("WaitForSingleObject",
+          reinterpret_cast<void*>(&k32_WaitForSingleObject)),
+        e("WaitForSingleObjectEx",
+          reinterpret_cast<void*>(&k32_WaitForSingleObjectEx)),
         e("ExitProcess", reinterpret_cast<void*>(&k32_ExitProcess)),
         e("TerminateProcess", reinterpret_cast<void*>(&k32_TerminateProcess)),
         e("GetCommandLineA", reinterpret_cast<void*>(&k32_GetCommandLineA)),
