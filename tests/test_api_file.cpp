@@ -68,7 +68,10 @@ void reset_tree() {
     char here[512];
     if (::getcwd(here, sizeof(here)) != nullptr &&
         std::strcmp(here, kHostDir) == 0) {
-        ::chdir("/tmp");
+        if (::chdir("/tmp") != 0) {
+            std::fprintf(stderr,
+                         "FAIL file: could not leave the directory under test\n");
+        }
     }
     ::unlink(kHostFile);
     ::unlink(kHostCopy);
@@ -78,11 +81,21 @@ void reset_tree() {
 }
 
 void write_fixture(const char* path, const char* text) {
+    const std::size_t length = std::strlen(text);
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) {
-        ::write(fd, text, std::strlen(text));
-        ::close(fd);
+    if (fd < 0) {
+        std::fprintf(stderr, "FAIL file: could not create the fixture\n");
+        return;
     }
+    // The length written is checked rather than discarded: a short write
+    // leaves a truncated fixture behind, and every assertion made against
+    // that fixture afterwards would be reporting on the truncation rather
+    // than on the function under test.
+    const ::ssize_t written = ::write(fd, text, length);
+    if (written != static_cast<::ssize_t>(length)) {
+        std::fprintf(stderr, "FAIL file: the fixture was not written whole\n");
+    }
+    ::close(fd);
 }
 
 void test_attributes() {
@@ -269,7 +282,14 @@ void test_copies_and_moves() {
     std::memset(body, 0, sizeof(body));
     const int fd = ::open(kHostCopy, O_RDONLY);
     if (fd >= 0) {
-        ::read(fd, body, sizeof(body) - 1);
+        // As in the fixture writer, the count is compared rather than
+        // dropped: a short read would leave `body` partly zeroed and the
+        // comparison below would then be reading the zeroing.
+        const ::ssize_t got = ::read(fd, body, sizeof(body) - 1);
+        if (got < 0) {
+            std::fprintf(stderr, "FAIL file: the copy could not be read\n");
+            body[0] = '\0';
+        }
         ::close(fd);
     }
     check(std::strcmp(body, "hello") == 0, "file: and the contents arrive");
