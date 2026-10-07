@@ -9,14 +9,14 @@ that added this file.
 
 ## Where the code is
 
-About 33,600 lines across 72 files under `src/` and `include/`. The
+About 44,200 lines across 80 files under `src/` and `include/`. The
 distribution is uneven on purpose — the observation layer is the product,
 and it is the deepest part.
 
 | Area | Files | State |
 |---|---|---|
-| `src/observer/` | 10 | The deepest part. Event schema, ptrace control, RSP server, transport, watchpoints, W^X tracking, uprobes, the Wine ntdll probe table |
-| `src/runtime/` | 5 | The PE-facing runtime: address space, image loader, mapper, export resolution, the `ntdll` surface |
+| `src/observer/` | 10 | The deepest part. Event schema, ptrace control, RSP server, transport, watchpoints, W^X tracking, uprobes, the ntdll probe table |
+| `src/runtime/` | 8 | The PE-facing runtime: address space, image loader, mapper, export resolution, the Windows process, SEH, the `ntdll` surface, and the API the guest imports |
 | `src/` (top level) | 6 | `main.cpp` and the five subcommand files |
 | `src/engine/` | 4 | The dispatch table and one engine per format: ELF, PE, APK |
 | `src/util/` | 4 | Strings, spans, filesystem, logging |
@@ -24,41 +24,61 @@ and it is the deepest part.
 | `src/isolation/` | 2 | Namespaces, overlay root, cgroup v2, seccomp BPF, capabilities |
 | `src/syscall/` | 2 | Syscall numbers, errno, kernel ABI |
 | `src/probe/` | 2 | Turning a requested symbol into a placed uprobe |
-| `src/runner/` | 1 | Spawns a target under the isolation and observation layers |
+| `src/runner/` | 2 | Spawns a target under the isolation and observation layers, and the in-process PE runner |
 
-The test suite is 2,725 assertions across twenty binaries. The counts are
-what the binaries print, not what the sources appear to contain — the two
-differ, because a check written across several lines is one assertion to a
-reader and none to a grep:
+The test suite is twenty-four binaries and 3,410 assertions on this host. The
+counts are what the binaries print, not what the sources appear to contain —
+the two differ, because a check written across several lines is one assertion
+to a reader and none to a grep, and because two binaries phrase their summary
+differently and one prints no number at all:
 
 | Test | Assertions |
 |---|---|
-| `test_pe` | 466 |
-| `test_runtime_loader` | 382 |
-| `test_observer` | 345 |
-| `test_ntdll` | 208 |
+| `test_pe` | 474 |
+| `test_runtime_loader` | 444 |
+| `test_winabi` | 375 |
+| `test_observer` | 351 |
+| `test_ntdll` | 326 |
 | `test_placement` | 193 |
+| `test_engine` | 151 |
 | `test_elf` | 150 |
-| `test_engine` | 134 |
-| `test_runtime_exports` | 121 |
-| `test_uprobe` | 128 |
-| `test_ntdll_probes` | 99 |
-| `test_mapper` | 92 |
-| `test_seccomp` | 91 |
+| `test_uprobe` | 133 |
+| `test_mapper` | 125 |
+| `test_runtime_exports` | 125 |
+| `test_ntdll_probes` | 102 |
+| `test_event` | 66 |
 | `test_detect` | 65 |
+| `test_wx` | 47 |
 | `test_placer` | 46 |
-| `test_event` | 43 |
+| `test_seh` | 43 |
+| `test_container` | 42 |
 | `test_seeds` | 41 |
 | `test_probe_wiring` | 36 |
-| `test_container` | 32 |
 | `test_gdb_interop` | 29 |
 | `test_check` | 24 |
+| `test_registry` | 22 |
 
-Three of those counts are lower here than a build without a Wine
-installation would report. `test_engine` skips the probe-planning check, and
-`test_ntdll_probes` skips the symbol check, when no Wine `ntdll` is present
-on the host; both print the skip in a note rather than passing silently. The
-figures above are from a host with no Wine.
+`test_seccomp` is not in the table because it prints "all checks passed"
+rather than a count. Twenty-three of the twenty-four binaries report a number,
+and the total above is the sum of those twenty-three.
+
+A count is a measurement of a host, not a property of the tree: a case the
+host cannot reach is skipped, and a skipped case is not counted. Re-measure
+rather than quote, and read the skips below to see which cases a given host
+leaves out.
+
+One count above is lower here than a host with Wine would report.
+`test_ntdll_probes` checks every symbol in its table against a real Wine
+`ntdll` where one can be found, and skips that check when there is none to
+read. It prints a note rather than passing silently, because a table that was
+verified and one that was not are different states, and a test that reported
+the second as the first could never fail. The rest of that binary's checks
+are the table's own properties and run on any host.
+
+No other count depends on Wine. What the rest depend on is the host's memory
+layout and the tools it has: the skips named further down are where that
+shows, and each of them prints the skip in a note rather than passing
+silently.
 
 `test_gdb_interop` is the one that does not run without a peer. It forks the
 host's gdb and drives a real attach, register read and detach through a
@@ -124,22 +144,24 @@ only, and `docs/SECURITY.md` draws that line explicitly.
 
 ## What does not work
 
-**The PE engine runs until it needs a loader, and then it needs one this
-host often does not have.** The dispatch exists: `runner::run` detects the
-format, asks `engine_for` which engine takes it, and every format it
-recognises has one. `src/engine/` holds `exe_engine.cpp` for ELF,
-`pe_engine.cpp` for PE, and `apk_engine.cpp` for APK, and `engine.cpp` is the
-table that names them.
+**The PE engine runs a PE32+ image in the runtime this binary carries.** The
+dispatch exists: `runner::run` detects the format, asks `engine_for` which
+engine takes it, and every format it recognises has one. `src/engine/` holds
+`exe_engine.cpp` for ELF, `pe_engine.cpp` for PE, and `apk_engine.cpp` for
+APK, and `engine.cpp` is the table that names them.
 
-What remains bounded is the PE path, and it is bounded by a fact about the
-host rather than a gap in the code. A Windows image needs a Wine loader, and
-a container usually has Wine's runtime libraries without the loader binary. The
-engine says so by name and refuses the run rather than exec'ing the file and
-letting the kernel's binfmt handler produce a process nobody configured. On a
-host with a Wine installation the engine assembles the run -- the loader, a
-per-run prefix under the run's scratch directory, the library directory bound
-read-only, the `.so`-side `Nt*` probes planned and placed -- and on a host
-without one it reports which of those it could not find.
+The image is not handed to a loader borrowed from the host. `plan` names
+`/proc/self/exe` with a runner token after it, the container exec's that
+pair, and the runner builds the Windows process itself from the pieces in
+`src/runtime/`. A 32-bit image is refused, and the refusal names the machine
+the image declares and the machine this build executes.
+
+What remains of the PE path is bounded by the API surface rather than by the
+host. A guest imports `kernel32` and `msvcrt` symbols, and every one it calls
+has to be a handler in `src/runtime/winabi.cpp` or a `nt_*` function behind
+one; a program that imports something nobody implemented refuses at load
+with the name of the import. `docs/RUNTIME.md` keeps that surface and the
+plan for growing it.
 
 The APK engine is the shallowest of the three. An APK is a zip and its native
 code is a `lib/*/lib*.so` inside it; what the engine does is the part that has
@@ -230,16 +252,16 @@ debug registers can express is partial by construction.
 
 ## Known rough edges
 
-**PE fidelity is bounded by the loader.** The engine runs the image under a
-Wine loader it found on the host, with the loader's own library directory
-bound read-only and a per-run prefix. How faithful that is follows from which
-Wine is installed, and the engine has no way to tell a Wine that runs an image
-from one that starts and then faults inside it: both produce a process that
-exits, and the exit code comes from Wine rather than from the image. That
-boundary is worth stating again: timing-sensitive, SEH-detail-sensitive and
-undocumented-structure-sensitive checks will diverge from genuine Windows,
-and some PE targets will never reach a state with analytical value. Saying so
-up front is cheaper than a user discovering it.
+**PE fidelity is bounded by this runtime.** The image runs in an address
+space this tree builds, on a stack it allocates, against an API surface it
+implements. How faithful that is follows from how much of that surface is
+there, and the engine has no way to tell an image that ran to completion from
+one that started and then faulted inside a handler: both produce a process
+that exits. That boundary is worth stating again: timing-sensitive,
+SEH-detail-sensitive and undocumented-structure-sensitive checks will
+diverge from genuine Windows, and some PE targets will never reach a state
+with analytical value. Saying so up front is cheaper than a user discovering
+it.
 
 **`capabilities` has no dedicated test file.** Zero, against a pair of
 wrappers in `src/syscall/syscall.cpp` that a container setup calls to drop what
@@ -282,18 +304,28 @@ occ doctor                      # what this host actually grants
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-The test suite is 2,725 assertions and needs no network. Six of the twenty
-binaries can skip: two need a host that permits namespaces and seccomp
-(`test_seccomp`, `test_container`), two need a Wine installation to find an
-`ntdll` in (`test_engine`, `test_ntdll_probes`), one needs a handwritten PE
-fixture on disk (`test_runtime_loader`), one needs a gdb on `PATH`, and one
-needs a `python3` to re-run the seed generator. Those are skipped rather than
-failed where the host does not have them, and the skip says so in a note. The
-last one is worth naming here: it
-is the only test whose skip weakens a guarantee rather than a measurement,
-because nothing else would notice a seed drifting away from the generator
-that describes it. A claim in this file that can be checked should be checked
-that way before it is believed.
+The test suite is twenty-four binaries and needs no network. Seven of them
+can skip cases, and the reasons are the host's rather than the tree's. Three
+skip where the host will not offer a free address range to place an image at
+(`test_placement`, `test_ntdll`, `test_runtime_exports`), one needs a
+handwritten PE fixture on disk (`test_runtime_loader`), one needs a gdb on
+`PATH` (`test_gdb_interop`), one needs a host that permits namespaces
+(`test_container`), and one needs a `python3` to re-run the seed generator
+(`test_seeds`). Those are skipped rather than failed where the host does not
+have them, and the skip says so in a note. One more binary skips a single
+check rather than a case: `test_ntdll_probes` checks its table against a real
+Wine `ntdll` when one is present, as described beside the table above. The
+last of the seven is worth naming here: it is the only test whose skip
+weakens a guarantee rather than a measurement, because nothing else would
+notice a seed drifting away from the generator that describes it. A claim in
+this file that can be checked should be checked that way before it is
+believed.
+
+Twenty-three of the twenty-four binaries print an assertion count, and their
+sum is 3,410 — the table above is that measurement, taken on this host.
+`test_seccomp` prints "all checks passed" instead, so it contributes no
+number. The total moves with how many cases a host can reach, which is why
+the skips above are named rather than counted.
 
 **A sanitizer is a host like any other, and one test is worse under it.** Two
 assertions are conditional on the absence of AddressSanitizer, and both

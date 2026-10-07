@@ -148,9 +148,10 @@ entry as `/`, with the host's `lowerdir` and `upperdir`. The evidence that
 the runtime is the cause rather than occ is `sysboxfs` appearing in the same
 table.
 
-What breaks is any target that passes a path to another process. Wine is the
-first one, and it is a good illustration of how far the failure is from the
-fault: the `wineserver` and the loader that talks to it both `chdir` into
+What breaks is any target that passes a path to another process. The
+observation that produced this section came from a PE run, back when the
+engine handed the image to a Wine loader: the `wineserver` and the loader
+that talks to it both `chdir` into
 `$TMPDIR/wine-<random>/server-<dev>-<ino>` and then talk over a socket named
 by a *relative* path. That works only if the two see the same directory. They
 do not — one sees its bind of the run's scratch, the other sees the overflow
@@ -162,7 +163,9 @@ wine: for some mysterious reason, the wine server failed to run.
 ```
 
 which names neither the mount that did not happen nor the runtime that
-skipped it.
+skipped it. The PE engine no longer borrows that loader and this particular
+pair is gone with it; the shape of the failure is not, which is why it stays
+written down.
 
 Nothing about this is specific to Wine. Any engine whose target and its
 helper process have to agree on a path will fail the same way, and the
@@ -173,10 +176,10 @@ failure will be as far from the cause. Two things follow:
   before reading anything else. `OCC_DEBUG_CONTAINER=1` makes the container
   print it, along with the environment it was handed, immediately before the
   exec.
-- A host that must run Wine under occ needs a runtime that does not
-  virtualise mounts — a plain namespace-based one, or no container at all.
-  There is no configuration of occ that works around it, because the missing
-  piece is kernel semantics rather than a setting.
+- A target that starts a helper process and passes it a path needs a runtime
+  that does not virtualise mounts — a plain namespace-based one, or no
+  container at all. There is no configuration of occ that works around it,
+  because the missing piece is kernel semantics rather than a setting.
 
 ## Why no version matrix for kernels
 

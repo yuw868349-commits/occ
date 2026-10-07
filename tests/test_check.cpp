@@ -259,6 +259,40 @@ void test_check_reports_a_successful_load() {
           "check: the entry point is reported as executable");
 }
 
+// The PE engine reports no host requirement, because it has none.
+//
+// It used to carry a caveat saying it needed a Wine loader from the host.
+// That was true while the PE path borrowed a loader; it stopped being true
+// when the runtime that executes the image moved into this binary, and the
+// caveat was left behind. The note is asserted empty rather than asserted
+// to hold other words, because the absence is the claim: `check` has no
+// host-level objection to raise about a PE, and a caller that reads an
+// empty note knows the engine's answer will come from the load below it.
+void test_check_names_no_host_requirement_for_a_pe() {
+    const Run r = run_occ({seed("pe32plus_min")});
+    check(r.status == 0, "check: a loadable PE exits 0");
+    check(has(r.out, "\"note\":\"\""),
+          "check: the pe engine reports no host requirement");
+    check(!has(r.out, "Wine"),
+          "check: no engine claims a Wine loader is needed");
+}
+
+// A PE this build cannot execute says so from the loader, not from a note.
+//
+// Which machine a runtime executes is a property of that runtime, and the
+// runtime is the one answering here: the load section names the machine the
+// image declares and the machine this build carries. A note that guessed
+// the answer from the format would be a second statement of the same fact,
+// and the two would disagree the first time either changed.
+void test_check_reports_the_machine_a_pe_needs() {
+    const Run r = run_occ({seed("pe32_min")});
+    check(r.status == 5, "check: a 32-bit image is refused by the loader");
+    check(has(r.out, "\"note\":\"\""),
+          "check: the refusal is not restated as a host caveat");
+    check(has(r.out, "this runtime executes only amd64"),
+          "check: the loader names the machine this build executes");
+}
+
 // The readable form says the same things as the JSON.
 //
 // Both are printed from the same LoadCheck and a change that updated one and
@@ -291,6 +325,8 @@ int main() {
     test_check_reports_each_loader_refusal();
     test_check_does_not_attempt_a_load_without_a_loader();
     test_check_reports_a_successful_load();
+    test_check_names_no_host_requirement_for_a_pe();
+    test_check_reports_the_machine_a_pe_needs();
     test_check_text_form_names_the_load();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);

@@ -174,54 +174,66 @@ bytes. Naming things is analysis and analysis is the other tool's job.
 
 ## The PE engine
 
-### Why Wine
+### Why the runtime is in this tree
 
 Running a PE natively means implementing the Win32 and NT API surface the
-binary uses. Wine already implements a large fraction of it and is
-maintained by people who care about it.
+binary uses. That surface is the work, and it is why this engine was once a
+launcher: an earlier revision looked for a Wine loader on the host, built a
+prefix, and handed the file over, on the grounds that Wine already
+implements a large fraction of that surface and is maintained by people who
+care about it.
 
-Occ supplies the isolation and the observation. Wine supplies the loader
-and the API translation. Neither modifies the other.
+What that arrangement could not do is answer for its own behaviour. A guest
+that faulted inside Wine produced a process that exited, and the engine had
+no way to tell a run that worked from one Wine rescued. The runtime in
+`src/runtime/` replaced it. The loader, the address space, the mapper, the
+export registry and the `nt_*` family are this tree's, the guest's imports
+resolve to handlers in this tree, and what a run does is a fact this project
+states rather than inherits.
 
-### Why the hook is in Wine's ntdll
+### Why the seam is the import table
 
-Wine's Unix-side `ntdll` is where PE requests become Unix syscalls. Hooking
-there gives function-level events for the calls that matter, at a
-granularity syscall tracing cannot reach, without touching the PE.
+A guest calls `WriteFile` because its import table has an entry for it. That
+entry holds a string, and the string has to resolve to an address in the
+guest's process. The runtime owns everything up to that question and
+nothing past it: resolving an import asks "where is kernel32!WriteFile" and
+the export registry answers. That split is why the surface can grow one
+handler at a time without reopening the loader, and why a missing API is a
+named refusal at load rather than a fault at the call site.
 
-The hook is a uprobe. It is worth being precise: a uprobe is the kernel
-inserting a trap into the target's text. Occ does not write those bytes;
-the kernel does, on Occ's request. The "target unmodified" claim is about
-what Occ writes, and a uprobe is not Occ writing. `docs/SECURITY.md` states
-this without hedging, because a reader who assumes otherwise will draw the
-wrong conclusion about what Occ guarantees.
+### Probes, and where they are not pointed
 
-### Why stripped Wine degrades
+The observer can place a uprobe on a symbol in a library a target loads, and
+the event schema has the pair of events for it. Nothing in the PE path asks
+for one today. The table of probes this format once requested named symbols
+in Wine's Unix-side `ntdll`, and the loader it hooked is no longer in the
+path; pointing that table at this runtime's own `nt_*` functions is open
+work, and until it is done the function-level events belong to no run.
 
-A uprobe needs an address. Addresses come from the dynamic symbol table.
-`strip` removes the static symbol table but keeps `.dynsym` for exported
-functions, so most builds still expose what is needed. A build with
-`.dynsym` emptied cannot be probed at function granularity.
-
-When that happens, function-level events stop and syscall-level events
-continue. The session reports the reduction. It does not fail, and it does
-not pretend the probes are working.
+The uprobe mechanics outlive any particular target and are worth stating
+precisely. A uprobe is the kernel inserting a trap into the target's text.
+Occ does not write those bytes; the kernel does, on Occ's request. The
+"target unmodified" claim is about what Occ writes, and a uprobe is not Occ
+writing. `docs/SECURITY.md` states this without hedging, because a reader who
+assumes otherwise will draw the wrong conclusion about what Occ guarantees.
 
 ### Fidelity
 
-Wine is not Windows. Stated here so it is not a surprise later:
+This runtime is not Windows. Stated here so it is not a surprise later:
 
-- TLS callback ordering differs.
-- SEH unwinding differs in the details.
-- `NtQuerySystemInformation` classes return different or missing fields.
-- Anti-debug checks that read the PEB, that hide threads from debuggers,
-  or that time instructions will produce answers that differ from Windows.
-- Structures that are undocumented on Windows may be approximations in
-  Wine.
+- TLS callback ordering follows this loader's reading of the format.
+- SEH unwinding is implemented from the structures, and the details are this
+  tree's rather than Microsoft's.
+- `NtQuerySystemInformation` classes are answered where a handler exists and
+  refuse by name otherwise.
+- Anti-debug checks that read the PEB, that hide threads from debuggers, or
+  that time instructions will produce answers that differ from Windows.
+- Structures that are undocumented on Windows may be approximations here.
 
 Some targets will not run far enough to be worth analyzing. That is a
-property of the target, and the honest thing is to say so rather than to
-imply that every PE works.
+property of how much of the surface is implemented rather than of the
+target, and the honest thing is to say so rather than to imply that every PE
+works.
 
 ## The event schema
 

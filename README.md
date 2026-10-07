@@ -18,8 +18,8 @@ but the kernel's binfmt handler decides what that means, not this project.
 `pe_engine.cpp` for PE, `apk_engine.cpp` for APK — and `engine.cpp` is the
 table that names them. What each engine does with the format differs, and
 the difference is stated where it applies rather than here: the ELF engine
-runs the image, the PE engine assembles a run around a Wine loader it finds
-on the host, and the APK engine reads the package and refuses. See
+runs the image, the PE engine runs it in the runtime this binary carries,
+and the APK engine reads the package and refuses. See
 `docs/ROADMAP.md` for the state of each part, including what is known to be
 missing.
 
@@ -111,23 +111,33 @@ served from observer data. Writes go through `process_vm_writev` and
 
 ## PE engine
 
-The PE engine is in the tree and it does not run a PE image by itself. It
-looks for a Wine loader on the host, assembles a run around the one it
-finds — the loader, a per-run prefix under the run's scratch directory, the
-library directory bound read-only, and the `.so`-side `Nt*` probes planned
-and placed — and on a host without one it refuses and names what it could
-not find. It does not modify Wine. It hooks Wine's Unix-side `ntdll`
-through a uprobe and turns those probes into events.
+The PE engine runs a PE32+ image itself, in the runtime this binary carries.
+It asks the host for nothing. `plan` names this binary through
+`/proc/self/exe` with a runner token after it, the container exec's that
+pair, and the runner builds a Windows process out of the pieces in
+`src/runtime/` — an address space, the image mapped into it, a stack, a TEB,
+a PEB — and starts it at the image's entry point. There is no loader to
+find, no prefix to build, and no library directory to bind.
 
-Fidelity is bounded by the Wine build supplied. Timing-sensitive,
-SEH-detail-sensitive, and undocumented-structure-sensitive anti-analysis
-checks will diverge from genuine Windows. Some PE targets will not reach a
-state with analytical value under Wine. The documentation says so instead
-of implying universal coverage.
+What the image imports is answered from this binary. `KERNEL32.dll` and
+`msvcrt.dll` resolve through the runtime's own export registry, so the API
+a guest calls is code in this tree. `docs/RUNTIME.md` describes that surface
+and the plan for growing it.
 
-A stripped Wine with no dynamic symbol table degrades function-level
-observability to syscall-level only. This is a reduction in granularity,
-not a failure, and is reported as such.
+A 32-bit image is refused by name. The runtime carries amd64 and nothing
+else, and a second runtime is not something this one grows into; the refusal
+names the machine the image declares and the machine this build executes.
+
+Fidelity is bounded by this runtime rather than by a Wine build. Timing-
+sensitive, SEH-detail-sensitive, and undocumented-structure-sensitive
+anti-analysis checks will diverge from genuine Windows, and some PE targets
+will not reach a state with analytical value. The documentation says so
+instead of implying universal coverage.
+
+Function-level probes are not placed for a PE today. The table of probes
+this format once asked for named symbols in Wine's Unix-side `ntdll`, which
+is the loader that used to be in the path; nothing requests it now, and
+pointing it at this runtime's own `Nt*` functions is open work.
 
 The APK engine reads a package and refuses to run it. An APK is a zip whose
 native code is a `lib/*/lib*.so` inside it; occ has no Android runtime, so
@@ -181,8 +191,8 @@ include/occ/     public headers
   syscall/       typed syscall wrappers, one per syscall
   isolation/     namespaces, rootfs, cgroup, seccomp
   observer/      event encoding, ptrace control, rsp server, transport,
-                 watchpoints, W^X tracking, uprobes, the Wine ntdll
-                 probe table
+                 watchpoints, W^X tracking, uprobes, the ntdll probe
+                 table
   parser/        elf, pe, format detection
   engine/        one engine per format: elf, pe, apk
   runtime/       the PE-facing runtime: address space, loader, mapper,

@@ -1660,11 +1660,23 @@ element is the runtime, the container binds the runtime's own files instead
 of a Wine installation, and the probe table points at the runtime's ntdll
 rather than Wine's.
 
-The tests that compare against Wine move to `tests/local/`, which is in
-`.gitignore`. They are useful — a reference implementation is the only
-oracle available for some questions — and they are not part of the tree.
-A test that requires Wine to pass is a test that makes Wine a dependency,
-and the point of this milestone is that Wine is not one.
+The loader half of this is in the tree. `plan` names `/proc/self/exe` with a
+runner token after it, `PeProcess` builds the process out of this runtime's
+pieces, and a guest's imports resolve to handlers in this tree; there is no
+host requirement left for a PE, and `occ check` no longer reports one.
+
+The probe half is not done. The table in `src/observer/ntdll_probes.cpp`
+still names symbols in Wine's Unix-side `ntdll`, no engine asks for a probe,
+and the pair of function-level events therefore belongs to no run. Pointing
+that table at this runtime's own `nt_*` functions is what remains of this
+milestone.
+
+The move of the Wine-comparing tests into `tests/local/` is also only partly
+done. The directory is ignored and absent, and one test still reaches for
+Wine from inside `tests/`: `test_ntdll_probes` verifies its symbols against a
+real Wine `ntdll` when the host has one, and skips that check when it does
+not. That check is the reason no other test depends on Wine, and it belongs
+where the milestone says once the table has been re-pointed.
 
 ### M6 — replay
 

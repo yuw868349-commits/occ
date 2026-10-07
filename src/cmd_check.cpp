@@ -129,9 +129,19 @@ std::string refusal(const Detection& d) {
 // they have different exit statuses. The first is whether an engine takes
 // this format at all, which preflight answers. The second is whether the
 // engine that takes it can actually run this file, which is a property of
-// the host and of the file's contents rather than of the format -- a PE
-// needs a Wine loader, an APK needs an Android runtime, and neither is a
-// fact `occ check` can read from a detection.
+// the runtime behind the engine and of the file's contents rather than of
+// the format -- an APK needs an Android runtime, and that is not a fact
+// `occ check` can read from a detection.
+//
+// The PE engine is not on this list, and its absence is the answer to the
+// question rather than a gap in it. The runtime that executes a PE image is
+// this binary, so what it accepts is a property of the image, and the loader
+// reports it in the load section below together with the machine the image
+// declares and the machine this build executes. The caveat it used to carry
+// -- a Wine loader the host had to supply -- was true when the PE path
+// borrowed a loader and stopped being true when that path was replaced. A
+// caveat restating the runtime's own answer would be a second table of what
+// each engine accepts, and the second table is the one that goes stale.
 //
 // So the second question is reported as a caveat rather than folded into
 // the refusal. A caller that sees a caveat knows the engine will read the
@@ -146,11 +156,6 @@ std::string caveat(const Detection& d) {
         return "the apk engine reads a package and reports it, but occ has no "
                "Android runtime and will not run one; extract the native "
                "library under lib/ and point occ at that";
-    }
-    if (e->kind() == engine::EngineKind::Pe) {
-        return "the pe engine needs a Wine loader on this host, and needs one "
-               "matching the image's bitness; occ checks that when it runs, "
-               "not here";
     }
     return {};
 }

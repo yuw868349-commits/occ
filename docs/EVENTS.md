@@ -54,8 +54,10 @@ file does not make. An `import` is one DLL the image imports, in the order the
 import directory lists them.
 
 `probe_attached` and `probe_hit` are the function-level observation pair. A
-probe is a uprobe placed on an entry point inside a library the target loads --
-for a PE run, an `Nt*` function of Wine's Unix-side `ntdll`. `probe_attached`
+probe is a uprobe placed on an entry point inside a library a target loads,
+named by the run's plan. No PE run asks for one today -- `docs/DESIGN.md`
+records what the table still points at -- so the pair appears in the runs
+whose engine requests probes. For those, `probe_attached`
 is a fact about the run's setup and is emitted once per probe;
 `probe_hit` is a fact about the target and is emitted as often as the target
 enters the function. Attaching is reported even when it fails, because a run
