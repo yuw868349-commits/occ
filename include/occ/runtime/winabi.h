@@ -617,6 +617,15 @@ void* heap_realloc(std::uint32_t flags, void* block,
 [[nodiscard]] std::uint64_t heap_size(const void* block) noexcept;
 bool heap_free(void* block) noexcept;
 
+// The handle `GetProcessHeap` answers with.
+//
+// Published rather than written down twice. The PEB carries the process's
+// heap list, and a program that enumerates heaps and then asks for the
+// process heap compares what it walked with what it was given; if the PEB
+// were filled from a second spelling of the same number, that comparison
+// would report a heap `GetProcessHeap` had never heard of.
+[[nodiscard]] std::uint64_t process_heap_handle() noexcept;
+
 }  // namespace winabi
 
 }  // namespace occ::runtime

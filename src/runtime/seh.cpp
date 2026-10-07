@@ -75,6 +75,14 @@ std::size_t opcode_size(std::uint8_t slot) noexcept {
         return opcode_info(slot) != 0 ? 3 : 2;
     case kUwopSaveNonvol:
     case kUwopSaveXmm128:
+    case kUwopEpilog:
+        // The epilogue marker carries a payload pair the walk never reads,
+        // and its size is the reason this case exists: an opcode whose size
+        // is wrong by one slot moves the cursor onto the middle of the next
+        // code, and every code after it is then reversed from the wrong
+        // place. The marker is only meaningful in a version 2 table, where
+        // the reverse switch below leaves it alone, but the cursor has to
+        // step over it in either version.
         return 2;
     case kUwopSaveNonvolFar:
     case kUwopSaveXmm128Far:
@@ -121,6 +129,31 @@ std::uint64_t load_u64(const void* address) noexcept {
     std::uint64_t value = 0;
     std::memcpy(&value, address, sizeof(value));
     return value;
+}
+
+std::uint8_t get_u8(const std::uint8_t* base, std::size_t offset) noexcept {
+    return base[offset];
+}
+
+std::uint16_t get_u16(const std::uint8_t* base, std::size_t offset) noexcept {
+    std::uint16_t value = 0;
+    std::memcpy(&value, base + offset, sizeof(value));
+    return value;
+}
+
+void put_u8(std::uint8_t* base, std::size_t offset,
+            std::uint8_t value) noexcept {
+    base[offset] = value;
+}
+
+void put_u16(std::uint8_t* base, std::size_t offset,
+             std::uint16_t value) noexcept {
+    std::memcpy(base + offset, &value, sizeof(value));
+}
+
+void copy_bytes(std::uint8_t* dst, const std::uint8_t* src,
+                std::size_t bytes) noexcept {
+    std::memcpy(dst, src, bytes);
 }
 
 std::uint32_t get_u32(const std::uint8_t* base, std::size_t offset) noexcept {
@@ -194,6 +227,36 @@ using GuestHandlerFn = std::uint64_t(__attribute__((ms_abi))*)(
     const void* dispatcher);
 
 }  // namespace
+
+void copy_fpregs_to_context(std::uint8_t* context,
+                            const std::uint8_t* fp) noexcept {
+    std::uint8_t* const flt = context + kContextFltSave;
+
+    put_u16(flt, kFltControlWord, get_u16(fp, kFxCwd));
+    put_u16(flt, kFltStatusWord, get_u16(fp, kFxSwd));
+    put_u8(flt, kFltTagWord, get_u8(fp, kFxTwd));
+    put_u16(flt, kFltErrorOpcode, get_u16(fp, kFxFop));
+    // The CONTEXT names the 64-bit FIP and FDP as an offset and a selector
+    // each, and both halves are written. Stopping at the offsets would leave
+    // the two selectors holding whatever the previous stop put there, and a
+    // guest that read them back would see another frame's address rather
+    // than its own -- a value that looks plausible, which is what makes it
+    // worth writing down.
+    put_u32(flt, kFltErrorOffset, get_u32(fp, kFxFip));
+    put_u16(flt, kFltErrorSelector, get_u16(fp, kFxFipHigh));
+    put_u32(flt, kFltDataOffset, get_u32(fp, kFxRdp));
+    put_u16(flt, kFltDataSelector, get_u16(fp, kFxRdpHigh));
+    put_u32(flt, kFltMxCsr, get_u32(fp, kFxMxCsr));
+    put_u32(flt, kFltMxCsrMask, get_u32(fp, kFxMxCsrMask));
+    copy_bytes(flt + kFltFloatRegisters, fp + kFxSt, 8 * 16);
+    copy_bytes(flt + kFltXmmRegisters, fp + kFxXmm, 16 * 16);
+
+    // The same MXCSR again, as the CONTEXT's own field. The guest reads this
+    // one; the copy inside the save area is what a reader of the raw area
+    // sees, and a CONTEXT that disagreed with itself is a debugging session
+    // nobody enjoys.
+    put_u32(context, kContextMxCsr, get_u32(fp, kFxMxCsr));
+}
 
 // The table's own row for the pc, chains left alone: the contract
 // `RtlLookupFunctionEntry` documents, and the shape a caller that wants

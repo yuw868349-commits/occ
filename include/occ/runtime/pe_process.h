@@ -91,6 +91,15 @@ struct ProcessOptions {
     // about it wants.
     std::string current_directory;
 
+    // The process's heaps, as the PEB's heap list carries them.
+    //
+    // Handles rather than addresses, in the order a program enumerating
+    // them sees. Supplied rather than discovered because a handle belongs to
+    // the layer that implements the heap functions, and this type does not;
+    // empty leaves the PEB's field null, which a program reads as "this
+    // process has no heaps" rather than as "the list is empty".
+    std::vector<std::uint64_t> process_heaps;
+
     // The events to write to, or nullptr. The same writer the loader takes,
     // for the reason the loader takes one: a run that cannot be observed is
     // a run whose failures are reported as a fault address and nothing else.

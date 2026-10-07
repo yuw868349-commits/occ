@@ -88,12 +88,16 @@ constexpr std::uint64_t kCurrentProcessHandle = 0xFFFFFFFFFFFFFFFFULL;
 
 constexpr std::uint32_t kHeapZeroMemory = 0x00000008u;
 
-// Win32 errors this layer reports, as Windows spells them.
+// Win32 errors this layer reports, as Windows spells them. A constant here
+// is one a function below actually returns; an error this layer has no
+// place to report yet is not listed, because a value nothing reads is a
+// value nothing checks. (`ERROR_NO_MORE_ITEMS` is 259 and
+// `ERROR_NO_MORE_FILES` is 18, and they arrive with `FindNextFile`,
+// `FindNextVolume` and `HeapWalk`, which are not implemented here yet.)
 constexpr std::uint32_t kErrorInvalidHandle = 6;
 constexpr std::uint32_t kErrorFileNotFound = 2;
 constexpr std::uint32_t kErrorNotSupported = 50;
 constexpr std::uint32_t kErrorInsufficientBuffer = 122;
-constexpr std::uint32_t kErrorNoMoreItems = 381;
 constexpr std::uint32_t kErrorInvalidParameter = 87;
 constexpr std::uint32_t kErrorEnvVarNotFound = 203;
 constexpr std::uint32_t kErrorProcNotFound = 127;
@@ -940,7 +944,26 @@ int host_vformat(std::string& text, const char* fmt,
     static_assert(sizeof(ap) == sizeof(SysvVaList),
                   "the host descriptor must be the ABI's");
     __builtin_memcpy(&ap, &built, sizeof(ap));
+    // The format is not a literal, and that is the design rather than an
+    // oversight: it is built above from the guest's own format string,
+    // conversion by conversion, and the rebuild is what makes the call safe
+    // -- every conversion the guest wrote was read against the descriptor
+    // it will consume, so what reaches the host is a format whose
+    // conversions match the arguments behind it.
+    //
+    // A warning about non-literal formats is right in general and wrong
+    // here, so it is turned off for this call rather than for the file. The
+    // guard is Clang's because Clang is the compiler that raises it: GCC
+    // accepts the same call without a diagnostic, which is one of the
+    // differences between the two that `docs/BUILD.md` keeps a list of.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#endif
     const int written = ::vfprintf(mem, rebuilt.c_str(), ap);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
     ::fclose(mem);
     if (written < 0 || raw == nullptr) {
         ::free(raw);
@@ -2269,7 +2292,7 @@ constexpr std::uint64_t kProcessHeapHandle = 1;
 std::uint64_t g_next_heap_handle = 0x10;
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetProcessHeap() noexcept {
-    return kProcessHeapHandle;
+    return process_heap_handle();
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32_HeapCreate(
@@ -2759,6 +2782,14 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_atexit(
     }
     g->atexit_list.push_back(function);
     return 0;
+}
+
+// The one spelling of the process heap's handle. `GetProcessHeap` answers
+// with it, and the PEB's heap list is filled from this rather than from a
+// second copy of the number, so a guest that enumerates the heaps and then
+// asks for the process heap finds the same one both times.
+std::uint64_t process_heap_handle() noexcept {
+    return kProcessHeapHandle;
 }
 
 namespace {

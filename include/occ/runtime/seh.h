@@ -74,6 +74,50 @@ constexpr std::size_t kContextR15 = 0xF0;
 constexpr std::size_t kContextRip = 0xF8;
 constexpr std::size_t kContextFltSave = 0x100;  // XSAVE_FORMAT, 512 bytes
 
+// The save area at `kContextFltSave`, and the kernel's FXSAVE64 area a
+// CONTEXT is built from.
+//
+// The two are the same 512 bytes in the same order: the CONTEXT's
+// `XMM_SAVE_AREA32` is FXSAVE64 with the two halves of the 64-bit FIP and
+// FDP named as an offset and a selector each. Every field of one therefore
+// has a counterpart in the other, and a copy that reaches most of them
+// leaves the rest holding what the CONTEXT held before -- not zeroes,
+// because a CONTEXT is filled in at every stop. The field lists live here
+// rather than beside the copy so that a test can walk them.
+constexpr std::size_t kFltSaveBytes = 512;
+
+// Fields of the CONTEXT's own save area, relative to `kContextFltSave`.
+constexpr std::size_t kFltControlWord = 0x00;
+constexpr std::size_t kFltStatusWord = 0x02;
+constexpr std::size_t kFltTagWord = 0x04;
+constexpr std::size_t kFltErrorOpcode = 0x06;
+constexpr std::size_t kFltErrorOffset = 0x08;
+constexpr std::size_t kFltErrorSelector = 0x0C;
+constexpr std::size_t kFltDataOffset = 0x10;
+constexpr std::size_t kFltDataSelector = 0x14;
+constexpr std::size_t kFltMxCsr = 0x18;
+constexpr std::size_t kFltMxCsrMask = 0x1C;
+constexpr std::size_t kFltFloatRegisters = 0x20;  // 8 * 16 bytes
+constexpr std::size_t kFltXmmRegisters = 0xA0;    // 16 * 16 bytes
+
+// Fields of the kernel's FXSAVE64 area, which `uc_mcontext.fpregs` points
+// at. Unlike the 32-bit FXSAVE it holds all sixteen XMM registers, which is
+// what makes the copy a straight one. `kFxFip` and `kFxRdp` are eight bytes
+// wide, and the halves of them above the low 32 bits are what the CONTEXT's
+// selector fields carry.
+constexpr std::size_t kFxCwd = 0x00;
+constexpr std::size_t kFxSwd = 0x02;
+constexpr std::size_t kFxTwd = 0x04;
+constexpr std::size_t kFxFop = 0x06;
+constexpr std::size_t kFxFip = 0x08;      // 8 bytes
+constexpr std::size_t kFxFipHigh = 0x0C;  // the half above the low 32 bits
+constexpr std::size_t kFxRdp = 0x10;      // 8 bytes
+constexpr std::size_t kFxRdpHigh = 0x14;  // the half above the low 32 bits
+constexpr std::size_t kFxMxCsr = 0x18;
+constexpr std::size_t kFxMxCsrMask = 0x1C;
+constexpr std::size_t kFxSt = 0x20;   // 8 * 16 bytes
+constexpr std::size_t kFxXmm = 0xA0;  // 16 * 16 bytes
+
 // The two EXCEPTION_RECORD fields the walk itself reads or writes: the
 // flags at 0x04, which the unwind pass raises, and the code at 0x00, which
 // a filter-driven unwind passes on as the landing pad's return value.
@@ -230,6 +274,17 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                     std::uint64_t stack_low, std::uint64_t stack_high,
                     const void** data_out, std::uint64_t* frame_out,
                     std::uint64_t* handler_out) noexcept;
+
+// Fills the floating-point half of a CONTEXT from a kernel FXSAVE64 area.
+//
+// `context` is a whole CONTEXT and `fp` points at the 512 bytes the kernel
+// saved, which is what `ucontext_t::uc_mcontext.fpregs` points at on this
+// host. The copy reaches every field of both layouts; the field lists above
+// say why "every" is the requirement rather than a target. `MxCsr` exists
+// twice -- once inside the save area and once as a field of the CONTEXT
+// itself -- and both are written.
+void copy_fpregs_to_context(std::uint8_t* context,
+                            const std::uint8_t* fp) noexcept;
 
 // The search pass. Walks the frames from the control point upward, calling
 // each frame's language handler the way Windows calls it -- the original

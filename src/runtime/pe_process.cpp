@@ -134,6 +134,18 @@ constexpr std::uint64_t kPebBytes = 0x1000;
 constexpr std::size_t kTlsSlots = 64;
 constexpr std::size_t kTlsArrayOffset = 0x1480;
 
+// The array has to land inside the region the segment base points at. A
+// slot count that outgrew the TEB would put the last slots past its end,
+// where the mapping above begins, and a guest that wrote one would be
+// writing into a region this file placed for something else. The two
+// numbers are independent constants, so the relationship is asserted rather
+// than trusted.
+static_assert(kTlsArrayOffset + kTlsSlots * sizeof(std::uint64_t) <=
+                  kTebBytes,
+              "the TLS array must fit inside the TEB");
+static_assert(kTlsArrayOffset % alignof(std::uint64_t) == 0,
+              "the TLS array must be aligned for the slots it holds");
+
 // Where the process's memory goes.
 //
 // Windows places a 64-bit image at its preferred base when it can and the
@@ -200,6 +212,18 @@ void store_u64(std::uint64_t base, std::size_t off, std::uint64_t v,
 // a separate allocation. A reader that treats it as a C string reads past
 // the end of a `CommandLine` whose buffer happens to have no terminator
 // within the count, which is a heap read in the target.
+// A single byte, with the same bounds check the wider stores make. The PEB
+// has byte-sized fields, and they are written for the same reason the wider
+// ones are: the region arrives zeroed, and a run that wrote nothing would be
+// relying on that rather than stating what the field holds.
+void store_u8(std::uint64_t base, std::size_t off, std::uint8_t v,
+              std::uint64_t region_bytes) noexcept {
+    if (off + 1 > region_bytes) {
+        return;
+    }
+    std::memcpy(reinterpret_cast<void*>(base + off), &v, 1);
+}
+
 void store_u16(std::uint64_t base, std::size_t off, std::uint16_t v,
                std::uint64_t region_bytes) noexcept {
     if (off + 2 > region_bytes) {
@@ -517,6 +541,36 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     store_u16(peb, PebLayout::kOsMinorVersion, 0, kPebBytes);
     store_u16(peb, PebLayout::kOsBuildNumber, 19045, kPebBytes);
 
+    // The two fields a program reads to find the process's heaps, written as
+    // a pair because that is how they are read. `ProcessHeaps` points at an
+    // array of handles inside the PEB's own region -- handles, not
+    // addresses, which is what Windows stores and what `GetProcessHeap`
+    // answers with -- and `NumberOfHeaps` is its length. Leaving the pointer
+    // null would not mean "no list here": a program that enumerates the
+    // heaps reads null as "this process has no heaps", which is a statement
+    // about the process rather than about where the runtime put the array.
+    //
+    // The run supplies the list, because the handles belong to the layer
+    // that implements the heap functions. An empty list is a real answer
+    // and leaves the field null, so a caller that wants the field filled
+    // says so by naming the heaps.
+    if (!options.process_heaps.empty()) {
+        const std::uint64_t heaps = peb + 0x300;
+        for (std::size_t i = 0; i < options.process_heaps.size(); ++i) {
+            store_u64(heaps, i * sizeof(std::uint64_t),
+                      options.process_heaps[i], kPebBytes);
+        }
+        store_u64(peb, PebLayout::kProcessHeaps, heaps, kPebBytes);
+        store_u32(peb, PebLayout::kNumberOfHeaps,
+                  static_cast<std::uint32_t>(options.process_heaps.size()),
+                  kPebBytes);
+    }
+
+    // `InheritedAddressSpace` is FALSE: this process was not handed the
+    // parent's address space, which is what every process the loader starts
+    // for itself reports.
+    store_u8(peb, PebLayout::kInheritedAddressSpace, 0, kPebBytes);
+
     // --- 7. record the regions ------------------------------------------
 
     for (const Region& r : self->space_.regions()) {
@@ -685,33 +739,9 @@ using occ::runtime::seh::kContextSegGs;
 using occ::runtime::seh::kContextSegSs;
 using occ::runtime::seh::kContextSize;
 
-// The registers inside the floating-point save area, relative to its start.
-constexpr std::size_t kFltControlWord = 0x00;
-constexpr std::size_t kFltStatusWord = 0x02;
-constexpr std::size_t kFltTagWord = 0x04;
-constexpr std::size_t kFltErrorOpcode = 0x06;
-constexpr std::size_t kFltErrorOffset = 0x08;
-constexpr std::size_t kFltErrorSelector = 0x0C;
-constexpr std::size_t kFltDataOffset = 0x10;
-constexpr std::size_t kFltDataSelector = 0x14;
-constexpr std::size_t kFltMxCsr = 0x18;
-constexpr std::size_t kFltMxCsrMask = 0x1C;
-constexpr std::size_t kFltFloatRegisters = 0x20;  // 8 * 16 bytes
-constexpr std::size_t kFltXmmRegisters = 0xA0;    // 16 * 16 bytes
-
-// The kernel's FXSAVE64 area, which `uc_mcontext.fpregs` points at. Unlike
-// the 32-bit FXSAVE it holds all sixteen XMM registers, which is what makes
-// the copy below a straight one.
-constexpr std::size_t kFxCwd = 0x00;
-constexpr std::size_t kFxSwd = 0x02;
-constexpr std::size_t kFxTwd = 0x04;
-constexpr std::size_t kFxFop = 0x06;
-constexpr std::size_t kFxFip = 0x08;  // 8 bytes
-constexpr std::size_t kFxRdp = 0x10;  // 8 bytes
-constexpr std::size_t kFxMxCsr = 0x18;
-constexpr std::size_t kFxMxCsrMask = 0x1C;
-constexpr std::size_t kFxSt = 0x20;   // 8 * 16 bytes
-constexpr std::size_t kFxXmm = 0xA0;  // 16 * 16 bytes
+// The floating-point save area's two layouts are the seh layer's constants,
+// imported where they are used below: the CONTEXT is seh's structure, and a
+// second copy of its layout here is the thing that goes stale.
 
 constexpr std::uint32_t kMxCsrReset = 0x1F80u;  // all exceptions masked
 
@@ -833,10 +863,11 @@ void enter_guest_asm(std::uint64_t entry, std::uint64_t stack_top) noexcept {
 // The field writers the CONTEXT builder uses. `memcpy` into a byte buffer
 // because the buffer is unaligned by design -- it is laid out the way
 // Windows lays out memory, not the way C structures align.
-void put_u8(std::uint8_t* base, std::size_t offset, std::uint8_t value) noexcept {
-    base[offset] = value;
-}
-
+//
+// There is no reader here and no byte-wide writer: the floating-point half
+// of the CONTEXT is filled by the seh layer, which owns both save-area
+// layouts and the walk that copies one into the other, and what is left in
+// this file only writes fields it names itself.
 void put_u16(std::uint8_t* base, std::size_t offset,
              std::uint16_t value) noexcept {
     std::memcpy(base + offset, &value, sizeof(value));
@@ -850,30 +881,6 @@ void put_u32(std::uint8_t* base, std::size_t offset,
 void put_u64(std::uint8_t* base, std::size_t offset,
              std::uint64_t value) noexcept {
     std::memcpy(base + offset, &value, sizeof(value));
-}
-
-[[nodiscard]] std::uint8_t get_u8(const std::uint8_t* base,
-                                  std::size_t offset) noexcept {
-    return base[offset];
-}
-
-[[nodiscard]] std::uint16_t get_u16(const std::uint8_t* base,
-                                    std::size_t offset) noexcept {
-    std::uint16_t value = 0;
-    std::memcpy(&value, base + offset, sizeof(value));
-    return value;
-}
-
-[[nodiscard]] std::uint32_t get_u32(const std::uint8_t* base,
-                                    std::size_t offset) noexcept {
-    std::uint32_t value = 0;
-    std::memcpy(&value, base + offset, sizeof(value));
-    return value;
-}
-
-void copy_bytes(std::uint8_t* dst, const std::uint8_t* src,
-                std::size_t bytes) noexcept {
-    std::memcpy(dst, src, bytes);
 }
 
 // --------------------------------------------------------------- the maps
@@ -919,25 +926,11 @@ void fill_guest_context(std::uint8_t* context, const ::ucontext_t& uc) noexcept 
     const auto* fp =
         reinterpret_cast<const std::uint8_t*>(uc.uc_mcontext.fpregs);
     if (fp != nullptr) {
-        put_u32(context, kContextMxCsr, get_u32(fp, kFxMxCsr));
-        put_u16(context, kContextFltSave + kFltControlWord,
-                get_u16(fp, kFxCwd));
-        put_u16(context, kContextFltSave + kFltStatusWord,
-                get_u16(fp, kFxSwd));
-        put_u8(context, kContextFltSave + kFltTagWord, get_u8(fp, kFxTwd));
-        put_u16(context, kContextFltSave + kFltErrorOpcode,
-                get_u16(fp, kFxFop));
-        put_u32(context, kContextFltSave + kFltErrorOffset,
-                get_u32(fp, kFxFip));
-        put_u32(context, kContextFltSave + kFltDataOffset,
-                get_u32(fp, kFxRdp));
-        put_u32(context, kContextFltSave + kFltMxCsr, get_u32(fp, kFxMxCsr));
-        put_u32(context, kContextFltSave + kFltMxCsrMask,
-                get_u32(fp, kFxMxCsrMask));
-        copy_bytes(context + kContextFltSave + kFltFloatRegisters, fp + kFxSt,
-                   8 * 16);
-        copy_bytes(context + kContextFltSave + kFltXmmRegisters, fp + kFxXmm,
-                   16 * 16);
+        // The floating-point half, by the layer that owns the CONTEXT's
+        // layout. The walk of the two save areas lives there rather than
+        // here because a copy of it here is a second list of fields to keep
+        // in step with seh's, and the list is what went stale.
+        seh::copy_fpregs_to_context(context, fp);
     } else {
         // No floating-point state was saved, which the kernel does not do
         // once any has been used; the reset MXCSR is the honest default.

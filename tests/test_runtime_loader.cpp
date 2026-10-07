@@ -21,6 +21,7 @@
 #include "occ/runtime/address_space.h"
 #include "occ/runtime/loader.h"
 #include "occ/runtime/pe_process.h"
+#include "occ/runtime/winabi.h"
 
 #include <algorithm>
 #include <array>
@@ -591,7 +592,14 @@ std::vector<std::uint16_t> tls_dir_reloc_entries(std::uint32_t dir_rva,
         if (off + width > 0x1000u) {
             return {};
         }
-        entries.push_back(static_cast<std::uint16_t>((type << 12) | off));
+        // Both shifts and the or are spelled on unsigned values. `type` is a
+        // 16-bit field and `off` is 32-bit, so `type << 12` promotes to a
+        // signed `int` and the or against `off` converts it back -- a
+        // conversion that is lossless here and still one of the two
+        // compilers' diagnostics rather than the other's.
+        const std::uint32_t word =
+            (static_cast<std::uint32_t>(type) << 12) | off;
+        entries.push_back(static_cast<std::uint16_t>(word));
     }
     return entries;
 }
@@ -4689,6 +4697,7 @@ void test_a_pe_process_is_laid_out_like_a_windows_process() {
     ProcessOptions opts;
     opts.command_line = "C:\\app.exe alpha beta";
     opts.image_path = "C:\\app.exe";
+    opts.process_heaps = {winabi::process_heap_handle()};
 
     ProcessImage failure;
     std::unique_ptr<PeProcess> proc = PeProcess::build(
@@ -4756,6 +4765,36 @@ void test_a_pe_process_is_laid_out_like_a_windows_process() {
     check(v != 0, "process: PEB.Ldr points at a loader data block");
     std::memcpy(&v, reinterpret_cast<const void*>(pi.peb + 0x20), 8);
     check(v != 0, "process: PEB.ProcessParameters points at a block");
+
+    // The two fields a program reads to enumerate the process's heaps. The
+    // pair is asserted together because that is how it is read: a walk takes
+    // the count and the pointer, and either one wrong sends it somewhere
+    // that is not the list. The handle in the array is the one
+    // `GetProcessHeap` answers with, so a program that enumerates heaps and
+    // then asks which one is the process heap finds it.
+    std::uint64_t heaps = 0;
+    std::memcpy(&heaps, reinterpret_cast<const void*>(pi.peb + 0x30), 8);
+    check(heaps != 0, "process: PEB.ProcessHeaps points at the heap list");
+    std::uint32_t heap_count = 0;
+    std::memcpy(&heap_count, reinterpret_cast<const void*>(pi.peb + 0x38), 4);
+    check(heap_count == opts.process_heaps.size(),
+          "process: PEB.NumberOfHeaps is the list's length");
+    check(heaps >= pi.peb && heaps + heap_count * 8 <= pi.peb + 0x1000,
+          "process: the heap list lies inside the PEB's own region");
+    if (heaps != 0 && heap_count != 0) {
+        std::uint64_t first_heap = 0;
+        std::memcpy(&first_heap, reinterpret_cast<const void*>(heaps), 8);
+        check(first_heap == winabi::process_heap_handle(),
+              "process: and it holds the handle GetProcessHeap answers with");
+    }
+
+    // A byte-sized PEB field, written rather than left to the region's
+    // zeroes. FALSE is what every process the loader starts for itself
+    // reports, and a program that reads it is asking whether it inherited
+    // another process's address space.
+    std::uint8_t inherited = 1;
+    std::memcpy(&inherited, reinterpret_cast<const void*>(pi.peb), 1);
+    check(inherited == 0, "process: PEB.InheritedAddressSpace is FALSE");
 
     // The command line, as the counted string Windows uses. The length is
     // in bytes and excludes the terminator, and a reader that took it for a

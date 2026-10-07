@@ -379,6 +379,61 @@ void test_body_unwind_reverses_push_and_alloc() {
           "a frame with no frame register frames itself at the entry rsp");
 }
 
+void test_body_unwind_steps_over_an_epilogue_marker() {
+    // An epilogue marker in the middle of the code list, with a push behind
+    // it in the direction the walk travels. The marker carries a payload
+    // pair the walk never reads, and the size it is recorded with is what
+    // keeps the cursor on a code boundary: stepped over as one slot instead
+    // of two, the cursor lands inside the payload, reads two bytes of it as
+    // the next code, and reverses an effect the prolog never produced --
+    // which shows up as a stack pointer eight bytes too high and a
+    // register restored from a slot nothing was saved in.
+    //
+    // The marker is stored the way the format stores it, in the order the
+    // prolog produced the effects: the allocation first, then the marker,
+    // then the push.
+    TableFixture fixture;
+    UnwindInfoBytes info(0, 7, 0, 0);
+    info.code(4, 2, 4);              // ALLOC_SMALL, 5 units of 8: 0x28 bytes
+    info.code(2, 6, 0, 0, true);     // UWOP_EPILOG, with a payload to skip
+    info.code(0, 0, 3);              // PUSH_NONVOL rbx
+    fixture.place(info.bytes);
+
+    alignas(16) std::uint8_t context[seh::kContextSize];
+    std::memset(context, 0, sizeof(context));
+    alignas(8) std::uint8_t stack[256];
+    std::memset(stack, 0, sizeof(stack));
+    const std::uint64_t stack_base = reinterpret_cast<std::uint64_t>(stack);
+    const std::uint64_t body_rsp = stack_base + 128;
+    const std::uint64_t saved_rbx = 0x1111111111111111ULL;
+    const std::uint64_t return_address = 0x140002000ULL;
+    put64(stack, 128 + 40, saved_rbx);
+    put64(stack, 128 + 48, return_address);
+    put64(context, seh::kContextRsp, body_rsp);
+
+    const auto* entry = seh::lookup_function_entry(
+        fixture.base, fixture.pdata, sizeof(fixture.pdata), fixture.pc);
+    check(entry != nullptr, "the fixture's pc lands in its own row");
+
+    const void* data = nullptr;
+    std::uint64_t frame = 0;
+    std::uint64_t handler = 0;
+    const bool ok = seh::virtual_unwind(seh::kUnwFlagEHandler, fixture.base,
+                                        fixture.pc, entry, context,
+                                        fixture.xdata(), 0, 0, &data,
+                                        &frame, &handler);
+    check(ok, "a body control point with an epilogue marker unwinds");
+    check(get64(context, seh::kContextRsp) == body_rsp + 0x28 + 8 + 8,
+          "the marker consumed no stack, and the push behind it was "
+          "reversed once");
+    check(get64(context, seh::kContextRbx) == saved_rbx,
+          "rbx is restored from the slot its push left");
+    check(get64(context, seh::kContextRip) == return_address,
+          "the caller is the address its call pushed");
+    check(get64(context, seh::kContextRax) == 0,
+          "the payload was not read as a code and stored into r0");
+}
+
 void test_prolog_middle_skips_the_codes_not_reached() {
     // The same prolog, entered three bytes in: the allocation and the
     // push have run, the save has not.
@@ -744,6 +799,7 @@ int main() {
     test_body_unwind_refuses_a_row_pointing_outside_xdata();
     test_unwind_stops_when_the_code_count_overruns_the_section();
     test_body_unwind_reverses_push_and_alloc();
+    test_body_unwind_steps_over_an_epilogue_marker();
     test_prolog_middle_skips_the_codes_not_reached();
     test_frame_register_anchors_the_save_slots();
     test_dispatch_reports_the_handler_that_will_handle();
