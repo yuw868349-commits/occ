@@ -940,6 +940,154 @@ void test_crt_stdio_files() {
           "the ungetc file clears away");
 }
 
+// ---------------------------------------------------------------- calendar
+
+void test_crt_time_env() {
+    // time: the guest's time_t is the host's -- sixty-four bits of
+    // seconds -- and both spellings of the answer agree.
+    std::int64_t stored = 0;
+    const std::int64_t now = winabi::cr_time(&stored);
+    check(now > 1700000000 && stored == now,
+          "time answers the seconds it also stores");
+
+    // clock: wall time in thousandths of a second, and it moves forward.
+    const std::int32_t first_tick = winabi::cr_clock();
+    const std::int32_t second_tick = winabi::cr_clock();
+    check(second_tick >= first_tick, "clock moves forward");
+
+    // gmtime over a fixed instant: 86400 is the second day of 1970, and
+    // the nine ints the answer carries are the ones the UTC calendar
+    // spells -- zero seconds through midnight, February-less month zero,
+    // years since 1900, a Friday, the year's first day, no DST.
+    std::int64_t day = 86400;
+    const int* fields = static_cast<const int*>(winabi::cr_gmtime(&day));
+    check(fields != nullptr && fields[0] == 0 && fields[1] == 0 &&
+              fields[2] == 0 && fields[3] == 2 && fields[4] == 0 &&
+              fields[5] == 70 && fields[6] == 5 && fields[7] == 1 &&
+              fields[8] == 0,
+          "gmtime reads the calendar the instant names");
+    check(winabi::cr_gmtime(nullptr) == nullptr,
+          "a null timer answers no broken-down time");
+
+    // asctime over the same fields: the zone-free line the epoch spells.
+    std::int64_t zero = 0;
+    const char* line = winabi::cr_asctime(winabi::cr_gmtime(&zero));
+    check(line != nullptr &&
+              std::string(line) == "Thu Jan 01 00:00:00 1970\n",
+          "asctime spells the line the fields make");
+
+    // _mkgmtime inverts it, with no time zone to guess around.
+    int round[9] = {0, 0, 0, 2, 0, 70, 0, 0, 0};
+    check(winabi::cr__mkgmtime(round) == 86400 && round[6] == 5 &&
+              round[7] == 1,
+          "_mkgmtime reads the fields back into the instant");
+
+    // mktime answers the local spelling of the fields it is given and
+    // writes the normalized week day and year day back; localtime reads
+    // the instant back into the fields that produced it.
+    int local[9] = {45, 30, 12, 29, 1, 124, 0, 0, -1}; // 2024-02-29 12:30:45
+    const std::int64_t stamp = winabi::cr_mktime(local);
+    check(stamp != -1 && local[6] >= 0 && local[7] >= 0,
+          "mktime normalizes the fields it answers");
+    const int* back = static_cast<const int*>(winabi::cr_localtime(&stamp));
+    check(back != nullptr && back[0] == 45 && back[1] == 30 &&
+              back[2] == 12 && back[3] == 29 && back[4] == 1 &&
+              back[5] == 124,
+          "localtime reads the instant back into the fields");
+    check(winabi::cr_localtime(nullptr) == nullptr,
+          "a null timer answers no local time");
+
+    // strftime over the UTC fields: the date, the weekday, the year day.
+    char formatted[64] = {};
+    check(winabi::cr_strftime(formatted, sizeof(formatted),
+                              "%Y-%m-%d %H:%M:%S|%A|%j",
+                              winabi::cr_gmtime(&day)) == 30 &&
+              std::string(formatted) == "1970-01-02 00:00:00|Friday|002",
+          "strftime spells what the format asks");
+    char tiny[8] = {};
+    check(winabi::cr_strftime(tiny, sizeof(tiny), "%Y-%m-%d %H:%M:%S",
+                              winabi::cr_gmtime(&day)) == 0,
+          "a strftime that cannot fit answers zero");
+
+    // difftime is the difference it names.
+    check(winabi::cr_difftime(172800, 86400) == 86400.0,
+          "difftime answers the seconds between");
+
+    // ------------------------------------------------------ environment
+
+    // getenv over a name the table carries and one it does not.
+    const char* path = winabi::cr_getenv("PATH");
+    check(path != nullptr && std::strchr(path, '/') != nullptr,
+          "getenv reads a name the environment carries");
+    check(winabi::cr_getenv("OCC_DEFINITELY_NOT_SET_9F2") == nullptr,
+          "getenv answers null for a name it does not carry");
+
+    // _putenv_s writes, and the kernel32 narrow call sees the same value:
+    // one environment, two spellings.
+    check(winabi::cr__putenv_s("OCC_TEST_VAR", "41") == 0,
+          "_putenv_s writes the name");
+    const char* read = winabi::cr_getenv("OCC_TEST_VAR");
+    check(read != nullptr && std::string(read) == "41",
+          "getenv reads what putenv wrote");
+    char value[8] = {};
+    check(winabi::k32_GetEnvironmentVariableA("OCC_TEST_VAR", value,
+                                              sizeof(value)) == 2 &&
+              std::string(value) == "41",
+          "the kernel32 spelling reads the same environment");
+    char tight[2] = {};
+    check(winabi::k32_GetEnvironmentVariableA("OCC_TEST_VAR", tight,
+                                              sizeof(tight)) == 3,
+          "a tight buffer asks for the count it needed, terminator in");
+    check(winabi::k32_GetEnvironmentVariableA("OCC_DEFINITELY_NOT_SET_9F2",
+                                              value, sizeof(value)) == 0,
+          "an unknown name answers zero");
+
+    // _putenv with the "NAME=VALUE" spelling, and "NAME=" for the delete.
+    check(winabi::cr__putenv("OCC_TEST_VAR2=7") == 0,
+          "_putenv writes the form it spells");
+    read = winabi::cr_getenv("OCC_TEST_VAR2");
+    check(read != nullptr && std::string(read) == "7",
+          "the second name reads back");
+    check(winabi::cr__putenv("OCC_TEST_VAR2=") == 0,
+          "_putenv with no value deletes");
+    check(winabi::cr_getenv("OCC_TEST_VAR2") == nullptr,
+          "the deleted name reads as gone");
+
+    // SetEnvironmentVariable deletes on a null value and on an empty one.
+    check(winabi::k32_SetEnvironmentVariableA("OCC_TEST_VAR", "x") == 1,
+          "the kernel32 set writes");
+    check(winabi::k32_GetEnvironmentVariableA("OCC_TEST_VAR", value,
+                                              sizeof(value)) == 1 &&
+              std::string(value) == "x",
+          "the set the kernel32 wrote reads back");
+    check(winabi::k32_SetEnvironmentVariableA("OCC_TEST_VAR", nullptr) == 1,
+          "the kernel32 set with no value deletes");
+    check(winabi::k32_GetEnvironmentVariableA("OCC_TEST_VAR", value,
+                                              sizeof(value)) == 0,
+          "the kernel32-deleted name reads as gone");
+    check(winabi::k32_SetEnvironmentVariableA("OCC_TEST_VAR", "") == 1,
+          "the kernel32 set with an empty value deletes");
+    check(winabi::k32_GetEnvironmentVariableA("OCC_TEST_VAR", value,
+                                              sizeof(value)) == 0,
+          "the empty-set name reads as gone");
+    check(winabi::k32_SetEnvironmentVariableA("OCC_HAS=EQ", "x") == 0,
+          "a name with an equals is no name");
+
+    // the wide spelling carries the same value over the UTF-16 the
+    // guest's wchar_t is
+    check(winabi::k32_SetEnvironmentVariableW(u"OCC_TEST_WVAR", u"ok") == 1,
+          "the wide set writes");
+    char16_t wide[8] = {};
+    check(winabi::k32_GetEnvironmentVariableW(u"OCC_TEST_WVAR", wide, 8) ==
+                  2 &&
+              std::u16string(wide) == u"ok",
+          "the wide get reads what the wide set wrote");
+    check(winabi::k32_SetEnvironmentVariableW(u"OCC_TEST_WVAR", nullptr) == 1,
+          "the wide delete deletes");
+    check(winabi::k32_GetEnvironmentVariableW(u"OCC_TEST_WVAR", wide, 8) == 0,
+          "the wide-deleted name reads as gone");
+}
+
 // --------------------------------------------------------------- registry
 
 void test_every_fixture_import_resolves() {
@@ -948,12 +1096,17 @@ void test_every_fixture_import_resolves() {
     // here is a name a program reaches for, and the check below is what
     // notices the runtime missing it.
     const char* kernel32[] = {
-        "DeleteCriticalSection", "EnterCriticalSection", "GetLastError",
-        "GetProcessHeap",        "GetStdHandle",          "HeapAlloc",
-        "HeapFree",              "HeapReAlloc",           "HeapSize",
-        "InitializeCriticalSection", "IsDBCSLeadByteEx",  "LeaveCriticalSection",
-        "MultiByteToWideChar",   "SetUnhandledExceptionFilter", "Sleep",
-        "TlsGetValue",           "VirtualProtect",        "VirtualQuery",
+        "DeleteCriticalSection",  "EnterCriticalSection",
+        "GetEnvironmentVariableA", "GetEnvironmentVariableW",
+        "GetLastError",           "GetProcessHeap",
+        "GetStdHandle",           "HeapAlloc",
+        "HeapFree",               "HeapReAlloc",
+        "HeapSize",               "InitializeCriticalSection",
+        "IsDBCSLeadByteEx",       "LeaveCriticalSection",
+        "MultiByteToWideChar",    "SetEnvironmentVariableA",
+        "SetEnvironmentVariableW", "SetUnhandledExceptionFilter",
+        "Sleep",                  "TlsGetValue",
+        "VirtualProtect",         "VirtualQuery",
         "WideCharToMultiByte",
     };
     const char* msvcrt[] = {
@@ -962,40 +1115,48 @@ void test_every_fixture_import_resolves() {
         "__initenv",            "__iob_func",
         "__set_app_type",       "__setusermatherr",
         "_amsg_exit",           "_cexit",
-        "_commode",             "_errno",
-        "_fmode",               "_i64toa",
-        "_initterm",            "_itoa",
+        "_commode",             "_environ",
+        "_errno",               "_fmode",
+        "_i64toa",              "_initterm",
+        "_itoa",                "_localtime64",
         "_lock",                "_ltoa",
-        "_onexit",              "_stricmp",
+        "_mkgmtime",            "_mktime64",
+        "_onexit",              "_putenv",
+        "_putenv_s",            "_stricmp",
         "_strlwr",              "_strnicmp",
         "_strupr",              "_ui64toa",
         "_ultoa",               "_unlock",
-        "abs",                  "abort",
+        "abs",                  "asctime",
         "atof",                 "atoi",
         "atol",                 "bsearch",
-        "calloc",               "div",
-        "exit",                 "fprintf",
-        "fputc",                "free",
-        "fwrite",               "isalpha",
-        "isdigit",              "isspace",
-        "isupper",              "itoa",
-        "labs",                 "ldiv",
-        "lldiv",                "localeconv",
+        "calloc",               "clock",
+        "ctime",                "difftime",
+        "div",                  "exit",
+        "fprintf",              "fputc",
+        "free",                 "fwrite",
+        "getenv",               "gmtime",
+        "isalpha",              "isdigit",
+        "isspace",              "isupper",
+        "itoa",                 "labs",
+        "ldiv",                 "lldiv",
+        "localeconv",           "localtime",
         "malloc",               "mbstowcs",
         "memcmp",               "memcpy",
         "memmove",              "memset",
+        "mktime",               "putenv",
         "qsort",                "rand",
         "srand",                "signal",
         "strcat",               "strchr",
         "strcmp",               "strcspn",
-        "strerror",             "strlen",
-        "strncat",              "strncmp",
-        "strncpy",              "strnlen",
-        "strpbrk",              "strrchr",
-        "strspn",               "strstr",
-        "strtod",               "strtol",
-        "strtoll",              "strtoul",
-        "strtoull",             "tolower",
+        "strerror",             "strftime",
+        "strlen",               "strncat",
+        "strncmp",              "strncpy",
+        "strnlen",              "strpbrk",
+        "strrchr",              "strspn",
+        "strstr",               "strtod",
+        "strtol",               "strtoll",
+        "strtoul",              "strtoull",
+        "time",                 "tolower",
         "toupper",              "vfprintf",
         "wcschr",               "wcscmp",
         "wcscpy",               "wcsdup",
@@ -1061,6 +1222,7 @@ int main() {
     test_crt_computational();
     test_crt_stdio_buffers();
     test_crt_stdio_files();
+    test_crt_time_env();
     test_every_fixture_import_resolves();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);

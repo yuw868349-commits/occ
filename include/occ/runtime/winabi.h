@@ -497,6 +497,50 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_remove(
     const char* path) noexcept;
 extern "C" __attribute__((ms_abi)) void* cr_tmpfile() noexcept;
 
+// The calendar: the guest's `time_t` is the host's own 64-bit spelling,
+// and the `struct tm` the calendar calls bridge through is the nine ints
+// both sides spell it with. `clock` is Windows' -- wall time in
+// thousandths of a second since the process started, wrapping with its
+// 32-bit answer.
+extern "C" __attribute__((ms_abi)) std::int64_t cr_time(
+    std::int64_t* store) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_clock() noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_localtime(
+    const std::int64_t* timer) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_gmtime(
+    const std::int64_t* timer) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr_mktime(
+    void* broken_down) noexcept;
+extern "C" __attribute__((ms_abi)) std::int64_t cr__mkgmtime(
+    void* broken_down) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strftime(
+    char* buffer, std::uint64_t max, const char* format,
+    const void* broken_down) noexcept;
+extern "C" __attribute__((ms_abi)) double cr_difftime(std::int64_t later,
+                                                      std::int64_t earlier) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_ctime(
+    const std::int64_t* timer) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr_asctime(
+    const void* broken_down) noexcept;
+
+// The environment: `getenv` reads the merged truth -- the table the
+// startup was handed with every `_putenv` and every
+// `SetEnvironmentVariable` applied -- and the setting calls rebuild it.
+extern "C" __attribute__((ms_abi)) char* cr_getenv(
+    const char* name) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr__putenv(
+    const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr__putenv_s(
+    const char* name, const char* value) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetEnvironmentVariableA(
+    const char* name, char* buffer, std::uint32_t size) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetEnvironmentVariableW(
+    const char16_t* name, char16_t* buffer, std::uint32_t size) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32_SetEnvironmentVariableA(
+    const char* name, const char* value) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32_SetEnvironmentVariableW(
+    const char16_t* name, const char16_t* value) noexcept;
+
 // --------------------------------------------------------------------------
 // The heap
 // --------------------------------------------------------------------------

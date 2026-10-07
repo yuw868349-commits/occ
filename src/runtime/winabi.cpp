@@ -1,10 +1,13 @@
 #include "occ/runtime/winabi.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -83,6 +86,8 @@ constexpr std::uint32_t kErrorInvalidHandle = 6;
 constexpr std::uint32_t kErrorNotSupported = 50;
 constexpr std::uint32_t kErrorInsufficientBuffer = 122;
 constexpr std::uint32_t kErrorNoMoreItems = 381;
+constexpr std::uint32_t kErrorInvalidParameter = 87;
+constexpr std::uint32_t kErrorEnvVarNotFound = 203;
 
 // --------------------------------------------------------------------------
 // TEB access
@@ -1059,6 +1064,208 @@ void forget_file_mode(const void* stream) noexcept {
     g_file_modes.erase(stream);
 }
 
+// ---- the process environment --------------------------------------------
+//
+// The environment the guest starts with is the one the runtime was handed
+// in `options.environment`, and the startup's `__getmainargs` hands the
+// guest that same table through `__initenv` and `_environ`. What the guest
+// changes afterwards cannot go into that frozen table, so the changes land
+// here: an override map for the names a call set, a deleted set for the
+// ones it cleared, and a flat table rebuilt from the three of them every
+// time either changes -- the same shape `_environ` has on Windows, where a
+// program that walks it sees the merged truth.
+
+std::mutex g_env_mutex;
+std::map<std::string, std::string> g_env_overrides;
+std::set<std::string> g_env_deleted;
+std::vector<std::string> g_env_storage;
+std::vector<char*> g_env_flat;
+char** g_environ_ptr = nullptr;
+
+// "NAME=VALUE" spells its name in the part before the first '='; a form
+// without one has no name this table can carry.
+[[nodiscard]] std::string environment_name_of(const char* entry) noexcept {
+    const char* equals = ::strchr(entry, '=');
+    return equals == nullptr ? std::string(entry)
+                             : std::string(entry, static_cast<std::size_t>(
+                                                          equals - entry));
+}
+
+// The caller holds the mutex. Base entries first -- first spelling wins,
+// as it does on Windows -- each carrying its override if one exists and
+// nothing at all if it was deleted; then the names the base never had.
+void rebuild_environment(const GuestState& g) noexcept {
+    g_env_storage.clear();
+    g_env_flat.clear();
+    std::set<std::string> carried;
+    for (const char* entry : g.env_table) {
+        if (entry == nullptr) {
+            break;
+        }
+        const std::string name = environment_name_of(entry);
+        if (carried.count(name) > 0) {
+            continue;
+        }
+        carried.insert(name);
+        const auto over = g_env_overrides.find(name);
+        if (over != g_env_overrides.end()) {
+            g_env_storage.push_back(name + "=" + over->second);
+        } else if (g_env_deleted.count(name) == 0) {
+            g_env_storage.push_back(entry);
+        }
+    }
+    for (const auto& [name, value] : g_env_overrides) {
+        if (carried.count(name) == 0) {
+            g_env_storage.push_back(name + "=" + value);
+        }
+    }
+    g_env_flat.reserve(g_env_storage.size() + 1);
+    for (const std::string& entry : g_env_storage) {
+        // The flat table is what `_environ` spells, and `_environ` is
+        // `char**` on Windows; the storage itself stays const-owned here.
+        g_env_flat.push_back(const_cast<char*>(entry.data()));
+    }
+    g_env_flat.push_back(nullptr);
+    g_environ_ptr = g_env_flat.data();
+}
+
+// The value a name spells right now. Without a guest there is no table of
+// this runtime's own -- a host tool reaches the same thunks, and the
+// host's own environment is the environment it means.
+[[nodiscard]] char* lookup_environment(const char* name) noexcept {
+    const GuestState* g = require_state();
+    if (g == nullptr) {
+        return ::getenv(name);
+    }
+    if (name == nullptr) {
+        return nullptr;
+    }
+    const std::lock_guard<std::mutex> lock(g_env_mutex);
+    if (g_env_flat.empty() && !g->env_table.empty()) {
+        rebuild_environment(*g);
+    }
+    const std::size_t length = ::strlen(name);
+    for (char* entry : g_env_flat) {
+        if (entry == nullptr) {
+            break;
+        }
+        if (::strncmp(entry, name, length) == 0 && entry[length] == '=') {
+            return entry + length + 1;
+        }
+    }
+    return nullptr;
+}
+
+// ---- the clock and the calendar ------------------------------------------
+//
+// Windows' `clock` counts *wall* time since the process started, in
+// thousandths of a second, and wraps with its 32-bit answer the same way
+// the real library does; the host's `clock` counts processor time in
+// millionths, which is a different quantity under the same name. The boot
+// mark below is taken when this translation unit loads -- the earliest a
+// static initializer in the guest-facing side can run, and close enough to
+// the process start no guest code could have observed the difference.
+const std::chrono::steady_clock::time_point g_boot_steady =
+    std::chrono::steady_clock::now();
+
+// `localtime` and `gmtime` answer a pointer to a `struct tm` the library
+// owns; the guest's struct carries the same nine ints the host's does, so
+// the answer is this static copy, and the mutex makes the shared-buffer
+// race behave the way the real library's single-threaded answer does.
+std::mutex g_time_mutex;
+int g_guest_tm[9] = {};
+char g_ctime_buffer[26] = {};
+
+// The bridge in both directions. Host and guest agree on the nine ints --
+// seconds, minutes, hours, month day, month, years since 1900, week day,
+// year day, DST flag -- and the host's struct carries two fields more
+// after them that the guest's does not know about.
+void bridge_tm_out(const std::tm& host_tm, int* out) noexcept {
+    out[0] = host_tm.tm_sec;
+    out[1] = host_tm.tm_min;
+    out[2] = host_tm.tm_hour;
+    out[3] = host_tm.tm_mday;
+    out[4] = host_tm.tm_mon;
+    out[5] = host_tm.tm_year;
+    out[6] = host_tm.tm_wday;
+    out[7] = host_tm.tm_yday;
+    out[8] = host_tm.tm_isdst;
+}
+
+void bridge_tm_in(const int* in, std::tm& host_tm) noexcept {
+    host_tm = std::tm{};
+    host_tm.tm_sec = in[0];
+    host_tm.tm_min = in[1];
+    host_tm.tm_hour = in[2];
+    host_tm.tm_mday = in[3];
+    host_tm.tm_mon = in[4];
+    host_tm.tm_year = in[5];
+    host_tm.tm_wday = in[6];
+    host_tm.tm_yday = in[7];
+    host_tm.tm_isdst = in[8];
+    // %Z spells the zone name from here; the offset stays zero, which is
+    // the UTC reading, since a nine-int struct carries no offset of its
+    // own. `mktime` fills its own back below.
+    host_tm.tm_zone = ::tzname[host_tm.tm_isdst > 0 ? 1 : 0];
+}
+
+// The line Windows' asctime spells: "Www Mmm dd hh:mm:ss yyyy\n", with the
+// day of the month zero-padded -- the one place the host's own spelling
+// differs, a space standing where Windows puts the zero. The weekday and
+// month names come from the struct's own fields, exactly as the real
+// library spells them.
+void spell_ctime_line(const std::tm& broken, char* out) noexcept {
+    static const char* const weekdays[7] = {
+        "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char* const months[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    // The line is spelled into a roomy scratch first -- every int the
+    // format names fits here whatever it carries -- and the first 26
+    // bytes land in the caller's buffer, which is the exact width the
+    // Windows answer has and the width a guest has to be ready for.
+    char line[64] = {};
+    ::snprintf(line, sizeof(line), "%.3s %.3s %02d %02d:%02d:%02d %04d\n",
+               (broken.tm_wday >= 0 && broken.tm_wday < 7)
+                   ? weekdays[broken.tm_wday]
+                   : "   ",
+               (broken.tm_mon >= 0 && broken.tm_mon < 12)
+                   ? months[broken.tm_mon]
+                   : "   ",
+               broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec,
+               broken.tm_year + 1900);
+    std::memcpy(out, line, 26);
+    out[25] = '\0';
+}
+
+// ---- the guest's one-time initialization ---------------------------------
+
+// The startup's own call wires the two data exports to the table the
+// runtime was handed; until it runs, `_environ` spells null, which is what
+// the real library's does before its startup too.
+void wire_environment(const GuestState& g) noexcept {
+    const std::lock_guard<std::mutex> lock(g_env_mutex);
+    g_initenv = const_cast<char**>(g.env_table.data());
+    if (g_env_flat.empty()) {
+        rebuild_environment(g);
+    }
+}
+
+void set_environment_value(const GuestState& g, const std::string& name,
+                           const char* value) noexcept {
+    const std::lock_guard<std::mutex> lock(g_env_mutex);
+    if (value == nullptr || value[0] == '\0') {
+        // Windows deletes the name when a set names no value or an empty
+        // one; `_putenv` spells the same rule with "NAME=".
+        g_env_overrides.erase(name);
+        g_env_deleted.insert(name);
+    } else {
+        g_env_overrides[name] = value;
+        g_env_deleted.erase(name);
+    }
+    rebuild_environment(g);
+}
+
 // The msvcrt internal locks. The real library has one per stdio stream and a
 // handful for its own state; the guest's startup takes two and releases them
 // in the same order. The table is indexed by the number the guest passed and
@@ -1260,6 +1467,114 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetCurrentThread() noexcept
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32_IsDebuggerPresent() noexcept {
     return 0;
+}
+
+// ---- the environment, the kernel32 spelling ------------------------------
+//
+// The narrow call answers the character count of the value, not counting
+// the terminator, and answers zero twice over: when the name has no value
+// (and the last error says which of "not found" and "found but empty"
+// it was), and when the caller's buffer would not have held it -- that
+// one is the count the caller needed, terminator included. Setting a name
+// to an empty value deletes it, the way the real call does.
+
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetEnvironmentVariableA(
+    const char* name, char* buffer, std::uint32_t size) noexcept {
+    const char* value = lookup_environment(name);
+    if (value == nullptr) {
+        set_last_error(kErrorEnvVarNotFound);
+        return 0;
+    }
+    const std::uint64_t length = ::strlen(value);
+    if (length == 0) {
+        set_last_error(0);
+        return 0;
+    }
+    if (length + 1 > size) {
+        set_last_error(kErrorInsufficientBuffer);
+        return static_cast<std::uint32_t>(length + 1);
+    }
+    if (buffer != nullptr) {
+        ::memcpy(buffer, value, length + 1);
+    }
+    set_last_error(0);
+    return static_cast<std::uint32_t>(length);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetEnvironmentVariableW(
+    const char16_t* name, char16_t* buffer, std::uint32_t size) noexcept {
+    std::string narrow_name;
+    if (!utf16_to_utf8(name == nullptr ? std::u16string_view()
+                                       : std::u16string_view(name),
+                       narrow_name)) {
+        set_last_error(kErrorEnvVarNotFound);
+        return 0;
+    }
+    const char* value = lookup_environment(narrow_name.c_str());
+    if (value == nullptr) {
+        set_last_error(kErrorEnvVarNotFound);
+        return 0;
+    }
+    std::u16string wide;
+    if (!utf8_to_utf16(std::string_view(value), wide)) {
+        set_last_error(0);
+        return 0;
+    }
+    if (wide.empty()) {
+        set_last_error(0);
+        return 0;
+    }
+    if (wide.size() + 1 > size) {
+        set_last_error(kErrorInsufficientBuffer);
+        return static_cast<std::uint32_t>(wide.size() + 1);
+    }
+    if (buffer != nullptr) {
+        ::memcpy(buffer, wide.data(), (wide.size() + 1) * sizeof(char16_t));
+    }
+    set_last_error(0);
+    return static_cast<std::uint32_t>(wide.size());
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t k32_SetEnvironmentVariableA(
+    const char* name, const char* value) noexcept {
+    if (name == nullptr || name[0] == '\0' || ::strchr(name, '=') != nullptr) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    const GuestState* g = require_state();
+    if (g == nullptr) {
+        // A host tool speaks to the host's own environment, the same way
+        // its getenv does.
+        if (value == nullptr || value[0] == '\0') {
+            ::unsetenv(name);
+        } else {
+            ::setenv(name, value, 1);
+        }
+        set_last_error(0);
+        return 1;
+    }
+    set_environment_value(*g, name, value);
+    set_last_error(0);
+    return 1;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t k32_SetEnvironmentVariableW(
+    const char16_t* name, const char16_t* value) noexcept {
+    std::string narrow_name;
+    std::string narrow_value;
+    if (name != nullptr &&
+        !utf16_to_utf8(std::u16string_view(name), narrow_name)) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    if (value != nullptr &&
+        !utf16_to_utf8(std::u16string_view(value), narrow_value)) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    return k32_SetEnvironmentVariableA(
+        narrow_name.c_str(),
+        value == nullptr ? nullptr : narrow_value.c_str());
 }
 
 // ---- the console --------------------------------------------------------
@@ -1809,6 +2124,199 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr___getmainargs(
     // startup's; the guest receives pointers into strings it never writes.
     *argv = const_cast<char**>(g->argv_table.data());
     *env = const_cast<char**>(g->env_table.data());
+    // The same table is what `__initenv` and `_environ` spell until a
+    // `_putenv` rebuilds the flat one over it.
+    wire_environment(*g);
+    return 0;
+}
+
+// ---- the calendar --------------------------------------------------------
+//
+// The guest's `time_t` is the host's -- sixty-four bits of seconds from
+// the epoch, which is the same answer Windows' 64-bit `time` gives -- and
+// the calendar calls are the host's own, bridged through the nine ints
+// both sides spell a `struct tm` with.
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr_time(
+    std::int64_t* store) noexcept {
+    const std::time_t now = ::time(nullptr);
+    if (store != nullptr) {
+        *store = static_cast<std::int64_t>(now);
+    }
+    return static_cast<std::int64_t>(now);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_clock() noexcept {
+    const auto milliseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_boot_steady)
+            .count());
+    // Windows answers a 32-bit long here, and a long enough run wraps it;
+    // the truncation is the same answer the real library would give.
+    return static_cast<std::int32_t>(milliseconds);
+}
+
+extern "C" __attribute__((ms_abi)) void* cr_localtime(
+    const std::int64_t* timer) noexcept {
+    if (timer == nullptr) {
+        return nullptr;
+    }
+    std::tm broken;
+    const std::time_t when = static_cast<std::time_t>(*timer);
+    const std::lock_guard<std::mutex> lock(g_time_mutex);
+    if (::localtime_r(&when, &broken) == nullptr) {
+        return nullptr;
+    }
+    bridge_tm_out(broken, g_guest_tm);
+    return g_guest_tm;
+}
+
+extern "C" __attribute__((ms_abi)) void* cr_gmtime(
+    const std::int64_t* timer) noexcept {
+    if (timer == nullptr) {
+        return nullptr;
+    }
+    std::tm broken;
+    const std::time_t when = static_cast<std::time_t>(*timer);
+    const std::lock_guard<std::mutex> lock(g_time_mutex);
+    if (::gmtime_r(&when, &broken) == nullptr) {
+        return nullptr;
+    }
+    bridge_tm_out(broken, g_guest_tm);
+    return g_guest_tm;
+}
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr_mktime(
+    void* broken_down) noexcept {
+    if (broken_down == nullptr) {
+        errno = EINVAL;
+        return -1;
+    }
+    auto* fields = static_cast<int*>(broken_down);
+    std::tm broken;
+    bridge_tm_in(fields, broken);
+    const std::time_t answer = ::mktime(&broken);
+    // mktime normalizes the struct either way -- a time it cannot name
+    // still tells the caller which day of the week it would have been --
+    // and the Windows one writes the nine fields back the same way.
+    bridge_tm_out(broken, fields);
+    return static_cast<std::int64_t>(answer);
+}
+
+extern "C" __attribute__((ms_abi)) std::int64_t cr__mkgmtime(
+    void* broken_down) noexcept {
+    if (broken_down == nullptr) {
+        errno = EINVAL;
+        return -1;
+    }
+    auto* fields = static_cast<int*>(broken_down);
+    std::tm broken;
+    bridge_tm_in(fields, broken);
+    const std::time_t answer = ::timegm(&broken);
+    bridge_tm_out(broken, fields);
+    return static_cast<std::int64_t>(answer);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strftime(
+    char* buffer, std::uint64_t max, const char* format,
+    const void* broken_down) noexcept {
+    if (buffer == nullptr || max == 0 || format == nullptr ||
+        broken_down == nullptr) {
+        return 0;
+    }
+    std::tm broken;
+    ::tzset();
+    bridge_tm_in(static_cast<const int*>(broken_down), broken);
+    // The format is the guest's own spelling -- its correctness is the
+    // guest's contract with its users, not something this side re-checks.
+    // The call goes through the pointer because the compiler's literal
+    // check applies to direct calls only.
+    static constexpr auto host_strftime = ::strftime;
+    const std::size_t written = host_strftime(
+        buffer, static_cast<std::size_t>(max), format, &broken);
+    return static_cast<std::uint64_t>(written);
+}
+
+extern "C" __attribute__((ms_abi)) double cr_difftime(
+    std::int64_t later, std::int64_t earlier) noexcept {
+    return ::difftime(static_cast<std::time_t>(later),
+                      static_cast<std::time_t>(earlier));
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_ctime(
+    const std::int64_t* timer) noexcept {
+    if (timer == nullptr) {
+        return nullptr;
+    }
+    std::tm broken;
+    const std::time_t when = static_cast<std::time_t>(*timer);
+    const std::lock_guard<std::mutex> lock(g_time_mutex);
+    // ctime is asctime over localtime's reading, and both halves of that
+    // answer spell the Windows line.
+    if (::localtime_r(&when, &broken) == nullptr) {
+        return nullptr;
+    }
+    spell_ctime_line(broken, g_ctime_buffer);
+    return g_ctime_buffer;
+}
+
+extern "C" __attribute__((ms_abi)) char* cr_asctime(
+    const void* broken_down) noexcept {
+    if (broken_down == nullptr) {
+        return nullptr;
+    }
+    std::tm broken;
+    bridge_tm_in(static_cast<const int*>(broken_down), broken);
+    const std::lock_guard<std::mutex> lock(g_time_mutex);
+    spell_ctime_line(broken, g_ctime_buffer);
+    return g_ctime_buffer;
+}
+
+// ---- the environment, the C spelling -------------------------------------
+
+extern "C" __attribute__((ms_abi)) char* cr_getenv(
+    const char* name) noexcept {
+    return lookup_environment(name);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr__putenv(
+    const char* text) noexcept {
+    if (text == nullptr) {
+        return -1;
+    }
+    const char* equals = ::strchr(text, '=');
+    if (equals == nullptr || equals == text) {
+        // Windows answers failure for a form with no name or no equals;
+        // a bare name is not a spelling this contract carries.
+        return -1;
+    }
+    const std::string name(text, static_cast<std::size_t>(equals - text));
+    const GuestState* g = require_state();
+    if (g == nullptr) {
+        // The host's own environment, the way a host tool's getenv reads.
+        if (equals[1] == '\0') {
+            return ::unsetenv(name.c_str()) == 0 ? 0 : -1;
+        }
+        return ::setenv(name.c_str(), equals + 1, 1) == 0 ? 0 : -1;
+    }
+    set_environment_value(*g, name, equals + 1);
+    return 0;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr__putenv_s(
+    const char* name, const char* value) noexcept {
+    if (name == nullptr || name[0] == '\0' ||
+        ::strchr(name, '=') != nullptr) {
+        return -1;
+    }
+    const GuestState* g = require_state();
+    if (g == nullptr) {
+        if (value == nullptr) {
+            return ::unsetenv(name) == 0 ? 0 : -1;
+        }
+        return ::setenv(name, value, 1) == 0 ? 0 : -1;
+    }
+    set_environment_value(*g, name, value);
     return 0;
 }
 
@@ -3302,7 +3810,15 @@ void add_kernel32(ExportModule& module) {
         e("GetCurrentProcess", reinterpret_cast<void*>(&k32_GetCurrentProcess)),
         e("GetCurrentThread", reinterpret_cast<void*>(&k32_GetCurrentThread)),
         e("IsDebuggerPresent", reinterpret_cast<void*>(&k32_IsDebuggerPresent)),
+        e("GetEnvironmentVariableA",
+          reinterpret_cast<void*>(&k32_GetEnvironmentVariableA)),
+        e("GetEnvironmentVariableW",
+          reinterpret_cast<void*>(&k32_GetEnvironmentVariableW)),
         e("GetLastError", reinterpret_cast<void*>(&k32_GetLastError)),
+        e("SetEnvironmentVariableA",
+          reinterpret_cast<void*>(&k32_SetEnvironmentVariableA)),
+        e("SetEnvironmentVariableW",
+          reinterpret_cast<void*>(&k32_SetEnvironmentVariableW)),
         e("SetLastError", reinterpret_cast<void*>(&k32_SetLastError)),
         e("InitializeCriticalSection",
           reinterpret_cast<void*>(&k32_InitializeCriticalSection)),
@@ -3380,13 +3896,19 @@ void add_msvcrt(ExportModule& module) {
         e("_cexit", reinterpret_cast<void*>(&cr__cexit)),
         d("_commode", &g_commode),
         e("_errno", reinterpret_cast<void*>(&cr__errno)),
+        d("_environ", &g_environ_ptr),
         e("_fmode", &g_fmode),
         e("_i64toa", reinterpret_cast<void*>(&cr__i64toa)),
         e("_initterm", reinterpret_cast<void*>(&cr__initterm)),
         e("_itoa", reinterpret_cast<void*>(&cr__itoa)),
         e("_lock", reinterpret_cast<void*>(&cr__lock)),
         e("_ltoa", reinterpret_cast<void*>(&cr__ltoa)),
+        e("_localtime64", reinterpret_cast<void*>(&cr_localtime)),
+        e("_mkgmtime", reinterpret_cast<void*>(&cr__mkgmtime)),
+        e("_mktime64", reinterpret_cast<void*>(&cr_mktime)),
         e("_onexit", reinterpret_cast<void*>(&cr__onexit)),
+        e("_putenv", reinterpret_cast<void*>(&cr__putenv)),
+        e("_putenv_s", reinterpret_cast<void*>(&cr__putenv_s)),
         e("_stricmp", reinterpret_cast<void*>(&cr__stricmp)),
         e("_strlwr", reinterpret_cast<void*>(&cr__strlwr)),
         e("_strnicmp", reinterpret_cast<void*>(&cr__strnicmp)),
@@ -3398,6 +3920,7 @@ void add_msvcrt(ExportModule& module) {
         e("_vsnprintf", reinterpret_cast<void*>(&cr__vsnprintf)),
         e("_wfopen", reinterpret_cast<void*>(&cr__wfopen)),
         e("abs", reinterpret_cast<void*>(&cr_abs)),
+        e("asctime", reinterpret_cast<void*>(&cr_asctime)),
         e("atexit", reinterpret_cast<void*>(&cr_atexit)),
         e("atof", reinterpret_cast<void*>(&cr_atof)),
         e("atoi", reinterpret_cast<void*>(&cr_atoi)),
@@ -3405,6 +3928,9 @@ void add_msvcrt(ExportModule& module) {
         e("abort", reinterpret_cast<void*>(&cr_abort)),
         e("bsearch", reinterpret_cast<void*>(&cr_bsearch)),
         e("calloc", reinterpret_cast<void*>(&cr_calloc)),
+        e("clock", reinterpret_cast<void*>(&cr_clock)),
+        e("ctime", reinterpret_cast<void*>(&cr_ctime)),
+        e("difftime", reinterpret_cast<void*>(&cr_difftime)),
         e("div", reinterpret_cast<void*>(&cr_div)),
         e("exit", reinterpret_cast<void*>(&cr_exit)),
         e("fclose", reinterpret_cast<void*>(&cr_fclose)),
@@ -3426,6 +3952,8 @@ void add_msvcrt(ExportModule& module) {
         e("fwrite", reinterpret_cast<void*>(&cr_fwrite)),
         e("getc", reinterpret_cast<void*>(&cr_getc)),
         e("getchar", reinterpret_cast<void*>(&cr_getchar)),
+        e("getenv", reinterpret_cast<void*>(&cr_getenv)),
+        e("gmtime", reinterpret_cast<void*>(&cr_gmtime)),
         e("isalnum", reinterpret_cast<void*>(&cr_isalnum)),
         e("isalpha", reinterpret_cast<void*>(&cr_isalpha)),
         e("iscntrl", reinterpret_cast<void*>(&cr_iscntrl)),
@@ -3441,6 +3969,7 @@ void add_msvcrt(ExportModule& module) {
         e("labs", reinterpret_cast<void*>(&cr_labs)),
         e("ldiv", reinterpret_cast<void*>(&cr_ldiv)),
         e("lldiv", reinterpret_cast<void*>(&cr_lldiv)),
+        e("localtime", reinterpret_cast<void*>(&cr_localtime)),
         e("localeconv", reinterpret_cast<void*>(&cr_localeconv)),
         e("malloc", reinterpret_cast<void*>(&cr_malloc)),
         e("mbstowcs", reinterpret_cast<void*>(&cr_mbstowcs)),
@@ -3448,8 +3977,10 @@ void add_msvcrt(ExportModule& module) {
         e("memcpy", reinterpret_cast<void*>(&cr_memcpy)),
         e("memmove", reinterpret_cast<void*>(&cr_memmove)),
         e("memset", reinterpret_cast<void*>(&cr_memset)),
+        e("mktime", reinterpret_cast<void*>(&cr_mktime)),
         e("putc", reinterpret_cast<void*>(&cr_putc)),
         e("putchar", reinterpret_cast<void*>(&cr_putchar)),
+        e("putenv", reinterpret_cast<void*>(&cr__putenv)),
         e("puts", reinterpret_cast<void*>(&cr_puts)),
         e("qsort", reinterpret_cast<void*>(&cr_qsort)),
         e("rand", reinterpret_cast<void*>(&cr_rand)),
@@ -3460,6 +3991,7 @@ void add_msvcrt(ExportModule& module) {
         e("strcmp", reinterpret_cast<void*>(&cr_strcmp)),
         e("strcspn", reinterpret_cast<void*>(&cr_strcspn)),
         e("strerror", reinterpret_cast<void*>(&cr_strerror)),
+        e("strftime", reinterpret_cast<void*>(&cr_strftime)),
         e("strlen", reinterpret_cast<void*>(&cr_strlen)),
         e("strncat", reinterpret_cast<void*>(&cr_strncat)),
         e("strncmp", reinterpret_cast<void*>(&cr_strncmp)),
@@ -3474,6 +4006,7 @@ void add_msvcrt(ExportModule& module) {
         e("strtoll", reinterpret_cast<void*>(&cr_strtoll)),
         e("strtoul", reinterpret_cast<void*>(&cr_strtoul)),
         e("strtoull", reinterpret_cast<void*>(&cr_strtoull)),
+        e("time", reinterpret_cast<void*>(&cr_time)),
         e("tolower", reinterpret_cast<void*>(&cr_tolower)),
         e("toupper", reinterpret_cast<void*>(&cr_toupper)),
         e("vfprintf", reinterpret_cast<void*>(&cr_vfprintf)),
