@@ -15,6 +15,7 @@ void add_module_ntdll(ExportModule& module) {
     add_ntdll_rtl(module.host_exports);
     add_ntdll_rtl_str(module.host_exports);
     add_ntdll_rtl_mem1(module.host_exports);
+    add_ntdll_rtl_mem2(module.host_exports);
     add_ntdll_nt(module.host_exports);
 }
 

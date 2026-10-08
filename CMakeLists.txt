@@ -601,6 +601,7 @@ add_library(occ_core STATIC
     src/runtime/api/advapi32_sec.cpp
     src/runtime/api/ntdll_rtl_str.cpp
     src/runtime/api/ntdll_rtl_mem1.cpp
+    src/runtime/api/ntdll_rtl_mem2.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

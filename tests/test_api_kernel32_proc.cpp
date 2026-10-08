@@ -716,15 +716,20 @@ void test_toolhelp_processes() {
              "toolhelp: the walk ends with ERROR_NO_MORE_FILES");
     check(rows >= 1, "toolhelp: at least one process was walked");
 
-    // The A walk over a fresh snapshot answers the same count.
-    const std::uint64_t snapshot_a = k32p_CreateToolhelp32Snapshot(2, 0);
+    // The A walk over the SAME snapshot answers the same count. The
+    // snapshot captured the process list when it was created, so a second
+    // walk of the same handle is the same rows spelled differently -- which
+    // is the property being asserted. Walking a fresh snapshot would compare
+    // two captures of a host process table that other tests start and stop
+    // in, and the counts would drift under a parallel run for reasons that
+    // say nothing about the A and W entries.
     std::uint8_t entry_a[kProcessEntryBytesA] = {};
     const std::uint32_t entry_size_a = kProcessEntryBytesA;
     std::memcpy(entry_a, &entry_size_a, sizeof(entry_size_a));
-    check_eq(k32p_Process32FirstA(snapshot_a, entry_a), 1,
-             "toolhelp: the A walk starts");
+    check_eq(k32p_Process32FirstA(snapshot, entry_a), 1,
+             "toolhelp: the A walk starts over the same snapshot");
     std::uint32_t rows_a = 1;
-    while (k32p_Process32NextA(snapshot_a, entry_a) == 1) {
+    while (k32p_Process32NextA(snapshot, entry_a) == 1) {
         ++rows_a;
     }
     check_eq(rows_a, rows, "toolhelp: A and W walk the same rows");

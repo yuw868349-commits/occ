@@ -298,7 +298,10 @@ void test_registration() {
         }
     }
     check(addressed, "api: every entry has a name and an address");
-    check(memory_count == 37, "api: the memory domain contributes thirty-seven");
+    // Thirty-six: `GetProcessHeap` moved to `winabi.cpp`, which owns the
+    // name, and a name registered twice would answer differently depending
+    // on which table the export index read first.
+    check(memory_count == 36, "api: the memory domain contributes thirty-six");
     check(console_count == 53, "api: the console domain contributes fifty-three");
 }
 

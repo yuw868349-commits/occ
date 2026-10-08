@@ -410,10 +410,14 @@ void test_heaps() {
     std::memset(plain, 0x5A, 32);
 
     // A zero-byte allocation succeeds on Windows and must not hand back a
-    // pointer the caller treats as failure.
-    check(nr1_RtlAllocateHeap(heap, 0, 0) != nullptr,
+    // pointer the caller treats as failure. The block is kept and freed with
+    // the others: a test that drops it leaks it, which a leak-checked run
+    // reports against the whole file.
+    void* zero_byte = nr1_RtlAllocateHeap(heap, 0, 0);
+    check(zero_byte != nullptr,
           "rtl_mem1: a zero-byte allocation still succeeds");
-    check(nr1_RtlAllocateHeap(nullptr, 0, 16) != nullptr,
+    void* from_process_heap = nr1_RtlAllocateHeap(nullptr, 0, 16);
+    check(from_process_heap != nullptr,
           "rtl_mem1: the process heap answers a null handle");
     check(nr1_RtlAllocateHeap(reinterpret_cast<void*>(0xDEAD0000ULL), 0, 16) ==
               nullptr,
@@ -422,6 +426,12 @@ void test_heaps() {
           "rtl_mem1: compaction reports zero bytes moved");
     check(nr1_RtlExtendHeap(heap, 0, nullptr, 0x1000) == nullptr,
           "rtl_mem1: extending a host-backed heap is refused");
+    // Everything this test allocated comes back before the heap goes, so a
+    // leak-checked build ends the file with nothing outstanding.
+    winabi::heap_free(zeroed);
+    winabi::heap_free(plain);
+    winabi::heap_free(zero_byte);
+    winabi::heap_free(from_process_heap);
     check(nr1_RtlDestroyHeap(nullptr) == nullptr,
           "rtl_mem1: destroying the process heap is refused in place");
     check(nr1_RtlDestroyHeap(heap) == nullptr,
@@ -797,6 +807,11 @@ void test_acl_sid() {
     check(nr1_RtlAbsoluteToSelfRelativeSD(absolute, relative, &length) ==
               kStatusInvalidParameter,
           "rtl_mem1: an already self-relative descriptor is refused");
+    // The three SIDs come back at the end of the ACL and SID test, which is
+    // where the last comparison against them happens.
+    winabi::heap_free(sid);
+    winabi::heap_free(sid_b);
+    winabi::heap_free(sid_same_prefix);
 }
 
 // ------------------------------------------------------------- DOS paths
@@ -840,6 +855,9 @@ void test_dos_paths() {
           "rtl_mem1: the filename starts after the last separator");
     check(relative[0] == 0 && relative[8] == 0 && relative[24] == 0,
           "rtl_mem1: the relative-name structure is zeroed, no fake form");
+    // The conversion allocated the name's buffer out of the heap; the test
+    // gives it back now that nothing reads it.
+    winabi::heap_free(reinterpret_cast<void*>(read_ptr(nt_name, 8)));
 
     std::uint8_t nt_name_b[16] = {};
     check(nr1_RtlDosPathNameToNtPathName_U_WithStatus(

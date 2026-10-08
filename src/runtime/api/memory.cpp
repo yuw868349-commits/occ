@@ -716,7 +716,10 @@ void add_memory_kernel32(ExportList& out) {
         entry.address = reinterpret_cast<std::uint64_t>(fn);
         out.push_back(std::move(entry));
     };
-    e("GetProcessHeap", reinterpret_cast<void*>(&k32m_GetProcessHeap));
+    // `GetProcessHeap` is registered by `winabi.cpp`, which owns the name
+    // for kernel32; two registrations of one name would leave the answer
+    // depending on which module's table the export index read first, and
+    // both answer the same process heap anyway.
     e("GetProcessHeaps", reinterpret_cast<void*>(&k32m_GetProcessHeaps));
     e("GlobalAlloc", reinterpret_cast<void*>(&k32m_GlobalAlloc));
     e("GlobalFlags", reinterpret_cast<void*>(&k32m_GlobalFlags));

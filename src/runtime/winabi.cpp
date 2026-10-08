@@ -457,6 +457,37 @@ struct HeapHeader {
                                          sizeof(HeapHeader));
 }
 
+// The blocks this allocator has handed out and has not taken back. Every
+// header peek below is reached through this list first, because the magic
+// test alone reads the eight bytes in front of whatever pointer the caller
+// supplies -- and a pointer a caller invented, or one that names a stack
+// buffer or a foreign allocation, has no eight bytes in front of it that
+// this allocator may read. The guest runs on one host thread, so there is
+// no lock, for the same reason the atom-table list has none.
+std::vector<void*>& heap_blocks() noexcept {
+    static std::vector<void*> blocks;
+    return blocks;
+}
+
+[[nodiscard]] bool heap_is_ours(void* block) noexcept {
+    for (void* live : heap_blocks()) {
+        if (live == block) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void heap_forget(void* block) noexcept {
+    auto& blocks = heap_blocks();
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        if (blocks[i] == block) {
+            blocks.erase(blocks.begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
+}
+
 }  // namespace
 
 void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
@@ -477,6 +508,7 @@ void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
     header->magic = kHeapMagic;
     header->size = bytes;
     void* block = static_cast<char*>(raw) + sizeof(HeapHeader);
+    heap_blocks().push_back(block);
     if ((flags & kHeapZeroMemory) != 0) {
         ::memset(block, 0, static_cast<std::size_t>(bytes));
     }
@@ -488,11 +520,15 @@ void* heap_realloc(std::uint32_t flags, void* block,
     if (block == nullptr) {
         return heap_alloc(flags, bytes);
     }
+    if (!heap_is_ours(block)) {
+        return nullptr;
+    }
     const HeapHeader* old = header_of(block);
     if (old->magic != kHeapMagic) {
         return nullptr;
     }
     const std::uint64_t old_size = old->size;
+    heap_forget(block);
     void* fresh = heap_alloc(0, bytes);
     if (fresh == nullptr) {
         return nullptr;
@@ -517,6 +553,9 @@ std::uint64_t heap_size(const void* block) noexcept {
     if (block == nullptr) {
         return 0;
     }
+    if (!heap_is_ours(const_cast<void*>(block))) {
+        return 0;
+    }
     const HeapHeader* header = header_of(const_cast<void*>(block));
     if (header->magic != kHeapMagic) {
         // Not ours. Answering 0 is the honest "unknown"; answering the
@@ -539,10 +578,18 @@ bool heap_free(void* block) noexcept {
     // owns, which is a lifetime this header, allocated with the block, does
     // not have -- and so does this: there is no honest answer to give from
     // memory the caller no longer owns.
+    if (!heap_is_ours(block)) {
+        // A second free of the same block lands here too: the block came off
+        // the list at the first free, so the second one is refused without
+        // reading the header of memory this allocator has already handed
+        // back to malloc.
+        return false;
+    }
     const HeapHeader* header = header_of(block);
     if (header->magic != kHeapMagic) {
         return false;
     }
+    heap_forget(block);
     ::free(static_cast<char*>(block) - sizeof(HeapHeader));
     return true;
 }
@@ -4873,16 +4920,13 @@ void add_kernel32(ExportModule& module) {
         e("TlsGetValue", reinterpret_cast<void*>(&k32_TlsGetValue)),
         e("TlsSetValue", reinterpret_cast<void*>(&k32_TlsSetValue)),
         e("TlsFree", reinterpret_cast<void*>(&k32_TlsFree)),
-        e("VirtualProtect", reinterpret_cast<void*>(&k32_VirtualProtect)),
-        e("VirtualQuery", reinterpret_cast<void*>(&k32_VirtualQuery)),
+        // `VirtualProtect` and `VirtualQuery` are registered by the memory
+        // domain, which owns the virtual-memory family.
         e("GetProcessHeap", reinterpret_cast<void*>(&k32_GetProcessHeap)),
-        e("HeapCreate", reinterpret_cast<void*>(&k32_HeapCreate)),
-        e("HeapDestroy", reinterpret_cast<void*>(&k32_HeapDestroy)),
-        e("HeapAlloc", reinterpret_cast<void*>(&k32_HeapAlloc)),
-        e("HeapFree", reinterpret_cast<void*>(&k32_HeapFree)),
-        e("HeapSize", reinterpret_cast<void*>(&k32_HeapSize)),
-        e("HeapReAlloc", reinterpret_cast<void*>(&k32_HeapReAlloc)),
-        e("HeapValidate", reinterpret_cast<void*>(&k32_HeapValidate)),
+        // The core heap family is registered by the memory domain, which
+        // owns it and carries the tests for it; the entries here that the
+        // domain does not have -- the compact and information queries --
+        // stay with this table.
         e("HeapCompact", reinterpret_cast<void*>(&k32_HeapCompact)),
         e("HeapSetInformation",
           reinterpret_cast<void*>(&k32_HeapSetInformation)),
@@ -4893,8 +4937,10 @@ void add_kernel32(ExportModule& module) {
           reinterpret_cast<void*>(&k32_MultiByteToWideChar)),
         e("WideCharToMultiByte",
           reinterpret_cast<void*>(&k32_WideCharToMultiByte)),
-        e("GetSystemTimeAsFileTime",
-          reinterpret_cast<void*>(&k32_GetSystemTimeAsFileTime)),
+        // `GetSystemTimeAsFileTime` is registered by the time domain, which
+        // owns the clock family for kernel32; registering it here too would
+        // leave the export's answer depending on which table the index read
+        // first.
         e("QueryPerformanceCounter",
           reinterpret_cast<void*>(&k32_QueryPerformanceCounter)),
         e("QueryPerformanceFrequency",

@@ -483,6 +483,12 @@ void add_ntdll_rtl_str(ExportList& out);
 // library of the same name does.
 void add_ntdll_rtl_mem1(ExportList& out);
 
+// The Rtl* surface's second slice: the lock-free stack, the security
+// descriptor accessors, the large-integer arithmetic, the bitmap queries,
+// the version and path queries, the 8.3 name generation and the atom-table
+// lookups the first slice's tables answer through.
+void add_ntdll_rtl_mem2(ExportList& out);
+
 // The Nt* and Zw* half of ntdll. In user mode the two are one function.
 void add_ntdll_nt(ExportList& out);
 

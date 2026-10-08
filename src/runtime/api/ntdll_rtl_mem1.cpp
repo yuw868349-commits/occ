@@ -1959,6 +1959,106 @@ std::vector<AtomTable*>& atom_tables() noexcept {
 
 }  // namespace
 
+// The three questions `ntdll_rtl_mem2.cpp` asks about an atom table reach
+// the table through here rather than keeping a second copy of the entries.
+// The reason is not tidiness: two tables of the same atoms would answer
+// differently depending on which slice's `RtlCreateAtomTable` the guest saw,
+// and an atom added through one spelling would be invisible to the other.
+extern "C" std::uint32_t occ_atom_find(void* table, const char16_t* name) noexcept {
+    AtomTable* atoms = atom_table_of(table);
+    if (atoms == nullptr || name == nullptr) {
+        return 0;
+    }
+    std::size_t chars = 0;
+    while (name[chars] != u'\0') {
+        ++chars;
+    }
+    const std::u16string_view text(name, chars);
+    for (const AtomEntry& entry : atoms->entries) {
+        if (entry.name == text) {
+            return entry.atom;
+        }
+    }
+    return 0;
+}
+
+extern "C" std::uint32_t occ_atom_query(void* table, std::uint32_t atom,
+                                        std::uint32_t* refs, std::uint32_t* flags,
+                                        char16_t* name,
+                                        std::uint32_t* name_bytes) noexcept {
+    constexpr std::uint32_t kStatusSuccess = 0;
+    constexpr std::uint32_t kStatusInvalidParameter = 0xC000000D;
+    constexpr std::uint32_t kStatusInvalidHandle = 0xC0000008;
+    constexpr std::uint32_t kStatusBufferTooSmall = 0xC0000023;
+    AtomTable* atoms = atom_table_of(table);
+    if (atoms == nullptr) {
+        return kStatusInvalidHandle;
+    }
+    if (atom < kAtomFirst) {
+        return kStatusInvalidParameter;
+    }
+    const AtomEntry* found = nullptr;
+    for (const AtomEntry& entry : atoms->entries) {
+        if (entry.atom == atom) {
+            found = &entry;
+            break;
+        }
+    }
+    if (found == nullptr) {
+        return kStatusInvalidHandle;
+    }
+    if (refs != nullptr) {
+        *refs = found->refs;
+    }
+    if (flags != nullptr) {
+        // The two flags Windows defines for an atom: 0 for an ordinary
+        // string atom, and ATOM_HEAP (1) once the entry is large enough that
+        // the table keeps it on the heap rather than in the pool.
+        *flags = found->name.size() >= 256 ? 1u : 0u;
+    }
+    if (name == nullptr || name_bytes == nullptr) {
+        return kStatusSuccess;
+    }
+    // The name comes back without the terminator, and `name_bytes` is both
+    // the size the caller's buffer has and the size the name needs -- the
+    // in/out convention that lets a caller ask first and then read.
+    const std::uint32_t needed =
+        static_cast<std::uint32_t>(found->name.size() * sizeof(char16_t));
+    if (*name_bytes < needed) {
+        *name_bytes = needed;
+        return kStatusBufferTooSmall;
+    }
+    for (std::size_t i = 0; i < found->name.size(); ++i) {
+        name[i] = found->name[i];
+    }
+    *name_bytes = needed;
+    return kStatusSuccess;
+}
+
+extern "C" std::uint32_t occ_atom_pin(void* table, std::uint32_t atom) noexcept {
+    constexpr std::uint32_t kStatusSuccess = 0;
+    constexpr std::uint32_t kStatusInvalidParameter = 0xC000000D;
+    constexpr std::uint32_t kStatusInvalidHandle = 0xC0000008;
+    AtomTable* atoms = atom_table_of(table);
+    if (atoms == nullptr) {
+        return kStatusInvalidHandle;
+    }
+    if (atom < kAtomFirst) {
+        return kStatusInvalidParameter;
+    }
+    for (AtomEntry& entry : atoms->entries) {
+        if (entry.atom == atom) {
+            // Pinning raises the reference count without a matching delete:
+            // the entry stays in the table for the life of the table.
+            if (entry.refs != 0xFFFFFFFFu) {
+                ++entry.refs;
+            }
+            return kStatusSuccess;
+        }
+    }
+    return kStatusInvalidHandle;
+}
+
 extern "C" __attribute__((ms_abi)) void* nr1_RtlCreateAtomTable(
     std::uint32_t flags, std::uint32_t buckets) noexcept {
     (void)flags;

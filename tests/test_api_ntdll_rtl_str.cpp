@@ -3662,6 +3662,10 @@ void test_sid() {
                               copied_to)),
                           owner, 12) == 0,
               "copy security descriptor: and the SID itself came across");
+        // The copy allocated the SID's new home; the test gives it back so a
+        // leak-checked run ends the file with nothing outstanding.
+        winabi::heap_free(reinterpret_cast<void*>(static_cast<std::uintptr_t>(
+            copied_to)));
     }
     {
         // The self-relative header is twelve bytes, so a copy that used the
