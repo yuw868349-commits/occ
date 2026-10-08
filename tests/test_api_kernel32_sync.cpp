@@ -147,7 +147,6 @@ constexpr std::uint32_t kWaitObject0 = 0;
 constexpr std::uint32_t kWaitTimeout = 258;
 constexpr std::uint32_t kWaitFailed = 0xFFFFFFFFu;
 
-constexpr std::uint32_t kInfinite = 0xFFFFFFFFu;
 constexpr std::uint32_t kCreateEventManualReset = 1;
 constexpr std::uint32_t kCreateMutexInitialOwner = 1;
 

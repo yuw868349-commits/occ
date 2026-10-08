@@ -97,16 +97,10 @@ constexpr std::int32_t kStatusNoMoreItems =
 constexpr std::int32_t kStatusKeyHasChildren = 1015;  // ERROR_KEY_HAS_CHILDREN
 
 // The value type codes, as the wire spells them.
-constexpr std::uint32_t kRegNone = 0;
 constexpr std::uint32_t kRegSz = 1;
 constexpr std::uint32_t kRegExpandSz = 2;
-constexpr std::uint32_t kRegBinary = 3;
-constexpr std::uint32_t kRegDword = 4;
-constexpr std::uint32_t kRegDwordBigEndian = 5;
 constexpr std::uint32_t kRegLink = 6;
 constexpr std::uint32_t kRegMultiSz = 7;
-constexpr std::uint32_t kRegResourceList = 8;
-constexpr std::uint32_t kRegQword = 11;
 
 constexpr std::uint32_t kRegCreatedNewKey = 1;
 constexpr std::uint32_t kRegOpenedExistingKey = 2;

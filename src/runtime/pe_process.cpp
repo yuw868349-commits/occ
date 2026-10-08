@@ -189,16 +189,25 @@ constexpr std::uint32_t kOurThreadId = 0x0DCD;
 // are mapped read-write by this file and the offsets are constants that a
 // future edit can push past the end of a page, and a store past the end of a
 // mapping is a fault reported at an address with no relation to the field.
-void store_u32(std::uint64_t base, std::size_t off, std::uint32_t v,
-               std::uint64_t region_bytes) noexcept {
+//
+// The helpers are not inlined on purpose. With the callers' constant offsets
+// folded in, GCC's store-overflow analysis concludes that the destination
+// object -- an address computed from an integer, so an object of no known
+// size -- must be empty, and reports the guarded store against it. The bound
+// is checked here, where it is, and noinline keeps that decision in this
+// function instead of in an analysis that cannot see it.
+__attribute__((noinline)) void store_u32(std::uint64_t base, std::size_t off,
+                                         std::uint32_t v,
+                                         std::uint64_t region_bytes) noexcept {
     if (off + 4 > region_bytes) {
         return;
     }
     std::memcpy(reinterpret_cast<void*>(base + off), &v, 4);
 }
 
-void store_u64(std::uint64_t base, std::size_t off, std::uint64_t v,
-               std::uint64_t region_bytes) noexcept {
+__attribute__((noinline)) void store_u64(std::uint64_t base, std::size_t off,
+                                         std::uint64_t v,
+                                         std::uint64_t region_bytes) noexcept {
     if (off + 8 > region_bytes) {
         return;
     }

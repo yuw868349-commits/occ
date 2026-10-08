@@ -84,7 +84,7 @@ namespace {
 // every use.
 constexpr std::uint32_t kErrorBufferOverflow = 111;
 constexpr std::uint32_t kErrorMoreData = 234;
-constexpr std::uint32_t kErrorEnvvarNotFound = 203;  // kept for reference
+[[maybe_unused]] constexpr std::uint32_t kErrorEnvvarNotFound = 203;  // kept for reference
 
 // ---------------------------------------------------------------- constants
 
@@ -100,13 +100,13 @@ constexpr std::uint32_t kMaxComputerNameLength = 15;
 
 // COMPUTER_NAME_FORMAT, from `sysinfoapi.h`.
 constexpr std::uint32_t kComputerNameNetBIOS = 0;
-constexpr std::uint32_t kComputerNameDnsHostname = 1;
+[[maybe_unused]] constexpr std::uint32_t kComputerNameDnsHostname = 1;
 constexpr std::uint32_t kComputerNameDnsDomain = 2;
-constexpr std::uint32_t kComputerNameDnsFullyQualified = 3;
+[[maybe_unused]] constexpr std::uint32_t kComputerNameDnsFullyQualified = 3;
 constexpr std::uint32_t kComputerNamePhysicalNetBIOS = 4;
-constexpr std::uint32_t kComputerNamePhysicalDnsHostname = 5;
+[[maybe_unused]] constexpr std::uint32_t kComputerNamePhysicalDnsHostname = 5;
 constexpr std::uint32_t kComputerNamePhysicalDnsDomain = 6;
-constexpr std::uint32_t kComputerNamePhysicalDnsFullyQualified = 7;
+[[maybe_unused]] constexpr std::uint32_t kComputerNamePhysicalDnsFullyQualified = 7;
 constexpr std::uint32_t kComputerNameMax = 8;
 
 // Priority classes, from `winbase.h`.
@@ -204,18 +204,18 @@ constexpr std::uint64_t kProcessHandleBase = 0x71000000;
 
 // SYSTEM_INFO, 48 bytes on the 64-bit ABI.
 struct SystemInfoLayout {
-    static constexpr std::size_t kArchitecture = 0;  // uint16
-    static constexpr std::size_t kReserved = 2;      // uint16
-    static constexpr std::size_t kPageSize = 4;      // uint32
-    static constexpr std::size_t kMinAppAddress = 8;
-    static constexpr std::size_t kMaxAppAddress = 16;
-    static constexpr std::size_t kProcessorMask = 24;
-    static constexpr std::size_t kNumberOfProcessors = 32;  // uint32
-    static constexpr std::size_t kProcessorType = 36;       // uint32
-    static constexpr std::size_t kGranularity = 40;         // uint32
-    static constexpr std::size_t kProcessorLevel = 44;      // uint16
-    static constexpr std::size_t kProcessorRevision = 46;   // uint16
-    static constexpr std::size_t kBytes = 48;
+    [[maybe_unused]] static constexpr std::size_t kArchitecture = 0;  // uint16
+    [[maybe_unused]] static constexpr std::size_t kReserved = 2;      // uint16
+    [[maybe_unused]] static constexpr std::size_t kPageSize = 4;      // uint32
+    [[maybe_unused]] static constexpr std::size_t kMinAppAddress = 8;
+    [[maybe_unused]] static constexpr std::size_t kMaxAppAddress = 16;
+    [[maybe_unused]] static constexpr std::size_t kProcessorMask = 24;
+    [[maybe_unused]] static constexpr std::size_t kNumberOfProcessors = 32;  // uint32
+    [[maybe_unused]] static constexpr std::size_t kProcessorType = 36;       // uint32
+    [[maybe_unused]] static constexpr std::size_t kGranularity = 40;         // uint32
+    [[maybe_unused]] static constexpr std::size_t kProcessorLevel = 44;      // uint16
+    [[maybe_unused]] static constexpr std::size_t kProcessorRevision = 46;   // uint16
+    [[maybe_unused]] static constexpr std::size_t kBytes = 48;
 };
 
 // PROCESSSENTRY32, A and W. The x64 structure pads four bytes after
@@ -223,74 +223,74 @@ struct SystemInfoLayout {
 // the offsets are the same for both spellings, and only the character
 // width of `szExeFile` differs.
 struct ProcessEntryLayout {
-    static constexpr std::size_t kSize = 0;        // uint32
-    static constexpr std::size_t kUsage = 4;       // uint32
-    static constexpr std::size_t kProcessId = 8;   // uint32
-    static constexpr std::size_t kHeapId = 16;     // pointer-width
-    static constexpr std::size_t kModuleId = 24;   // uint32
-    static constexpr std::size_t kThreads = 28;    // uint32
-    static constexpr std::size_t kParentId = 32;   // uint32
-    static constexpr std::size_t kPriority = 36;   // int32
-    static constexpr std::size_t kFlags = 40;      // uint32
-    static constexpr std::size_t kExeFile = 44;
-    static constexpr std::size_t kExeChars = 260;
-    static constexpr std::size_t kBytesW = 568;
-    static constexpr std::size_t kBytesA = 304;
+    [[maybe_unused]] static constexpr std::size_t kSize = 0;        // uint32
+    [[maybe_unused]] static constexpr std::size_t kUsage = 4;       // uint32
+    [[maybe_unused]] static constexpr std::size_t kProcessId = 8;   // uint32
+    [[maybe_unused]] static constexpr std::size_t kHeapId = 16;     // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kModuleId = 24;   // uint32
+    [[maybe_unused]] static constexpr std::size_t kThreads = 28;    // uint32
+    [[maybe_unused]] static constexpr std::size_t kParentId = 32;   // uint32
+    [[maybe_unused]] static constexpr std::size_t kPriority = 36;   // int32
+    [[maybe_unused]] static constexpr std::size_t kFlags = 40;      // uint32
+    [[maybe_unused]] static constexpr std::size_t kExeFile = 44;
+    [[maybe_unused]] static constexpr std::size_t kExeChars = 260;
+    [[maybe_unused]] static constexpr std::size_t kBytesW = 568;
+    [[maybe_unused]] static constexpr std::size_t kBytesA = 304;
 };
 
 // THREADENTRY32, 28 bytes, no pointer-width fields.
 struct ThreadEntryLayout {
-    static constexpr std::size_t kSize = 0;      // uint32
-    static constexpr std::size_t kUsage = 4;     // uint32
-    static constexpr std::size_t kThreadId = 8;  // uint32
-    static constexpr std::size_t kOwnerId = 12;  // uint32
-    static constexpr std::size_t kBasePriority = 16;   // int32
-    static constexpr std::size_t kDeltaPriority = 20;  // int32
-    static constexpr std::size_t kFlags = 24;          // uint32
-    static constexpr std::size_t kBytes = 28;
+    [[maybe_unused]] static constexpr std::size_t kSize = 0;      // uint32
+    [[maybe_unused]] static constexpr std::size_t kUsage = 4;     // uint32
+    [[maybe_unused]] static constexpr std::size_t kThreadId = 8;  // uint32
+    [[maybe_unused]] static constexpr std::size_t kOwnerId = 12;  // uint32
+    [[maybe_unused]] static constexpr std::size_t kBasePriority = 16;   // int32
+    [[maybe_unused]] static constexpr std::size_t kDeltaPriority = 20;  // int32
+    [[maybe_unused]] static constexpr std::size_t kFlags = 24;          // uint32
+    [[maybe_unused]] static constexpr std::size_t kBytes = 28;
 };
 
 // MODULEENTRY32, A and W. `szModule` holds MAX_MODULE_NAME32+1 (256)
 // characters and `szExePath` MAX_PATH (260); the wide size follows.
 struct ModuleEntryLayout {
-    static constexpr std::size_t kSize = 0;          // uint32
-    static constexpr std::size_t kModuleId = 4;      // uint32
-    static constexpr std::size_t kProcessId = 8;     // uint32
-    static constexpr std::size_t kGlobalUsage = 12;  // uint32
-    static constexpr std::size_t kProcessUsage = 16;  // uint32
-    static constexpr std::size_t kBaseAddress = 24;   // pointer
-    static constexpr std::size_t kBaseSize = 32;      // uint32
-    static constexpr std::size_t kModuleHandle = 40;  // pointer
-    static constexpr std::size_t kModuleName = 48;
-    static constexpr std::size_t kNameChars = 256;
-    static constexpr std::size_t kExePath = 560;
-    static constexpr std::size_t kPathChars = 260;
-    static constexpr std::size_t kBytesW = 1080;
-    static constexpr std::size_t kBytesA = 568;
+    [[maybe_unused]] static constexpr std::size_t kSize = 0;          // uint32
+    [[maybe_unused]] static constexpr std::size_t kModuleId = 4;      // uint32
+    [[maybe_unused]] static constexpr std::size_t kProcessId = 8;     // uint32
+    [[maybe_unused]] static constexpr std::size_t kGlobalUsage = 12;  // uint32
+    [[maybe_unused]] static constexpr std::size_t kProcessUsage = 16;  // uint32
+    [[maybe_unused]] static constexpr std::size_t kBaseAddress = 24;   // pointer
+    [[maybe_unused]] static constexpr std::size_t kBaseSize = 32;      // uint32
+    [[maybe_unused]] static constexpr std::size_t kModuleHandle = 40;  // pointer
+    [[maybe_unused]] static constexpr std::size_t kModuleName = 48;
+    [[maybe_unused]] static constexpr std::size_t kNameChars = 256;
+    [[maybe_unused]] static constexpr std::size_t kExePath = 560;
+    [[maybe_unused]] static constexpr std::size_t kPathChars = 260;
+    [[maybe_unused]] static constexpr std::size_t kBytesW = 1080;
+    [[maybe_unused]] static constexpr std::size_t kBytesA = 568;
 };
 
 // HEAPLIST32. `dwSize` is a SIZE_T here, not a DWORD -- the one toolhelp
 // structure where the size field is pointer-width.
 struct HeapListLayout {
-    static constexpr std::size_t kSize = 0;      // pointer-width
-    static constexpr std::size_t kProcessId = 8;   // uint32
-    static constexpr std::size_t kHeapId = 16;     // pointer-width
-    static constexpr std::size_t kFlags = 24;      // uint32
-    static constexpr std::size_t kBytes = 32;
+    [[maybe_unused]] static constexpr std::size_t kSize = 0;      // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kProcessId = 8;   // uint32
+    [[maybe_unused]] static constexpr std::size_t kHeapId = 16;     // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kFlags = 24;      // uint32
+    [[maybe_unused]] static constexpr std::size_t kBytes = 32;
 };
 
 // HEAPENTRY32, 56 bytes on the 64-bit ABI.
 struct HeapEntryLayout {
-    static constexpr std::size_t kSize = 0;         // pointer-width
-    static constexpr std::size_t kHandle = 8;       // pointer-width
-    static constexpr std::size_t kAddress = 16;     // pointer-width
-    static constexpr std::size_t kBlockSize = 24;   // pointer-width
-    static constexpr std::size_t kFlags = 32;       // uint32
-    static constexpr std::size_t kLockCount = 36;   // uint32
-    static constexpr std::size_t kReserved = 40;    // uint32
-    static constexpr std::size_t kProcessId = 44;   // uint32
-    static constexpr std::size_t kHeapId = 48;      // pointer-width
-    static constexpr std::size_t kBytes = 56;
+    [[maybe_unused]] static constexpr std::size_t kSize = 0;         // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kHandle = 8;       // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kAddress = 16;     // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kBlockSize = 24;   // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kFlags = 32;       // uint32
+    [[maybe_unused]] static constexpr std::size_t kLockCount = 36;   // uint32
+    [[maybe_unused]] static constexpr std::size_t kReserved = 40;    // uint32
+    [[maybe_unused]] static constexpr std::size_t kProcessId = 44;   // uint32
+    [[maybe_unused]] static constexpr std::size_t kHeapId = 48;      // pointer-width
+    [[maybe_unused]] static constexpr std::size_t kBytes = 56;
 };
 
 // ------------------------------------------------------------- identities

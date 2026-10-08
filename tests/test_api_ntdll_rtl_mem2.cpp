@@ -340,10 +340,6 @@ constexpr std::uint32_t kStatusObjectNameNotFound = 0xC0000034u;
 
 constexpr std::uint16_t kSeSelfRelative = 0x8000;
 constexpr std::uint16_t kSeDaclPresent = 0x0004;
-constexpr std::uint16_t kSeDaclDefaulted = 0x0008;
-constexpr std::uint16_t kSeSaclPresent = 0x0010;
-constexpr std::uint16_t kSeOwnerDefaulted = 0x0001;
-constexpr std::uint16_t kSeGroupDefaulted = 0x0002;
 
 // RTL_BITMAP's own field order: the count first, the pointer last.
 constexpr std::size_t kBitmapSize = 0;

@@ -1025,10 +1025,10 @@ namespace {
 // caller sized the buffer and a silent growth would move ACEs it already
 // holds pointers into.
 constexpr std::size_t kAclRevision = 0;  // uint8
-constexpr std::size_t kAclSbz1 = 1;
+[[maybe_unused]] constexpr std::size_t kAclSbz1 = 1;
 constexpr std::size_t kAclSize = 2;      // uint16, buffer capacity
 constexpr std::size_t kAclAceCount = 4;  // uint16
-constexpr std::size_t kAclSbz2 = 6;
+[[maybe_unused]] constexpr std::size_t kAclSbz2 = 6;
 constexpr std::size_t kAclHeaderBytes = 8;
 
 // ACE, byte offsets. The header is four bytes, the mask four, and the SID
@@ -1343,7 +1343,7 @@ nr1_RtlCreateSecurityDescriptor(void* descriptor,
 namespace {
 // SECURITY_DESCRIPTOR, absolute form, byte offsets on the 64-bit ABI: two
 // bytes of header, the control word, then four pointers.
-constexpr std::size_t kSdRevision = 0;  // uint8
+[[maybe_unused]] constexpr std::size_t kSdRevision = 0;  // uint8
 constexpr std::size_t kSdControl = 2;   // uint16
 constexpr std::size_t kSdOwner = 8;
 constexpr std::size_t kSdGroup = 16;
@@ -1474,7 +1474,7 @@ namespace {
 constexpr std::size_t kUniLength = 0;        // uint16, bytes
 constexpr std::size_t kUniMaximumLength = 2;  // uint16, bytes
 constexpr std::size_t kUniBuffer = 8;         // pointer
-constexpr std::size_t kUniBytes = 16;
+[[maybe_unused]] constexpr std::size_t kUniBytes = 16;
 
 // RTL_RELATIVE_NAME_U: one UNICODE_STRING, a directory handle, and the
 // curdir reference -- 32 bytes. The relative-name entries zero it, which is
@@ -1727,7 +1727,7 @@ namespace {
 // section walk to convert it through.
 
 constexpr std::uint32_t kPeSignature = 0x00004550u;  // "PE\0\0"
-constexpr std::size_t kNtMachine = 4;                 // uint16
+[[maybe_unused]] constexpr std::size_t kNtMachine = 4;                 // uint16
 constexpr std::size_t kNtNumberOfSections = 6;        // uint16
 constexpr std::size_t kNtSizeOfOptionalHeader = 20;   // uint16
 constexpr std::size_t kNtOptionalHeader = 24;
@@ -1744,8 +1744,8 @@ constexpr std::size_t kSectionSizeOfRawData = 16;   // uint32
 constexpr std::size_t kDosHeaderLfanew = 0x3C;  // uint32
 
 // The export directory, field offsets.
-constexpr std::size_t kExportBase = 16;
-constexpr std::size_t kExportNumberOfFunctions = 20;
+[[maybe_unused]] constexpr std::size_t kExportBase = 16;
+[[maybe_unused]] constexpr std::size_t kExportNumberOfFunctions = 20;
 constexpr std::size_t kExportNumberOfNames = 24;
 constexpr std::size_t kExportAddressOfFunctions = 28;
 constexpr std::size_t kExportAddressOfNames = 32;
@@ -1986,16 +1986,16 @@ extern "C" std::uint32_t occ_atom_query(void* table, std::uint32_t atom,
                                         std::uint32_t* refs, std::uint32_t* flags,
                                         char16_t* name,
                                         std::uint32_t* name_bytes) noexcept {
-    constexpr std::uint32_t kStatusSuccess = 0;
-    constexpr std::uint32_t kStatusInvalidParameter = 0xC000000D;
-    constexpr std::uint32_t kStatusInvalidHandle = 0xC0000008;
-    constexpr std::uint32_t kStatusBufferTooSmall = 0xC0000023;
+    constexpr std::uint32_t kAtomQuerySuccess = 0;
+    constexpr std::uint32_t kAtomQueryBadParameter = 0xC000000D;
+    constexpr std::uint32_t kAtomQueryBadHandle = 0xC0000008;
+    constexpr std::uint32_t kAtomQueryShortBuffer = 0xC0000023;
     AtomTable* atoms = atom_table_of(table);
     if (atoms == nullptr) {
-        return kStatusInvalidHandle;
+        return kAtomQueryBadHandle;
     }
     if (atom < kAtomFirst) {
-        return kStatusInvalidParameter;
+        return kAtomQueryBadParameter;
     }
     const AtomEntry* found = nullptr;
     for (const AtomEntry& entry : atoms->entries) {
@@ -2005,7 +2005,7 @@ extern "C" std::uint32_t occ_atom_query(void* table, std::uint32_t atom,
         }
     }
     if (found == nullptr) {
-        return kStatusInvalidHandle;
+        return kAtomQueryBadHandle;
     }
     if (refs != nullptr) {
         *refs = found->refs;
@@ -2017,7 +2017,7 @@ extern "C" std::uint32_t occ_atom_query(void* table, std::uint32_t atom,
         *flags = found->name.size() >= 256 ? 1u : 0u;
     }
     if (name == nullptr || name_bytes == nullptr) {
-        return kStatusSuccess;
+        return kAtomQuerySuccess;
     }
     // The name comes back without the terminator, and `name_bytes` is both
     // the size the caller's buffer has and the size the name needs -- the
@@ -2026,25 +2026,25 @@ extern "C" std::uint32_t occ_atom_query(void* table, std::uint32_t atom,
         static_cast<std::uint32_t>(found->name.size() * sizeof(char16_t));
     if (*name_bytes < needed) {
         *name_bytes = needed;
-        return kStatusBufferTooSmall;
+        return kAtomQueryShortBuffer;
     }
     for (std::size_t i = 0; i < found->name.size(); ++i) {
         name[i] = found->name[i];
     }
     *name_bytes = needed;
-    return kStatusSuccess;
+    return kAtomQuerySuccess;
 }
 
 extern "C" std::uint32_t occ_atom_pin(void* table, std::uint32_t atom) noexcept {
-    constexpr std::uint32_t kStatusSuccess = 0;
-    constexpr std::uint32_t kStatusInvalidParameter = 0xC000000D;
-    constexpr std::uint32_t kStatusInvalidHandle = 0xC0000008;
+    constexpr std::uint32_t kAtomPinSuccess = 0;
+    constexpr std::uint32_t kAtomPinBadParameter = 0xC000000D;
+    constexpr std::uint32_t kAtomPinBadHandle = 0xC0000008;
     AtomTable* atoms = atom_table_of(table);
     if (atoms == nullptr) {
-        return kStatusInvalidHandle;
+        return kAtomPinBadHandle;
     }
     if (atom < kAtomFirst) {
-        return kStatusInvalidParameter;
+        return kAtomPinBadParameter;
     }
     for (AtomEntry& entry : atoms->entries) {
         if (entry.atom == atom) {
@@ -2053,10 +2053,10 @@ extern "C" std::uint32_t occ_atom_pin(void* table, std::uint32_t atom) noexcept 
             if (entry.refs != 0xFFFFFFFFu) {
                 ++entry.refs;
             }
-            return kStatusSuccess;
+            return kAtomPinSuccess;
         }
     }
-    return kStatusInvalidHandle;
+    return kAtomPinBadHandle;
 }
 
 extern "C" __attribute__((ms_abi)) void* nr1_RtlCreateAtomTable(

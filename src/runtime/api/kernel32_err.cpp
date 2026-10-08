@@ -511,10 +511,6 @@ void wrap_lines(std::u16string& text, std::uint32_t width) {
 // variable is the whole of the storage; the guest's own TEB is not the
 // place for it because the mode outlives no TEB and is read by calls that
 // never touch one.
-constexpr std::uint32_t kSemFailCriticalErrors = 0x0001;
-constexpr std::uint32_t kSemNoGpFaultErrorBox = 0x0002;
-constexpr std::uint32_t kSemNoAlignmentFaultExcept = 0x0004;
-constexpr std::uint32_t kSemNoOpenFileErrorBox = 0x8000;
 
 std::uint32_t g_error_mode = 0;
 

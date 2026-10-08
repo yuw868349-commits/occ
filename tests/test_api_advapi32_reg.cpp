@@ -259,7 +259,6 @@ constexpr std::int32_t kNoMoreItems = 259;
 constexpr std::int32_t kKeyHasChildren = 1015;
 
 constexpr std::uint32_t kRegSz = 1;
-constexpr std::uint32_t kRegExpandSz = 2;
 constexpr std::uint32_t kRegBinary = 3;
 constexpr std::uint32_t kRegDword = 4;
 constexpr std::uint32_t kRegMultiSz = 7;

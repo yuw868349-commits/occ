@@ -95,7 +95,6 @@ constexpr Ntstatus kStSuccess = 0x00000000;
 constexpr Ntstatus kStNotImplemented = 0xC0000002;
 constexpr Ntstatus kStAccessViolation = 0xC0000005;
 constexpr Ntstatus kStInvalidParameter = 0xC000000D;
-constexpr Ntstatus kStInvalidParameter1 = 0xC00000EF;
 constexpr Ntstatus kStInvalidParameter2 = 0xC00000F0;
 constexpr Ntstatus kStInvalidParameter4 = 0xC00000F2;
 constexpr Ntstatus kStInvalidParameter5 = 0xC00000F3;
@@ -109,7 +108,6 @@ constexpr Ntstatus kStNotFound = 0xC0000225;
 // specific codes rather than `InvalidParameter`: a caller that passes a name
 // Windows will not accept needs to tell that apart from a caller that passed
 // a null pointer.
-constexpr Ntstatus kStInvalidIdnNormalization = 0xC0000716;
 constexpr Ntstatus kStNoUnicodeTranslation = 0xC0000717;
 
 // The `BOOLEAN` a ntdll entry point takes and answers. One byte on Windows,
@@ -137,7 +135,6 @@ constexpr Boolean kTrue = 1;
 constexpr std::size_t kStrLength = 0;        // uint16
 constexpr std::size_t kStrMaximumLength = 2; // uint16
 constexpr std::size_t kStrBuffer = 8;        // pointer
-constexpr std::size_t kStrBytes = 16;
 
 // The four `Length`/`MaximumLength` pairs a `UNICODE_STRING` uses, spelled
 // as the named values the reference's own comments use, because "65532" is
@@ -2656,7 +2653,6 @@ extern "C" __attribute__((ms_abi)) Ntstatus nrs_RtlConvertSidToUnicodeString(
 // The security descriptor's own layout. Only the fields this function moves
 // are named; the rest are passed through by the flat assignment, which is
 // correct because they are scalars.
-constexpr std::size_t kSdRevision = 0;   // BYTE
 constexpr std::size_t kSdControl = 2;    // WORD, with the SE_* bits
 //
 // The four variable-length parts sit after the four-byte scalar header, and

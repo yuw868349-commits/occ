@@ -120,8 +120,8 @@ struct NarrowBuf {
 constexpr std::uint32_t kSuccess = 0x00000000;
 constexpr std::uint32_t kNotImplemented = 0xC0000002;
 constexpr std::uint32_t kInvalidParameter = 0xC000000D;
-constexpr std::uint32_t kInvalidParameter1 = 0xC00000EF;
-constexpr std::uint32_t kInvalidParameter2 = 0xC00000F0;
+[[maybe_unused]] constexpr std::uint32_t kInvalidParameter1 = 0xC00000EF;
+[[maybe_unused]] constexpr std::uint32_t kInvalidParameter2 = 0xC00000F0;
 constexpr std::uint32_t kInvalidParameter4 = 0xC00000F2;
 constexpr std::uint32_t kInvalidParameter5 = 0xC00000F3;
 constexpr std::uint32_t kBufferOverflow = 0x80000005;
@@ -130,12 +130,12 @@ constexpr std::uint32_t kBufferOverflow = 0x80000005;
 // was fine. Windows distinguishes the two, and a caller that gets the wrong one
 // retries with different arguments instead of fixing the null.
 constexpr std::uint32_t kAccessViolation = 0xC0000005;
-constexpr std::uint32_t kNoMemory = 0xC0000017;
+[[maybe_unused]] constexpr std::uint32_t kNoMemory = 0xC0000017;
 constexpr std::uint32_t kBufferTooSmall = 0xC0000023;
-constexpr std::uint32_t kNameTooLong = 0xC0000106;
+[[maybe_unused]] constexpr std::uint32_t kNameTooLong = 0xC0000106;
 constexpr std::uint32_t kNotFound = 0xC0000225;
 constexpr std::uint32_t kUnknownRevision = 0xC0000058;
-constexpr std::uint32_t kNoUnicodeTranslation = 0xC0000717;
+[[maybe_unused]] constexpr std::uint32_t kNoUnicodeTranslation = 0xC0000717;
 constexpr std::uint32_t kObjectNameNotFound = 0xC0000034;
 constexpr std::uint32_t kSxsKeyNotFound = 0xC0150008;
 
@@ -292,10 +292,10 @@ ExportList g_exports;
 // calling the entry points by name is deliberate: it is the only way to check
 // that a name is exported *and* points at code, which is the whole contract
 // of this file's domain function.
-const void* find(const char* name) {
+void* find(const char* name) {
     for (const HostExport& entry : g_exports) {
         if (entry.name == name) {
-            return reinterpret_cast<const void*>(entry.address);
+            return reinterpret_cast<void*>(entry.address);
         }
     }
     std::fprintf(stderr, "FAIL missing export %s\n", name);
@@ -582,7 +582,10 @@ void test_free() {
         check(s.buffer_is_null(), "free: freeing a zeroed structure is a no-op");
     }
     {
+        // A structure whose state is never read: the call exists to exercise
+        // the null path, and the local exists to be the zeroed subject.
         Str s;
+        (void)s;
         fn<void (__attribute__((ms_abi)) *)(void*)>("RtlFreeUnicodeString")(nullptr);
         check(true, "free: a null structure does not crash");
     }

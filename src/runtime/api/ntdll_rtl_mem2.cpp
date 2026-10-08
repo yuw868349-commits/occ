@@ -45,14 +45,9 @@ using Ntstatus = std::uint32_t;
 // `ntstatus_to_dos` below implements.
 constexpr Ntstatus kStSuccess = 0;
 constexpr Ntstatus kStInvalidParameter = 0xC000000D;
-constexpr Ntstatus kStInvalidParameter2 = 0xC00000F0;
-constexpr Ntstatus kStInvalidParameter3 = 0xC00000F1;
-constexpr Ntstatus kStInvalidParameter4 = 0xC00000F2;
 constexpr Ntstatus kStBufferTooSmall = 0xC0000023;
 constexpr Ntstatus kStBufferOverflow = 0xC0000100;
 constexpr Ntstatus kStNotImplemented = 0xC0000002;
-constexpr Ntstatus kStAccessDenied = 0xC0000022;
-constexpr Ntstatus kStInvalidSid = 0xC0000078;
 constexpr Ntstatus kStInvalidSecurityDescr = 0xC0000079;
 constexpr Ntstatus kStInfoLengthMismatch = 0xC0000143;
 constexpr Ntstatus kStUnknownRevision = 0xC0000058;
@@ -67,15 +62,8 @@ constexpr Ntstatus kEInvalidArgAsStatus = 0x80070057;
 // below are the security- and quota-specific values the families in this
 // slice answer with.
 constexpr std::uint32_t kErrorInvalidAccess = 12;
-constexpr std::uint32_t kErrorInvalidData = 13;
-constexpr std::uint32_t kErrorOutOfPaper = 28;
-constexpr std::uint32_t kErrorNotEnoughQuota = 1816;
-constexpr std::uint32_t kErrorNoTrackingService = 1174;
-constexpr std::uint32_t kErrorRevisionMismatch = 1306;
-constexpr std::uint32_t kErrorNoneMapped = 1332;
 constexpr std::uint32_t kErrorInvalidSecurityDescr = 1338;
 constexpr std::uint32_t kErrorBadImpersonationLevel = 1346;
-constexpr std::uint32_t kErrorNotLocked = 158;
 
 // The RTL_OSVERSIONINFOW the version queries fill: 32 bytes, five 32-bit
 // fields and a 128-byte name after them in the extended form.
@@ -109,11 +97,9 @@ constexpr std::uint32_t kSListSequenceShift = 16;
 // CRITICAL_SECTION, 40 bytes on the 64-bit ABI. The fields after the
 // pointer are signed counts and a handle, and the layout is Microsoft's
 // rather than this host's, so every field is placed by offset.
-constexpr std::size_t kCritDebugInfo = 0;
 constexpr std::size_t kCritLockCount = 8;
 constexpr std::size_t kCritRecursionCount = 12;
 constexpr std::size_t kCritOwningThread = 16;
-constexpr std::size_t kCritLockSemaphore = 24;
 constexpr std::size_t kCritSpinCount = 32;
 constexpr std::size_t kCritBytes = 40;
 
@@ -146,10 +132,8 @@ constexpr std::size_t kSdAbsOwner = 8;
 constexpr std::size_t kSdAbsGroup = 16;
 constexpr std::size_t kSdAbsSacl = 24;
 constexpr std::size_t kSdAbsDacl = 32;
-constexpr std::size_t kSdAbsBytes = 40;
 
 // An ACL header, and the ACE header inside it.
-constexpr std::size_t kAclRevision = 0;
 constexpr std::size_t kAclSize = 2;
 constexpr std::size_t kAclCount = 4;
 constexpr std::size_t kAclBytes = 8;
@@ -1035,7 +1019,6 @@ namespace {
 
 constexpr std::size_t kLiLow = 0;
 constexpr std::size_t kLiHigh = 4;
-constexpr std::size_t kLiBytes = 8;
 
 [[nodiscard]] std::int64_t li_read(const void* li) noexcept {
     const std::uint64_t low = read_u32(li, kLiLow);
@@ -2067,21 +2050,17 @@ constexpr std::size_t kDosLfanew = 0x3C;
 constexpr std::size_t kNtSignature = 0;
 constexpr std::size_t kNtFileHeader = 4;
 constexpr std::size_t kNtOptional = 24;
-constexpr std::size_t kFileHeaderSize = 20;
 // The two file-header fields this file reads, counted from the file
 // header's own start -- which is the NT signature plus four, not the NT
 // signature itself. Reading them from the signature would take the symbol
 // table's fields for these.
 constexpr std::size_t kFileOptionalSize = 16;      // SizeOfOptionalHeader
-constexpr std::size_t kFileCharacteristics = 18;
 constexpr std::size_t kOptionalMagic = 0;
 constexpr std::size_t kOptionalDirectoryCount = 0x6C;  // NumberOfRvaAndSizes
 constexpr std::size_t kOptionalDirectoryBase = 0x70;   // the array itself
 
 // IMAGE_DIRECTORY_ENTRY_EXPORT is the first data directory, which is the one
 // the export queries walk.
-constexpr std::size_t kExportDirectory = 0;
-constexpr std::size_t kExportDirectoryBytes = 0x28;
 
 [[nodiscard]] bool read_pe_header(const std::uint8_t* base, std::size_t size,
                                   std::uint8_t** nt_out,
@@ -2943,11 +2922,6 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlLocalTimeToSystemTime(
 namespace {
 
 constexpr std::size_t kContextFlags = 0x30;
-constexpr std::size_t kContextRip = 0xF8;
-constexpr std::size_t kContextRsp = 0x98;
-constexpr std::size_t kContextInteger = 0x02;
-constexpr std::size_t kContextControl = 0x00100001;
-constexpr std::size_t kContextAll = 0x0010003F;
 constexpr std::size_t kContextBytes = 0x698;
 
 }  // namespace
