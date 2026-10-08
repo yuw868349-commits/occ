@@ -471,6 +471,11 @@ void add_kernel32_sys2(ExportList& out);
 void add_kernel32_file2(ExportList& out);
 void add_kernel32_state2(ExportList& out);
 
+// kernel32's context, exception and module calls: the pair a debugger
+// builds on, the filter a process registers, and the bookkeeping that goes
+// with asking about the image.
+void add_kernel32_ctx2(ExportList& out);
+
 // The KERNELBASE names a guest imports from it directly.
 void add_kernelbase_extra(ExportList& out);
 
@@ -549,6 +554,13 @@ void add_ole32(ExportList& out);
 // fourteen copies of the same table is how the family is built on Windows
 // and how it would be built here, and it is not what a reader needs.
 void add_crt(ExportList& out, const char* module);
+
+// The C runtime's exports, as one list. Every module that presents the C
+// runtime -- `ucrtbase.dll`, `msvcrt.dll`, and the versioned `MSVCR*.dll`
+// family -- registers this same list, because a program built against any
+// of them calls the same functions and a per-module copy would let the
+// copies disagree about what the runtime provides.
+void add_crt_exports(ExportList& out);
 
 // The modules built from domains, named once each.
 void add_module_ntdll(ExportModule& module);

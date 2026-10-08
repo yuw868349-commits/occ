@@ -191,33 +191,6 @@ k32_GetCurrentThreadId() noexcept;
 
 namespace {
 
-// ---------------------------------------------------------------- helpers
-
-// Reads the single-byte fields the SID and ACL layouts below walk. The
-// 16- and 32-bit readers come from `api_common.h`; there is no 8-bit one
-// there because no other family has needed one, and this slice's SID
-// revision and sub-authority count are both bytes.
-[[nodiscard]] std::uint8_t read_u8(const void* base,
-                                   std::size_t offset) noexcept {
-    const auto* bytes = static_cast<const std::uint8_t*>(base);
-    return bytes[offset];
-}
-
-void write_u8(void* base, std::size_t offset, std::uint8_t value) noexcept {
-    auto* bytes = static_cast<std::uint8_t*>(base);
-    bytes[offset] = value;
-}
-
-// The 64-bit pair, for the fields that are a whole pointer or tick count
-// wide. They are written one byte at a time for the same reason the narrower
-// ones are: the byte order is the guest's, not the host's.
-void write_u64(void* base, std::size_t offset, std::uint64_t value) noexcept {
-    auto* bytes = static_cast<std::uint8_t*>(base);
-    for (std::size_t k = 0; k < 8; ++k) {
-        bytes[offset + k] = static_cast<std::uint8_t>(value >> (k * 8));
-    }
-}
-
 // The host's monotonic clock, in the 100-nanosecond ticks the Windows time
 // queries answer. The 1601-to-1970 offset is what turns the host's count
 // into the guest's; the constant is the number of seconds between the two

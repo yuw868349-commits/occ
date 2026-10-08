@@ -448,6 +448,58 @@ extern "C" __attribute__((ms_abi)) void* cr_bsearch(
 extern "C" __attribute__((ms_abi)) void cr_srand(std::uint32_t seed) noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t cr_rand() noexcept;
 
+// The C runtime's data exports. A guest that reads `_fmode` or `_environ`
+// reads the variable this runtime keeps, and its address is what the export
+// list hands out; a copy would be a value the guest sets and this runtime
+// never sees.
+extern int g_fmode;
+extern int g_commode;
+extern char** g_initenv;
+extern char** g_environ_ptr;
+
+// The remaining C runtime entry points. Each is the one
+// implementation the runtime presents under every module name the C
+// runtime answers to, and the declarations live here because this is
+// where the rest of them are: a second header for part of one surface
+// is a second place to look for a signature.
+extern "C" __attribute__((ms_abi)) std::int32_t cr___getmainargs( std::int32_t* argc, char*** argv, char*** env, std::int32_t wildcard, void* start_info) noexcept;
+extern "C" __attribute__((ms_abi)) void cr___set_app_type( std::uint32_t type) noexcept;
+extern "C" __attribute__((ms_abi)) void cr___setusermatherr( std::uint64_t handler) noexcept;
+extern "C" __attribute__((ms_abi)) void cr__initterm( std::uint64_t* begin, std::uint64_t* end) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr__onexit( std::uint64_t function) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_atexit( std::uint64_t function) noexcept;
+extern "C" __attribute__((ms_abi)) void cr__cexit() noexcept;
+extern "C" __attribute__((ms_abi)) void cr_exit( std::int32_t code) noexcept;
+extern "C" __attribute__((ms_abi)) void cr__amsg_exit( std::int32_t code) noexcept;
+extern "C" __attribute__((ms_abi)) void cr_abort() noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_signal( std::int32_t sig, std::uint64_t handler) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t* cr__errno() noexcept;
+extern "C" __attribute__((ms_abi)) void* cr___iob_func() noexcept;
+extern "C" __attribute__((ms_abi)) void cr__lock( std::int32_t index) noexcept;
+extern "C" __attribute__((ms_abi)) void cr__unlock( std::int32_t index) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t cr___lc_codepage_func() noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr___mb_cur_max_func() noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_vfprintf( void* stream, const char* fmt, void* ms_slots) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fprintf( void* stream, const char* fmt, ...) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fputs( const char* text, void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_puts( const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_malloc( std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_calloc( std::uint64_t count, std::uint64_t size) noexcept;
+extern "C" __attribute__((ms_abi)) void cr_free(void* block) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_realloc( void* block, std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_memchr(const void* haystack, std::int32_t needle, std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_memcpy( void* target, const void* source, std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_memset( void* target, std::int32_t value, std::uint64_t bytes) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint64_t cr_strlen( const char* text) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_strncmp( const char* a, const char* b, std::uint64_t n) noexcept;
+extern "C" __attribute__((ms_abi)) const char* cr_strerror( std::int32_t err) noexcept;
+extern "C" __attribute__((ms_abi)) void* cr_localeconv() noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr__read( std::int32_t fd, void* buffer, std::uint32_t count) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_getc( void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_putc( std::int32_t c, void* stream) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_getchar() noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_putchar( std::int32_t c) noexcept;
+
 extern "C" __attribute__((ms_abi)) std::int32_t cr_abs(
     std::int32_t value) noexcept;
 extern "C" __attribute__((ms_abi)) std::int64_t cr_labs(

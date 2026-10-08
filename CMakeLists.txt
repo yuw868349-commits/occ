@@ -573,6 +573,7 @@ add_library(occ_core STATIC
     src/runtime/seh.cpp
     src/runtime/winabi.cpp
     src/runtime/api_common.cpp
+    src/runtime/apiset.cpp
     src/runtime/api/path.cpp
     src/runtime/api/string.cpp
     src/runtime/api/file.cpp
@@ -600,6 +601,7 @@ add_library(occ_core STATIC
     src/runtime/api/kernel32_sys2.cpp
     src/runtime/api/kernel32_file2.cpp
     src/runtime/api/kernel32_state2.cpp
+    src/runtime/api/kernel32_ctx2.cpp
     src/runtime/api/advapi32_reg.cpp
     src/runtime/api/advapi32_sec.cpp
     src/runtime/api/ntdll_rtl_str.cpp

@@ -1,3 +1,4 @@
+#include "occ/runtime/apiset.h"
 #include "occ/runtime/loader.h"
 
 #include <algorithm>
@@ -1627,6 +1628,28 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                     break;
                 }
 
+                // The name the resolver is asked about.
+                //
+                // A modern image names its imports through an API set -- a
+                // contract like `api-ms-win-core-file-l1-1-0` -- rather than
+                // through the module that implements it, and the resolver is
+                // keyed by module names. Resolving the contract first is what
+                // the platform's own loader does, and without it every import
+                // from a modern image names a DLL that does not exist.
+                //
+                // A contract this runtime does not implement is left as it
+                // was: the resolver then fails on the contract's own name,
+                // and the load failure names the thing the image actually
+                // asked for rather than a module that was guessed at.
+                std::string module_name = dll;
+                if (occ::runtime::is_api_set_name(module_name)) {
+                    const std::string resolved =
+                        occ::runtime::resolve_api_set(module_name);
+                    if (!resolved.empty()) {
+                        module_name = resolved;
+                    }
+                }
+
                 if (context.resolve != nullptr) {
                     std::uint16_t ordinal = 0;
                     if (imp.by_ordinal) {
@@ -1634,8 +1657,8 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
                             value & 0xFFFFU);
                     }
                     imp.target_va = context.resolve(
-                        context.resolver_state, dll, imp.name, ordinal,
-                        imp.by_ordinal);
+                        context.resolver_state, module_name, imp.name,
+                        ordinal, imp.by_ordinal);
                     imp.resolved = imp.target_va != 0;
                 }
 

@@ -19,12 +19,14 @@
 // a constant was taken from reading that tree are marked where they occur.
 
 #include "occ/runtime/api.h"
+#include "occ/runtime/seh.h"
 #include "occ/runtime/api_common.h"
 #include "occ/runtime/address_space.h"
 #include "occ/runtime/winabi.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -132,23 +134,6 @@ constexpr int kMonthLengths[2][12] = {
 [[nodiscard]] bool is_leap_year(int year) noexcept {
     return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
 }
-
-[[nodiscard]] std::uint8_t read_u8(const void* base,
-                                   std::size_t offset) noexcept {
-    return static_cast<const std::uint8_t*>(base)[offset];
-}
-
-void write_u8(void* base, std::size_t offset, std::uint8_t value) noexcept {
-    static_cast<std::uint8_t*>(base)[offset] = value;
-}
-
-void write_u64(void* base, std::size_t offset, std::uint64_t value) noexcept {
-    auto* bytes = static_cast<std::uint8_t*>(base);
-    for (std::size_t k = 0; k < 8; ++k) {
-        bytes[offset + k] = static_cast<std::uint8_t>(value >> (k * 8));
-    }
-}
-
 void write_i16(void* base, std::size_t offset, std::int16_t value) noexcept {
     const auto bits = static_cast<std::uint16_t>(value);
     write_u16(base, offset, bits);
@@ -3501,14 +3486,28 @@ extern "C" __attribute__((ms_abi)) void nr3_RtlRaiseStatus(
     static_cast<void>(status);
 }
 
-extern "C" __attribute__((ms_abi)) void nr3_RtlRestoreContext(
-    void* context,
-    void* record) noexcept {
-    // Needs the exception dispatcher that would walk the handlers; this runtime has none of it, so the call
-    // is refused rather than answered with a value that would
-    // be believed.
-    static_cast<void>(context);
+extern "C" __attribute__((ms_abi, noreturn)) void nr3_RtlRestoreContext(
+    void* context, void* record) noexcept {
+    // The last step of an unwinding: the exception record has already been
+    // walked, the handler that accepted has already decided where to
+    // resume, and this call takes the machine there. It is the same restore
+    // the language handler reaches through `RtlUnwindEx`, which is why it is
+    // the same function -- a second implementation would have to agree with
+    // the unwinder about the context layout, and the two would drift.
+    //
+    // The record is not consulted: the resume address and the registers are
+    // all in the context, and a context that is absent leaves nothing to
+    // restore, which ends the process rather than continuing from a frame
+    // the caller did not name.
     static_cast<void>(record);
+    if (context == nullptr) {
+        // Nothing to restore. Returning would tell the caller its unwind
+        // had completed, and the caller has no code after this call: it
+        // asked to resume somewhere and there is nowhere to go.
+        ::abort();
+    }
+    seh::seh_restore_context(static_cast<const std::uint8_t*>(context));
+    __builtin_unreachable();
 }
 
 extern "C" __attribute__((ms_abi)) void nr3_RtlUnwind(
@@ -3938,6 +3937,27 @@ extern "C" __attribute__((ms_abi)) std::uint64_t nr3_RtlWow64SuspendThread(
     // second thread for, let alone a 32-bit one.
     static_cast<void>(thread);
     return static_cast<std::uint64_t>(-1);
+}
+
+// The two pieces of this slice's state that the kernel32 shell reaches for.
+//
+// The filter and the error mode are owned here, and the Win32 spellings of
+// the same operations live in another file. They are read and written
+// through these two rather than kept in a second place, because a second
+// place is a second value: a guest that set the mode through
+// `RtlSetThreadErrorMode` and read it through `SetThreadErrorMode` must see
+// one answer, and it will only see one if there is one variable.
+extern "C" void* occ_unhandled_filter() noexcept {
+    return g_unhandled_filter;
+}
+
+extern "C" std::uint32_t occ_set_thread_error_mode(
+    std::uint32_t mode, std::uint32_t* previous) noexcept {
+    if (previous != nullptr) {
+        *previous = g_thread_error_mode;
+    }
+    g_thread_error_mode = mode;
+    return 1;
 }
 
 // ------------------------------------------------------------- registration

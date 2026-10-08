@@ -53,6 +53,10 @@ constexpr std::uint32_t kErrorSuccess = 0;
 
 constexpr std::uint32_t kErrorInvalidFunction = 1;
 constexpr std::uint32_t kErrorFileNotFound = 2;
+// ERROR_MOD_NOT_FOUND: a module the caller named is not loaded. Distinct
+// from "the file is not there", because a caller that meant to load it and
+// a caller that meant to find it handle the two differently.
+constexpr std::uint32_t kErrorModuleNotFound = 126;
 constexpr std::uint32_t kErrorPathNotFound = 3;
 constexpr std::uint32_t kErrorTooManyOpenFiles = 4;
 constexpr std::uint32_t kErrorAccessDenied = 5;
@@ -230,6 +234,22 @@ void write_ptr(void* base, std::size_t offset,
                std::uint64_t value) noexcept;
 
 // Reads and writes a `WORD`.
+// The byte-wide pair. A structure whose fields are single bytes -- a code
+// page's sizes, an ACL's revision -- has no wider accessor that reaches them.
+[[nodiscard]] std::uint8_t read_u8(const void* base,
+                                   std::size_t offset) noexcept;
+
+void write_u8(void* base, std::size_t offset, std::uint8_t value) noexcept;
+
+// The 64-bit pair, for the fields that are a whole pointer or a tick count
+// wide. They are here rather than in each slice because every slice that
+// touches a FILETIME or a large integer needs them, and a copy per slice is
+// a copy per place for the byte order to be written the other way.
+[[nodiscard]] std::uint64_t read_u64(const void* base,
+                                     std::size_t offset) noexcept;
+
+void write_u64(void* base, std::size_t offset, std::uint64_t value) noexcept;
+
 [[nodiscard]] std::uint16_t read_u16(const void* base,
                                      std::size_t offset) noexcept;
 void write_u16(void* base, std::size_t offset,

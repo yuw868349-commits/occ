@@ -106,4 +106,28 @@ void write_u16(void* base, std::size_t offset,
     bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
 }
 
+std::uint8_t read_u8(const void* base, std::size_t offset) noexcept {
+    return static_cast<const std::uint8_t*>(base)[offset];
+}
+
+void write_u8(void* base, std::size_t offset, std::uint8_t value) noexcept {
+    static_cast<std::uint8_t*>(base)[offset] = value;
+}
+
+std::uint64_t read_u64(const void* base, std::size_t offset) noexcept {
+    const auto* bytes = static_cast<const std::uint8_t*>(base);
+    std::uint64_t value = 0;
+    for (std::size_t k = 0; k < 8; ++k) {
+        value |= static_cast<std::uint64_t>(bytes[offset + k]) << (k * 8);
+    }
+    return value;
+}
+
+void write_u64(void* base, std::size_t offset, std::uint64_t value) noexcept {
+    auto* bytes = static_cast<std::uint8_t*>(base);
+    for (std::size_t k = 0; k < 8; ++k) {
+        bytes[offset + k] = static_cast<std::uint8_t>(value >> (k * 8));
+    }
+}
+
 }  // namespace occ::runtime::winabi

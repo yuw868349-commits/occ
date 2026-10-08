@@ -71,13 +71,6 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32s2_FreeEnvironmentStringsA(
 
 namespace {
 
-// Writes one byte into a guest structure. `api_common.h` carries the 16-,
-// 32- and 64-bit writers; the code page structure has single-byte fields
-// and needs this one to reach them.
-void write_u8(void* base, std::size_t offset, std::uint8_t value) noexcept {
-    static_cast<std::uint8_t*>(base)[offset] = value;
-}
-
 // The code pages this runtime admits to. A is the ANSI code page and O is the
 // OEM one; both are reported as UTF-8, which is what every narrow string this
 // runtime produces actually is. Reporting 1252 would be a claim that a byte

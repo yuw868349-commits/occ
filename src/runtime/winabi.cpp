@@ -1150,12 +1150,7 @@ std::uint32_t g_host_last_error = 0;
                         : translate_stream(*g, stream);
 }
 
-// The data exports. Their addresses are the whole of the answer; the
-// variables live for the process and their values are whatever the guest's
-// startup leaves in them.
-int g_fmode = 0;
-int g_commode = 0;
-char** g_initenv = nullptr;
+
 
 // Windows' FILE carries a text mode in both directions: writes expand,
 // and reads press a carriage return and a newline back into one newline.
@@ -1226,7 +1221,6 @@ std::map<std::string, std::string> g_env_overrides;
 std::set<std::string> g_env_deleted;
 std::vector<std::string> g_env_storage;
 std::vector<char*> g_env_flat;
-char** g_environ_ptr = nullptr;
 
 // "NAME=VALUE" spells its name in the part before the first '='; a form
 // without one has no name this table can carry.
@@ -1431,6 +1425,21 @@ constexpr int kGuestSigIgnore = 1; // SIG_IGN
 constexpr int kGuestSigAbrt = 22;  // SIGABRT on Windows
 
 }  // namespace
+
+// The data exports. Their addresses are the whole of the answer; the
+// variables live for the process and their values are whatever the guest's
+// startup leaves in them.
+//
+// They are defined outside the anonymous namespace the rest of the
+// file's state lives in, because the C runtime's export list -- which is
+// built in its own domain file -- registers them by address, and a
+// variable with internal linkage cannot be named from there. The
+// alternative, an accessor per variable, would add a function to every
+// data export for the sake of one caller.
+int g_fmode = 0;
+int g_commode = 0;
+char** g_initenv = nullptr;
+char** g_environ_ptr = nullptr;
 
 // ---- process and module -------------------------------------------------
 
@@ -5025,6 +5034,7 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_sys2(module.host_exports);
     add_kernel32_file2(module.host_exports);
     add_kernel32_state2(module.host_exports);
+    add_kernel32_ctx2(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {
@@ -5072,175 +5082,11 @@ void add_shlwapi(ExportModule& module) {
     add_string_shlwapi(module.host_exports);
 }
 
+// The module the runtime is presented under in the list above. It is a
+// wrapper so the module table keeps naming one function per module.
 void add_msvcrt(ExportModule& module) {
     module.name = "msvcrt.dll";
-    const auto e = [](const char* n, void* fn) {
-        HostExport out;
-        out.name = n;
-        out.address = reinterpret_cast<std::uint64_t>(fn);
-        return out;
-    };
-    const auto d = [](const char* n, void* var) {
-        HostExport out;
-        out.name = n;
-        out.address = reinterpret_cast<std::uint64_t>(var);
-        return out;
-    };
-    module.host_exports = {
-        e("__getmainargs", reinterpret_cast<void*>(&cr___getmainargs)),
-        d("__initenv", &g_initenv),
-        e("__iob_func", reinterpret_cast<void*>(&cr___iob_func)),
-        e("__set_app_type", reinterpret_cast<void*>(&cr___set_app_type)),
-        e("__setusermatherr", reinterpret_cast<void*>(&cr___setusermatherr)),
-        e("__C_specific_handler",
-          reinterpret_cast<void*>(&seh::seh_C_specific_handler)),
-        e("___lc_codepage_func",
-          reinterpret_cast<void*>(&cr___lc_codepage_func)),
-        e("___mb_cur_max_func",
-          reinterpret_cast<void*>(&cr___mb_cur_max_func)),
-        e("_amsg_exit", reinterpret_cast<void*>(&cr__amsg_exit)),
-        e("_abs64", reinterpret_cast<void*>(&cr__abs64)),
-        e("_atoi64", reinterpret_cast<void*>(&cr__atoi64)),
-        e("_cexit", reinterpret_cast<void*>(&cr__cexit)),
-        d("_commode", &g_commode),
-        e("_ctime64", reinterpret_cast<void*>(&cr_ctime)),
-        e("_errno", reinterpret_cast<void*>(&cr__errno)),
-        d("_environ", &g_environ_ptr),
-        e("_fmode", &g_fmode),
-        e("_gmtime64", reinterpret_cast<void*>(&cr_gmtime)),
-        e("_i64toa", reinterpret_cast<void*>(&cr__i64toa)),
-        e("_initterm", reinterpret_cast<void*>(&cr__initterm)),
-        e("_itoa", reinterpret_cast<void*>(&cr__itoa)),
-        e("_lock", reinterpret_cast<void*>(&cr__lock)),
-        e("_ltoa", reinterpret_cast<void*>(&cr__ltoa)),
-        e("_localtime64", reinterpret_cast<void*>(&cr_localtime)),
-        e("_mkgmtime", reinterpret_cast<void*>(&cr__mkgmtime)),
-        e("_mkgmtime64", reinterpret_cast<void*>(&cr__mkgmtime)),
-        e("_mktime64", reinterpret_cast<void*>(&cr_mktime)),
-        e("_onexit", reinterpret_cast<void*>(&cr__onexit)),
-        e("_putenv", reinterpret_cast<void*>(&cr__putenv)),
-        e("_putenv_s", reinterpret_cast<void*>(&cr__putenv_s)),
-        e("_stricmp", reinterpret_cast<void*>(&cr__stricmp)),
-        e("_strlwr", reinterpret_cast<void*>(&cr__strlwr)),
-        e("_strnicmp", reinterpret_cast<void*>(&cr__strnicmp)),
-        e("_strupr", reinterpret_cast<void*>(&cr__strupr)),
-        e("_snprintf", reinterpret_cast<void*>(&cr__snprintf)),
-        e("_time64", reinterpret_cast<void*>(&cr_time)),
-        e("_ui64toa", reinterpret_cast<void*>(&cr__ui64toa)),
-        e("_ultoa", reinterpret_cast<void*>(&cr__ultoa)),
-        e("_unlock", reinterpret_cast<void*>(&cr__unlock)),
-        e("_vsnprintf", reinterpret_cast<void*>(&cr__vsnprintf)),
-        e("_wfopen", reinterpret_cast<void*>(&cr__wfopen)),
-        e("abs", reinterpret_cast<void*>(&cr_abs)),
-        e("asctime", reinterpret_cast<void*>(&cr_asctime)),
-        e("atexit", reinterpret_cast<void*>(&cr_atexit)),
-        e("atof", reinterpret_cast<void*>(&cr_atof)),
-        e("atoi", reinterpret_cast<void*>(&cr_atoi)),
-        e("atol", reinterpret_cast<void*>(&cr_atol)),
-        e("abort", reinterpret_cast<void*>(&cr_abort)),
-        e("bsearch", reinterpret_cast<void*>(&cr_bsearch)),
-        e("calloc", reinterpret_cast<void*>(&cr_calloc)),
-        e("clock", reinterpret_cast<void*>(&cr_clock)),
-        e("ctime", reinterpret_cast<void*>(&cr_ctime)),
-        e("difftime", reinterpret_cast<void*>(&cr_difftime)),
-        e("div", reinterpret_cast<void*>(&cr_div)),
-        e("exit", reinterpret_cast<void*>(&cr_exit)),
-        e("memchr", reinterpret_cast<void*>(&cr_memchr)),
-        e("realloc", reinterpret_cast<void*>(&cr_realloc)),
-        e("fclose", reinterpret_cast<void*>(&cr_fclose)),
-        e("feof", reinterpret_cast<void*>(&cr_feof)),
-        e("ferror", reinterpret_cast<void*>(&cr_ferror)),
-        e("fflush", reinterpret_cast<void*>(&cr_fflush)),
-        e("fgetc", reinterpret_cast<void*>(&cr_fgetc)),
-        e("fgets", reinterpret_cast<void*>(&cr_fgets)),
-        e("fopen", reinterpret_cast<void*>(&cr_fopen)),
-        e("fprintf", reinterpret_cast<void*>(&cr_fprintf)),
-        e("fputc", reinterpret_cast<void*>(&cr_fputc)),
-        e("fputs", reinterpret_cast<void*>(&cr_fputs)),
-        e("fread", reinterpret_cast<void*>(&cr_fread)),
-        e("free", reinterpret_cast<void*>(&cr_free)),
-        e("_read", reinterpret_cast<void*>(&cr__read)),
-        e("fseek", reinterpret_cast<void*>(&cr_fseek)),
-        e("fseeki64", reinterpret_cast<void*>(&cr_fseeki64)),
-        e("ftell", reinterpret_cast<void*>(&cr_ftell)),
-        e("ftelli64", reinterpret_cast<void*>(&cr_ftelli64)),
-        e("fwrite", reinterpret_cast<void*>(&cr_fwrite)),
-        e("getc", reinterpret_cast<void*>(&cr_getc)),
-        e("getchar", reinterpret_cast<void*>(&cr_getchar)),
-        e("getenv", reinterpret_cast<void*>(&cr_getenv)),
-        e("gmtime", reinterpret_cast<void*>(&cr_gmtime)),
-        e("isalnum", reinterpret_cast<void*>(&cr_isalnum)),
-        e("isalpha", reinterpret_cast<void*>(&cr_isalpha)),
-        e("iscntrl", reinterpret_cast<void*>(&cr_iscntrl)),
-        e("isdigit", reinterpret_cast<void*>(&cr_isdigit)),
-        e("isgraph", reinterpret_cast<void*>(&cr_isgraph)),
-        e("islower", reinterpret_cast<void*>(&cr_islower)),
-        e("isprint", reinterpret_cast<void*>(&cr_isprint)),
-        e("ispunct", reinterpret_cast<void*>(&cr_ispunct)),
-        e("isspace", reinterpret_cast<void*>(&cr_isspace)),
-        e("isupper", reinterpret_cast<void*>(&cr_isupper)),
-        e("isxdigit", reinterpret_cast<void*>(&cr_isxdigit)),
-        e("itoa", reinterpret_cast<void*>(&cr_itoa)),
-        e("labs", reinterpret_cast<void*>(&cr_labs)),
-        e("ldiv", reinterpret_cast<void*>(&cr_ldiv)),
-        e("lldiv", reinterpret_cast<void*>(&cr_lldiv)),
-        e("localtime", reinterpret_cast<void*>(&cr_localtime)),
-        e("localeconv", reinterpret_cast<void*>(&cr_localeconv)),
-        e("malloc", reinterpret_cast<void*>(&cr_malloc)),
-        e("mbstowcs", reinterpret_cast<void*>(&cr_mbstowcs)),
-        e("memcmp", reinterpret_cast<void*>(&cr_memcmp)),
-        e("memcpy", reinterpret_cast<void*>(&cr_memcpy)),
-        e("memmove", reinterpret_cast<void*>(&cr_memmove)),
-        e("memset", reinterpret_cast<void*>(&cr_memset)),
-        e("mktime", reinterpret_cast<void*>(&cr_mktime)),
-        e("putc", reinterpret_cast<void*>(&cr_putc)),
-        e("putchar", reinterpret_cast<void*>(&cr_putchar)),
-        e("putenv", reinterpret_cast<void*>(&cr__putenv)),
-        e("puts", reinterpret_cast<void*>(&cr_puts)),
-        e("qsort", reinterpret_cast<void*>(&cr_qsort)),
-        e("rand", reinterpret_cast<void*>(&cr_rand)),
-        e("srand", reinterpret_cast<void*>(&cr_srand)),
-        e("signal", reinterpret_cast<void*>(&cr_signal)),
-        e("strcat", reinterpret_cast<void*>(&cr_strcat)),
-        e("strchr", reinterpret_cast<void*>(&cr_strchr)),
-        e("strcmp", reinterpret_cast<void*>(&cr_strcmp)),
-        e("strcspn", reinterpret_cast<void*>(&cr_strcspn)),
-        e("strerror", reinterpret_cast<void*>(&cr_strerror)),
-        e("strftime", reinterpret_cast<void*>(&cr_strftime)),
-        e("strlen", reinterpret_cast<void*>(&cr_strlen)),
-        e("strncat", reinterpret_cast<void*>(&cr_strncat)),
-        e("strncmp", reinterpret_cast<void*>(&cr_strncmp)),
-        e("strncpy", reinterpret_cast<void*>(&cr_strncpy)),
-        e("strnlen", reinterpret_cast<void*>(&cr_strnlen)),
-        e("strpbrk", reinterpret_cast<void*>(&cr_strpbrk)),
-        e("strrchr", reinterpret_cast<void*>(&cr_strrchr)),
-        e("strspn", reinterpret_cast<void*>(&cr_strspn)),
-        e("strstr", reinterpret_cast<void*>(&cr_strstr)),
-        e("strtod", reinterpret_cast<void*>(&cr_strtod)),
-        e("strtol", reinterpret_cast<void*>(&cr_strtol)),
-        e("strtoll", reinterpret_cast<void*>(&cr_strtoll)),
-        e("strtoul", reinterpret_cast<void*>(&cr_strtoul)),
-        e("strtoull", reinterpret_cast<void*>(&cr_strtoull)),
-        e("time", reinterpret_cast<void*>(&cr_time)),
-        e("tolower", reinterpret_cast<void*>(&cr_tolower)),
-        e("toupper", reinterpret_cast<void*>(&cr_toupper)),
-        e("vfprintf", reinterpret_cast<void*>(&cr_vfprintf)),
-        e("wcschr", reinterpret_cast<void*>(&cr_wcschr)),
-        e("wcscmp", reinterpret_cast<void*>(&cr_wcscmp)),
-        e("wcscpy", reinterpret_cast<void*>(&cr_wcscpy)),
-        e("wcsdup", reinterpret_cast<void*>(&cr_wcsdup)),
-        e("wcslen", reinterpret_cast<void*>(&cr_wcslen)),
-        e("wcsncat", reinterpret_cast<void*>(&cr_wcsncat)),
-        e("wcsncmp", reinterpret_cast<void*>(&cr_wcsncmp)),
-        e("wcsncpy", reinterpret_cast<void*>(&cr_wcsncpy)),
-        e("wcsnlen", reinterpret_cast<void*>(&cr_wcsnlen)),
-        e("wcsrchr", reinterpret_cast<void*>(&cr_wcsrchr)),
-        e("wcsstr", reinterpret_cast<void*>(&cr_wcsstr)),
-        e("wcstombs", reinterpret_cast<void*>(&cr_wcstombs)),
-    };
-    // The C runtime this module is named for, appended from
-    // the one table the whole family shares.
-    add_crt(module.host_exports, "msvcrt.dll");
+    add_crt_exports(module.host_exports);
 }
 
 }  // namespace

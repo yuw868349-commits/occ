@@ -51,15 +51,6 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_DeleteFileA(
 
 namespace {
 
-// Writes a 64-bit value into a guest structure. `api_common.h` carries the
-// narrower writers; the file times and sizes here are 64-bit fields.
-void write_u64(void* base, std::size_t offset, std::uint64_t value) noexcept {
-    auto* bytes = static_cast<std::uint8_t*>(base);
-    for (std::size_t k = 0; k < 8; ++k) {
-        bytes[offset + k] = static_cast<std::uint8_t>(value >> (k * 8));
-    }
-}
-
 // ---------------------------------------------------------------- layouts
 
 // WIN32_FIND_DATAW: the attributes, three FILETIMEs, the two size halves,

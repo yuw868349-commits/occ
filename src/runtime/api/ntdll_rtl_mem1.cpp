@@ -89,23 +89,6 @@ constexpr std::int32_t kStatusInsufficientResources =
     set_last_error(kErrorCallNotImplemented);
     return nullptr;
 }
-
-// ---------------------------------------------------------------- small reads
-//
-// api_common covers words and pointers; ACL and SID headers are byte-sized.
-[[nodiscard]] std::uint8_t read_u8(const void* base,
-                                   std::size_t offset) noexcept {
-    std::uint8_t value = 0;
-    std::memcpy(&value, static_cast<const std::uint8_t*>(base) + offset,
-                sizeof(value));
-    return value;
-}
-
-void write_u8(void* base, std::size_t offset, std::uint8_t value) noexcept {
-    std::memcpy(static_cast<std::uint8_t*>(base) + offset, &value,
-                sizeof(value));
-}
-
 // ===========================================================================
 // Heaps
 // ===========================================================================
