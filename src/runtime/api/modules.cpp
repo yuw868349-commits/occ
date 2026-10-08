@@ -13,6 +13,8 @@ namespace occ::runtime::winabi {
 void add_module_ntdll(ExportModule& module) {
     module.name = "NTDLL.dll";
     add_ntdll_rtl(module.host_exports);
+    add_ntdll_rtl_str(module.host_exports);
+    add_ntdll_rtl_mem1(module.host_exports);
     add_ntdll_nt(module.host_exports);
 }
 
@@ -24,6 +26,8 @@ void add_module_gdi32(ExportModule& module) {
 void add_module_advapi32(ExportModule& module) {
     module.name = "ADVAPI32.dll";
     add_advapi32(module.host_exports);
+    add_advapi32_reg(module.host_exports);
+    add_advapi32_sec(module.host_exports);
 }
 
 void add_module_rpcrt4(ExportModule& module) {

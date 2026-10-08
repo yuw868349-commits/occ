@@ -435,6 +435,32 @@ extern "C" __attribute__((ms_abi)) std::int32_t sw_StrToInt64ExW(
 // The KERNEL32 names that are not file, path, time, memory or console.
 void add_kernel32_extra(ExportList& out);
 
+// The KERNEL32 synchronization surface: the wait, the objects a wait can
+// name, and the timers and thread-pool entries that hang off them. A wait
+// is where a guest blocks, so this is the one area whose answer has a
+// shape -- a wait consumes an auto-reset event's signal, it does not
+// merely observe it -- and the distinction is in the file.
+void add_kernel32_sync(ExportList& out);
+
+// The KERNEL32 process, thread and environment surface. A guest's command
+// line and its environment are answered from the one parse the runtime
+// built before the guest started, so the three spellings of a command line
+// cannot disagree with each other.
+void add_kernel32_proc(ExportList& out);
+
+// The KERNEL32 string surface: the `lstr*` family, the code-page
+// conversions and the locale-driven compares. The `W` spellings carry the
+// decisions and the `A` ones convert, because two implementations of one
+// function is one more thing to keep in agreement.
+void add_kernel32_str(ExportList& out);
+
+// The KERNEL32 error surface: the last-error storage, the error mode, and
+// the message formatter. `FormatMessage` is the one that earns this file
+// -- its format is a language of its own, with position arguments and type
+// suffixes, and a guest that reads an unformatted message cannot tell it
+// from a missing one.
+void add_kernel32_err(ExportList& out);
+
 // The KERNELBASE names a guest imports from it directly.
 void add_kernelbase_extra(ExportList& out);
 
@@ -444,6 +470,19 @@ void add_user32_extra(ExportList& out);
 // The Rtl* half of ntdll: memory, strings, bits, sections, version.
 void add_ntdll_rtl(ExportList& out);
 
+// The Rtl* string surface: `UNICODE_STRING` and its siblings. The lengths
+// in that structure are byte counts that exclude the terminator, and every
+// function here is a different way of being wrong about that -- a length
+// in characters, a length that includes the terminator, a compare that
+// runs to the terminator instead of to the length.
+void add_ntdll_rtl_str(ExportList& out);
+
+// The Rtl* heap, bitmap, list and integer surface. The bitmaps are
+// MSB-first over a ULONG array and the lists are the kernel's doubly-linked
+// ones with a self-referential empty list, neither of which is what a host
+// library of the same name does.
+void add_ntdll_rtl_mem1(ExportList& out);
+
 // The Nt* and Zw* half of ntdll. In user mode the two are one function.
 void add_ntdll_nt(ExportList& out);
 
@@ -452,6 +491,19 @@ void add_gdi32(ExportList& out);
 
 // The ADVAPI32 surface: registry, tokens, services, events.
 void add_advapi32(ExportList& out);
+
+// The registry half of ADVAPI32. The keys are a tree this runtime keeps
+// rather than a mapping onto a host file, because a host has no registry
+// and a mapping onto one directory would be a different thing with the
+// same name: the seven predefined roots are handles with fixed values, and
+// a key opened and closed is a handle that stops naming anything.
+void add_advapi32_reg(ExportList& out);
+
+// The security half of ADVAPI32: SIDs, tokens, descriptors, ACLs and
+// accounts. The SID accessors answer pointers into the caller's own buffer
+// rather than copies, which is the one behaviour here a caller is allowed
+// to write through.
+void add_advapi32_sec(ExportList& out);
 
 // The RPCRT4 surface.
 void add_rpcrt4(ExportList& out);

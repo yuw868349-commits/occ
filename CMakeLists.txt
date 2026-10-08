@@ -593,6 +593,14 @@ add_library(occ_core STATIC
     src/runtime/api/crypt32.cpp
     src/runtime/api/ole32.cpp
     src/runtime/api/crt.cpp
+    src/runtime/api/kernel32_sync.cpp
+    src/runtime/api/kernel32_proc.cpp
+    src/runtime/api/kernel32_str.cpp
+    src/runtime/api/kernel32_err.cpp
+    src/runtime/api/advapi32_reg.cpp
+    src/runtime/api/advapi32_sec.cpp
+    src/runtime/api/ntdll_rtl_str.cpp
+    src/runtime/api/ntdll_rtl_mem1.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

@@ -4914,6 +4914,10 @@ void add_kernel32(ExportModule& module) {
     add_memory_kernel32(module.host_exports);
     add_console_kernel32(module.host_exports);
     add_kernel32_extra(module.host_exports);
+    add_kernel32_sync(module.host_exports);
+    add_kernel32_proc(module.host_exports);
+    add_kernel32_str(module.host_exports);
+    add_kernel32_err(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {
