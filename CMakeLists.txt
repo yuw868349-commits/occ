@@ -602,6 +602,7 @@ add_library(occ_core STATIC
     src/runtime/api/ntdll_rtl_str.cpp
     src/runtime/api/ntdll_rtl_mem1.cpp
     src/runtime/api/ntdll_rtl_mem2.cpp
+    src/runtime/api/ntdll_rtl_mem3.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

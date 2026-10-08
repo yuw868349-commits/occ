@@ -489,6 +489,12 @@ void add_ntdll_rtl_mem1(ExportList& out);
 // lookups the first slice's tables answer through.
 void add_ntdll_rtl_mem2(ExportList& out);
 
+// The Rtl* surface's third slice: the clock arithmetic, the pseudo-random
+// generators, the heap queries, the lock and run-once families, the
+// environment blocks, the descriptor builders, the splay and red-black
+// tree surgery, and the language and error-mode state.
+void add_ntdll_rtl_mem3(ExportList& out);
+
 // The Nt* and Zw* half of ntdll. In user mode the two are one function.
 void add_ntdll_nt(ExportList& out);
 

@@ -450,6 +450,13 @@ constexpr std::uint64_t kHeapMagic = 0x4F43434845415031ULL;
 struct HeapHeader {
     std::uint64_t magic;
     std::uint64_t size;  // what the guest asked for, not what was rounded to
+    // The bookkeeping the heap APIs let a caller hang off a block. It is in
+    // the header rather than a side table so that the two cannot disagree
+    // about which block a value belongs to, and so that freeing the block
+    // releases the value with it.
+    void* user_value;
+    std::uint32_t user_flags;
+    std::uint32_t user_flags_set_by_user;
 };
 
 [[nodiscard]] HeapHeader* header_of(void* block) noexcept {
@@ -507,6 +514,9 @@ void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
     auto* header = static_cast<HeapHeader*>(raw);
     header->magic = kHeapMagic;
     header->size = bytes;
+    header->user_value = nullptr;
+    header->user_flags = 0;
+    header->user_flags_set_by_user = 0;
     void* block = static_cast<char*>(raw) + sizeof(HeapHeader);
     heap_blocks().push_back(block);
     if ((flags & kHeapZeroMemory) != 0) {
@@ -528,7 +538,11 @@ void* heap_realloc(std::uint32_t flags, void* block,
         return nullptr;
     }
     const std::uint64_t old_size = old->size;
-    heap_forget(block);
+    // The new block is taken before the old one leaves the ledger. Doing
+    // it the other way round would drop the old block on a failed
+    // allocation: it would still hold the caller's data, and the caller
+    // could no longer free it, because the ledger is what says a block is
+    // this allocator's.
     void* fresh = heap_alloc(0, bytes);
     if (fresh == nullptr) {
         return nullptr;
@@ -545,6 +559,7 @@ void* heap_realloc(std::uint32_t flags, void* block,
         ::memset(static_cast<char*>(fresh) + carried, 0,
                  static_cast<std::size_t>(bytes - carried));
     }
+    heap_forget(block);
     ::free(static_cast<char*>(block) - sizeof(HeapHeader));
     return fresh;
 }
@@ -564,6 +579,49 @@ std::uint64_t heap_size(const void* block) noexcept {
         return 0;
     }
     return header->size;
+}
+
+std::vector<void*> heap_live_blocks() {
+    const std::vector<void*>& blocks = heap_blocks();
+    return std::vector<void*>(blocks.begin(), blocks.end());
+}
+
+bool heap_owns(const void* block) noexcept {
+    if (block == nullptr) {
+        return false;
+    }
+    return heap_is_ours(const_cast<void*>(block));
+}
+
+bool heap_user_info(const void* block, HeapUserInfo& out) noexcept {
+    if (!heap_owns(block)) {
+        return false;
+    }
+    const HeapHeader* header = header_of(const_cast<void*>(block));
+    if (header->magic != kHeapMagic) {
+        return false;
+    }
+    out.value = header->user_value;
+    out.flags = header->user_flags;
+    out.flags_set_by_user = header->user_flags_set_by_user;
+    return true;
+}
+
+bool heap_set_user_info(void* block, const HeapUserInfo& info) noexcept {
+    if (!heap_owns(block)) {
+        return false;
+    }
+    HeapHeader* header = header_of(block);
+    if (header->magic != kHeapMagic) {
+        return false;
+    }
+    header->user_value = info.value;
+    // The flags the caller did not touch keep whatever allocator-set value
+    // they had: the user flags and the allocator's own bits share the
+    // field, and the mask is what says which half a write reaches.
+    header->user_flags = info.flags;
+    header->user_flags_set_by_user = info.flags_set_by_user;
+    return true;
 }
 
 bool heap_free(void* block) noexcept {

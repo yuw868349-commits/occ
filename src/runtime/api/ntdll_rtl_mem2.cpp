@@ -225,6 +225,9 @@ void write_u64(void* base, std::size_t offset, std::uint64_t value) noexcept {
 // else in this runtime too.
 constexpr std::uint64_t kEpochOffsetSeconds = 11644473600ull;
 constexpr std::uint64_t kTicksPerSecond = 10000000ull;
+// The same unit as a signed value, for the conversions where a difference
+// can be negative -- a local time before the epoch.
+constexpr std::int64_t kTicksPerSecondSigned = 10000000;
 
 [[nodiscard]] std::uint64_t host_ticks_1601() noexcept {
     ::timespec now = {};
@@ -288,6 +291,14 @@ constexpr std::uint64_t kTicksPerSecond = 10000000ull;
 }
 
 }  // namespace
+
+// The status-to-Win32 mapping, published to the third slice of this
+// surface. The table is the one a guest observes through `GetLastError`,
+// and two tables would be two answers to the same question depending on
+// which slice a caller went through.
+extern "C" std::uint32_t occ_ntstatus_to_dos(std::uint32_t status) noexcept {
+    return ntstatus_to_dos(static_cast<Ntstatus>(status));
+}
 
 // ------------------------------------------------------- last-error bridge
 
@@ -2782,12 +2793,26 @@ namespace {
 
 constexpr std::uint32_t kUserDefaultFlag = 0x00000001;
 
+// The language the process asked for, owned by the third slice because
+// that is where the setters live. A null answer means no caller has set
+// one, and the runtime's own default applies.
+extern "C" const char16_t* occ_ui_language() noexcept;
+
 [[nodiscard]] Ntstatus preferred_languages(char16_t* buffer,
                                            std::uint32_t* bytes,
                                            std::uint32_t* count,
                                            std::uint32_t* out_flags) noexcept {
     static const char16_t kOnly[] = u"en-US";
-    constexpr std::size_t kChars = 5;  // four characters and the terminator
+    // The list a caller set wins over the default: a guest that set a
+    // language and then read it back has to see its own value, which is
+    // the whole reason the setter exists.
+    const char16_t* chosen = occ_ui_language();
+    const char16_t* source = chosen != nullptr ? chosen : kOnly;
+    std::size_t kChars = 0;
+    while (source[kChars] != u'\0') {
+        ++kChars;
+    }
+    ++kChars;  // the terminator the caller allocates for
     const std::size_t needed = kChars * sizeof(char16_t);
     if (bytes == nullptr) {
         return kStInvalidParameter;
@@ -2797,7 +2822,7 @@ constexpr std::uint32_t kUserDefaultFlag = 0x00000001;
         return kStBufferOverflow;
     }
     for (std::size_t k = 0; k < kChars; ++k) {
-        buffer[k] = kOnly[k];
+        buffer[k] = source[k];
     }
     *bytes = static_cast<std::uint32_t>(needed);
     if (count != nullptr) {
@@ -2854,6 +2879,12 @@ extern "C" __attribute__((ms_abi)) void nr2_RtlGetSystemTimePrecise(
     write_u64(time, 0, host_ticks_1601());
 }
 
+// The zone bias in minutes, owned by `ntdll_rtl_mem3.cpp` because that is
+// where the zone queries live. This direction subtracts it, the other adds
+// it, and both ask the same variable so a set cannot reach one and miss
+// the other.
+extern "C" std::int32_t occ_time_zone_bias_minutes() noexcept;
+
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlLocalTimeToSystemTime(
     const void* local, void* system) noexcept {
     // SYSTEMTIME is sixteen-bit fields, and the conversion is the reverse of
@@ -2883,6 +2914,11 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlLocalTimeToSystemTime(
         return kStInvalidParameter;
     }
 
+    // The zone bias is subtracted here and added by the reverse
+    // conversion: a local time is the zone's own reading of the instant,
+    // so turning it back into the instant means taking the offset away.
+    const std::int32_t bias = occ_time_zone_bias_minutes();
+
     // Days from the 1601 epoch to the date, by the calendar the kernel uses:
     // the Gregorian rules extended back before 1582, with the leap year
     // every fourth year except the centuries that are not divisible by 400.
@@ -2902,8 +2938,17 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlLocalTimeToSystemTime(
                                    static_cast<std::uint64_t>(hour) * 3600ull +
                                    static_cast<std::uint64_t>(minute) * 60ull +
                                    static_cast<std::uint64_t>(second);
-    write_u64(system, 0, seconds * kTicksPerSecond +
-                            static_cast<std::uint64_t>(millis) * 10000ull);
+    // The arithmetic is signed throughout: a local time before the epoch
+    // has a negative tick count, and an unsigned subtraction there would
+    // wrap to a value near the top of the range instead of staying
+    // negative.
+    const std::int64_t instant_ticks =
+        static_cast<std::int64_t>(seconds) * kTicksPerSecondSigned +
+        static_cast<std::int64_t>(millis) * 10000;
+    const std::int64_t offset_ticks =
+        static_cast<std::int64_t>(bias) * 60 * kTicksPerSecondSigned;
+    write_u64(system, 0,
+              static_cast<std::uint64_t>(instant_ticks - offset_ticks));
     return kStSuccess;
 }
 

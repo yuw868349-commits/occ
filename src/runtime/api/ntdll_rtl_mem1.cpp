@@ -1959,6 +1959,20 @@ std::vector<AtomTable*>& atom_tables() noexcept {
 
 }  // namespace
 
+// Whether a heap handle names a heap this runtime knows.
+//
+// The heap APIs are split across the Rtl slices: this file mints the
+// handles and the third slice answers the queries. A query that accepted
+// any non-null handle would answer "the block is not mine" for a block
+// that is in a heap it was never told about, so the check lives here,
+// with the table that can make it, and the third slice asks.
+extern "C" bool occ_heap_handle_ok(std::uint64_t handle) noexcept {
+    if (is_process_heap(handle)) {
+        return true;
+    }
+    return as_created_heap(handle) != nullptr;
+}
+
 // The three questions `ntdll_rtl_mem2.cpp` asks about an atom table reach
 // the table through here rather than keeping a second copy of the entries.
 // The reason is not tidiness: two tables of the same atoms would answer
@@ -2243,6 +2257,22 @@ extern "C" __attribute__((ms_abi)) void* nr1_RtlAddVectoredExceptionHandler(
 extern "C" __attribute__((ms_abi)) void* nr1_RtlAddVectoredContinueHandler(
     std::uint32_t first, void* handler) noexcept {
     return vectored_add(vectored_continue_list(), first, handler);
+}
+
+extern "C" bool occ_vectored_remove(void* handler, bool is_continue) noexcept {
+    if (handler == nullptr) {
+        return false;
+    }
+    VectoredList& list = is_continue ? vectored_continue_list()
+                                     : vectored_exception_list();
+    for (std::size_t i = 0; i < list.handlers.size(); ++i) {
+        if (list.handlers[i] == handler) {
+            list.handlers.erase(list.handlers.begin() +
+                                static_cast<std::ptrdiff_t>(i));
+            return true;
+        }
+    }
+    return false;
 }
 
 // ===========================================================================

@@ -626,6 +626,41 @@ void* heap_realloc(std::uint32_t flags, void* block,
 [[nodiscard]] std::uint64_t heap_size(const void* block) noexcept;
 bool heap_free(void* block) noexcept;
 
+// Whether this allocator handed the block out and has not taken it back.
+//
+// The header magic is what `heap_size` reads, but reading it is itself a
+// read of the bytes in front of the pointer: a caller that hands over a
+// pointer this allocator never minted -- a stack buffer, a foreign
+// allocation, an invented address -- must be told no without those bytes
+// being touched. This is that check, and it is the one the header reads
+// are gated behind.
+[[nodiscard]] bool heap_owns(const void* block) noexcept;
+
+// The per-block user value and user flags the heap APIs store.
+//
+// `HeapSetUserValue` and `HeapSetUserFlags` exist so a caller can hang its
+// own bookkeeping off a block without a side table, and a runtime that
+// refuses them makes every such caller keep its own. They are part of the
+// block's header here. Both return false for a block this allocator does
+// not own, which is the same refusal `heap_free` gives.
+struct HeapUserInfo {
+    void* value = nullptr;
+    std::uint32_t flags = 0;
+    std::uint32_t flags_set_by_user = 0;
+};
+[[nodiscard]] bool heap_user_info(const void* block, HeapUserInfo& out) noexcept;
+bool heap_set_user_info(void* block, const HeapUserInfo& info) noexcept;
+
+// Every block this allocator has handed out and not taken back, in the
+// order the allocations happened.
+//
+// Published because the heap validator has to check something the size and
+// ownership questions cannot express: that the same address does not
+// appear twice, which is what a free that failed to unlink one would
+// produce. A copy of the pointers rather than the vector, so a caller
+// cannot disturb the allocator's own record by holding what it was handed.
+[[nodiscard]] std::vector<void*> heap_live_blocks();
+
 // The handle `GetProcessHeap` answers with.
 //
 // Published rather than written down twice. The PEB carries the process's
