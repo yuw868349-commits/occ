@@ -398,8 +398,23 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     lc.resolve = options.resolve;
     lc.placement = &self->mapper_;
 
+    // The retrying spelling, not the plain one.
+    //
+    // An image whose preferred base is occupied still has to run -- this is
+    // the case the relocation pass exists for, and an image that carries a
+    // relocation table can be placed anywhere in the window. The plain load
+    // hands the conflict back to its caller, which is the right answer for
+    // a caller that named a base and the wrong one for a caller that named
+    // an image; this is the second kind. The base passed here is zero, so
+    // the loader starts at the image's own and steps down a granule at a
+    // time while it is taken.
+    //
+    // The retry is consulted rather than ignored: when a placement took
+    // more than one attempt, the bases that did not work are part of what a
+    // person diagnosing the load wants to see.
+    BaseRetry retry{};
     const LoadResult loaded =
-        load_image(image, bytes, image.image_base(), self->space_, lc);
+        load_image_retrying(image, bytes, 0, self->space_, lc, &retry);
     if (!loaded.ok) {
         // The loader's own detail, verbatim. It knows which section was short
         // and which relocation pointed outside the image, and re-expressing

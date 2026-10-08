@@ -1421,8 +1421,15 @@ void test_every_fixture_import_resolves() {
     // A name the layer does not implement must not resolve, because an
     // import that resolved to nothing would fault with a null in its IAT
     // where a refusal -- or, later, a message -- would have named it.
-    const ExportLookup missing =
-        registry.find_by_name("kernel32.dll", "CreateFileW", 0);
+    //
+    // The name is deliberately one no Windows DLL exports. An earlier
+    // version of this case named a real API that had not been written yet,
+    // which made the assertion a statement about how far the surface had
+    // been filled in rather than about the lookup: the day that API was
+    // implemented the case started failing, and it said nothing about
+    // whether an unknown name is refused.
+    const ExportLookup missing = registry.find_by_name(
+        "kernel32.dll", "OCC_NoSuchExportExists", 0);
     check(missing.address == 0,
           "an export the layer does not have does not resolve");
 }

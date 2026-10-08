@@ -461,6 +461,16 @@ void add_kernel32_str(ExportList& out);
 // from a missing one.
 void add_kernel32_err(ExportList& out);
 
+// The second slice of kernel32's system-information family: the environment
+// block, the code pages, the processor set, the physical memory report and
+// the process-wide switches that go with them.
+void add_kernel32_sys2(ExportList& out);
+
+// kernel32's file-by-name and directory-walk calls, and the module and
+// thread-state calls that reach facilities the Rtl slices own.
+void add_kernel32_file2(ExportList& out);
+void add_kernel32_state2(ExportList& out);
+
 // The KERNELBASE names a guest imports from it directly.
 void add_kernelbase_extra(ExportList& out);
 

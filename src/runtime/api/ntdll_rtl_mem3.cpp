@@ -73,20 +73,14 @@ constexpr Ntstatus kStNotImplemented = 0xC0000002;
 constexpr Ntstatus kStBufferTooSmall = 0xC0000023;
 constexpr Ntstatus kStInvalidParameter = 0xC000000D;
 constexpr Ntstatus kStInvalidParameter1 = 0xC00000EF;
-constexpr Ntstatus kStInvalidParameter2 = 0xC00000F0;
-constexpr Ntstatus kStInvalidParameter3 = 0xC00000F1;
-constexpr Ntstatus kStInvalidParameter4 = 0xC00000F2;
 constexpr Ntstatus kStObjectNameInvalid = 0xC0000033;
-constexpr Ntstatus kStObjectNameNotFound = 0xC0000034;
 constexpr Ntstatus kStObjectPathNotFound = 0xC000003A;
 constexpr Ntstatus kStVariableNotFound = 0xC0000153;
-constexpr Ntstatus kStObjectPathSyntaxBad = 0xC000003B;
 constexpr Ntstatus kStInvalidSid = 0xC0000078;
 constexpr Ntstatus kStInvalidAcl = 0xC0000077;
 constexpr Ntstatus kStInvalidSecurityDescr = 0xC0000079;
 constexpr Ntstatus kStUnknownRevision = 0xC0000058;
 constexpr Ntstatus kStNoMemory = 0xC0000017;
-constexpr Ntstatus kStInvalidHandle = 0xC0000008;
 
 // ------------------------------------------------------------- the clock
 //
@@ -126,7 +120,6 @@ constexpr std::size_t kTfMinute = 8;
 constexpr std::size_t kTfSecond = 10;
 constexpr std::size_t kTfMilli = 12;
 constexpr std::size_t kTfWeekday = 14;
-constexpr std::size_t kTfBytes = 16;
 
 // The month lengths, indexed by whether the year is a leap year. The table
 // is the calendar's, and the second row differs from the first only in
@@ -207,31 +200,29 @@ extern "C" std::int32_t occ_time_zone_bias_minutes() noexcept {
 
 namespace {
 
-// TIME_ZONE_INFORMATION on x64: the bias, the two 32-character names, the
-// two transition dates and the two daylight biases, which lands the
-// standard block at 4 and the daylight block at 88.
+// TIME_ZONE_INFORMATION on x64: the bias at 0, the standard name at 4, the
+// standard transition date at 68, the standard bias at 84, the daylight
+// name at 88, the daylight date at 152 and the daylight bias at 168, for
+// 172 bytes. Only the offsets this file writes are named: the transition
+// dates and the two biases are left zero by the fill below, and zero is
+// "no transition" -- which is the honest answer for a zone with no
+// daylight rule, and not a field this file has to name to leave alone.
 constexpr std::size_t kTziBias = 0;
 constexpr std::size_t kTziStandardName = 4;
-constexpr std::size_t kTziStandardDate = 68;
-constexpr std::size_t kTziStandardBias = 84;
 constexpr std::size_t kTziDaylightName = 88;
-constexpr std::size_t kTziDaylightDate = 152;
-constexpr std::size_t kTziDaylightBias = 168;
 constexpr std::size_t kTziBytes = 172;
 
 // DYNAMIC_TIME_ZONE_INFORMATION adds the zone's registry key name and a
 // flag that says whether the daylight rule comes from that key.
-constexpr std::size_t kDtziTimeZone = 0;
 constexpr std::size_t kDtziKeyName = 172;
 constexpr std::size_t kDtziKeyChars = 128;
 constexpr std::size_t kDtziDisabled = 428;
 constexpr std::size_t kDtziBytes = 432;
 
-// The names this runtime reports for the zone. They are spelled out rather
-// than taken from the host's zone database: the host may have a zone the
-// guest's conversions do not apply, and a name that disagrees with the
+// The name this runtime reports for the zone is spelled out at the fill
+// rather than taken from the host's zone database: the host may have a zone
+// the guest's conversions do not apply, and a name that disagrees with the
 // bias the conversions use is worse than a generic one.
-constexpr char16_t kZoneStandardName[] = u"Coordinated Universal Time";
 
 void write_zone_name(void* base, std::size_t offset,
                      std::string_view name) noexcept {
@@ -855,16 +846,24 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr3_RtlSetCurrentDirectory_U(
     return kStSuccess;
 }
 
-extern "C" __attribute__((ms_abi)) std::int32_t nr3_RtlSetSearchPathMode(
+extern "C" __attribute__((ms_abi)) Ntstatus nr3_RtlSetSearchPathMode(
     std::uint32_t flags) noexcept {
     if ((flags & ~kSearchPathModeMask) != 0) {
         // A bit outside the two the mode defines is the caller's error, and
-        // storing it would make the value read back disagree with the one
-        // the caller passed.
-        return 0;
+        // storing it would leave a mode no documented call could have
+        // produced. The answer is the NTSTATUS the call is declared with,
+        // not a boolean: a caller compares the result against zero.
+        return kStInvalidParameter1;
     }
     g_search_path_mode = flags;
-    return 1;
+    return kStSuccess;
+}
+
+// The mode a guest set, read by the search-path query in the second slice:
+// the flag that says the search must not reach the current directory is
+// what that query acts on, and it is the only consumer of this state.
+extern "C" std::uint32_t occ_search_path_mode() noexcept {
+    return g_search_path_mode;
 }
 
 // -------------------------------------------- the unhandled-exception filter
@@ -879,9 +878,14 @@ void* g_unhandled_filter = nullptr;
 
 }  // namespace
 
-extern "C" __attribute__((ms_abi)) void nr3_RtlSetUnhandledExceptionFilter(
+extern "C" __attribute__((ms_abi)) void* nr3_RtlSetUnhandledExceptionFilter(
     void* filter) noexcept {
+    // The call answers the filter it replaced rather than nothing: a caller
+    // that installs its own and later wants the previous one back needs the
+    // value, and the value is the only thing that reads this state.
+    void* const previous = g_unhandled_filter;
     g_unhandled_filter = filter;
+    return previous;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint8_t

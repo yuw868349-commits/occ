@@ -1636,18 +1636,60 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetExePath(
     return copy_path_out(wide, buffer, bytes);
 }
 
+// The search-path mode a guest set through the third slice's
+// `RtlSetSearchPathMode`, and the one flag of it this query acts on.
+// Reading it here is what makes the setter's state observable: a mode that
+// nothing consumed would be a mode the guest could set and not see.
+extern "C" std::uint32_t occ_search_path_mode() noexcept;
+
+constexpr std::uint32_t kSearchPathModeSafeProcess = 0x00000001;
+
+namespace {
+
+// Drops the entries that name the current directory -- the empty entry and
+// the bare dot -- from a colon-separated search path. The safe mode exists
+// precisely to keep the current directory out of the search, so the
+// entries are removed rather than reordered: a caller that asked for the
+// safe mode must not find the directory earlier in the list.
+[[nodiscard]] std::string drop_current_directory(const std::string& path) noexcept {
+    std::string out;
+    std::size_t at = 0;
+    while (at <= path.size()) {
+        const std::size_t end = path.find(':', at);
+        const std::size_t stop = end == std::string::npos ? path.size() : end;
+        const std::string entry = path.substr(at, stop - at);
+        if (!entry.empty() && entry != ".") {
+            if (!out.empty()) {
+                out.push_back(':');
+            }
+            out += entry;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        at = end + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetSearchPath(
     char16_t* buffer, std::uint32_t* bytes) noexcept {
     // The search path this runtime answers is PATH, the environment variable
     // the loader's own search falls back to, which is the one list a caller
     // can both read and set.
     const char* path = ::getenv("PATH");
+    std::string text = path == nullptr ? std::string() : std::string(path);
+    if ((occ_search_path_mode() & kSearchPathModeSafeProcess) != 0) {
+        text = drop_current_directory(text);
+    }
     std::u16string wide;
-    if (path != nullptr) {
+    if (!text.empty()) {
         // A PATH that is not convertible is reported as an empty search path
         // rather than as a failure: the caller asked for a path, and "no
         // directories" is a path it can act on.
-        static_cast<void>(narrow_in(std::string_view(path), wide).status);
+        static_cast<void>(narrow_in(std::string_view(text), wide).status);
     }
     return copy_path_out(wide, buffer, bytes);
 }
@@ -2250,7 +2292,7 @@ constexpr std::uint32_t kFlsUnset = 0xFFFFFFFFu;
 }  // namespace
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlFlsAlloc(
-    void** callback) noexcept {
+    void* callback) noexcept {
     FlsState& state = fls_state();
     if (state.in_use) {
         // Nesting is refused rather than silently aliased: two callers

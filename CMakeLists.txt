@@ -597,6 +597,9 @@ add_library(occ_core STATIC
     src/runtime/api/kernel32_proc.cpp
     src/runtime/api/kernel32_str.cpp
     src/runtime/api/kernel32_err.cpp
+    src/runtime/api/kernel32_sys2.cpp
+    src/runtime/api/kernel32_file2.cpp
+    src/runtime/api/kernel32_state2.cpp
     src/runtime/api/advapi32_reg.cpp
     src/runtime/api/advapi32_sec.cpp
     src/runtime/api/ntdll_rtl_str.cpp

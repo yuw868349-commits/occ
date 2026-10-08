@@ -60,6 +60,11 @@ constexpr std::uint32_t kErrorInvalidHandle = 6;
 constexpr std::uint32_t kErrorNotEnoughMemory = 8;
 constexpr std::uint32_t kErrorInvalidParameter = 87;
 constexpr std::uint32_t kErrorNoMoreFiles = 18;
+// ERROR_WRITE_FAULT: a write that reached the device and did not complete.
+// It is the code `FlushFileBuffers` and the write wrappers report, and it is
+// distinct from a refused open because the caller's handling differs: a
+// failed write of an open handle is retried or reported, not re-opened.
+constexpr std::uint32_t kErrorWriteFault = 29;
 constexpr std::uint32_t kErrorAlreadyExists = 183;
 constexpr std::uint32_t kErrorDirectoryNotEmpty = 145;
 constexpr std::uint32_t kErrorNotSupported = 50;

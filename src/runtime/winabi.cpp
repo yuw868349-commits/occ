@@ -5022,6 +5022,9 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_proc(module.host_exports);
     add_kernel32_str(module.host_exports);
     add_kernel32_err(module.host_exports);
+    add_kernel32_sys2(module.host_exports);
+    add_kernel32_file2(module.host_exports);
+    add_kernel32_state2(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {

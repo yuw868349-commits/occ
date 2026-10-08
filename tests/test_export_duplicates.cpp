@@ -37,19 +37,30 @@ int main() {
     occ::runtime::ExportRegistry registry;
     w::register_host_modules(registry);
 
-    std::vector<std::string> names;
+    // The check is per module, because that is what an import resolves
+    // against: it names a DLL and a symbol, and the same symbol in two DLLs
+    // is the ordinary case -- kernel32 and ntdll both export
+    // `RtlPcToFileHeader`, and a guest that imports it from either gets an
+    // answer. What must not happen is the same name twice inside one module,
+    // where the index keeps whichever entry reached it first and one of the
+    // two implementations becomes unreachable.
+    std::size_t total = 0;
     for (const occ::runtime::ExportModule* module : registry.modules()) {
+        std::vector<std::string> names;
         for (const auto& entry : module->host_exports) {
             names.push_back(entry.name);
         }
+        total += names.size();
+        std::sort(names.begin(), names.end());
+        const auto dup = std::adjacent_find(names.begin(), names.end());
+        if (dup != names.end()) {
+            std::fprintf(stderr, "duplicated export in %s: %s\n",
+                         module->name.c_str(), dup->c_str());
+        }
+        check(dup == names.end(),
+              "dup: no export name is registered twice within a module");
     }
-    check(!names.empty(), "dup: the registry assembled at least one export");
-    std::sort(names.begin(), names.end());
-    const auto dup = std::adjacent_find(names.begin(), names.end());
-    if (dup != names.end()) {
-        std::fprintf(stderr, "duplicated export name: %s\n", dup->c_str());
-    }
-    check(dup == names.end(), "dup: no export name is registered twice");
+    check(total != 0, "dup: the registry assembled at least one export");
 
     if (failures != 0) {
         std::fprintf(stderr, "%d of %d checks failed\n", failures, checks);
