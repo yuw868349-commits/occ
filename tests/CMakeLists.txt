@@ -172,3 +172,4 @@ target_compile_definitions(occ_test_seeds PRIVATE
     OCC_SEED_GENERATOR="${CMAKE_SOURCE_DIR}/tools/make_pe_seeds.py"
     OCC_SEED_DIR="${CMAKE_SOURCE_DIR}/fuzz/seeds")
 occ_add_test(occ_test_api_psapi_version test_api_psapi_version.cpp)
+occ_add_test(occ_test_api_dbghelp test_api_dbghelp.cpp)

@@ -498,6 +498,11 @@ void add_psapi(ExportList& out);
 // The version-information surface, read from the file itself.
 void add_version(ExportList& out);
 
+// The image-help and symbol surface: what an image is, and the symbol
+// handler's own state, with the stack walk a debugger makes without
+// symbols.
+void add_dbghelp(ExportList& out);
+
 // The Rtl* half of ntdll: memory, strings, bits, sections, version.
 void add_ntdll_rtl(ExportList& out);
 
