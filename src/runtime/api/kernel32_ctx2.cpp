@@ -25,6 +25,7 @@
 #include "occ/runtime/api.h"
 #include "occ/runtime/api_common.h"
 #include "occ/runtime/seh.h"
+#include "occ/runtime/guest_module.h"
 #include "occ/runtime/winabi.h"
 
 #include <cstddef>
@@ -317,12 +318,43 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32c2_GetModuleHandleExW(
                 ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch);
         }
         std::string narrow;
-        if (!narrow_out(wanted, narrow).converted ||
-            narrow != lower_image) {
-            set_last_error(kErrorModuleNotFound);
-            return 0;
+        const bool converted = narrow_out(wanted, narrow).converted;
+        if (converted && narrow == lower_image) {
+            *module = reinterpret_cast<void*>(state->image_base);
+        } else {
+            // A name the image does not answer for is the placed module
+            // layer's to answer: every module the loader list names has an
+            // image whose base the lookup knows, and a caller probing for
+            // one -- the way the newer runtimes probe for the managed
+            // shim -- wants the same base the loader list carries.
+            std::string folded;
+            if (converted) {
+                folded = narrow;
+            } else {
+                for (char16_t ch : wanted) {
+                    folded.push_back(static_cast<char>(
+                        ch >= u'A' && ch <= u'Z'
+                            ? static_cast<char>(ch - u'A' + 'a')
+                            : static_cast<char>(ch)));
+                }
+            }
+            std::string base = folded;
+            const std::size_t separator = base.find_last_of("/\\");
+            if (separator != std::string::npos) {
+                base = base.substr(separator + 1);
+            }
+            if (base.size() > 4 && base.compare(base.size() - 4, 4,
+                                                ".dll", 4) == 0) {
+                base.erase(base.size() - 4);
+            }
+            const std::uint64_t placed =
+                guest_module::module_base(base + ".dll");
+            if (placed == 0) {
+                set_last_error(kErrorModuleNotFound);
+                return 0;
+            }
+            *module = reinterpret_cast<void*>(placed);
         }
-        *module = reinterpret_cast<void*>(state->image_base);
     }
 
     if (*module == nullptr) {

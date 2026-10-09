@@ -228,33 +228,42 @@ namespace {
     put8(image, 1, 'Z');
     put32(image, 0x3c, 0x80);
 
-    // --- the NT headers at 0x80. Every field below is one a walker reads;
-    // the ones left zero are left zero because zero is the true value, not
-    // because the write was skipped.
+    // --- the NT headers at 0x80. The offsets below are the PE32+ ones the
+    // manual spells, and a walker parses them from the same table: the
+    // file header's twenty bytes end at 0x98, the optional header runs to
+    // 0x188, and the export directory is the first entry of the data
+    // directory -- which is the field a walker's `0x88` load reads, and
+    // the one that must not be zero.
     put32(image, 0x80, 0x00004550);  // "PE\0\0"
     put16(image, 0x84, 0x8664);      // FileHeader.Machine: AMD64
     put16(image, 0x86, 2);           // NumberOfSections
-    put16(image, 0x90, 0xF0);        // SizeOfOptionalHeader (PE32+)
-    put16(image, 0x92, 0x2022);      // DLL | LARGE_ADDRESS_AWARE | EXECUTABLE
-    put16(image, 0x94, 0x020B);      // OptionalHeader.Magic: PE32+
-    put32(image, 0x98, 0);           // SizeOfCode -- the trampolines are data
+    put16(image, 0x94, 0xF0);        // SizeOfOptionalHeader (PE32+)
+    put16(image, 0x96, 0x2022);      // DLL | LARGE_ADDRESS_AWARE | EXECUTABLE
+    put16(image, 0x98, 0x020B);      // OptionalHeader.Magic: PE32+
+    put32(image, 0x9c, 0);           // SizeOfCode -- the trampolines are data
                                      // to the loader that built them
-    put32(image, 0x9c, static_cast<std::uint32_t>(
-                            size - kExportRva));  // SizeOfInitializedData
-    put32(image, 0xa4, static_cast<std::uint32_t>(text_rva));  // BaseOfCode
-    put32(image, 0xb0, kPage);       // SectionAlignment
-    put32(image, 0xb4, kPage);       // FileAlignment
-    put16(image, 0xb8, 10);          // OS major
-    put16(image, 0xbc, 10);          // SubsystemVersion-equivalent major
-    put16(image, 0xc0, 6);           // Subsystem major
-    put32(image, 0xc8, static_cast<std::uint32_t>(size));  // SizeOfImage
-    put32(image, 0xcc, kPage);       // SizeOfHeaders
-    put16(image, 0xd2, 0x0160);      // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX
-    put64(image, 0xd4, 0x100000);    // stack reserve
-    put64(image, 0xdc, 0x1000);      // stack commit
-    put64(image, 0xe4, 0x100000);    // heap reserve
-    put64(image, 0xec, 0x1000);      // heap commit
-    put32(image, 0xf8, 16);          // NumberOfRvaAndSizes
+    put32(image, 0xa0, 0);           // patched below: SizeOfInitializedData
+    put32(image, 0xa8, 0);           // AddressOfEntryPoint: none
+    put32(image, 0xac, static_cast<std::uint32_t>(text_rva));  // BaseOfCode
+    put32(image, 0xb8, kPage);       // SectionAlignment
+    put32(image, 0xbc, kPage);       // FileAlignment
+    put16(image, 0xc0, 10);          // OS major
+    put16(image, 0xc8, 6);           // Subsystem major
+    put32(image, 0xd0, static_cast<std::uint32_t>(size));  // SizeOfImage
+    put32(image, 0xd4, kPage);       // SizeOfHeaders
+    put16(image, 0xdc, 3);           // Subsystem: console
+    put16(image, 0xde, 0x0160);      // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX
+    put64(image, 0xe0, 0x100000);    // stack reserve
+    put64(image, 0xe8, 0x1000);      // stack commit
+    put64(image, 0xf0, 0x100000);    // heap reserve
+    put64(image, 0xf8, 0x1000);      // heap commit
+    put32(image, 0x104, 16);         // NumberOfRvaAndSizes
+    // DataDirectory[0]: the export directory. Written after the page
+    // layout is computed -- the two fields below are patched when the
+    // directory's own extent is known, and the walker that reads them is
+    // the one this file exists to serve.
+    put32(image, 0x108, 0);          // patched below: export RVA
+    put32(image, 0x10c, 0);          // patched below: export size
 
     // --- the export data's layout inside its pages. The directory sits at
     // the page's start, the module name follows it, then the export name
@@ -281,6 +290,8 @@ namespace {
     const std::uint64_t names_rva = cursor;
     cursor += static_cast<std::uint64_t>(name_count) * 4;
     const std::uint64_t ordinals_rva = cursor;
+    cursor += static_cast<std::uint64_t>(name_count) * 2;
+    const std::uint64_t export_size = cursor - dir_rva;
 
     // --- the trampolines, in registration order: the function table is
     // indexed by the ordinal-relative index, `Base` is one, and the i-th
@@ -374,10 +385,12 @@ namespace {
     // The two fields that are facts about the placement: the ImageBase
     // and the directory's module-name pointer, whose string is written
     // into the same buffer before the whole image is copied across.
-    put64(image, 0xa8, base);
+    put64(image, 0xb0, base);
     put_string(image, module_name_rva, module.name);
     put32(image, dir_rva + 0x0c, static_cast<std::uint32_t>(module_name_rva));
-    put32(image, 0xc0 + 2, 3);  // Subsystem: console, spelled once here
+    put32(image, 0x108, static_cast<std::uint32_t>(dir_rva));
+    put32(image, 0x10c, static_cast<std::uint32_t>(export_size));
+    put32(image, 0xa0, static_cast<std::uint32_t>(size - kExportRva));
     std::memcpy(reinterpret_cast<void*>(base), image.data(), image.size());
 
     out.base = base;
@@ -490,10 +503,13 @@ bool install(const InstallRequest& request) noexcept {
     const std::size_t entry_count = entries.size();
     const std::uint64_t entry_bytes =
         ((entry_count + kEntriesPerPage - 1) / kEntriesPerPage) * kPage;
-    std::size_t name_bytes = 0;
-    for (const Entry& entry : entries) {
-        name_bytes += (entry.full_name.size() + 1) * 2 + kNameBufferStride;
-    }
+    // Two buffers per entry -- the full name and the base name -- each in
+    // its own stride. The stride bounds the buffer, so the region's size
+    // is computed from the strides rather than from the names: a loop that
+    // wrote by stride into a region sized from the name lengths would run
+    // past the end the first time a stride was longer than the name it
+    // held.
+    const std::size_t name_bytes = entry_count * 2 * kNameBufferStride;
     const std::uint64_t region_bytes =
         entry_bytes + ((name_bytes + kPage - 1) / kPage) * kPage;
     const auto placed = mapper.map_above(0x04000000, region_bytes,

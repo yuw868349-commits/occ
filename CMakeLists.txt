@@ -610,6 +610,7 @@ add_library(occ_core STATIC
     src/runtime/api/kernel32_io2.cpp
     src/runtime/api/bcrypt.cpp
     src/runtime/api/winmm.cpp
+    src/runtime/api/mscoree.cpp
     src/runtime/api/ws2_32.cpp
     src/runtime/api/iphlpapi.cpp
     src/runtime/api/advapi32_reg.cpp

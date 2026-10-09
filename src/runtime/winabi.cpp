@@ -30,6 +30,7 @@
 #include "occ/runtime/ntdll.h"
 #include "occ/runtime/objects.h"
 #include "occ/runtime/seh.h"
+#include "occ/runtime/apiset.h"
 
 namespace occ::runtime::winabi {
 
@@ -1863,7 +1864,26 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_LoadLibraryExW(
     // not have; the module table is the whole of the answer either way.
     (void)file;
     (void)flags;
-    return k32_LoadLibraryW(name);
+    if (k32_LoadLibraryW(name) != 0) {
+        return k32_LoadLibraryW(name);
+    }
+    // A name the table does not hold may be a contract: the `api-ms-*`
+    // spellings are not module names but redirects, and a caller probing
+    // one -- the way the newer runtimes probe for the AppPolicy family --
+    // wants the module the schema names, resolved the same way the import
+    // walk resolved it.
+    if (name == nullptr) {
+        return 0;
+    }
+    std::string narrow;
+    if (!utf16_to_utf8(std::u16string_view(name), narrow)) {
+        return 0;
+    }
+    const std::string resolved = resolve_api_set(narrow);
+    if (resolved == narrow) {
+        return 0;
+    }
+    return k32_LoadLibraryA(resolved.c_str());
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetProcAddress(
@@ -5475,6 +5495,7 @@ void register_host_modules(ExportRegistry& registry) {
         {"BCRYPT.dll", &add_module_bcrypt},
         {"bcryptprimitives.dll", &add_module_bcryptprimitives},
         {"winmm.dll", &add_module_winmm},
+        {"MSCOREE.dll", &add_module_mscoree},
         {"WS2_32.dll", &add_module_ws2_32},
         {"IPHLPAPI.dll", &add_module_iphlpapi},
         {"OLE32.dll", &add_module_ole32},

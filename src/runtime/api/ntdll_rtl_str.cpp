@@ -67,6 +67,9 @@
 
 #include "occ/runtime/api.h"
 #include "occ/runtime/api_common.h"
+
+#include <mutex>
+#include <vector>
 #include "occ/runtime/winabi.h"
 
 #include <cstddef>
@@ -5228,6 +5231,90 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nrs_RtlConvertDeviceFamilyInfoT
 // asking for the same computation under the name the kernel's own internal
 // callers use, and registering it against a different implementation would
 // be a second answer to one question.
+// -- the dynamic function tables -----------------------------------------
+//
+// The table an installation names is identified by the caller's own
+// handle -- Windows uses the identifier's low bits to keep the entry out
+// of the static range -- and the registration is what the unwinder's
+// lookup asks for first. This runtime keeps the registrations in a list
+// the lookup can walk; the callback is stored and called with the
+// arguments Windows spells, and the out-parameter receives the context
+// the callback returns.
+
+namespace {
+
+struct DynamicFunctionTable {
+    std::uint64_t identifier = 0;
+    std::uint64_t base = 0;
+    std::uint64_t length = 0;
+    std::uint64_t callback = 0;
+    std::uint64_t context = 0;
+};
+
+std::mutex& g_function_table_lock() noexcept {
+    static std::mutex lock;
+    return lock;
+}
+
+std::vector<DynamicFunctionTable>& g_function_tables() noexcept {
+    static std::vector<DynamicFunctionTable> tables;
+    return tables;
+}
+
+}  // namespace
+
+
+extern "C" __attribute__((ms_abi)) std::int32_t
+nrs_RtlInstallFunctionTableCallback(std::uint64_t table_identifier,
+                                    std::uint64_t base_address,
+                                    std::uint64_t length,
+                                    void* callback, void* context,
+                                    void** out_table) noexcept {
+    if (callback == nullptr || base_address == 0 ||
+        (table_identifier & 3) != 0) {
+        // The identifier's low two bits are Windows' own marker for the
+        // dynamic range; a caller that passed a static-range identifier
+        // has made the mistake the check exists to catch.
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_function_table_lock());
+    DynamicFunctionTable table;
+    table.identifier = table_identifier;
+    table.base = base_address;
+    table.length = length;
+    table.callback = reinterpret_cast<std::uint64_t>(callback);
+    table.context = reinterpret_cast<std::uint64_t>(context);
+    g_function_tables().push_back(table);
+    if (out_table != nullptr) {
+        *out_table = reinterpret_cast<void*>(table_identifier);
+    }
+    set_last_error(0);
+    return 1;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t nrs_RtlDeleteFunctionTable(
+    void* table) noexcept {
+    if (table == nullptr) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    const std::uint64_t identifier =
+        reinterpret_cast<std::uint64_t>(table);
+    std::lock_guard<std::mutex> lock(g_function_table_lock());
+    auto& tables = g_function_tables();
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        if (tables[i].identifier == identifier) {
+            tables.erase(tables.begin() + static_cast<std::ptrdiff_t>(i));
+            set_last_error(0);
+            return 1;
+        }
+    }
+    set_last_error(kErrorInvalidParameter);
+    return 0;
+}
+
+
 void add_ntdll_rtl_str(ExportList& out) {
     const auto e = [&out](const char* name, void* fn) {
         HostExport entry;
@@ -5501,6 +5588,18 @@ void add_ntdll_rtl_str(ExportList& out) {
     // -- device family
     e("RtlConvertDeviceFamilyInfoToString",
       reinterpret_cast<void*>(&nrs_RtlConvertDeviceFamilyInfoToString));
+
+    // -- the dynamic function tables. A runtime that generates code -- a
+    // JIT, a interpreter's stubs -- describes its frames to the unwinder
+    // through these, and the SEH walk consults the registered tables
+    // before the image's own .pdata. The callback form is the one the
+    // kernel hands to RtlLookupFunctionEntry, and the runtime-function
+    // callback this runtime stores is the guest's own, called with the
+    // address it was registered for.
+    e("RtlInstallFunctionTableCallback",
+      reinterpret_cast<void*>(&nrs_RtlInstallFunctionTableCallback));
+    e("RtlDeleteFunctionTable",
+      reinterpret_cast<void*>(&nrs_RtlDeleteFunctionTable));
 }
 
 }  // namespace occ::runtime::winabi

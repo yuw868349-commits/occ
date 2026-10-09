@@ -322,8 +322,8 @@ Fn fn(const char* name) {
 }
 
 void test_table_is_complete() {
-    check(g_exports.size() == 127,
-          "table: the domain contributes exactly 127 names");
+    check(g_exports.size() == 129,
+          "table: the domain contributes exactly 129 names");
     for (const char* name : kExpected) {
         check(find(name) != nullptr, "table: name resolves to code");
     }

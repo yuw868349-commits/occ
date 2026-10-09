@@ -67,6 +67,11 @@ void add_module_winmm(ExportModule& module) {
     add_winmm(module.host_exports);
 }
 
+void add_module_mscoree(ExportModule& module) {
+    module.name = "MSCOREE.dll";
+    add_mscoree(module.host_exports);
+}
+
 void add_module_ws2_32(ExportModule& module) {
     module.name = "WS2_32.dll";
     add_ws2_32(module.host_exports);
