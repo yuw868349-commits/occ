@@ -9,6 +9,7 @@
 #include "occ/runtime/guest_module.h"
 
 #include "occ/runtime/address_space.h"
+#include "occ/runtime/api_hook.h"
 #include "occ/runtime/mapper.h"
 
 #include <cstring>
@@ -29,13 +30,23 @@ constexpr std::uint64_t kPage = 0x1000;
 constexpr std::uint64_t kExportRva = 0x1000;
 [[maybe_unused]] constexpr std::uint64_t kTextRva = 0x2000;
 
-// The trampoline. `movabs rax, imm64; jmp rax` -- twelve bytes that turn a
-// pointer the guest holds into a call that arrives at the host thunk. Padded
-// to sixteen, which keeps every trampoline's RVA within a `u16` ordinal
-// walk's alignment assumptions and leaves the padding a `0xCC` any stray
-// execution lands in and faults on, rather than in the next function's
-// first byte.
-constexpr std::uint64_t kTrampolineStride = 16;
+// The trampoline, in the two shapes it takes.
+//
+// Plain, `movabs rax, imm64; jmp rax` -- twelve bytes that turn a pointer
+// the guest holds into a call that arrives at the host thunk. Traced, the
+// same call with one detour: `mov r11, imm64` loads the hook's slot and
+// the jump goes to the hook instead, which records the call and then
+// jumps to the implementation the plain shape would have reached. `r11` is
+// the register the x64 convention leaves undefined at a call, so the slot
+// costs the guest nothing and the implementation never sees it.
+//
+// Both are padded to thirty-two with `0xCC`, which is the wider shape's
+// size. The stride is one value for both because the layout -- the page
+// count, the RVAs and `SizeOfImage` -- is computed from it before a single
+// trampoline is written, and a layout that depended on which shape was
+// chosen would make the image two different images depending on an
+// environment variable.
+constexpr std::uint64_t kTrampolineStride = 32;
 
 // The names the export directory itself carries. The module name is the
 // string the directory's Name field points at, spelled the way the module
@@ -299,6 +310,7 @@ namespace {
     // trampoline -- the first registration wins, as it does in the name
     // table.
     std::map<std::string, std::uint32_t> function_index;
+    const bool traced = api_hook::enabled();
     std::uint32_t index = 0;
     for (const Export& entry : module.exports) {
         if (function_index.count(entry.name) != 0) {
@@ -307,12 +319,36 @@ namespace {
         const std::uint32_t rva = static_cast<std::uint32_t>(
             text_rva + static_cast<std::uint64_t>(index) * kTrampolineStride);
         const std::uint64_t at = rva;
-        put8(image, at, 0x48);       // REX.W
-        put8(image, at + 1, 0xB8);   // movabs rax, imm64
-        put64(image, at + 2, entry.address);
-        put8(image, at + 10, 0xFF);  // jmp rax
-        put8(image, at + 11, 0xE0);
-        put32(image, at + 12, 0xCCCCCCCC);
+        if (traced) {
+            // The slot is claimed before the bytes that name it are
+            // written, because the trampoline carries the slot and the
+            // hook resolves it through the table -- so the two have to be
+            // the same number, and the only way to be sure is to write the
+            // one this call answered with.
+            const std::uint32_t slot =
+                api_hook::note(module.name, entry.name, entry.address);
+            put8(image, at, 0x49);       // REX.WB
+            put8(image, at + 1, 0xBB);   // mov r11, imm64
+            put64(image, at + 2, slot);
+            put8(image, at + 10, 0x48);  // REX.W
+            put8(image, at + 11, 0xB8);  // movabs rax, imm64
+            put64(image, at + 12,
+                  reinterpret_cast<std::uint64_t>(&api_hook::occ_api_hook));
+            put8(image, at + 20, 0xFF);  // jmp rax
+            put8(image, at + 21, 0xE0);
+            for (std::uint64_t pad = 22; pad < kTrampolineStride; ++pad) {
+                put8(image, at + pad, 0xCC);
+            }
+        } else {
+            put8(image, at, 0x48);       // REX.W
+            put8(image, at + 1, 0xB8);   // movabs rax, imm64
+            put64(image, at + 2, entry.address);
+            put8(image, at + 10, 0xFF);  // jmp rax
+            put8(image, at + 11, 0xE0);
+            for (std::uint64_t pad = 12; pad < kTrampolineStride; ++pad) {
+                put8(image, at + pad, 0xCC);
+            }
+        }
         put32(image, functions_rva + static_cast<std::uint64_t>(index) * 4, rva);
         function_index.emplace(entry.name, index);
         ++index;
