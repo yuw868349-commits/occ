@@ -126,16 +126,37 @@ constexpr std::uint64_t kTebBytes = 0x2000; // 8 KiB, two pages
 // runtime did not fill the field".
 struct PebLayout {
     static constexpr std::size_t kInheritedAddressSpace = 0x00;
+    // The byte every debugger check reads first. A process with no debugger
+    // carries a zero here, and a program that reads it gets the answer it
+    // would get on an unwatched machine.
+    static constexpr std::size_t kBeingDebugged = 0x02;
     static constexpr std::size_t kImageBaseAddress = 0x10;
     static constexpr std::size_t kLdr = 0x18;
     static constexpr std::size_t kProcessParameters = 0x20;
-    static constexpr std::size_t kProcessHeaps = 0x30;
-    static constexpr std::size_t kNumberOfHeaps = 0x38;
+    // The address of the process's default heap. This is the field a
+    // hardened program dereferences to read the heap's own flags, so it must
+    // point at a real, readable heap structure rather than at a list.
+    static constexpr std::size_t kProcessHeap = 0x30;
     static constexpr std::size_t kNtGlobalFlag = 0xBC;
+    static constexpr std::size_t kNumberOfHeaps = 0xF0;
+    static constexpr std::size_t kProcessHeaps = 0xF8;
     static constexpr std::size_t kOsMajorVersion = 0x118;
     static constexpr std::size_t kOsMinorVersion = 0x11A;
     static constexpr std::size_t kOsBuildNumber = 0x120;
 };
+
+// Where inside the PEB region the runtime keeps the process heap, and the
+// offsets within that structure a debugger check reads. The offsets are the
+// heap header's own, and the two fields below are the pair that a check
+// compares: `Flags` holds `HEAP_GROWABLE` on a clean process, and
+// `ForceFlags` is zero. A debugger sets the first to include the debug bits
+// and the second to a non-zero value, so a program that reads them expects
+// exactly these values on a machine it is not being watched on.
+constexpr std::uint64_t kProcessHeapOffset = 0x130;  // within the PEB region
+constexpr std::size_t kHeapFlagsOffset = 0x70;
+constexpr std::size_t kHeapForceFlagsOffset = 0x74;
+constexpr std::uint32_t kHeapFlagsClean = 0x00000002u;  // HEAP_GROWABLE
+constexpr std::uint32_t kHeapForceFlagsClean = 0x00000000u;
 
 constexpr std::uint64_t kPebBytes = 0x1000;
 
@@ -740,22 +761,52 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     // that implements the heap functions. An empty list is a real answer
     // and leaves the field null, so a caller that wants the field filled
     // says so by naming the heaps.
-    if (!options.process_heaps.empty()) {
-        const std::uint64_t heaps = peb + 0x300;
-        for (std::size_t i = 0; i < options.process_heaps.size(); ++i) {
-            store_u64(heaps, i * sizeof(std::uint64_t),
-                      options.process_heaps[i], kPebBytes);
+    // The process heap. Windows keeps a `HEAP` structure and points
+    // `PEB->ProcessHeap` at it; a hardened program reads that structure's
+    // own flags to decide whether a debugger marked the heap, and reads them
+    // through the address `GetProcessHeap` returns as well as through the
+    // PEB field. Both must therefore name a real, readable structure, so one
+    // is built here inside the PEB's own region -- which is mapped and
+    // writable -- with the two fields a check reads carrying the values a
+    // clean process carries.
+    const std::uint64_t process_heap = peb + kProcessHeapOffset;
+    store_u32(process_heap, kHeapFlagsOffset, kHeapFlagsClean, kPebBytes);
+    store_u32(process_heap, kHeapForceFlagsOffset, kHeapForceFlagsClean,
+              kPebBytes);
+    store_u64(peb, PebLayout::kProcessHeap, process_heap, kPebBytes);
+    winabi::set_process_heap_handle(process_heap);
+
+    // The heap list: the process heap first, then any the run named. The
+    // first entry is the process heap because that is the one
+    // `GetProcessHeap` answers with, and a program that enumerates the list
+    // and then asks for the process heap compares the two and must find the
+    // same one.
+    {
+        std::vector<std::uint64_t> heaps{process_heap};
+        for (const std::uint64_t h : options.process_heaps) {
+            if (h != process_heap) {
+                heaps.push_back(h);
+            }
         }
-        store_u64(peb, PebLayout::kProcessHeaps, heaps, kPebBytes);
+        const std::uint64_t array = peb + 0x310;
+        for (std::size_t i = 0; i < heaps.size(); ++i) {
+            store_u64(array, i * sizeof(std::uint64_t), heaps[i], kPebBytes);
+        }
+        store_u64(peb, PebLayout::kProcessHeaps, array, kPebBytes);
         store_u32(peb, PebLayout::kNumberOfHeaps,
-                  static_cast<std::uint32_t>(options.process_heaps.size()),
-                  kPebBytes);
+                  static_cast<std::uint32_t>(heaps.size()), kPebBytes);
     }
 
     // `InheritedAddressSpace` is FALSE: this process was not handed the
     // parent's address space, which is what every process the loader starts
     // for itself reports.
     store_u8(peb, PebLayout::kInheritedAddressSpace, 0, kPebBytes);
+
+    // `BeingDebugged` is FALSE, and it is written rather than left to the
+    // region's zeroing: it is the very first field a debugger check reads,
+    // and a runtime that relied on an anonymous mapping's zeroes to answer it
+    // would be one change away from answering it wrong.
+    store_u8(peb, PebLayout::kBeingDebugged, 0, kPebBytes);
 
     // --- 7. record the regions ------------------------------------------
 

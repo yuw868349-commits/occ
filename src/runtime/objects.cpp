@@ -176,6 +176,16 @@ bool is_object(std::uint64_t handle) noexcept {
     return find(handle) != nullptr;
 }
 
+bool kind_of(std::uint64_t handle, Kind& out) noexcept {
+    const std::lock_guard<std::mutex> guard(g_lock);
+    const Entry* const entry = find(handle);
+    if (entry == nullptr) {
+        return false;
+    }
+    out = entry->kind;
+    return true;
+}
+
 bool close(std::uint64_t handle) noexcept {
     const std::lock_guard<std::mutex> guard(g_lock);
     Entry* const entry = find(handle);

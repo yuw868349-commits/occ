@@ -88,6 +88,13 @@ constexpr std::uint32_t kInfinite = 0xFFFFFFFFu;
 // `CloseHandle` makes to decide which namespace a handle belongs to.
 [[nodiscard]] bool is_object(std::uint64_t handle) noexcept;
 
+// The kind of object a handle names. Answers false when the handle names no
+// object, and writes the kind through `out` when it does. A caller that has
+// to describe a handle it was handed -- the object-type query of the
+// anti-debug surface is the one -- needs the kind rather than the bare
+// existence test `is_object` gives.
+[[nodiscard]] bool kind_of(std::uint64_t handle, Kind& out) noexcept;
+
 // Releases an object. Returns false when the handle names none.
 bool close(std::uint64_t handle) noexcept;
 

@@ -2879,7 +2879,17 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_VirtualQuery(
 
 // ---- the heap -----------------------------------------------------------
 
-constexpr std::uint64_t kProcessHeapHandle = 1;
+// The address of the process's default heap, recorded by the loader when it
+// placed the heap structure in the guest's address space. It is an address
+// rather than a small synthetic handle because a hardened program reads the
+// heap's header through it -- `*(DWORD*)((BYTE*)GetProcessHeap() + 0x70)` is
+// the oldest way to ask whether a debugger marked the heap -- and a handle
+// that is not a pointer would fault on that read instead of answering it.
+//
+// Zero until the loader has built a process, which is the state a caller
+// outside a run is in and the reason the accessors below are the only way to
+// reach it.
+std::uint64_t g_process_heap_address = 0;
 std::uint64_t g_next_heap_handle = 0x10;
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetProcessHeap() noexcept {
@@ -3375,12 +3385,18 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_atexit(
     return 0;
 }
 
-// The one spelling of the process heap's handle. `GetProcessHeap` answers
+// The one spelling of the process heap's address. `GetProcessHeap` answers
 // with it, and the PEB's heap list is filled from this rather than from a
 // second copy of the number, so a guest that enumerates the heaps and then
 // asks for the process heap finds the same one both times.
 std::uint64_t process_heap_handle() noexcept {
-    return kProcessHeapHandle;
+    return g_process_heap_address;
+}
+
+// Records the address the loader placed the process heap at. Called once,
+// while the PEB is being built, before any guest code runs.
+void set_process_heap_handle(std::uint64_t handle) noexcept {
+    g_process_heap_address = handle;
 }
 
 namespace {
@@ -5406,6 +5422,7 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_extra(module.host_exports);
     add_kernel32_sync(module.host_exports);
     add_kernel32_proc(module.host_exports);
+    add_kernel32_debug(module.host_exports);
     add_kernel32_str(module.host_exports);
     add_kernel32_err(module.host_exports);
     add_kernel32_sys2(module.host_exports);

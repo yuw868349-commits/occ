@@ -860,6 +860,11 @@ bool heap_set_user_info(void* block, const HeapUserInfo& info) noexcept;
 // would report a heap `GetProcessHeap` had never heard of.
 [[nodiscard]] std::uint64_t process_heap_handle() noexcept;
 
+// Records where the process's default heap lives. The loader calls this once,
+// while building the PEB, so that `GetProcessHeap` answers an address a
+// program can read the heap header through rather than a synthetic handle.
+void set_process_heap_handle(std::uint64_t handle) noexcept;
+
 }  // namespace winabi
 
 }  // namespace occ::runtime

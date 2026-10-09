@@ -18,6 +18,7 @@
 // that rule, and these tests exercise it.
 
 #include "occ/runtime/api.h"
+#include "occ/runtime/winabi.h"
 #include "occ/runtime/api_common.h"
 
 #include <cstdint>
@@ -751,6 +752,12 @@ void test_toolhelp_processes() {
 }
 
 void test_toolhelp_threads_modules_heaps() {
+    // The heap list is built by the loader, which is the layer that places
+    // the process heap in the guest's address space. A test with no loader
+    // has no such address, so one is recorded here the way the loader would
+    // record it -- the value only has to be the address the enumeration
+    // reports, not a real heap.
+    winabi::set_process_heap_handle(0x0000000012340000ULL);
     // Threads: a filter naming this process answers its one thread.
     const std::uint64_t snapshot =
         k32p_CreateToolhelp32Snapshot(4, static_cast<std::uint32_t>(::getpid()));

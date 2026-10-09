@@ -448,6 +448,10 @@ void add_kernel32_sync(ExportList& out);
 // cannot disagree with each other.
 void add_kernel32_proc(ExportList& out);
 
+// The kernel32 debugger-adjacent calls: the remote debugger check, the debug
+// string, and the self-attach pair.
+void add_kernel32_debug(ExportList& out);
+
 // The KERNEL32 string surface: the `lstr*` family, the code-page
 // conversions and the locale-driven compares. The `W` spellings carry the
 // decisions and the `A` ones convert, because two implementations of one
@@ -533,6 +537,11 @@ void add_ntdll_rtl_mem3(ExportList& out);
 
 // The Nt* and Zw* half of ntdll. In user mode the two are one function.
 void add_ntdll_nt(ExportList& out);
+
+// The anti-debug answering surface: the process, object, system and memory
+// queries a hardened program uses to decide whether it is being watched, and
+// the clock, the locale and the thread creation beside them.
+void add_ntdll_antidebug(ExportList& out);
 
 // The debug object, the CSR client, the ALPC message shapes and the
 // SHA-1 the boot-time code hashes with.

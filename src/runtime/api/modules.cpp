@@ -22,6 +22,7 @@ void add_module_ntdll(ExportModule& module) {
     add_ntdll_rtl_mem3(module.host_exports);
     add_ntdll_nt(module.host_exports);
     add_ntdll_debug(module.host_exports);
+    add_ntdll_antidebug(module.host_exports);
 }
 
 void add_module_gdi32(ExportModule& module) {

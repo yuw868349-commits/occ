@@ -4697,7 +4697,6 @@ void test_a_pe_process_is_laid_out_like_a_windows_process() {
     ProcessOptions opts;
     opts.command_line = "C:\\app.exe alpha beta";
     opts.image_path = "C:\\app.exe";
-    opts.process_heaps = {winabi::process_heap_handle()};
 
     ProcessImage failure;
     std::unique_ptr<PeProcess> proc = PeProcess::build(
@@ -4772,21 +4771,53 @@ void test_a_pe_process_is_laid_out_like_a_windows_process() {
     // that is not the list. The handle in the array is the one
     // `GetProcessHeap` answers with, so a program that enumerates heaps and
     // then asks which one is the process heap finds it.
+    // The process heap: the field the loader points at a real heap
+    // structure, and the two flags inside it that a debugger check reads.
+    // The structure must be dereferenceable, which is the whole reason the
+    // field holds an address rather than a synthetic handle.
+    std::uint64_t process_heap = 0;
+    std::memcpy(&process_heap, reinterpret_cast<const void*>(pi.peb + 0x30), 8);
+    check(process_heap != 0, "process: PEB.ProcessHeap points at a heap");
+    check(process_heap >= pi.peb && process_heap < pi.peb + 0x1000,
+          "process: the process heap lies inside the PEB's own region");
+    check(process_heap == winabi::process_heap_handle(),
+          "process: and it is the address GetProcessHeap answers with");
+    if (process_heap != 0) {
+        std::uint32_t flags = 0;
+        std::uint32_t force = 0;
+        std::memcpy(&flags,
+                    reinterpret_cast<const void*>(process_heap + 0x70), 4);
+        std::memcpy(&force,
+                    reinterpret_cast<const void*>(process_heap + 0x74), 4);
+        check(flags == 0x00000002u,
+              "process: the heap's Flags carry HEAP_GROWABLE and nothing else");
+        check(force == 0, "process: the heap's ForceFlags are zero");
+    }
+
+    // The heap list: the process heap first, and the count and pointer at
+    // the offsets a walk reads them from.
     std::uint64_t heaps = 0;
-    std::memcpy(&heaps, reinterpret_cast<const void*>(pi.peb + 0x30), 8);
+    std::memcpy(&heaps, reinterpret_cast<const void*>(pi.peb + 0xF8), 8);
     check(heaps != 0, "process: PEB.ProcessHeaps points at the heap list");
     std::uint32_t heap_count = 0;
-    std::memcpy(&heap_count, reinterpret_cast<const void*>(pi.peb + 0x38), 4);
-    check(heap_count == opts.process_heaps.size(),
-          "process: PEB.NumberOfHeaps is the list's length");
+    std::memcpy(&heap_count, reinterpret_cast<const void*>(pi.peb + 0xF0), 4);
+    check(heap_count >= 1, "process: PEB.NumberOfHeaps names the list's length");
     check(heaps >= pi.peb && heaps + heap_count * 8 <= pi.peb + 0x1000,
           "process: the heap list lies inside the PEB's own region");
     if (heaps != 0 && heap_count != 0) {
         std::uint64_t first_heap = 0;
         std::memcpy(&first_heap, reinterpret_cast<const void*>(heaps), 8);
         check(first_heap == winabi::process_heap_handle(),
-              "process: and it holds the handle GetProcessHeap answers with");
+              "process: and it holds the heap GetProcessHeap answers with");
     }
+
+    // The name GetProcessHeap answers with is also the one an enumeration
+    // finds, which is the property the runner used to arrange by hand and
+    // the loader now arranges itself.
+    std::uint8_t being_debugged = 0;
+    std::memcpy(&being_debugged, reinterpret_cast<const void*>(pi.peb + 0x02),
+                1);
+    check(being_debugged == 0, "process: PEB.BeingDebugged is false");
 
     // A byte-sized PEB field, written rather than left to the region's
     // zeroes. FALSE is what every process the loader starts for itself

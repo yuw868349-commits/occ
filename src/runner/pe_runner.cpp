@@ -108,11 +108,10 @@ int run_pe_runner(int argc, char** argv) noexcept {
     options.command_line = runtime::winabi::build_command_line(
         dos_path, guest_args);
     options.image_path = dos_path;
-    // The process heap, in the PEB's heap list. A program that enumerates
-    // heaps and then asks which one is the process heap compares the two
-    // answers, so the list is filled from the handle `GetProcessHeap`
-    // answers with rather than from a number spelled again here.
-    options.process_heaps.push_back(runtime::winabi::process_heap_handle());
+    // The heap list is built by the loader, which is the layer that knows
+    // where in the guest's address space the process heap was placed. The
+    // runner does not name it here: a handle spelled before the process
+    // exists would be a second answer to a question the loader answers once.
     // The environment the container handed this process, unchanged: the
     // caller's `--env` entries, the runner's defaults, and nothing the
     // runner invents. A Windows program reads its environment through the
