@@ -616,6 +616,14 @@ void add_module_iphlpapi(ExportModule& module);
 
 void add_module_ole32(ExportModule& module);
 void add_module_ucrtbase(ExportModule& module);
+
+// The modern Universal CRT surface: the secure functions, the qualified
+// heaps, the locale objects and the `__stdio_common_*` entry points.
+void add_ucrt_extra(ExportList& out);
+
+// One of the `api-ms-win-crt-*` forwarder stubs, whose subset is decided
+// by the name the module already carries.
+void add_module_api_ms_win_crt(ExportModule& module);
 void add_module_msvcr70(ExportModule& module);
 void add_module_msvcr71(ExportModule& module);
 void add_module_msvcr80(ExportModule& module);

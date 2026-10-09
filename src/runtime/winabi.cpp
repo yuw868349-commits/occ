@@ -5522,6 +5522,23 @@ void register_host_modules(ExportRegistry& registry) {
         {"IPHLPAPI.dll", &add_module_iphlpapi},
         {"OLE32.dll", &add_module_ole32},
         {"UCRTBASE.dll", &add_module_ucrtbase},
+        {"api-ms-win-crt-runtime-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-stdio-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-string-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-stdlib-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-math-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-ctype-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-locale-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-time-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-convert-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-heap-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-environment-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-filesystem-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-process-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-conio-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-utility-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-multibyte-l1-1-0.dll", &add_module_api_ms_win_crt},
+        {"api-ms-win-crt-private-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"MSVCR70.dll", &add_module_msvcr70},
         {"MSVCR71.dll", &add_module_msvcr71},
         {"MSVCR80.dll", &add_module_msvcr80},
@@ -5541,6 +5558,10 @@ void register_host_modules(ExportRegistry& registry) {
     guest_module_inputs_impl().clear();
     for (const ModuleSpec& spec : kModules) {
         ExportModule module;
+        // The name is set before the domain runs, because a module whose
+        // exports depend on which module it is -- the `api-ms-win-crt-*`
+        // forwarder stubs -- reads it from the module it is filling.
+        module.name = spec.name;
         spec.add(module);
         module.name = spec.name;
         // The index is keyed by the folded name. A module name is matched
