@@ -407,8 +407,23 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // The caller's --env entries are merged over the defaults, and over the
     // engine's, so that a flag which sets one variable leaves the rest of
     // the environment as the run would have had it without the flag.
-    const std::vector<std::string> env = merge_environment(
+    std::vector<std::string> env = merge_environment(
         merge_environment(default_environment(), plan.env), options.env);
+
+    // occ's own debugging switches travel with the runner rather than with
+    // the target. The runner is this same binary exec'd with a token, and it
+    // is the process that actually runs the guest -- so a switch the outer
+    // process could see and the runner could not would be invisible exactly
+    // where it is needed, and the trace it turns on would look broken rather
+    // than absent. Appending after the merge is deliberate: an --env of the
+    // same name is a caller trying to set a variable for the target, and it
+    // must not displace the switch that describes how this run is observed.
+    for (const char* name : {"OCC_GUEST_TRACE", "OCC_GUEST_TRACE_STOP"}) {
+        const char* value = ::getenv(name);
+        if (value != nullptr && value[0] != '\0') {
+            env.emplace_back(std::string(name) + "=" + value);
+        }
+    }
 
     // An observed run has to have its target stop at the exec boundary, or
     // the target can complete before the observer reaches it.

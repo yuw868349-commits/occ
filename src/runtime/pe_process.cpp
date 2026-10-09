@@ -1372,14 +1372,30 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                            g_run_frame, address);
 
     if (guest_trace_enabled()) {
+        // The dispatch is a chain of four decisions and a diagnosis needs
+        // all four: which status the signal mapped to, whether the walk has
+        // a table to use at all (`pdata_va`), where its unwind data is
+        // bounded, and whether a top-level filter was registered. A trace
+        // that named only the fault would leave the reader guessing which
+        // stage declined it.
         std::fprintf(stderr,
                      "occ trace: %s at guest rip 0x%llx, fault address "
-                     "0x%llx, status 0x%08x\n",
+                     "0x%llx, status 0x%08x | pdata 0x%llx+%llu, "
+                     "xdata 0x%llx+%llu, filter 0x%llx\n",
                      signal_name(sig),
                      static_cast<unsigned long long>(
                          uc->uc_mcontext.gregs[REG_RIP]),
-                     static_cast<unsigned long long>(address),
-                     code);
+                     static_cast<unsigned long long>(address), code,
+                     static_cast<unsigned long long>(
+                         state != nullptr ? state->pdata_va : 0),
+                     static_cast<unsigned long long>(
+                         state != nullptr ? state->pdata_bytes : 0),
+                     static_cast<unsigned long long>(
+                         state != nullptr ? state->xdata_va : 0),
+                     static_cast<unsigned long long>(
+                         state != nullptr ? state->xdata_bytes : 0),
+                     static_cast<unsigned long long>(
+                         state != nullptr ? state->unhandled_filter : 0));
     }
 
     // The frame walk comes first, which is the order Windows keeps: the
@@ -1406,6 +1422,14 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                              "fault at guest rip 0x%llx\n",
                              static_cast<unsigned long long>(rip));
             }
+            // The fault was handled. A handler repaired the state and the
+            // faulting instruction runs again, so the run did not end here,
+            // and the flag has to say so: `faulted` means "this run ended on
+            // an unhandled fault", not "a fault was ever raised". Leaving it
+            // set is how a guest that traps on purpose -- a breakpoint probe,
+            // a guard page it grows past, an anti-debug `int3` loop -- gets
+            // reported as a crash after it has already run to completion.
+            state->faulted = false;
             ::sigset_t mask;
             std::memcpy(&mask, &uc->uc_sigmask, sizeof(mask));
             ::sigprocmask(SIG_SETMASK, &mask, nullptr);
@@ -1440,14 +1464,32 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                              "at guest rip 0x%llx\n",
                              static_cast<unsigned long long>(rip));
             }
+            // Same clearing as the vectored path, for the same reason: the
+            // frame walk found a handler that resumed the fault, so the run
+            // did not end on it.
+            state->faulted = false;
             ::sigset_t mask;
             std::memcpy(&mask, state->resume_mask, sizeof(mask));
             ::sigprocmask(SIG_SETMASK, &mask, nullptr);
             seh::seh_restore_context(context);
+        } else if (guest_trace_enabled()) {
+            std::fprintf(stderr,
+                         "occ trace: the frame walk declined the fault at "
+                         "guest rip 0x%llx\n",
+                         static_cast<unsigned long long>(rip));
         }
+    } else if (guest_trace_enabled()) {
+        std::fprintf(stderr,
+                     "occ trace: no .pdata for this image; the frame walk was "
+                     "skipped\n");
     }
 
     const std::uint64_t filter = state != nullptr ? state->unhandled_filter : 0;
+    if (filter == 0 && guest_trace_enabled()) {
+        std::fprintf(stderr,
+                     "occ trace: no top-level filter; the fault is the "
+                     "loader's to end\n");
+    }
     if (filter != 0) {
         alignas(16) std::uint8_t context[kContextSize];
         fill_guest_context(context, *uc);
