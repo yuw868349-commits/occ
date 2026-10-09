@@ -29,9 +29,17 @@
 #include <string>
 #include <string_view>
 
+#include <alloca.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
 
 namespace occ::runtime::winabi {
 
@@ -315,6 +323,312 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32io2_SetFileInformationByHandl
     }
 }
 
+// ------------------------------------------- the I/O completion ports
+//
+// A completion port is a queue with a scheduling policy: a caller that
+// posted a packet hands the caller waiting for one the answer, and a file
+// handle associated with the port gets its completed overlapped operations
+// queued there. Windows builds the queue in the kernel; this runtime builds
+// it in the process, which is the same queue with the same contract and one
+// fewer context switch.
+//
+// The handle namespace is the third range this runtime issues -- above the
+// file handles and above the object table's, so a handle's value says which
+// structure it names, which is what every other range in the runtime says
+// too.
+namespace {
+
+constexpr std::uint64_t kIocpHandleBase = 0x300000;
+
+// WAIT_TIMEOUT: what an empty port answers with when the wait expired.
+constexpr std::uint32_t kWaitTimeout = 0x00000102u;
+
+// One queued completion. `key` and `overlapped` are the caller's values
+// handed back untouched -- they are the pair a completion means "yours"
+// with, and a runtime that rewrote either would answer a different
+// operation than the one that ran.
+struct CompletionPacket {
+    std::uint32_t bytes = 0;
+    std::uint64_t key = 0;
+    std::uint64_t overlapped = 0;
+    std::uint32_t error = 0;
+};
+
+struct CompletionPort {
+    std::mutex lock;
+    std::condition_variable ready;
+    std::deque<CompletionPacket> queue;
+    // The file handles associated with this port, and the completion key
+    // each was associated with. The key is a per-handle constant the
+    // caller chose, and a completed operation on the handle is queued with
+    // it -- which is how a single port serves many files without the
+    // completion naming anything but the operation.
+    std::map<std::uint64_t, std::uint64_t> associated;
+};
+
+std::map<std::uint64_t, std::unique_ptr<CompletionPort>>& iocp_table() noexcept {
+    static std::map<std::uint64_t, std::unique_ptr<CompletionPort>> table;
+    return table;
+}
+
+[[nodiscard]] std::uint64_t iocp_handle_new() noexcept {
+    static std::uint64_t next = 0;
+    const std::uint64_t handle = kIocpHandleBase + next * 0x10ULL;
+    ++next;
+    return handle;
+}
+
+[[nodiscard]] CompletionPort* iocp_of(std::uint64_t handle) noexcept {
+    if (handle < kIocpHandleBase) {
+        return nullptr;
+    }
+    const auto it = iocp_table().find(handle);
+    return it == iocp_table().end() ? nullptr : it->second.get();
+}
+
+// Queues one packet and wakes one waiter. The lock is taken here and
+// released here: the waiters wake holding nothing, which is the shape of
+// the contract -- the packet is queued when the post returns, and the
+// waiter that takes it owns it alone.
+void iocp_post(CompletionPort& port, const CompletionPacket& packet) noexcept {
+    {
+        std::lock_guard<std::mutex> guard(port.lock);
+        port.queue.push_back(packet);
+    }
+    port.ready.notify_one();
+}
+
+// Takes one packet, waiting up to `milliseconds` -- forever when the value
+// is the one Windows spells INFINITE -- and answers whether it took one.
+[[nodiscard]] bool iocp_take(CompletionPort& port, std::uint32_t milliseconds,
+                             CompletionPacket& out) noexcept {
+    std::unique_lock<std::mutex> lock(port.lock);
+    constexpr std::uint32_t kInfinite = 0xFFFFFFFFu;
+    if (milliseconds == kInfinite) {
+        port.ready.wait(lock, [&port] { return !port.queue.empty(); });
+    } else {
+        if (!port.ready.wait_for(lock, std::chrono::milliseconds(milliseconds),
+                                 [&port] { return !port.queue.empty(); })) {
+            return false;
+        }
+    }
+    out = port.queue.front();
+    port.queue.pop_front();
+    return true;
+}
+
+// The queue's own drain for `GetQueuedCompletionStatusEx`: up to `count`
+// packets, whatever the queue holds, and the number it took is the number
+// the caller was told to read.
+[[nodiscard]] std::uint32_t iocp_take_many(
+    CompletionPort& port, std::uint32_t milliseconds,
+    CompletionPacket* out, std::uint32_t count) noexcept {
+    std::unique_lock<std::mutex> lock(port.lock);
+    constexpr std::uint32_t kInfinite = 0xFFFFFFFFu;
+    if (milliseconds == kInfinite) {
+        port.ready.wait(lock, [&port] { return !port.queue.empty(); });
+    } else {
+        if (!port.ready.wait_for(lock, std::chrono::milliseconds(milliseconds),
+                                 [&port] { return !port.queue.empty(); })) {
+            return 0;
+        }
+    }
+    std::uint32_t taken = 0;
+    while (taken < count && !port.queue.empty()) {
+        out[taken] = port.queue.front();
+        port.queue.pop_front();
+        ++taken;
+    }
+    return taken;
+}
+
+// The OVERLAPPED layout, as `file.cpp` spells it and as this file's
+// completion answers write it: two kernel words, the position, the event,
+// and the byte count the caller reads first.
+[[maybe_unused]] constexpr std::size_t kOverlappedInternalHigh = 8;
+[[maybe_unused]] constexpr std::size_t kOverlappedOffset = 16;
+[[maybe_unused]] constexpr std::size_t kOverlappedOffsetHigh = 24;
+constexpr std::size_t kOverlappedBytes = 40;
+
+void overlapped_set_bytes(void* overlapped, std::uint32_t bytes) noexcept {
+    if (overlapped != nullptr) {
+        std::memcpy(static_cast<std::uint8_t*>(overlapped) + kOverlappedBytes,
+                    &bytes, 4);
+    }
+}
+
+}  // namespace
+
+// `CreateIoCompletionPort`: a new port when both handles are null, an
+// association when both are named, and a refusal for the half-asked
+// question -- a file without a port to join, or a port joined to nothing.
+extern "C" __attribute__((ms_abi)) std::uint64_t k32io2_CreateIoCompletionPort(
+    std::uint64_t file_handle, std::uint64_t existing, std::uint64_t key,
+    std::uint32_t threads) noexcept {
+    static_cast<void>(threads);
+    if (file_handle == 0) {
+        if (existing != 0) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        const std::uint64_t handle = iocp_handle_new();
+        iocp_table()[handle] = std::make_unique<CompletionPort>();
+        set_last_error(kErrorSuccess);
+        return handle;
+    }
+    CompletionPort* port = iocp_of(existing);
+    if (port == nullptr) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex> guard(port->lock);
+        port->associated[file_handle] = key;
+    }
+    set_last_error(kErrorSuccess);
+    return existing;
+}
+
+// `PostQueuedCompletionStatus`: the caller's own packet, queued as it
+// stands. This is how a program drives its own workers -- the port is a
+// queue first, and a program that has a completion to hand out hands it
+// here rather than waiting for a file to complete on its behalf.
+extern "C" __attribute__((ms_abi)) std::int32_t k32io2_PostQueuedCompletionStatus(
+    std::uint64_t port, std::uint32_t bytes, std::uint64_t key,
+    void* overlapped) noexcept {
+    CompletionPort* p = iocp_of(port);
+    if (p == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    CompletionPacket packet;
+    packet.bytes = bytes;
+    packet.key = key;
+    packet.overlapped = reinterpret_cast<std::uint64_t>(overlapped);
+    iocp_post(*p, packet);
+    set_last_error(kErrorSuccess);
+    return 1;
+}
+
+// `GetQueuedCompletionStatus`: one packet, or a timeout. A packet whose
+// error field is set is a failed operation the caller still queued --
+// Windows reports it through `lpNumberOfBytes` zero and the error out of
+// `GetLastError`, which is the pair this returns.
+extern "C" __attribute__((ms_abi)) std::int32_t
+k32io2_GetQueuedCompletionStatus(std::uint64_t port, std::uint32_t* bytes_out,
+                                 std::uint64_t* key_out,
+                                 std::uint64_t* overlapped_out,
+                                 std::uint32_t milliseconds) noexcept {
+    CompletionPort* p = iocp_of(port);
+    if (p == nullptr || bytes_out == nullptr || key_out == nullptr ||
+        overlapped_out == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    CompletionPacket packet;
+    if (!iocp_take(*p, milliseconds, packet)) {
+        set_last_error(kWaitTimeout);
+        *bytes_out = 0;
+        return 0;
+    }
+    *bytes_out = packet.bytes;
+    *key_out = packet.key;
+    *overlapped_out = packet.overlapped;
+    if (packet.overlapped != 0) {
+        overlapped_set_bytes(reinterpret_cast<void*>(packet.overlapped),
+                             packet.bytes);
+    }
+    set_last_error(packet.error);
+    return packet.error == 0 ? 1 : 0;
+}
+
+// `GetQueuedCompletionStatusEx`: the batched take. A worker that drains
+// the port between other work reads several completions in one call, and
+// the count it gets back is the count it reads -- never more than it asked
+// for, and zero only when the timeout found an empty queue.
+extern "C" __attribute__((ms_abi)) std::int32_t
+k32io2_GetQueuedCompletionStatusEx(std::uint64_t port, void* entries,
+                                   std::uint32_t count,
+                                   std::uint32_t* removed_out,
+                                   std::uint32_t milliseconds,
+                                   std::int32_t alertable) noexcept {
+    static_cast<void>(alertable);
+    CompletionPort* p = iocp_of(port);
+    if (p == nullptr || entries == nullptr || count == 0 ||
+        removed_out == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    // Each entry is an OVERLAPPED_ENTRY: the completion key, the byte
+    // count, the overlapped pointer, and the internal status the caller
+    // does not read -- 32 bytes, of which three are filled here.
+    CompletionPacket* packets =
+        static_cast<CompletionPacket*>(::alloca(sizeof(CompletionPacket) *
+                                                count));
+    const std::uint32_t taken = iocp_take_many(*p, milliseconds, packets,
+                                               count);
+    if (taken == 0) {
+        set_last_error(kWaitTimeout);
+        *removed_out = 0;
+        return 0;
+    }
+    auto* out = static_cast<std::uint8_t*>(entries);
+    for (std::uint32_t i = 0; i < taken; ++i) {
+        const std::uint64_t at = static_cast<std::uint64_t>(i) * 32;
+        const std::uint64_t key = packets[i].key;
+        const std::uint32_t bytes = packets[i].bytes;
+        const std::uint64_t overlapped = packets[i].overlapped;
+        std::memcpy(out + at, &key, 8);
+        std::memcpy(out + at + 8, &bytes, 4);
+        std::memcpy(out + at + 16, &overlapped, 8);
+        if (overlapped != 0) {
+            overlapped_set_bytes(reinterpret_cast<void*>(overlapped),
+                                 packets[i].bytes);
+        }
+    }
+    *removed_out = taken;
+    set_last_error(kErrorSuccess);
+    return 1;
+}
+
+// Whether a completed overlapped operation on this handle is a completion
+// the port queues. Called from `ReadFile` and `WriteFile` when the handle
+// is associated: the operation has already run -- this runtime's I/O
+// completes before its calls return -- and what remains is the completion,
+// which is the packet the port's waiter is waiting for.
+bool iocp_complete_handle(std::uint64_t handle, std::uint32_t bytes,
+                          void* overlapped, std::uint32_t error) noexcept {
+    if (overlapped == nullptr) {
+        return false;
+    }
+    // The lookup takes the port's lock and leaves it; the post takes it
+    // again. A single critical section would work too, but the post is
+    // the one writer the queue has, and every queue invariant lives in
+    // one place.
+    for (auto& [h, port] : iocp_table()) {
+        std::uint64_t key = 0;
+        {
+            std::lock_guard<std::mutex> guard(port->lock);
+            if (port->associated.count(handle) == 0) {
+                continue;
+            }
+            key = port->associated.at(handle);
+        }
+        CompletionPacket packet;
+        packet.bytes = bytes;
+        packet.key = key;
+        packet.overlapped = reinterpret_cast<std::uint64_t>(overlapped);
+        packet.error = error;
+        // The byte count in the OVERLAPPED is the caller's other half of
+        // the answer, written here because the completion is the thing
+        // that says how much ran.
+        overlapped_set_bytes(overlapped, bytes);
+        iocp_post(*port, packet);
+        return true;
+    }
+    return false;
+}
+
 // ------------------------------------------------------------- registration
 
 void add_kernel32_io2(ExportList& out) {
@@ -325,6 +639,14 @@ void add_kernel32_io2(ExportList& out) {
         out.push_back(std::move(entry));
     };
     e("CancelIoEx", reinterpret_cast<void*>(&k32io2_CancelIoEx));
+    e("CreateIoCompletionPort",
+      reinterpret_cast<void*>(&k32io2_CreateIoCompletionPort));
+    e("GetQueuedCompletionStatus",
+      reinterpret_cast<void*>(&k32io2_GetQueuedCompletionStatus));
+    e("GetQueuedCompletionStatusEx",
+      reinterpret_cast<void*>(&k32io2_GetQueuedCompletionStatusEx));
+    e("PostQueuedCompletionStatus",
+      reinterpret_cast<void*>(&k32io2_PostQueuedCompletionStatus));
     e("DeviceIoControl", reinterpret_cast<void*>(&k32io2_DeviceIoControl));
     e("GetOverlappedResult",
       reinterpret_cast<void*>(&k32io2_GetOverlappedResult));

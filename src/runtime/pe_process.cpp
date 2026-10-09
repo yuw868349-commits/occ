@@ -30,6 +30,18 @@
 
 #include "occ/util/fs.h"
 #include "occ/runtime/seh.h"
+
+#include <sys/sysinfo.h>
+
+#include <chrono>
+#include <thread>
+#include "occ/runtime/guest_module.h"
+#include "occ/runtime/seh.h"
+
+#include <sys/sysinfo.h>
+
+#include <chrono>
+#include <thread>
 #include "occ/runtime/winabi.h"
 
 namespace occ::runtime {
@@ -424,6 +436,127 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     }
     image_out.module = loaded.module;
 
+    // --- 2b. the KUSER_SHARED_DATA page ----------------------------------
+    //
+    // Windows maps one page of the kernel's data into every process at a
+    // fixed address, and programs read it as *memory*, not as a call: the
+    // tick count, the interrupt time and the system time are fields a
+    // compiled program loads directly -- Go's runtime opens with `mov
+    // eax, [0x7ffe0008]` for its clock -- and a runtime that leaves the
+    // page unmapped faults a program whose only fault was reading its
+    // clock the way Windows taught it.
+    //
+    // The values a reader wants moving. A dedicated thread advances the
+    // interrupt time on the host's clock and keeps the system time beside
+    // it, which is what the kernel's own tick does; the granularity is
+    // finer than the tick Windows halves at 15.6 ms, and a finer clock is
+    // the kind of difference a caller measures as good news.
+    {
+        constexpr std::uint64_t kSharedData = 0x7FFE0000ULL;
+        constexpr std::uint64_t kSharedDataBytes = 0x1000;
+        const Result<std::uint64_t> shared = self->mapper_.map(
+            kSharedData, kSharedDataBytes, PageProtection::ReadWrite,
+            RegionKind::Control);
+        if (!shared.ok()) {
+            return bail(error_for(shared.status),
+                        "the KUSER_SHARED_DATA page could not be placed: " +
+                            std::string(status_name(shared.status)));
+        }
+        auto* page = reinterpret_cast<std::uint8_t*>(shared.value);
+
+        // The fields a reader wants at the offsets Windows spells. The
+        // times are `KSYSTEM_TIME` triplets -- low, high, high again --
+        // whose second copy is what makes a reader's two loads consistent
+        // against a tick that lands between them.
+        constexpr std::size_t kInterruptTime = 0x008;
+        constexpr std::size_t kSystemTime = 0x014;
+        [[maybe_unused]] constexpr std::size_t kTimeZoneBias = 0x020;
+        constexpr std::size_t kNtBuildNumber = 0x258;
+        constexpr std::size_t kNtProductType = 0x25C;
+        constexpr std::size_t kProductTypeIsValid = 0x260;
+        constexpr std::size_t kNativeProcessorArchitecture = 0x268;
+        constexpr std::size_t kSuiteMask = 0x2C8;
+        constexpr std::size_t kKdDebuggerEnabled = 0x2CC;
+        constexpr std::size_t kNumberOfPhysicalPages = 0x2E0;
+        constexpr std::size_t kTickCount = 0x320;
+
+        const auto put32 = [page](std::size_t off, std::uint32_t v) {
+            std::memcpy(page + off, &v, 4);
+        };
+
+        // The build and the product, which a program reads once to know
+        // what it is talking to. The suite mask names Terminal Server and
+        // the single-user terminal services, which is what a plain
+        // workstation reports.
+        put32(kNtBuildNumber, 19045);
+        put32(kNtProductType, 1);          // WinNT
+        put32(kProductTypeIsValid, 1);
+        put32(kNativeProcessorArchitecture, 9);  // PROCESSOR_ARCHITECTURE_AMD64
+        put32(kSuiteMask, 0x0110);
+        put32(kKdDebuggerEnabled, 0);
+
+        struct ::sysinfo host_info;
+        ::sysinfo(&host_info);
+        put32(kNumberOfPhysicalPages,
+              static_cast<std::uint32_t>(host_info.totalram));
+
+        // The advancing times. The thread owns the page; a reader is a
+        // load of the fields the thread writes, and the triplet's repeated
+        // high half is what tells a reader whether its two loads straddled
+        // an update.
+        const auto write_system_time = [page](std::uint64_t hundreds) {
+            // `hundreds` is the count of 100-nanosecond units since the
+            // 1601 epoch, as FILETIME spells time.
+            const std::uint32_t low = static_cast<std::uint32_t>(hundreds);
+            const std::uint32_t high =
+                static_cast<std::uint32_t>(hundreds >> 32);
+            // The bias stays zero: this runtime reports UTC everywhere, so
+            // the system time needs no offset subtracted.
+            std::memcpy(page + kSystemTime, &low, 4);
+            std::memcpy(page + kSystemTime + 4, &high, 4);
+            std::memcpy(page + kSystemTime + 8, &high, 4);
+        };
+        // Boot-relative interrupt time and wall-clock system time, both
+        // in the same units, written together so a reader of either sees
+        // a consistent pair.
+        const auto tick = []() -> std::uint64_t {
+            struct ::timespec now;
+            ::clock_gettime(CLOCK_REALTIME, &now);
+            constexpr std::int64_t kEpochOffset = 11644473600;
+            return (static_cast<std::uint64_t>(now.tv_sec) +
+                    static_cast<std::uint64_t>(kEpochOffset)) *
+                       10000000ULL +
+                   static_cast<std::uint64_t>(now.tv_nsec) / 100ULL;
+        };
+        write_system_time(tick());
+        const auto write_interrupt = [page](std::uint64_t hundreds) {
+            const std::uint32_t low = static_cast<std::uint32_t>(hundreds);
+            const std::uint32_t high =
+                static_cast<std::uint32_t>(hundreds >> 32);
+            std::memcpy(page + kInterruptTime, &low, 4);
+            std::memcpy(page + kInterruptTime + 4, &high, 4);
+            std::memcpy(page + kInterruptTime + 8, &high, 4);
+            std::memcpy(page + kTickCount, &low, 4);
+            std::memcpy(page + kTickCount + 4, &high, 4);
+            std::memcpy(page + kTickCount + 8, &high, 4);
+        };
+        // The updater runs detached for the life of the process, which is
+        // the life the page has: the page dies with the process and the
+        // thread's last write dies with it.
+        std::thread([write_interrupt, write_system_time, tick]() {
+            std::uint64_t elapsed = 0;
+            std::uint64_t last_real = tick();
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                const std::uint64_t now = tick();
+                elapsed += now - last_real;
+                last_real = now;
+                write_interrupt(elapsed);
+                write_system_time(now);
+            }
+        }).detach();
+    }
+
     // --- 3. the control region: TEB and PEB ------------------------------
 
     // One mapping holds both, the TEB first. Windows puts them in one region
@@ -511,22 +644,38 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
 
     store_u64(peb, PebLayout::kImageBaseAddress, image_out.module.base,
               kPebBytes);
-    // `Ldr` points at a `PEB_LDR_DATA` whose three list heads are circular
-    // with nothing in them. A program that walks the module list therefore
-    // finds zero modules rather than walking into an unmapped page, which is
-    // the honest answer for a process whose only module is the image itself:
-    // the image's own entry is added by the loader when there is a loader
-    // list to add it to, and until then an empty list is a smaller lie than
-    // a null pointer.
-    //
-    // The `PEB_LDR_DATA` lives at a fixed offset inside the PEB's own region
-    // so that no second allocation is needed and the pointer never dangles.
+    // `Ldr` points at a `PEB_LDR_DATA` whose three lists carry every
+    // module this process can name: the image itself, then the API
+    // modules, each with an image in the guest's own address space whose
+    // headers parse and whose export table answers a hand-rolled walk.
+    // The builder of the list is the guest-module layer, which owns the
+    // image shapes; this call hands it the PEB and the placements' ground.
+    // An install that failed leaves the empty circular lists -- the state
+    // the code below writes first -- because a list naming images that
+    // are not there is a walk that faults on the second hop, and the
+    // caller of the run reports the failure through its own channel.
     const std::uint64_t ldr = peb + 0x200;
     store_self_list(ldr + 0x10);  // InLoadOrderModuleList
     store_self_list(ldr + 0x20);  // InMemoryOrderModuleList
     store_self_list(ldr + 0x30);  // InInitializationOrderModuleList
     store_u32(ldr, 0, static_cast<std::uint32_t>(sizeof(void*) * 3), kPebBytes);
     store_u64(peb, PebLayout::kLdr, ldr, kPebBytes);
+
+    {
+        guest_module::InstallRequest request;
+        request.space = &self->space_;
+        request.mapper = &self->mapper_;
+        request.peb = peb;
+        request.image_base = image_out.module.base;
+        request.image_size = image_out.module.size;
+        request.image_name =
+            options.image_path.empty() ? "image.exe" : options.image_path;
+        for (const guest_module::ModuleInput& module :
+             winabi::guest_module_inputs()) {
+            request.modules.push_back(module);
+        }
+        static_cast<void>(guest_module::install(request));
+    }
 
     // The process parameters. Windows keeps them in the PEB's own address
     // space below the PEB proper, and the command line and image path are
@@ -1038,6 +1187,12 @@ void fill_exception_record(GuestExceptionRecord& record, std::uint32_t code,
     }
 }
 
+// The vectored dispatch, from the ntdll layer that owns the list the
+// registrations went into. Answering true means a handler repaired the
+// state and the faulting instruction runs again.
+extern "C" bool occ_vectored_dispatch(const void* record,
+                                      const void* context) noexcept;
+
 // ----------------------------------------------------------- the handler
 
 // The fault, seen from the host's side. It records what happened in the
@@ -1073,6 +1228,25 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // process filter below. A handler that decides to handle starts its
     // own unwind and never returns; a filter that answers
     // EXCEPTION_CONTINUE_EXECUTION lands on the restore below.
+    // The vectored handlers come before every frame, in Windows' order and
+    // for Windows' reason: a handler that registered first is the one the
+    // process wanted deciding first, and a handler that repairs the state
+    // -- which is what the runtimes that use vectored handlers do, their
+    // stack grows and their faults on purpose -- needs the resume without
+    // any scope table being walked at all.
+    if (state != nullptr) {
+        alignas(16) std::uint8_t context[kContextSize];
+        fill_guest_context(context, *uc);
+        GuestExceptionRecord record;
+        fill_exception_record(record, code, address, sig, *uc);
+        if (occ_vectored_dispatch(&record, context)) {
+            ::sigset_t mask;
+            std::memcpy(&mask, &uc->uc_sigmask, sizeof(mask));
+            ::sigprocmask(SIG_SETMASK, &mask, nullptr);
+            seh::seh_restore_context(context);
+        }
+    }
+
     if (state != nullptr && state->pdata_va != 0) {
         static_assert(sizeof(::sigset_t) <=
                           winabi::GuestState::kSignalMaskBytes,

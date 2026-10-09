@@ -677,7 +677,12 @@ k32s2_SetProcessPriorityBoost(std::uint64_t process,
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32s2_WerGetFlags(
-    std::uint32_t* flags) noexcept {
+    void* process, std::uint32_t* flags) noexcept {
+    // The handle names the process the flags belong to -- the current
+    // pseudo-handle is the only one a caller inside the process passes,
+    // and the flags are this process's state, so the handle names a fact
+    // the answer already assumes.
+    static_cast<void>(process);
     if (flags == nullptr) {
         set_last_error(kErrorInvalidParameter);
         return 0;

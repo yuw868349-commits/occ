@@ -124,9 +124,9 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32s_GetConsoleInputWaitHandle(
     noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t k32s_GenerateConsoleCtrlEvent(
     std::uint32_t control, std::uint32_t group) noexcept;
-extern "C" __attribute__((ms_abi)) std::uint32_t k32s_SetWaitableTimer(
+extern "C" __attribute__((ms_abi)) std::int32_t k32s_SetWaitableTimer(
     std::uint64_t handle, const std::int64_t* due, std::int32_t period,
-    std::int32_t resume, std::uint64_t completion) noexcept;
+    void* completion, void* completion_arg, std::int32_t resume) noexcept;
 }  // namespace occ::runtime::winabi
 
 namespace {
@@ -737,10 +737,10 @@ void test_refusals_say_why() {
     // on it into a hang the caller cannot detect.
     set_last_error(0);
     const std::int64_t due = -1000000;
-    check(k32s_SetWaitableTimer(0, &due, 0, 0, 0) == 0,
+    check(k32s_SetWaitableTimer(0, &due, 0, nullptr, nullptr, 0) == 0,
           "refused: arming one fails");
-    check(k32_GetLastError() == kErrorCallNotImplemented,
-          "refused: with the same reason");
+    check(k32_GetLastError() == kErrorInvalidHandle,
+          "refused: the handle is what it names");
 
     check(k32s_CreateTimerQueue() == kInvalidHandle,
           "refused: a timer queue is not created");

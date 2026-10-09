@@ -2242,6 +2242,46 @@ extern "C" __attribute__((ms_abi)) void* nr1_RtlAddVectoredContinueHandler(
     return vectored_add(vectored_continue_list(), first, handler);
 }
 
+// The vectored dispatch, which the fault path calls before it walks any
+// scope table. Windows' order is: the vectored exception handlers, front to
+// back in registration order -- `AddVectoredExceptionHandler(1, ...)` puts
+// a handler first and a first handler is called first -- then the frames,
+// then the filter. A handler answers `EXCEPTION_CONTINUE_EXECUTION` when it
+// has repaired the state and wants the faulting instruction re-run, and
+// this walks the chain until one answers that way or the chain ends.
+//
+// The pointers structure the handler reads lives where the caller built it,
+// which is the same address space this chain calls into -- the guest and
+// the host share one -- so the only work here is the call and the answer.
+extern "C" bool occ_vectored_dispatch(const void* record,
+                                      const void* context) noexcept {
+    // The EXCEPTION_POINTERS the handler reads: the record and the context
+    // the caller built, as the pair of pointers the structure carries.
+    struct ExceptionPointers {
+        const void* record;
+        const void* context;
+    };
+    const ExceptionPointers pointers{record, context};
+    const void* const argument = &pointers;
+
+    VectoredList& list = vectored_exception_list();
+    // A snapshot walk: a handler that adds or removes handlers while it
+    // runs mutates the vector this loop reads, and the copy is what keeps
+    // the iteration stable while the chain runs.
+    const std::vector<void*> handlers = list.handlers;
+    for (void* handler : handlers) {
+        if (handler == nullptr) {
+            continue;
+        }
+        using VectoredFn = std::int32_t(const void*) noexcept;
+        auto* const call = reinterpret_cast<VectoredFn*>(handler);
+        if (call(argument) == -1) {  // EXCEPTION_CONTINUE_EXECUTION
+            return true;
+        }
+    }
+    return false;
+}
+
 extern "C" bool occ_vectored_remove(void* handler, bool is_continue) noexcept {
     if (handler == nullptr) {
         return false;

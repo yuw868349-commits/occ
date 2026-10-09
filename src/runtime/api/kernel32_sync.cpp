@@ -57,6 +57,9 @@
 #include "occ/runtime/winabi.h"
 
 #include <atomic>
+#include <map>
+#include <memory>
+#include <thread>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1010,14 +1013,129 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32s_CreateWaitableTimerA(
     return no_facility_handle();
 }
 
+// ------------------------------------------- the waitable timers
+//
+// A waitable timer is an event the kernel fires on a clock: it is created
+// unsignalled, a due time -- and optionally a repeat period -- is set on
+// it, and the thread that waits on its handle wakes when the clock says
+// now. Go's runtime sleeps on one between scheduler passes, and a runtime
+// that refused the create handed that caller a sleep that never ended.
+//
+// The clock here is the host's, which is the same contract: the due time
+// the caller named is the due time the wait answers to, and a repeat
+// period keeps firing until the timer is cancelled.
+namespace {
+
+// The timer state. The worker thread holds a shared reference, so a close
+// and a cancel race it safely: the worker checks the flag at every step,
+// and the last reference out destroys the state.
+struct WaitableTimer {
+    std::uint64_t event = 0;  // the object the wait actually waits on
+    bool manual_reset = false;
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> running{false};
+    std::shared_ptr<WaitableTimer> self;
+};
+
+std::mutex& timer_lock() noexcept {
+    static std::mutex lock;
+    return lock;
+}
+
+std::map<std::uint64_t, std::shared_ptr<WaitableTimer>>& timer_table() noexcept {
+    static std::map<std::uint64_t, std::shared_ptr<WaitableTimer>> table;
+    return table;
+}
+
+// The worker: wait out the due time, signal, and repeat for as long as a
+// period was set and nobody cancelled. One sleep at a time -- the check
+// between sleeps is what bounds a cancel's latency to one interval, which
+// is the same bound Windows promises and the same one a caller relies on
+// when it closes a timer it no longer wants firing.
+void timer_worker(std::shared_ptr<WaitableTimer> state,
+                  std::uint64_t first_ms, std::uint32_t period_ms) noexcept {
+    state->running = true;
+    const auto sleep_ms = [](std::uint64_t ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    };
+    for (;;) {
+        if (state->cancelled) {
+            break;
+        }
+        sleep_ms(first_ms);
+        if (state->cancelled) {
+            break;
+        }
+        objects::set_event(state->event);
+        if (period_ms == 0) {
+            break;
+        }
+        first_ms = period_ms;
+    }
+    state->running = false;
+}
+
+// The interval, in milliseconds, between now and the due time. A negative
+// due time is relative -- the 100-nanosecond units Windows spells -- and a
+// positive one is an absolute FILETIME, which is the 1601 epoch's count
+// and is converted here against the host's own clock.
+[[nodiscard]] std::uint64_t due_time_to_ms(std::int64_t due_time) noexcept {
+    if (due_time < 0) {
+        const std::uint64_t hundreds =
+            static_cast<std::uint64_t>(-(due_time + 1));
+        return hundreds / 10000ULL + 1;
+    }
+    // The 1601-to-1970 offset, in seconds, is the conversion Windows'
+    // FILETIME needs and the one constant this spelling keeps.
+    constexpr std::int64_t kEpochOffset = 11644473600;
+    struct timespec now;
+    ::clock_gettime(CLOCK_REALTIME, &now);
+    const std::int64_t now_hundreds =
+        (static_cast<std::int64_t>(now.tv_sec) + kEpochOffset) * 10000000LL +
+        static_cast<std::int64_t>(now.tv_nsec) / 100LL;
+    const std::int64_t delta = due_time - now_hundreds;
+    if (delta <= 0) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(delta) / 10000ULL + 1;
+}
+
+[[nodiscard]] std::uint64_t timer_create(bool manual_reset) noexcept {
+    const std::uint64_t event = objects::create_event(manual_reset, false);
+    if (event == 0) {
+        return kInvalidHandle;
+    }
+    auto state = std::make_shared<WaitableTimer>();
+    state->event = event;
+    state->manual_reset = manual_reset;
+    const std::uint64_t handle = event;
+    {
+        std::lock_guard<std::mutex> guard(timer_lock());
+        timer_table()[handle] = state;
+    }
+    set_last_error(kErrorSuccess);
+    return handle;
+}
+
+[[nodiscard]] std::shared_ptr<WaitableTimer> timer_of(
+    std::uint64_t handle) noexcept {
+    std::lock_guard<std::mutex> guard(timer_lock());
+    const auto it = timer_table().find(handle);
+    return it == timer_table().end() ? nullptr : it->second;
+}
+
+}  // namespace
+
 extern "C" __attribute__((ms_abi)) std::uint64_t k32s_CreateWaitableTimerExW(
     void* attributes, const char16_t* name, std::uint32_t flags,
     std::uint32_t access) noexcept {
+    // The name and the attributes name a shareable, namespace-visible
+    // timer; the flag this runtime honours is the manual-reset one, which
+    // is the behaviour a waiter can tell the difference on.
     (void)attributes;
     (void)name;
-    (void)flags;
     (void)access;
-    return no_facility_handle();
+    return timer_create((flags & 0x1u) != 0);
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32s_CreateWaitableTimerExA(
@@ -1025,39 +1143,69 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32s_CreateWaitableTimerExA(
     std::uint32_t access) noexcept {
     (void)attributes;
     (void)name;
-    (void)flags;
     (void)access;
-    return no_facility_handle();
+    return timer_create((flags & 0x1u) != 0);
 }
 
-extern "C" __attribute__((ms_abi)) std::uint32_t k32s_SetWaitableTimer(
-    std::uint64_t handle, const std::int64_t* due, std::int32_t period,
-    std::int32_t resume, std::uint64_t completion) noexcept {
-    (void)handle;
-    (void)due;
-    (void)period;
-    (void)resume;
-    (void)completion;
-    return static_cast<std::uint32_t>(no_facility());
+extern "C" __attribute__((ms_abi)) std::int32_t k32s_SetWaitableTimer(
+    std::uint64_t handle, const std::int64_t* due_time, std::int32_t period,
+    void* completion, void* completion_arg, std::int32_t resume) noexcept {
+    // The completion routine form needs an alertable wait to run it, and
+    // the resume flag needs a suspend count to reset; both are recorded as
+    // the refusals they are rather than accepted as the no-ops they would
+    // become. A timer with neither -- the form Go's runtime and most
+    // callers use -- is the form this implements.
+    static_cast<void>(completion_arg);
+    if (due_time == nullptr || completion != nullptr || resume != 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    const std::shared_ptr<WaitableTimer> state = timer_of(handle);
+    if (state == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    // A set on a running timer restarts it: the old worker's cancellation
+    // is what stops it, and a new one takes the new due time. This is the
+    // same observable behaviour a Windows set has.
+    state->cancelled = true;
+    while (state->running) {
+        std::this_thread::yield();
+    }
+    state->cancelled = false;
+    objects::reset_event(state->event);
+    const std::uint64_t first_ms = due_time_to_ms(*due_time);
+    const std::uint32_t period_ms =
+        period > 0 ? static_cast<std::uint32_t>(period) : 0;
+    std::thread(timer_worker, state, first_ms, period_ms).detach();
+    set_last_error(kErrorSuccess);
+    return 1;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32s_SetWaitableTimerEx(
     std::uint64_t handle, const std::int64_t* due, std::int32_t period,
     std::int32_t resume, std::uint64_t completion,
     std::uint32_t flags) noexcept {
-    (void)handle;
-    (void)due;
-    (void)period;
-    (void)resume;
-    (void)completion;
+    // The Ex form is the plain set plus a tolerable-delay budget, which
+    // changes when the host may defer the wake and is not a decision this
+    // host makes. The set itself is the same set.
     (void)flags;
-    return static_cast<std::uint32_t>(no_facility());
+    return static_cast<std::uint32_t>(k32s_SetWaitableTimer(
+        handle, due, period,
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(completion)),
+        nullptr, resume));
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32s_CancelWaitableTimer(
     std::uint64_t handle) noexcept {
-    (void)handle;
-    return no_facility();
+    const std::shared_ptr<WaitableTimer> state = timer_of(handle);
+    if (state == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    state->cancelled = true;
+    set_last_error(kErrorSuccess);
+    return 1;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32s_OpenWaitableTimerW(

@@ -1693,20 +1693,41 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetModuleFileNameW(
     return static_cast<std::uint32_t>(copied);
 }
 
+// A module name with its case folded, for use as a map key.
+//
+// Windows matches a module name without regard to case, so `kernel32.dll`,
+// `KERNEL32.DLL` and `Kernel32.Dll` are one name. `module_basename` strips
+// the path and leaves the case alone, which is right for the registry --
+// an import table is compared against the spelling the module declares --
+// and wrong for a key: a `std::map<std::string, ...>` built under
+// `KERNEL32.dll` does not answer a lookup for `kernel32.dll`, and the
+// `LoadLibraryA` below passes what the guest wrote rather than what the
+// table holds. Folding here is what makes the two meet.
+[[nodiscard]] std::string fold_module_name(std::string_view name) noexcept {
+    std::string folded(name);
+    for (char& c : folded) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return folded;
+}
+
 extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetModuleHandleA(
     const char* name) noexcept {
     const GuestState* g = require_state();
     if (g == nullptr) {
         return 0;
     }
-    // A null name is the image itself. A named module would be a library
-    // this runtime has no file for; answering zero is what Windows answers
-    // for "not loaded", and GetLastError stays whatever it was, which is
-    // Windows' own behaviour for a lookup that found nothing.
+    // A null name is the image itself. A named module answers with the
+    // base of the image the guest-module layer placed for it -- an image
+    // whose headers parse, because the caller may be about to walk it --
+    // and zero only for a module no image was placed for, which is what
+    // Windows answers for "not loaded".
     if (name == nullptr) {
         return g->image_base;
     }
-    return 0;
+    return guest_module::module_base(fold_module_name(module_basename(name)));
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetModuleHandleW(
@@ -1718,7 +1739,12 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetModuleHandleW(
     if (name == nullptr) {
         return g->image_base;
     }
-    return 0;
+    std::string narrow;
+    if (!utf16_to_utf8(std::u16string_view(name), narrow)) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    return guest_module::module_base(fold_module_name(module_basename(narrow)));
 }
 
 // ---- LoadLibrary and GetProcAddress ---------------------------------------
@@ -1747,24 +1773,12 @@ own_export_index() noexcept {
     return index;
 }
 
-// A module name with its case folded, for use as a map key.
-//
-// Windows matches a module name without regard to case, so `kernel32.dll`,
-// `KERNEL32.DLL` and `Kernel32.Dll` are one name. `module_basename` strips
-// the path and leaves the case alone, which is right for the registry --
-// an import table is compared against the spelling the module declares --
-// and wrong for a key: a `std::map<std::string, ...>` built under
-// `KERNEL32.dll` does not answer a lookup for `kernel32.dll`, and the
-// `LoadLibraryA` below passes what the guest wrote rather than what the
-// table holds. Folding here is what makes the two meet.
-[[nodiscard]] std::string fold_module_name(std::string_view name) noexcept {
-    std::string folded(name);
-    for (char& c : folded) {
-        if (c >= 'A' && c <= 'Z') {
-            c = static_cast<char>(c - 'A' + 'a');
-        }
-    }
-    return folded;
+// The guest-side image inputs, in registration order. Lives beside the
+// index for the same reason: the one moment both are built is the one
+// moment they can be built to agree.
+std::vector<guest_module::ModuleInput>& guest_module_inputs_impl() noexcept {
+    static std::vector<guest_module::ModuleInput> inputs;
+    return inputs;
 }
 
 // The module name a LoadLibrary argument asks for: the bare name, folded
@@ -1778,6 +1792,18 @@ own_export_index() noexcept {
         if (name == bare) {
             return handle;
         }
+    }
+    // The handle is the base of the image the guest-module layer placed,
+    // when one was placed: a base is what Windows answers with, and a
+    // program that hands the handle to a walker or compares it against a
+    // base it found in the loader list is comparing two facts that have to
+    // agree. The recorded number remains for the modules no image covers,
+    // which the guest can still name and whose exports the host table
+    // still answers.
+    if (const std::uint64_t base = guest_module::module_base(bare);
+        base != 0) {
+        g.libraries.emplace(base, bare);
+        return base;
     }
     const std::uint64_t handle =
         0x00005E1700000000ULL + g.next_library_handle * 0x1000ULL;
@@ -1853,6 +1879,16 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetProcAddress(
                 }
             }
         }
+        // A module whose image was placed answers with the trampoline
+        // inside that image -- an address the guest can call, and one
+        // whose bytes parse as the function's own first instructions.
+        if (const std::uint64_t placed = guest_module::proc_address(
+                module, reinterpret_cast<const char*>(
+                            static_cast<std::uintptr_t>(ordinal)));
+            placed != 0) {
+            set_last_error(0);
+            return placed;
+        }
         set_last_error(kErrorProcNotFound);
         return 0;
     }
@@ -1867,6 +1903,13 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetProcAddress(
         }
         set_last_error(kErrorProcNotFound);
         return 0;
+    }
+
+    // A placed module: the trampoline in its own image.
+    if (const std::uint64_t placed = guest_module::proc_address(module, name);
+        placed != 0) {
+        set_last_error(0);
+        return placed;
     }
 
     // A handle LoadLibrary issued: the host table under the name it was
@@ -2105,6 +2148,12 @@ constexpr std::uint32_t kErrorWriteFault = 29;
 // layer reaches it. The declaration is here rather than in a header because
 // these two files are its only users, and a declaration next to the call is
 // what tells a reader where the other end of it lives.
+// The completion-port half of a finished overlapped operation, from the
+// I/O domain: whether the handle was associated with a port, and if it
+// was, the packet that answers the port's waiter.
+bool iocp_complete_handle(std::uint64_t handle, std::uint32_t bytes,
+                          void* overlapped, std::uint32_t error) noexcept;
+
 void threadpool_io_notify(std::uint64_t file, std::uint64_t overlapped,
                           std::uint32_t bytes, std::uint32_t status) noexcept;
 
@@ -2135,6 +2184,10 @@ void finish_overlapped(std::uint64_t handle, void* overlapped,
     }
     threadpool_io_notify(handle, reinterpret_cast<std::uint64_t>(overlapped),
                          bytes, status);
+    // The completion port the handle may be associated with gets the same
+    // completion: the operation has run, and the port's waiter is the
+    // caller that wants to know.
+    iocp_complete_handle(handle, bytes, overlapped, status);
 }
 
 // The position an overlapped operation names. The two halves are 32-bit
@@ -5414,6 +5467,8 @@ void register_host_modules(ExportRegistry& registry) {
         {"SHELL32.dll", &add_module_shell32},
         {"CRYPT32.dll", &add_module_crypt32},
         {"BCRYPT.dll", &add_module_bcrypt},
+        {"bcryptprimitives.dll", &add_module_bcryptprimitives},
+        {"winmm.dll", &add_module_winmm},
         {"WS2_32.dll", &add_module_ws2_32},
         {"IPHLPAPI.dll", &add_module_iphlpapi},
         {"OLE32.dll", &add_module_ole32},
@@ -5434,6 +5489,7 @@ void register_host_modules(ExportRegistry& registry) {
 
     auto& index = own_export_index();
     index.clear();
+    guest_module_inputs_impl().clear();
     for (const ModuleSpec& spec : kModules) {
         ExportModule module;
         spec.add(module);
@@ -5449,8 +5505,24 @@ void register_host_modules(ExportRegistry& registry) {
         for (const HostExport& entry : module.host_exports) {
             names.emplace(entry.name, entry.address);
         }
+        // The same table, as the guest-side image builder needs it. Built
+        // here rather than re-derived from the index, because the index
+        // lost the ordinals on the way in and the images' ordinal tables
+        // carry them.
+        guest_module::ModuleInput input;
+        input.name = module.name;
+        input.exports.reserve(module.host_exports.size());
+        for (const HostExport& entry : module.host_exports) {
+            input.exports.push_back(guest_module::Export{
+                entry.name, entry.ordinal, entry.address});
+        }
+        guest_module_inputs_impl().push_back(std::move(input));
         registry.add(std::move(module));
     }
+}
+
+const std::vector<guest_module::ModuleInput>& guest_module_inputs() {
+    return guest_module_inputs_impl();
 }
 
 // The error a guest reads back through `GetLastError`.

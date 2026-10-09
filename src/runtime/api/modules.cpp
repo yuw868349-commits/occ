@@ -57,6 +57,16 @@ void add_module_bcrypt(ExportModule& module) {
     add_bcrypt(module.host_exports);
 }
 
+void add_module_bcryptprimitives(ExportModule& module) {
+    module.name = "bcryptprimitives.dll";
+    add_bcryptprimitives(module.host_exports);
+}
+
+void add_module_winmm(ExportModule& module) {
+    module.name = "winmm.dll";
+    add_winmm(module.host_exports);
+}
+
 void add_module_ws2_32(ExportModule& module) {
     module.name = "WS2_32.dll";
     add_ws2_32(module.host_exports);

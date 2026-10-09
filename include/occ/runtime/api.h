@@ -578,7 +578,11 @@ void add_module_crypt32(ExportModule& module);
 // from them, and the random generator. The algorithms themselves live in the
 // domain file, written out rather than borrowed.
 void add_bcrypt(ExportList& out);
+void add_bcryptprimitives(ExportList& out);
+void add_winmm(ExportList& out);
 void add_module_bcrypt(ExportModule& module);
+void add_module_bcryptprimitives(ExportModule& module);
+void add_module_winmm(ExportModule& module);
 
 // The WinSock surface: the sockets themselves, the address conversion
 // between the guest's layout and the host's, and name resolution, which is

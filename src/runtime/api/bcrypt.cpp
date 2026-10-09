@@ -733,6 +733,28 @@ extern "C" __attribute__((ms_abi)) Ntstatus k32bc_GenRandom(
     return kStatusSuccess;
 }
 
+// `ProcessPrng`: what Go's runtime, and every newer loader of Microsoft's
+// own, asks `bcryptprimitives.dll` for. The contract is the honest one --
+// fill the buffer with unpredictable bytes, answer nonzero -- and the
+// entropy source is the same one `BCryptGenRandom` above reads.
+extern "C" __attribute__((ms_abi)) std::int32_t k32bc_ProcessPrng(
+    void* buffer, std::uint64_t bytes) noexcept {
+    if (buffer == nullptr && bytes != 0) {
+        return 0;
+    }
+    auto* out = static_cast<std::uint8_t*>(buffer);
+    std::size_t filled = 0;
+    while (filled < bytes) {
+        const ::ssize_t got = ::getrandom(
+            out + filled, static_cast<std::size_t>(bytes) - filled, 0);
+        if (got <= 0) {
+            return 0;
+        }
+        filled += static_cast<std::size_t>(got);
+    }
+    return 1;
+}
+
 // ------------------------------------------------------------- registration
 
 void add_bcrypt(ExportList& out) {
@@ -752,6 +774,16 @@ void add_bcrypt(ExportList& out) {
     e("BCryptHashData", reinterpret_cast<void*>(&k32bc_HashData));
     e("BCryptOpenAlgorithmProvider",
       reinterpret_cast<void*>(&k32bc_OpenAlgorithmProvider));
+}
+
+void add_bcryptprimitives(ExportList& out) {
+    const auto e = [&out](const char* name, void* fn) {
+        HostExport entry;
+        entry.name = name;
+        entry.address = reinterpret_cast<std::uint64_t>(fn);
+        out.push_back(std::move(entry));
+    };
+    e("ProcessPrng", reinterpret_cast<void*>(&k32bc_ProcessPrng));
 }
 
 }  // namespace occ::runtime::winabi

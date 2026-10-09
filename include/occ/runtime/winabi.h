@@ -50,6 +50,7 @@
 #include <vector>
 
 #include "occ/runtime/exports.h"
+#include "occ/runtime/guest_module.h"
 
 namespace occ::runtime {
 
@@ -345,6 +346,14 @@ void run_thread_detach_callbacks(GuestState& state) noexcept;
 // which is `ExportRegistry::add`'s own rule and is what a second call with a
 // grown table should do.
 void register_host_modules(ExportRegistry& registry);
+
+// The modules `register_host_modules` registered, as the guest-side image
+// builder needs them: names and exports in registration order, which is
+// the order the loader list will name them in. Empty until
+// `register_host_modules` ran, which is the one moment the registry and
+// this list are built from the same source.
+[[nodiscard]] const std::vector<guest_module::ModuleInput>&
+guest_module_inputs();
 
 // --------------------------------------------------------------------------
 // Command line and path forms
