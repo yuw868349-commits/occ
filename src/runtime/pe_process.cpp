@@ -683,6 +683,18 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     const std::uint64_t params = peb + 0x400;
     store_u64(peb, PebLayout::kProcessParameters, params, kPebBytes);
 
+    // The parameter block's own header. The flags a live Windows process
+    // carries are 0x6001 -- the compatibility bits and the reserved low
+    // word -- and *not* the normalized bit: a block built in place, as
+    // this one is, has no RVAs left to normalize away, and the programs
+    // that read the flag read it to decide which parameter-copying path
+    // their obfuscated loaders take.
+    const std::uint32_t params_length = 0x400;
+    constexpr std::uint32_t params_flags = 0x6001u;
+    store_u32(params, 0x00, params_length, kPebBytes);   // MaximumLength
+    store_u32(params, 0x04, params_length - 0x10, kPebBytes);  // Length
+    store_u32(params, 0x08, params_flags, kPebBytes);    // Flags
+
     // The command line and image path, as counted strings. The buffers are
     // placed after the parameters structure inside the same region, so a
     // program that reads one gets a pointer into its own PEB rather than
