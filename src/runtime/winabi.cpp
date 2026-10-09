@@ -1445,7 +1445,13 @@ void rebuild_environment(const GuestState& g) noexcept {
         if (entry == nullptr) {
             break;
         }
-        if (::strncmp(entry, name, length) == 0 && entry[length] == '=') {
+        // The match is without regard to case, which is what Windows
+        // does: a guest that asks for `LocalAppData` and a table that
+        // holds `LOCALAPPDATA` are asking about the same variable, and a
+        // comparison that kept the case would answer "not defined" for a
+        // variable the process carries.
+        if (entry[length] == '=' &&
+            ::strncasecmp(entry, name, length) == 0) {
             return entry + length + 1;
         }
     }

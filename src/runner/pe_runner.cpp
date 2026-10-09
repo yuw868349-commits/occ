@@ -120,6 +120,33 @@ int run_pe_runner(int argc, char** argv) noexcept {
     for (char** e = environ; *e != nullptr; ++e) {
         options.environment.emplace_back(*e);
     }
+    // The per-user directories a Windows program assumes exist. The
+    // container's environment has no `LOCALAPPDATA` -- it names Linux
+    // paths and Linux variables -- and a program that asks for its cache
+    // directory gets "not defined" from Windows when the variable is
+    // missing, which is the state the runner's defaults would leave every
+    // guest in. The paths are the ones a single-user Windows install
+    // spells, and the DOS-path layer resolves them onto the sandbox's
+    // own storage.
+    const char* kWindowsStandardVariables[] = {
+        "LOCALAPPDATA=C:\\Users\\User\\AppData\\Local",
+        "APPDATA=C:\\Users\\User\\AppData\\Roaming",
+        "USERPROFILE=C:\\Users\\User",
+        "HOMEDRIVE=C:",
+        "HOMEPATH=\\Users\\User",
+        "SYSTEMROOT=C:\\Windows",
+        "windir=C:\\Windows",
+        "TEMP=C:\\Users\\User\\AppData\\Local\\Temp",
+        "TMP=C:\\Users\\User\\AppData\\Local\\Temp",
+        "PROGRAMFILES=C:\\Program Files",
+        "COMMONPROGRAMFILES=C:\\Program Files\\Common Files",
+        "NUMBER_OF_PROCESSORS=8",
+        "PROCESSOR_ARCHITECTURE=AMD64",
+        "OS=Windows_NT",
+    };
+    for (const char* variable : kWindowsStandardVariables) {
+        options.environment.emplace_back(variable);
+    }
     options.resolver_state = &registry;
     options.resolve = &resolve_thunk;
 
