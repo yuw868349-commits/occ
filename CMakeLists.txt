@@ -603,6 +603,7 @@ add_library(occ_core STATIC
     src/runtime/api/setupapi.cpp
     src/runtime/api/shell32.cpp
     src/runtime/api/crypt32.cpp
+    src/runtime/api/secur32.cpp
     src/runtime/api/ole32.cpp
     src/runtime/api/crt.cpp
     src/runtime/api/kernel32_sync.cpp

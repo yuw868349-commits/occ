@@ -5422,6 +5422,11 @@ void add_module_psapi(ExportModule& module) {
     // and the kernel's own export surface both carry the same calls.
 }
 
+void add_module_secur32(ExportModule& module) {
+    module.name = "SECUR32.dll";
+    add_secur32(module.host_exports);
+}
+
 void add_module_dbghelp(ExportModule& module) {
     module.name = "DBGHELP.dll";
     add_dbghelp(module.host_exports);
@@ -5506,6 +5511,8 @@ void register_host_modules(ExportRegistry& registry) {
         {"PSAPI.DLL", &add_module_psapi},
         {"VERSION.dll", &add_module_version},
         {"DBGHELP.dll", &add_module_dbghelp},
+        {"SECUR32.dll", &add_module_secur32},
+        {"SSPICLI.dll", &add_module_secur32},
         {"SHLWAPI.dll", &add_shlwapi},
         {"NTDLL.dll", &add_module_ntdll},
         {"GDI32.dll", &add_module_gdi32},

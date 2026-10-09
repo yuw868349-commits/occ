@@ -569,6 +569,10 @@ void add_shell32(ExportList& out);
 // The CRYPT32 surface.
 void add_crypt32(ExportList& out);
 
+// The security support provider interface: the packages, the credentials
+// and contexts, the sealed messages, the LSA client and the names.
+void add_secur32(ExportList& out);
+
 // The OLE32 surface.
 void add_ole32(ExportList& out);
 
