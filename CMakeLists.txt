@@ -589,6 +589,7 @@ add_library(occ_core STATIC
     src/runtime/api/kernel32_extra.cpp
     src/runtime/api/kernelbase_extra.cpp
     src/runtime/api/user32_extra.cpp
+    src/runtime/api/user32_windows.cpp
     src/runtime/api/ntdll_rtl.cpp
     src/runtime/api/ntdll_nt.cpp
     src/runtime/api/gdi32.cpp

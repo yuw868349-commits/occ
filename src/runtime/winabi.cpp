@@ -5432,6 +5432,7 @@ void add_user32(ExportModule& module) {
         e("wsprintfW", reinterpret_cast<void*>(&cr_wsprintfW)),
     };
     add_user32_extra(module.host_exports);
+    add_user32_windows(module.host_exports);
 }
 
 void add_kernelbase(ExportModule& module) {

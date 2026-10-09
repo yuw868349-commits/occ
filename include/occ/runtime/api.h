@@ -486,6 +486,11 @@ void add_kernelbase_extra(ExportList& out);
 // The USER32 surface beyond the two printf-style names already here.
 void add_user32_extra(ExportList& out);
 
+// The window station: the classes, the windows, the queue, the
+// clipboard, the keyboard, the menus and the dialogs, as one headless
+// station keeps them.
+void add_user32_windows(ExportList& out);
+
 // The Rtl* half of ntdll: memory, strings, bits, sections, version.
 void add_ntdll_rtl(ExportList& out);
 
