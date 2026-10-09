@@ -476,6 +476,10 @@ void add_kernel32_state2(ExportList& out);
 // with asking about the image.
 void add_kernel32_ctx2(ExportList& out);
 
+// kernel32's handle-oriented I/O calls: the device control, the overlapped
+// result, the cancellation, and the file-information setter.
+void add_kernel32_io2(ExportList& out);
+
 // The KERNELBASE names a guest imports from it directly.
 void add_kernelbase_extra(ExportList& out);
 
@@ -570,6 +574,23 @@ void add_module_rpcrt4(ExportModule& module);
 void add_module_setupapi(ExportModule& module);
 void add_module_shell32(ExportModule& module);
 void add_module_crypt32(ExportModule& module);
+// The platform cryptography surface: the hash providers, the objects built
+// from them, and the random generator. The algorithms themselves live in the
+// domain file, written out rather than borrowed.
+void add_bcrypt(ExportList& out);
+void add_module_bcrypt(ExportModule& module);
+
+// The WinSock surface: the sockets themselves, the address conversion
+// between the guest's layout and the host's, and name resolution, which is
+// carried out by the host's own resolver.
+void add_ws2_32(ExportList& out);
+void add_module_ws2_32(ExportModule& module);
+
+// The interface and address tables: the machine's own view of what it can
+// reach, translated into the structures this module promises.
+void add_iphlpapi(ExportList& out);
+void add_module_iphlpapi(ExportModule& module);
+
 void add_module_ole32(ExportModule& module);
 void add_module_ucrtbase(ExportModule& module);
 void add_module_msvcr70(ExportModule& module);

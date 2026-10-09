@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -50,7 +51,12 @@ thread_local GuestState* g_guest = nullptr;
 // that layer can provide. Before it is installed the only honest exit is the
 // process's own, and the code is narrowed the way an exit status is.
 using TerminateFn = void(std::uint32_t) noexcept;
-TerminateFn* g_terminate = nullptr;
+// Thread-local, because the exit a guest thread reaches through this pointer
+// is that thread's own: the first thread leaves through the jump that
+// returns to `run_pe_process`, and a second thread leaves by ending itself
+// -- or, for `ExitProcess`, by ending the process. One pointer shared
+// between them would send a thread's exit through another thread's stack.
+thread_local TerminateFn* g_terminate = nullptr;
 
 void terminate(std::uint32_t code) noexcept {
     if (g_terminate != nullptr) {
@@ -469,35 +475,160 @@ struct HeapHeader {
 // test alone reads the eight bytes in front of whatever pointer the caller
 // supplies -- and a pointer a caller invented, or one that names a stack
 // buffer or a foreign allocation, has no eight bytes in front of it that
-// this allocator may read. The guest runs on one host thread, so there is
-// no lock, for the same reason the atom-table list has none.
-std::vector<void*>& heap_blocks() noexcept {
-    static std::vector<void*> blocks;
+// this allocator may read.
+//
+// It is a set rather than a list because the guest's own C allocator lands
+// here for every malloc and every free, and a walk that was linear in the
+// number of live blocks would make an allocating program quadratic for no
+// reason the program could see.
+// The heap lock. A guest thread allocates while another frees, which is the
+// ordinary state of a program with more than one thread, so the ledger and
+// the guest heap below are behind one lock. It is recursive because the
+// calls compose -- a realloc is an alloc, a copy and a free -- and a plain
+// mutex would turn that composition into a deadlock.
+std::recursive_mutex& heap_lock() noexcept {
+    static std::recursive_mutex lock;
+    return lock;
+}
+
+std::unordered_set<void*>& heap_blocks() noexcept {
+    static std::unordered_set<void*> blocks;
     return blocks;
 }
 
 [[nodiscard]] bool heap_is_ours(void* block) noexcept {
-    for (void* live : heap_blocks()) {
-        if (live == block) {
-            return true;
-        }
-    }
-    return false;
+    return heap_blocks().count(block) != 0;
 }
 
 void heap_forget(void* block) noexcept {
-    auto& blocks = heap_blocks();
-    for (std::size_t i = 0; i < blocks.size(); ++i) {
-        if (blocks[i] == block) {
-            blocks.erase(blocks.begin() + static_cast<std::ptrdiff_t>(i));
-            return;
-        }
+    heap_blocks().erase(block);
+}
+
+// ---- the heap's own memory ---------------------------------------------
+//
+// The blocks live in the guest's address space, mapped once and carved up
+// here, because where a heap pointer points is a fact a program reads. The
+// host's own malloc hands out addresses in the host's own mmap region, and
+// a guest that draws conclusions from the *range* a pointer falls in -- its
+// own region metadata, an address-range check, a page table indexed by the
+// pointer's aligned base -- reads a map of the wrong country. A Windows heap
+// sits inside the process's user window, and so does this one.
+
+// Half a gigabyte, which is what a `HeapCreate` with no maximum grows to
+// before Windows itself refuses.
+constexpr std::uint64_t kGuestHeapReserve = 512ULL << 20;
+// The floor the heap is placed at. It is above the regions the loader
+// places below -- the image, the control blocks, the stack all start low --
+// and well inside the user window, which is the span a program expects a
+// heap pointer to fall in.
+constexpr std::uint64_t kGuestHeapFloor = 0x01000000;
+
+std::uint8_t* g_guest_heap = nullptr;  // the mapped base, null until placed
+std::uint64_t g_guest_heap_bytes = 0;
+std::uint64_t g_guest_heap_top = 0;    // where the next fresh block starts
+
+struct GuestHeapFree {
+    std::uint64_t offset;
+    std::uint64_t bytes;
+};
+std::vector<GuestHeapFree> g_guest_heap_free;
+
+// Places the heap, once. Answers false when there is no guest to place it
+// in, which is the state a host-side test runs in, and the caller falls
+// back to the host allocator for that case.
+[[nodiscard]] bool guest_heap_place() noexcept {
+    if (g_guest_heap != nullptr) {
+        return true;
     }
+    const GuestState* g = guest_state();
+    if (g == nullptr || g->mapper == nullptr) {
+        return false;
+    }
+    const Result<std::uint64_t> mapped = g->mapper->map_above(
+        kGuestHeapFloor, kGuestHeapReserve, PageProtection::ReadWrite,
+        RegionKind::Private);
+    if (!mapped.ok()) {
+        return false;
+    }
+    g_guest_heap = reinterpret_cast<std::uint8_t*>(mapped.value);
+    g_guest_heap_bytes = kGuestHeapReserve;
+    g_guest_heap_top = 0;
+    return true;
+}
+
+// Carves a block out of the guest heap: first-fit through the free list,
+// then the bump pointer, everything 16-byte aligned the way the platform's
+// own heap entries are.
+[[nodiscard]] void* guest_heap_take(std::uint64_t bytes) noexcept {
+    if (!guest_heap_place()) {
+        return nullptr;
+    }
+    bytes = (bytes + 15) & ~std::uint64_t{15};
+
+    for (std::size_t i = 0; i < g_guest_heap_free.size(); ++i) {
+        if (g_guest_heap_free[i].bytes < bytes) {
+            continue;
+        }
+        const std::uint64_t offset = g_guest_heap_free[i].offset;
+        const std::uint64_t rest = g_guest_heap_free[i].bytes - bytes;
+        if (rest == 0) {
+            g_guest_heap_free.erase(g_guest_heap_free.begin() +
+                                    static_cast<std::ptrdiff_t>(i));
+        } else {
+            g_guest_heap_free[i].offset += bytes;
+            g_guest_heap_free[i].bytes = rest;
+        }
+        return g_guest_heap + offset;
+    }
+
+    if (g_guest_heap_top + bytes > g_guest_heap_bytes) {
+        return nullptr;
+    }
+    void* taken = g_guest_heap + g_guest_heap_top;
+    g_guest_heap_top += bytes;
+    return taken;
+}
+
+// Returns a block to the free list, joining each neighbour it touches, so
+// that a region freed in pieces is handed out whole again.
+void guest_heap_give(void* block, std::uint64_t bytes) noexcept {
+    const auto offset = static_cast<std::uint64_t>(
+        static_cast<std::uint8_t*>(block) - g_guest_heap);
+    bytes = (bytes + 15) & ~std::uint64_t{15};
+
+    std::uint64_t begin = offset;
+    std::uint64_t end = offset + bytes;
+    auto it = g_guest_heap_free.begin();
+    while (it != g_guest_heap_free.end()) {
+        if (it->offset + it->bytes == begin) {
+            begin = it->offset;
+            it = g_guest_heap_free.erase(it);
+            continue;
+        }
+        if (begin + bytes == it->offset) {
+            end = it->offset + it->bytes;
+            it = g_guest_heap_free.erase(it);
+            continue;
+        }
+        ++it;
+    }
+    g_guest_heap_free.push_back(GuestHeapFree{begin, end - begin});
+}
+
+// Whether a raw block (the header, not the user pointer) is inside the
+// guest heap, which is how a free decides where the memory goes back to.
+[[nodiscard]] bool guest_heap_contains(const void* raw) noexcept {
+    if (g_guest_heap == nullptr) {
+        return false;
+    }
+    return raw >= static_cast<const void*>(g_guest_heap) &&
+           raw < static_cast<const void*>(g_guest_heap + g_guest_heap_bytes);
 }
 
 }  // namespace
 
 void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
     if (bytes == 0) {
         // A zero-byte allocation succeeds on Windows and hands back a
         // pointer the guest can pass to HeapSize. A null here would turn a
@@ -507,7 +638,14 @@ void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
     if (bytes > (0xFFFFFFFFFFFFFFFFULL - sizeof(HeapHeader) - 16)) {
         return nullptr;
     }
-    void* raw = ::malloc(static_cast<std::size_t>(bytes + sizeof(HeapHeader)));
+    // The guest heap first, because a pointer inside the guest's own user
+    // window is what a guest expects a heap pointer to be. A host-side
+    // caller with no guest to place a heap in falls through to the host's
+    // allocator, which serves it exactly as well.
+    void* raw = guest_heap_take(bytes + sizeof(HeapHeader));
+    if (raw == nullptr) {
+        raw = ::malloc(static_cast<std::size_t>(bytes + sizeof(HeapHeader)));
+    }
     if (raw == nullptr) {
         return nullptr;
     }
@@ -518,7 +656,7 @@ void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
     header->user_flags = 0;
     header->user_flags_set_by_user = 0;
     void* block = static_cast<char*>(raw) + sizeof(HeapHeader);
-    heap_blocks().push_back(block);
+    heap_blocks().insert(block);
     if ((flags & kHeapZeroMemory) != 0) {
         ::memset(block, 0, static_cast<std::size_t>(bytes));
     }
@@ -527,6 +665,7 @@ void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
 
 void* heap_realloc(std::uint32_t flags, void* block,
                    std::uint64_t bytes) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
     if (block == nullptr) {
         return heap_alloc(flags, bytes);
     }
@@ -560,7 +699,12 @@ void* heap_realloc(std::uint32_t flags, void* block,
                  static_cast<std::size_t>(bytes - carried));
     }
     heap_forget(block);
-    ::free(static_cast<char*>(block) - sizeof(HeapHeader));
+    void* raw = static_cast<char*>(block) - sizeof(HeapHeader);
+    if (guest_heap_contains(raw)) {
+        guest_heap_give(raw, old_size + sizeof(HeapHeader));
+    } else {
+        ::free(raw);
+    }
     return fresh;
 }
 
@@ -568,6 +712,7 @@ std::uint64_t heap_size(const void* block) noexcept {
     if (block == nullptr) {
         return 0;
     }
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
     if (!heap_is_ours(const_cast<void*>(block))) {
         return 0;
     }
@@ -582,7 +727,8 @@ std::uint64_t heap_size(const void* block) noexcept {
 }
 
 std::vector<void*> heap_live_blocks() {
-    const std::vector<void*>& blocks = heap_blocks();
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
+    const std::unordered_set<void*>& blocks = heap_blocks();
     return std::vector<void*>(blocks.begin(), blocks.end());
 }
 
@@ -590,11 +736,13 @@ bool heap_owns(const void* block) noexcept {
     if (block == nullptr) {
         return false;
     }
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
     return heap_is_ours(const_cast<void*>(block));
 }
 
 bool heap_user_info(const void* block, HeapUserInfo& out) noexcept {
-    if (!heap_owns(block)) {
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
+    if (block == nullptr || !heap_is_ours(const_cast<void*>(block))) {
         return false;
     }
     const HeapHeader* header = header_of(const_cast<void*>(block));
@@ -608,7 +756,8 @@ bool heap_user_info(const void* block, HeapUserInfo& out) noexcept {
 }
 
 bool heap_set_user_info(void* block, const HeapUserInfo& info) noexcept {
-    if (!heap_owns(block)) {
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
+    if (block == nullptr || !heap_is_ours(block)) {
         return false;
     }
     HeapHeader* header = header_of(block);
@@ -630,8 +779,9 @@ bool heap_free(void* block) noexcept {
         // what was never allocated relies on that.
         return true;
     }
+    std::lock_guard<std::recursive_mutex> lock(heap_lock());
     // A second free of the same block would read the header of memory this
-    // allocator has already handed back to malloc. Windows leaves the double
+    // allocator has already handed back. Windows leaves the double
     // free undefined -- RtlFreeHeap's refusal runs on heap entry flags it
     // owns, which is a lifetime this header, allocated with the block, does
     // not have -- and so does this: there is no honest answer to give from
@@ -647,8 +797,14 @@ bool heap_free(void* block) noexcept {
     if (header->magic != kHeapMagic) {
         return false;
     }
+    const std::uint64_t user_bytes = header->size;
+    void* raw = static_cast<char*>(block) - sizeof(HeapHeader);
     heap_forget(block);
-    ::free(static_cast<char*>(block) - sizeof(HeapHeader));
+    if (guest_heap_contains(raw)) {
+        guest_heap_give(raw, user_bytes + sizeof(HeapHeader));
+    } else {
+        ::free(raw);
+    }
     return true;
 }
 
@@ -1929,41 +2085,134 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32_GetStdHandle(
     return handle;
 }
 
+// The fields of an OVERLAPPED this file reads and writes. The structure is
+// the guest's and its offsets are fixed, so they are named here rather than
+// counted at each use.
+namespace {
+constexpr std::size_t kOverlappedInternal = 0;
+constexpr std::size_t kOverlappedInternalHigh = 8;
+constexpr std::size_t kOverlappedOffset = 16;
+constexpr std::size_t kOverlappedOffsetHigh = 24;
+constexpr std::size_t kOverlappedEvent = 32;
+
+// The error a failed write leaves for the caller. It is the Win32 code for
+// a device that could not take the bytes, which is what a failed `write` on
+// a regular file means here.
+constexpr std::uint32_t kErrorWriteFault = 29;
+}  // namespace
+
+// The process domain owns the threadpool IO table; this is how the file
+// layer reaches it. The declaration is here rather than in a header because
+// these two files are its only users, and a declaration next to the call is
+// what tells a reader where the other end of it lives.
+void threadpool_io_notify(std::uint64_t file, std::uint64_t overlapped,
+                          std::uint32_t bytes, std::uint32_t status) noexcept;
+
+// The completion of an overlapped operation, performed in the caller's own
+// thread.
+//
+// Windows delivers this through a completion port or a threadpool callback,
+// which is another thread's work. This runtime performs the operation
+// synchronously, so the result is in hand before the call returns: the
+// structure is filled with it, the event it names is set, and any threadpool
+// IO object watching the file is told. A caller that waited on that event
+// finds it already signalled -- an outcome Windows produces as well, when an
+// operation completes before the caller gets around to waiting, and one its
+// code already has to handle.
+void finish_overlapped(std::uint64_t handle, void* overlapped,
+                       std::uint32_t bytes, std::uint32_t status) noexcept {
+    if (overlapped == nullptr) {
+        return;
+    }
+    auto* base = static_cast<std::uint8_t*>(overlapped);
+    std::memcpy(base + kOverlappedInternal, &status, sizeof(status));
+    std::memcpy(base + kOverlappedInternalHigh, &bytes, sizeof(bytes));
+
+    std::uint64_t event = 0;
+    std::memcpy(&event, base + kOverlappedEvent, sizeof(event));
+    if (event != 0) {
+        static_cast<void>(objects::set_event(event));
+    }
+    threadpool_io_notify(handle, reinterpret_cast<std::uint64_t>(overlapped),
+                         bytes, status);
+}
+
+// The position an overlapped operation names. The two halves are 32-bit
+// fields in the guest's structure and one 64-bit offset here, which is the
+// same information in a different shape.
+[[nodiscard]] std::uint64_t overlapped_offset(const void* overlapped) noexcept {
+    const auto* base = static_cast<const std::uint8_t*>(overlapped);
+    std::uint32_t low = 0;
+    std::uint32_t high = 0;
+    std::memcpy(&low, base + kOverlappedOffset, sizeof(low));
+    std::memcpy(&high, base + kOverlappedOffsetHigh, sizeof(high));
+    return static_cast<std::uint64_t>(low) |
+           (static_cast<std::uint64_t>(high) << 32);
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t k32_WriteFile(
     std::uint64_t handle, const void* buffer, std::uint32_t to_write,
     std::uint32_t* written, void* overlapped) noexcept {
-    if (overlapped != nullptr) {
-        // Overlapped I/O is a completion-port shape this runtime has no
-        // ports for, and a caller that passed one asked for asynchronous
-        // semantics that a synchronous write would silently break.
-        set_last_error(kErrorNotSupported);
-        return 0;
-    }
     const int fd = fd_for_handle(handle);
-    if (fd < 0) {
+    if (fd < 0 || (buffer == nullptr && to_write != 0)) {
+        if (written != nullptr) {
+            *written = 0;
+        }
         set_last_error(kErrorInvalidHandle);
+        finish_overlapped(handle, overlapped, 0, kErrorInvalidHandle);
         return 0;
     }
+
+    // The position the write goes to. An overlapped write names it and does
+    // not move the descriptor's own position, which is the part of the
+    // contract a caller with several writers on one file depends on -- so
+    // the write goes through the positioned call rather than the plain one.
     std::size_t done = 0;
-    while (done < to_write) {
-        const ssize_t n = ::write(
-            fd, static_cast<const char*>(buffer) + done,
-            static_cast<std::size_t>(to_write - done));
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
+    if (overlapped != nullptr) {
+        const ::off_t offset = static_cast<::off_t>(overlapped_offset(overlapped));
+        while (done < to_write) {
+            const ssize_t n = ::pwrite(
+                fd, static_cast<const char*>(buffer) + done,
+                static_cast<std::size_t>(to_write - done),
+                offset + static_cast<::off_t>(done));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (written != nullptr) {
+                    *written = static_cast<std::uint32_t>(done);
+                }
+                set_last_error(kErrorWriteFault);
+                finish_overlapped(handle, overlapped,
+                                  static_cast<std::uint32_t>(done),
+                                  kErrorWriteFault);
+                return 0;
             }
-            if (written != nullptr) {
-                *written = static_cast<std::uint32_t>(done);
-            }
-            set_last_error(kErrorInvalidHandle);
-            return 0;
+            done += static_cast<std::size_t>(n);
         }
-        done += static_cast<std::size_t>(n);
+    } else {
+        while (done < to_write) {
+            const ssize_t n = ::write(
+                fd, static_cast<const char*>(buffer) + done,
+                static_cast<std::size_t>(to_write - done));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (written != nullptr) {
+                    *written = static_cast<std::uint32_t>(done);
+                }
+                set_last_error(kErrorWriteFault);
+                return 0;
+            }
+            done += static_cast<std::size_t>(n);
+        }
     }
+
     if (written != nullptr) {
         *written = static_cast<std::uint32_t>(done);
     }
+    finish_overlapped(handle, overlapped, static_cast<std::uint32_t>(done), 0);
     return 1;
 }
 
@@ -2050,29 +2299,45 @@ extern "C" __attribute__((ms_abi)) void* k32_CreateFileA(
 extern "C" __attribute__((ms_abi)) std::int32_t k32_ReadFile(
     std::uint64_t handle, void* buffer, std::uint32_t to_read,
     std::uint32_t* read_out, void* overlapped) noexcept {
-    if (overlapped != nullptr) {
-        set_last_error(kErrorNotSupported);
-        return 0;
-    }
     const int fd = fd_for_handle(handle);
-    if (fd < 0 || buffer == nullptr) {
+    if (fd < 0 || (buffer == nullptr && to_read != 0)) {
         set_last_error(kErrorInvalidHandle);
+        if (read_out != nullptr) {
+            *read_out = 0;
+        }
+        finish_overlapped(handle, overlapped, 0, kErrorInvalidHandle);
         return 0;
     }
+
+    // An overlapped read names its own position and leaves the descriptor's
+    // where it was, so it goes through the positioned call. The plain read
+    // is the one that advances the position, and the two are kept apart
+    // because a caller that streams a file and a caller that reads into
+    // several buffers at once want the two different behaviours.
     ::ssize_t got = 0;
-    do {
-        got = ::read(fd, buffer, to_read);
-    } while (got < 0 && errno == EINTR);
+    if (overlapped != nullptr) {
+        const ::off_t offset = static_cast<::off_t>(overlapped_offset(overlapped));
+        do {
+            got = ::pread(fd, buffer, to_read, offset);
+        } while (got < 0 && errno == EINTR);
+    } else {
+        do {
+            got = ::read(fd, buffer, to_read);
+        } while (got < 0 && errno == EINTR);
+    }
+
     if (got < 0) {
         set_last_error(kErrorInvalidHandle);
         if (read_out != nullptr) {
             *read_out = 0;
         }
+        finish_overlapped(handle, overlapped, 0, kErrorInvalidHandle);
         return 0;
     }
     if (read_out != nullptr) {
         *read_out = static_cast<std::uint32_t>(got);
     }
+    finish_overlapped(handle, overlapped, static_cast<std::uint32_t>(got), 0);
     return 1;
 }
 
@@ -2118,6 +2383,12 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_CloseHandle(
         const int fd = static_cast<int>(handle - kFileHandleBase);
         ::close(fd);
         return 1;
+    }
+    if (is_guest_thread_handle(handle)) {
+        // A thread handle is released; the thread it names keeps running.
+        // What the close ends is this handle's claim on the record, and the
+        // record is released once the thread has stopped as well.
+        return close_guest_thread(handle) ? 1 : 0;
     }
     (void)objects::close(handle);
     return 1;
@@ -2214,6 +2485,16 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_ResetEvent(
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32_WaitForSingleObject(
     std::uint64_t handle, std::uint32_t milliseconds) noexcept {
+    if (is_guest_thread_handle(handle)) {
+        // A thread is signalled exactly when it has ended, so the wait is
+        // the wait for the thread. `INFINITE` is the all-ones timeout, and
+        // the guest layer spells it that way rather than as a negative
+        // number.
+        const std::int64_t bound =
+            (milliseconds == 0xFFFFFFFFu) ? -1
+                                          : static_cast<std::int64_t>(milliseconds);
+        return wait_guest_thread(handle, bound);
+    }
     return wait_status(objects::wait_one(handle, milliseconds));
 }
 
@@ -2226,6 +2507,12 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32_WaitForSingleObjectEx(
     std::uint64_t handle, std::uint32_t milliseconds,
     std::int32_t alertable) noexcept {
     (void)alertable;
+    if (is_guest_thread_handle(handle)) {
+        const std::int64_t bound =
+            (milliseconds == 0xFFFFFFFFu) ? -1
+                                          : static_cast<std::int64_t>(milliseconds);
+        return wait_guest_thread(handle, bound);
+    }
     return wait_status(objects::wait_one(handle, milliseconds));
 }
 
@@ -3279,17 +3566,28 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_puts(
 
 extern "C" __attribute__((ms_abi)) void* cr_malloc(
     std::uint64_t bytes) noexcept {
-    return ::malloc(static_cast<std::size_t>(bytes));
+    // The C allocator and the process heap are the same heap on Windows:
+    // malloc reaches `HeapAlloc(process heap)` through the UCRT, and a
+    // program that compares a pointer from one against a pointer from the
+    // other is comparing pointers from the same place. Answering from the
+    // host's own allocator would hand the guest addresses in a region its
+    // own memory bookkeeping does not cover.
+    return heap_alloc(0, bytes);
 }
 
 extern "C" __attribute__((ms_abi)) void* cr_calloc(
     std::uint64_t count, std::uint64_t size) noexcept {
-    return ::calloc(static_cast<std::size_t>(count),
-                    static_cast<std::size_t>(size));
+    // The overflow the multiplication could hide is checked before it is
+    // performed, which is the whole of what calloc adds to
+    // `malloc(count * size)`.
+    if (count != 0 && size > (0xFFFFFFFFFFFFFFFFULL / count)) {
+        return nullptr;
+    }
+    return heap_alloc(kHeapZeroMemory, count * size);
 }
 
 extern "C" __attribute__((ms_abi)) void cr_free(void* block) noexcept {
-    ::free(block);
+    heap_free(block);
 }
 
 extern "C" __attribute__((ms_abi)) void* cr_realloc(
@@ -3299,7 +3597,7 @@ extern "C" __attribute__((ms_abi)) void* cr_realloc(
     // only because the host's own realloc does. A guest that treats the
     // answer as "the block, possibly elsewhere" is the only caller this
     // spelling has.
-    return ::realloc(block, static_cast<std::size_t>(bytes));
+    return heap_realloc(0, block, bytes);
 }
 
 extern "C" __attribute__((ms_abi)) void* cr_memchr(const void* haystack,
@@ -5035,6 +5333,7 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_file2(module.host_exports);
     add_kernel32_state2(module.host_exports);
     add_kernel32_ctx2(module.host_exports);
+    add_kernel32_io2(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {
@@ -5114,6 +5413,9 @@ void register_host_modules(ExportRegistry& registry) {
         {"SETUPAPI.dll", &add_module_setupapi},
         {"SHELL32.dll", &add_module_shell32},
         {"CRYPT32.dll", &add_module_crypt32},
+        {"BCRYPT.dll", &add_module_bcrypt},
+        {"WS2_32.dll", &add_module_ws2_32},
+        {"IPHLPAPI.dll", &add_module_iphlpapi},
         {"OLE32.dll", &add_module_ole32},
         {"UCRTBASE.dll", &add_module_ucrtbase},
         {"MSVCR70.dll", &add_module_msvcr70},

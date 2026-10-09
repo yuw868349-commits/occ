@@ -50,7 +50,7 @@ extern "C" __attribute__((ms_abi)) void* nr1_RtlAddVectoredExceptionHandler(
 extern "C" __attribute__((ms_abi)) void* nr1_RtlAddVectoredContinueHandler(
     std::uint32_t first, void* handler) noexcept;
 extern "C" __attribute__((ms_abi)) std::uint64_t nr2_RtlGetEnabledExtendedFeatures(
-    void) noexcept;
+    std::uint64_t mask) noexcept;
 
 // The filter a guest registered through `RtlSetUnhandledExceptionFilter`,
 // and the setter's own reader. The state belongs to the slice that owns the
@@ -64,11 +64,10 @@ namespace {
 
 // The CONTEXT flag bits. `CONTEXT_AMD64` marks the record as this machine's,
 // and the three parts below select which groups the call reads or writes.
-constexpr std::uint32_t kContextControl = 0x00100001u;
-constexpr std::uint32_t kContextInteger = 0x00100002u;
-constexpr std::uint32_t kContextFloatingPoint = 0x00100008u;
-constexpr std::uint32_t kContextAll = 0x0010003Fu;
-
+[[maybe_unused]] constexpr std::uint32_t kContextControl = 0x00100001u;
+[[maybe_unused]] constexpr std::uint32_t kContextInteger = 0x00100002u;
+[[maybe_unused]] constexpr std::uint32_t kContextFloatingPoint = 0x00100008u;
+[[maybe_unused]] constexpr std::uint32_t kContextAll = 0x0010003Fu;
 // The flags `GetModuleHandleExW` accepts, and the two that change what the
 // call does with the reference count.
 constexpr std::uint32_t kModuleHandlePin = 0x00000001u;
@@ -162,12 +161,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32c2_InitializeContext(
 
 extern "C" __attribute__((ms_abi)) std::uint64_t
 k32c2_GetEnabledXStateFeatures(void) noexcept {
-    // Which extended-state components are enabled for this process. This
-    // runtime does not switch any on: the guest sees the host's own
-    // instruction set and no context-switch extension, so the answer is the
-    // empty mask rather than a guess at what the host happens to support.
-    const std::uint64_t features = nr2_RtlGetEnabledExtendedFeatures();
-    return features;
+    // Which extended-state components are enabled for this process. It is
+    // the host's own answer: the guest runs on the host's processor and
+    // reads the host's `XCR0`, so a program that asks whether it may use
+    // AVX is told the truth about the machine it is actually running on.
+    return nr2_RtlGetEnabledExtendedFeatures(~std::uint64_t{0});
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32c2_SetXStateFeaturesMask(
@@ -177,11 +175,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32c2_SetXStateFeaturesMask(
         return 0;
     }
     // The mask says which components of the extended state the record
-    // carries. With no component enabled the only mask this can honour is
-    // the empty one; a caller that asks for a component is refused, because
-    // recording a mask that no capture will fill would leave the caller
-    // reading state that was never written.
-    if (mask != 0) {
+    // carries. A mask naming a component this machine does not have is
+    // refused, because recording it would leave the caller reading state
+    // that no capture will ever fill.
+    const std::uint64_t enabled = nr2_RtlGetEnabledExtendedFeatures(~std::uint64_t{0});
+    if ((mask & ~enabled) != 0) {
         set_last_error(kErrorInvalidParameter);
         return 0;
     }

@@ -27,6 +27,7 @@
 //     rather than the protection being rounded to something that works.
 
 #include "occ/runtime/api.h"
+#include "occ/runtime/mapper.h"
 #include "occ/runtime/winabi.h"
 
 #include <cerrno>
@@ -59,6 +60,9 @@ constexpr std::size_t kMbiBytes = 48;
 
 constexpr std::uint32_t kMemCommit = 0x00001000;
 constexpr std::uint32_t kMemReserve = 0x00002000;
+// The placement hint: a large reservation asked for this way wants the
+// highest address range the window still has, not the lowest.
+constexpr std::uint32_t kMemTopDown = 0x00200000;
 constexpr std::uint32_t kMemRelease = 0x00008000;
 constexpr std::uint32_t kMemPrivate = 0x00020000;
 
@@ -162,6 +166,38 @@ void put_u64(std::uint8_t* base, std::size_t at, std::uint64_t value) noexcept {
     return bytes + (page - extra);
 }
 
+// The guest's own spelling of a protection word. The mapper that places an
+// allocation takes this type, and the two encodings are the same values for
+// the base bits and differ only in the modifiers, which this drops -- the
+// same reduction `host_protection` makes for the host's mmap.
+[[nodiscard]] PageProtection guest_protection(std::uint32_t protect) noexcept {
+    switch (protect & kPageModifiers) {
+    case kPageNoAccess:
+        return PageProtection::NoAccess;
+    case kPageReadOnly:
+        return PageProtection::ReadOnly;
+    case kPageExecute:
+        return PageProtection::Execute;
+    case kPageExecuteRead:
+        return PageProtection::ExecuteRead;
+    case kPageExecuteWriteCopy:
+        return PageProtection::ExecuteWriteCopy;
+    case kPageExecuteReadWrite:
+        return PageProtection::ExecuteReadWrite;
+    case kPageWriteCopy:
+        return PageProtection::WriteCopy;
+    default:
+        return PageProtection::ReadWrite;
+    }
+}
+
+// The lowest address an unnamed allocation may be placed at. It is above
+// the page the operating system reserves and below everything else the
+// process carries, because the mapper's search walks upward from here and
+// the regions it already placed -- the image, the control blocks, the
+// stacks -- are what it walks around.
+constexpr std::uint64_t kAllocationFloor = 0x10000;
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -205,8 +241,54 @@ template <typename T>
     }
     // MAP_FIXED when the caller named an address, because the caller is
     // asking for that address and a host that placed it elsewhere would be
-    // answering a different question. A caller that passed null gets
-    // whatever the host chooses, which is what Windows does too.
+    // answering a different question.
+    //
+    // A caller that passed null gets a placement from the guest's own user
+    // window rather than whatever the host's kernel would pick. Where an
+    // allocation landed is a fact a guest reads: its own region
+    // bookkeeping, its address-range checks and its page tables are all
+    // indexed by the placement, and an address from the host's mmap region
+    // would be an entry none of them contain.
+    //
+    // The direction follows the caller's request. `MEM_TOP_DOWN` is how a
+    // large reservation asks to be kept out of the regions the rest of the
+    // process will grow into, and it is honoured with the descending search:
+    // a 256-gigabyte reserve asked for that way is placed just under the top
+    // of the window in one step, where an ascending search from the bottom
+    // would walk past every region the loader placed first. Without the flag
+    // the placement is the ascending one, the same search that placed the
+    // image and the stacks. The host's own allocation is the fallback for a
+    // caller with no guest, which is the state a test runs in.
+    if (address == nullptr) {
+        const GuestState* g = guest_state();
+        if (g != nullptr && g->mapper != nullptr) {
+            const PageProtection protection = guest_protection(
+                commit ? protect : kPageNoAccess);
+            const bool top_down = (type & kMemTopDown) != 0;
+            // The direction follows the request: `MEM_TOP_DOWN` searches the
+            // window from the top, everything else from the bottom, and the
+            // kernel's own placement is the last word for whichever the two
+            // searches could not satisfy -- its view of the address space
+            // includes what this runtime's ledger does not, and `map` with an
+            // unspecified base asks it and records what it chose.
+            Result<std::uint64_t> placed =
+                top_down
+                    ? g->mapper->map_below(AddressSpace::kUserMax, rounded,
+                                           protection, RegionKind::Private)
+                    : g->mapper->map_above(kAllocationFloor, rounded,
+                                           protection, RegionKind::Private);
+            if (!placed.ok()) {
+                placed = g->mapper->map(0, rounded, protection,
+                                        RegionKind::Private);
+            }
+            if (placed.ok()) {
+                set_last_error(0);
+                return static_cast<T*>(reinterpret_cast<void*>(placed.value));
+            }
+            set_last_error(kErrorNotEnoughMemory);
+            return nullptr;
+        }
+    }
     const int flags = MAP_PRIVATE | MAP_ANONYMOUS |
                       (address != nullptr ? MAP_FIXED : 0);
     void* mapped = ::mmap(address, static_cast<std::size_t>(rounded), host,

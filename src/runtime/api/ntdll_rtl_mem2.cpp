@@ -24,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include <cpuid.h>
+#include <mutex>
 #include <sched.h>
 #include <time.h>
 #include <unistd.h>
@@ -2236,125 +2238,117 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlImageRvaToSection(
 
 // --------------------------------------------------------------- the FLS
 //
-// The fiber-local storage is an array of slots indexed by a per-call
-// allocation. One guest thread runs here, so the slot array is a single
-// vector and a fiber index has no other thread's values to collide with --
-// but the index a caller gets back is one it can pass to `RtlFlsFree`, so
-// it has to stay valid for as long as the storage does, which means indices
-// are never reused while an allocation holds one.
+// Fiber-local storage has two halves, and they are owned by different
+// things: the *index* is process-wide -- one `RtlFlsAlloc` hands out a
+// number every thread of the process will understand -- and the *value* is
+// per thread, because that is the whole of what makes the storage local. A
+// model that keeps the values beside the indexes would give one thread's
+// block to every other thread, which is precisely the confusion the "local"
+// in the name is there to prevent.
+//
+// The values live in a thread-local array here, grown as indexes are handed
+// out and filled with nulls in the new space. A thread that asks for an
+// index it has never written therefore reads null, which is what a freshly
+// created thread is promised.
 
 namespace {
 
-struct FlsState {
-    std::vector<void*> slots;
-    // The indices handed out and not yet freed. A freed index goes back on
-    // this list rather than into the free pool directly, because a fiber
-    // that frees during a callback may be interrupted before it is done
-    // with the value.
-    std::vector<std::uint32_t> live;
-    bool in_use = false;
+// The indexes the process has handed out, with the callback each was
+// created with. A freed index keeps its place: handing it to a later
+// allocation would let a thread that still holds the old number read the
+// new caller's block.
+struct FlsSlot {
+    void* callback = nullptr;
+    // A freed index keeps its place in the array but stops answering: reads
+    // and writes through it are refused, which is what keeps a caller that
+    // held the old number from reaching whoever the number belongs to next.
+    bool live = true;
 };
 
-FlsState& fls_state() noexcept {
-    static FlsState state;
-    return state;
+std::mutex& fls_lock() noexcept {
+    static std::mutex lock;
+    return lock;
 }
 
+std::vector<FlsSlot>& fls_slots() noexcept {
+    static std::vector<FlsSlot> slots;
+    return slots;
+}
+
+// How many indexes the platform carries. A program that allocates past this
+// is out of indexes, which is the same limit Windows reports.
+constexpr std::size_t kFlsMaxIndexes = 128;
+
 constexpr std::uint32_t kFlsUnset = 0xFFFFFFFFu;
+
+// This thread's values, one per index and grown as they are handed out.
+thread_local std::vector<void*> t_fls_values;
+
+[[nodiscard]] bool fls_index_live(std::uint32_t index) noexcept {
+    return index < fls_slots().size() && fls_slots()[index].live;
+}
+
+// The cell of this thread's array an index names, grown to cover it.
+[[nodiscard]] void** fls_value_cell(std::uint32_t index) noexcept {
+    if (t_fls_values.size() <= index) {
+        t_fls_values.resize(static_cast<std::size_t>(index) + 1, nullptr);
+    }
+    return &t_fls_values[index];
+}
 
 }  // namespace
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlFlsAlloc(
     void* callback) noexcept {
-    FlsState& state = fls_state();
-    if (state.in_use) {
-        // Nesting is refused rather than silently aliased: two callers
-        // sharing one fiber's storage would each see the other's values,
-        // and a refused call is something the caller can report.
-        set_last_error(kErrorBusy);
+    std::lock_guard<std::mutex> lock(fls_lock());
+    auto& slots = fls_slots();
+    if (slots.size() >= kFlsMaxIndexes) {
+        set_last_error(kErrorNotEnoughMemory);
         return kFlsUnset;
     }
-    const auto index = static_cast<std::uint32_t>(state.slots.size());
-    state.slots.push_back(nullptr);
-    state.live.push_back(index);
-    state.in_use = true;
-    // The callback is kept so a caller that allocated one can tell that it
-    // did; this runtime's fibers do not run the callback at thread exit,
-    // because the guest controls when its fibers end.
-    static_cast<void>(callback);
+    const auto index = static_cast<std::uint32_t>(slots.size());
+    slots.push_back(FlsSlot{callback});
+    // The index is live from now, and this thread's cell for it is cleared,
+    // which is what a fresh allocation reads back before its first write.
+    *fls_value_cell(index) = nullptr;
     set_last_error(kErrorSuccess);
     return index;
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlFlsFree(
     std::uint32_t index) noexcept {
-    FlsState& state = fls_state();
-    if (index >= state.slots.size()) {
-        return kStInvalidParameter;
-    }
-    bool live = false;
-    for (std::uint32_t candidate : state.live) {
-        if (candidate == index) {
-            live = true;
-            break;
-        }
-    }
-    if (!live) {
+    std::lock_guard<std::mutex> lock(fls_lock());
+    if (!fls_index_live(index)) {
         // Freeing an index that was never allocated, or freeing one twice,
         // is refused: the second free would drop a slot another allocation
         // may since have been given.
         return kStInvalidParameter;
     }
-    for (auto it = state.live.begin(); it != state.live.end(); ++it) {
-        if (*it == index) {
-            state.live.erase(it);
-            break;
-        }
-    }
-    state.slots[index] = nullptr;
-    state.in_use = false;
+    fls_slots()[index].live = false;
+    fls_slots()[index].callback = nullptr;
     return kStSuccess;
 }
 
-namespace {
-
-// Whether an index is still allocated. The free list is the one record of
-// that, and reads and writes have to consult it for the same reason frees
-// do: a slot whose index was handed back may since have been given to
-// another allocation, and answering for it would hand one caller's value to
-// another.
-[[nodiscard]] bool fls_live(const FlsState& state,
-                            std::uint32_t index) noexcept {
-    for (std::uint32_t candidate : state.live) {
-        if (candidate == index) {
-            return true;
-        }
-    }
-    return false;
-}
-
-}  // namespace
-
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlFlsGetValue(
     std::uint32_t index, void** value) noexcept {
-    const FlsState& state = fls_state();
     if (value == nullptr) {
         return kStInvalidParameter;
     }
-    if (index >= state.slots.size() || !fls_live(state, index)) {
+    std::lock_guard<std::mutex> lock(fls_lock());
+    if (!fls_index_live(index)) {
         return kStInvalidParameter;
     }
-    *value = state.slots[index];
+    *value = *fls_value_cell(index);
     return kStSuccess;
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlFlsSetValue(
     std::uint32_t index, void* value) noexcept {
-    FlsState& state = fls_state();
-    if (index >= state.slots.size() || !fls_live(state, index)) {
+    std::lock_guard<std::mutex> lock(fls_lock());
+    if (!fls_index_live(index)) {
         return kStInvalidParameter;
     }
-    state.slots[index] = value;
+    *fls_value_cell(index) = value;
     return kStSuccess;
 }
 
@@ -3043,16 +3037,46 @@ extern "C" __attribute__((ms_abi)) void nr2_RtlLocateLegacyContext(
     *legacy = extended;
 }
 
-extern "C" __attribute__((ms_abi)) void nr2_RtlGetEnabledExtendedFeatures(
-    std::uint64_t* features) noexcept {
-    // No architectural feature is switched on for a guest of this runtime:
-    // the guest sees the host's own instruction set and no context-switch
-    // extension, so the mask is zero rather than a guess at which of them
-    // the host happens to have.
-    if (features == nullptr) {
-        return;
+namespace {
+
+// The extended-state components this machine has switched on, as `XCR0`
+// holds them.
+//
+// The low bits of `XCR0` and the platform's own `XSTATE_MASK_*` constants
+// name the same components in the same order, so the register's value is the
+// mask a caller compares against. `XGETBV` is only legal when the processor
+// and the operating system both support it, which is what the `OSXSAVE` bit
+// of the first `CPUID` leaf reports -- executing it without that check is an
+// invalid-opcode fault rather than a wrong answer.
+[[nodiscard]] std::uint64_t enabled_extended_features() noexcept {
+    unsigned eax = 0;
+    unsigned ebx = 0;
+    unsigned ecx = 0;
+    unsigned edx = 0;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0) {
+        return 0;
     }
-    *features = 0;
+    constexpr unsigned kOsxsave = 1u << 27;
+    if ((ecx & kOsxsave) == 0) {
+        return 0;
+    }
+    std::uint32_t low = 0;
+    std::uint32_t high = 0;
+    __asm__ __volatile__("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+    return (static_cast<std::uint64_t>(high) << 32) | low;
+}
+
+}  // namespace
+
+extern "C" __attribute__((ms_abi)) std::uint64_t nr2_RtlGetEnabledExtendedFeatures(
+    std::uint64_t mask) noexcept {
+    // The argument is a mask of the components the caller is asking about,
+    // and the answer is the part of it this machine has switched on -- not a
+    // pointer to write through. The generated code reads the answer out of
+    // `%rax` and tests a bit of it, which is how the mistake this function
+    // once held showed itself: an address read out of a register that never
+    // held one.
+    return mask & enabled_extended_features();
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetExtendedFeaturesMask(

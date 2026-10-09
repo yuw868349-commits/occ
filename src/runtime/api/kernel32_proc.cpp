@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1737,30 +1738,52 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Toolhelp32ReadProcessMemory
 extern "C" __attribute__((ms_abi)) std::uint64_t k32p_CreateThread(
     void* attributes, std::uint64_t stack_size, std::uint64_t start,
     void* parameter, std::uint32_t flags, std::uint32_t* thread_id) noexcept {
-    // A second guest thread needs its own TEB, its own TLS slots and its
-    // own stack inside the address space, and a scheduler for the guest's
-    // fault and exception state. The runtime runs one guest thread by
-    // design; a stub that returned a handle would hand the caller a thread
-    // that never runs.
-    (void)attributes;
-    (void)stack_size;
-    (void)start;
-    (void)parameter;
-    (void)flags;
-    (void)thread_id;
-    set_last_error(kErrorCallNotImplemented);
-    return 0;
+    // The thread attributes carry a security descriptor and an inheritance
+    // flag, and neither applies here: the handle goes to the process that
+    // asked for it, and there is no second process to inherit it.
+    static_cast<void>(attributes);
+
+    // `CREATE_SUSPENDED`. The other flag a caller may set says the stack
+    // size is a reservation rather than a commitment, which is what a
+    // mapping of the guest's address space is either way.
+    constexpr std::uint32_t kCreateSuspended = 0x00000004u;
+
+    GuestThreadRequest request;
+    request.start = start;
+    request.parameter = reinterpret_cast<std::uint64_t>(parameter);
+    request.stack_size = stack_size;
+    request.suspended = (flags & kCreateSuspended) != 0;
+
+    std::uint32_t id = 0;
+    const std::uint64_t handle = create_guest_thread(request, &id);
+    if (handle == 0) {
+        return 0;
+    }
+    if (thread_id != nullptr) {
+        *thread_id = id;
+    }
+    return handle;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32p_OpenThread(
     std::uint32_t access, std::int32_t inherit, std::uint32_t tid) noexcept {
-    (void)access;
-    (void)inherit;
-    if (tid == 0 || tid != current_tid()) {
+    // The access the caller asked for is not modelled: every thread handle
+    // this runtime hands out is the full-access one, and a caller that
+    // narrows its request is asking for less than it is given.
+    static_cast<void>(access);
+    static_cast<void>(inherit);
+
+    if (tid == 0) {
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    return kCurrentThreadPseudo;
+    if (tid == current_tid()) {
+        // The pseudo handle names the calling thread and needs no table
+        // entry: it is the one handle Windows lets a program close without
+        // ending the thread it names.
+        return kCurrentThreadPseudo;
+    }
+    return open_guest_thread(tid);
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32p_GetExitCodeThread(
@@ -1769,30 +1792,42 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_GetExitCodeThread(
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    if (handle != kCurrentThreadPseudo) {
-        set_last_error(kErrorInvalidHandle);
+    if (handle == kCurrentThreadPseudo) {
+        // The calling thread has not ended, which is what `STILL_ACTIVE`
+        // says. A caller that reads this after the thread ended reads it
+        // through a handle, and a pseudo handle has no exit code to read.
+        *code = kStillActive;
+        set_last_error(0);
+        return 1;
+    }
+    if (guest_thread_exit_code(handle, code) != 0) {
         return 0;
     }
-    *code = kStillActive;
-    set_last_error(0);
     return 1;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32p_SuspendThread(
     std::uint64_t handle) noexcept {
-    // The one guest thread is the thread that would do the suspending;
-    // suspending it wedges the process, and there is no second thread to
-    // suspend instead. `(DWORD)-1` is the failure answer.
-    (void)handle;
-    set_last_error(kErrorCallNotImplemented);
-    return 0xFFFFFFFFU;
+    // Suspending the calling thread would park it with nothing left to
+    // resume it, which is a state Windows allows a program to enter and
+    // this runtime refuses to enter for it. `(DWORD)-1` is the failure
+    // answer either way.
+    if (handle == kCurrentThreadPseudo) {
+        set_last_error(kErrorInvalidHandle);
+        return 0xFFFFFFFFU;
+    }
+    return suspend_guest_thread(handle);
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32p_ResumeThread(
     std::uint64_t handle) noexcept {
-    (void)handle;
-    set_last_error(kErrorCallNotImplemented);
-    return 0xFFFFFFFFU;
+    if (handle == kCurrentThreadPseudo) {
+        set_last_error(kErrorInvalidHandle);
+        return 0xFFFFFFFFU;
+    }
+    std::uint32_t previous = 0;
+    const std::uint32_t status = resume_guest_thread(handle, &previous);
+    return status;
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32p_TerminateThread(
@@ -1809,11 +1844,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_TerminateThread(
 
 extern "C" __attribute__((ms_abi)) void k32p_ExitThread(
     std::uint32_t code) noexcept {
-    // The guest runs on one thread, so the thread calling `ExitThread` is
-    // the last thread, and Windows ends a process whose last thread
-    // exits. The exit path is the same one `ExitProcess` uses.
-    k32_ExitProcess(code);
-    __builtin_unreachable();
+    // `ExitThread` ends the thread that calls it, and nothing else: the
+    // image's entry thread is the one whose return ends the process, so
+    // calling this on it ends the process too, and on a thread this runtime
+    // created it ends that thread.
+    exit_current_guest_thread(code);
 }
 
 // ---------------------------------------------------------------------------
@@ -1840,15 +1875,191 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32p_CreateThreadpoolWork(
     return 0;
 }
 
+// The threadpool IO objects, and the three calls that surround an
+// operation on one.
+//
+// A caller hands a file handle to `CreateThreadpoolIo` and gets an object
+// back. It then brackets every asynchronous operation on that file with
+// `StartThreadpoolIo` and, if it changes its mind, `CancelThreadpoolIo`;
+// when the operation completes, the callback the object was created with
+// runs and `CloseThreadpoolIo` releases it.
+//
+// The object here is real and holds those four things. What it cannot do is
+// move the callback to a pool thread, because this runtime runs one guest
+// thread -- but the callback still runs, in the thread that completed the
+// operation, with the four arguments the contract gives it. A program that
+// used the callback as a wakeup gets the wakeup; one that used it expecting
+// a second thread would have got a second thread's worth of concurrency
+// only if there were a second thread, which there is not.
+namespace {
+
+// The handle range for these objects. It sits above the file range and
+// below the object range so that a handle of one kind handed to a call of
+// another is refused by the range test rather than by a table walk.
+constexpr std::uint64_t kThreadpoolIoBase = 0x600000;
+constexpr std::uint64_t kThreadpoolIoSpan = 0x1000;
+
+struct ThreadpoolIo {
+    std::uint64_t file = 0;
+    std::uint64_t callback = 0;
+    void* context = nullptr;
+    bool started = false;
+    bool live = false;
+};
+
+std::mutex& threadpool_mutex() noexcept {
+    static std::mutex guard;
+    return guard;
+}
+
+std::vector<ThreadpoolIo>& threadpool_table() noexcept {
+    static std::vector<ThreadpoolIo> table;
+    return table;
+}
+
+[[nodiscard]] ThreadpoolIo* threadpool_lookup(std::uint64_t handle) noexcept {
+    if (handle < kThreadpoolIoBase || handle >= kThreadpoolIoBase + kThreadpoolIoSpan) {
+        return nullptr;
+    }
+    const std::uint64_t index = handle - kThreadpoolIoBase;
+    if (index >= threadpool_table().size()) {
+        return nullptr;
+    }
+    ThreadpoolIo& entry = threadpool_table()[index];
+    return entry.live ? &entry : nullptr;
+}
+
+}  // namespace
+
+// The callback an IO object was created with. It is guest code called from
+// here, so the convention is part of the type.
+using ThreadpoolIoCallback = void(__attribute__((ms_abi))*)(
+    void* instance, void* context, void* overlapped, std::uint32_t result,
+    std::uint64_t transferred, std::uint64_t io);
+
+// The completion of an operation on a file some IO object is watching. This
+// is called by the file layer once the operation has finished, and it is
+// what turns the object into the callback the caller asked for.
+//
+// The callback is taken out of the table before it runs, so that a callback
+// which starts another operation cannot re-enter this one.
+void threadpool_io_notify(std::uint64_t file, std::uint64_t overlapped,
+                          std::uint32_t bytes,
+                          std::uint32_t status) noexcept {
+    std::uint64_t callback = 0;
+    void* context = nullptr;
+    std::uint64_t handle = 0;
+    {
+        const std::lock_guard<std::mutex> guard(threadpool_mutex());
+        for (std::size_t i = 0; i < threadpool_table().size(); ++i) {
+            ThreadpoolIo& entry = threadpool_table()[i];
+            if (!entry.live || !entry.started || entry.file != file) {
+                continue;
+            }
+            entry.started = false;
+            callback = entry.callback;
+            context = entry.context;
+            handle = kThreadpoolIoBase + i;
+            break;
+        }
+    }
+
+    if (callback == 0) {
+        return;
+    }
+    const auto run = reinterpret_cast<ThreadpoolIoCallback>(callback);
+    run(nullptr, context, reinterpret_cast<void*>(overlapped), status, bytes,
+        handle);
+}
+
+// Whether any IO object is watching this file, which is the question the
+// file layer asks before it pays for the notify above.
+[[nodiscard]] bool threadpool_io_watching(std::uint64_t file) noexcept {
+    const std::lock_guard<std::mutex> guard(threadpool_mutex());
+    for (const ThreadpoolIo& entry : threadpool_table()) {
+        if (entry.live && entry.started && entry.file == file) {
+            return true;
+        }
+    }
+    return false;
+}
+
 extern "C" __attribute__((ms_abi)) std::uint64_t k32p_CreateThreadpoolIo(
     std::uint64_t file, std::uint64_t callback, void* context,
     std::uint64_t environment) noexcept {
-    (void)file;
-    (void)callback;
-    (void)context;
-    (void)environment;
-    set_last_error(kErrorCallNotImplemented);
-    return 0;
+    static_cast<void>(environment);
+    if (callback == 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+
+    const std::lock_guard<std::mutex> guard(threadpool_mutex());
+    std::vector<ThreadpoolIo>& table = threadpool_table();
+
+    // A released slot is reused before the table grows, because a program
+    // that creates an IO object per operation would otherwise grow the
+    // table with every call.
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        if (table[i].live) {
+            continue;
+        }
+        table[i] = ThreadpoolIo {};
+        table[i].file = file;
+        table[i].callback = callback;
+        table[i].context = context;
+        table[i].live = true;
+        set_last_error(0);
+        return kThreadpoolIoBase + i;
+    }
+
+    table.push_back(ThreadpoolIo {});
+    ThreadpoolIo& entry = table.back();
+    entry.file = file;
+    entry.callback = callback;
+    entry.context = context;
+    entry.live = true;
+
+    set_last_error(0);
+    return kThreadpoolIoBase + table.size() - 1;
+}
+
+extern "C" __attribute__((ms_abi)) void k32p_StartThreadpoolIo(
+    std::uint64_t io) noexcept {
+    const std::lock_guard<std::mutex> guard(threadpool_mutex());
+    ThreadpoolIo* entry = threadpool_lookup(io);
+    if (entry == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return;
+    }
+    // Starting twice without a completion between is what a caller does
+    // when it starts an operation and then starts another; the contract
+    // says the second start is a no-op rather than a mistake.
+    entry->started = true;
+    set_last_error(0);
+}
+
+extern "C" __attribute__((ms_abi)) void k32p_CancelThreadpoolIo(
+    std::uint64_t io) noexcept {
+    const std::lock_guard<std::mutex> guard(threadpool_mutex());
+    ThreadpoolIo* entry = threadpool_lookup(io);
+    if (entry == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return;
+    }
+    entry->started = false;
+    set_last_error(0);
+}
+
+extern "C" __attribute__((ms_abi)) void k32p_CloseThreadpoolIo(
+    std::uint64_t io) noexcept {
+    const std::lock_guard<std::mutex> guard(threadpool_mutex());
+    ThreadpoolIo* entry = threadpool_lookup(io);
+    if (entry == nullptr) {
+        set_last_error(kErrorInvalidHandle);
+        return;
+    }
+    *entry = ThreadpoolIo {};
+    set_last_error(0);
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32p_CreateThreadpoolCleanupGroup() noexcept {
@@ -2013,6 +2224,9 @@ void add_kernel32_proc(ExportList& out) {
     e("CreateThreadpoolCleanupGroup",
       reinterpret_cast<void*>(&k32p_CreateThreadpoolCleanupGroup));
     e("CreateThreadpoolIo", reinterpret_cast<void*>(&k32p_CreateThreadpoolIo));
+    e("StartThreadpoolIo", reinterpret_cast<void*>(&k32p_StartThreadpoolIo));
+    e("CancelThreadpoolIo", reinterpret_cast<void*>(&k32p_CancelThreadpoolIo));
+    e("CloseThreadpoolIo", reinterpret_cast<void*>(&k32p_CloseThreadpoolIo));
     e("CreateThreadpoolWork",
       reinterpret_cast<void*>(&k32p_CreateThreadpoolWork));
     e("CreateToolhelp32Snapshot",

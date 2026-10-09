@@ -64,8 +64,8 @@ constexpr std::size_t kFindLastAccess = 12;
 constexpr std::size_t kFindLastWrite = 20;
 constexpr std::size_t kFindSizeHigh = 28;
 constexpr std::size_t kFindSizeLow = 32;
-constexpr std::size_t kFindReserved0 = 36;
-constexpr std::size_t kFindReserved1 = 40;
+[[maybe_unused]] constexpr std::size_t kFindReserved0 = 36;
+[[maybe_unused]] constexpr std::size_t kFindReserved1 = 40;
 constexpr std::size_t kFindName = 44;
 constexpr std::size_t kFindNameChars = 260;
 constexpr std::size_t kFindShortName = 564;
@@ -75,13 +75,11 @@ constexpr std::size_t kFindBytes = 592;
 // BY_HANDLE_FILE_INFORMATION, which is what `GetFileInformationByHandle`
 // fills: the same attributes and times, then the volume serial, the size in
 // two halves, the link count and two file indices.
-constexpr std::size_t kByHandleBytes = 52;
-
+[[maybe_unused]] constexpr std::size_t kByHandleBytes = 52;
 // FILE_BASIC_INFO and FILE_STANDARD_INFO are what the Ex accessor answers.
 // The basic one is the four times and the attributes, 40 bytes in all.
-constexpr std::size_t kBasicInfoBytes = 40;
-constexpr std::size_t kStandardInfoBytes = 24;
-
+[[maybe_unused]] constexpr std::size_t kBasicInfoBytes = 40;
+[[maybe_unused]] constexpr std::size_t kStandardInfoBytes = 24;
 // The attributes a directory entry can carry. Windows spells them as bits
 // and a guest tests them the same way, so the numbers matter: they are what
 // a caller compares against `FILE_ATTRIBUTE_DIRECTORY`.

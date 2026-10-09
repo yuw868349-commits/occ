@@ -200,7 +200,7 @@ std::string wide_to_narrow(const char16_t* text) {
 void test_registration() {
     ExportList list;
     add_kernel32_proc(list);
-    check_eq(list.size(), 60, "api: the domain registers 60 names");
+    check_eq(list.size(), 63, "api: the domain registers 63 names");
     static const char* const names[] = {
         "CreateProcessA", "CreateProcessAsUserA", "CreateProcessAsUserW",
         "CreateProcessInternalA", "CreateProcessInternalW", "CreateProcessW",
@@ -655,9 +655,9 @@ void test_thread_handles() {
              "threads: an unknown handle names ERROR_INVALID_HANDLE");
 
     check_eq(k32p_SuspendThread(kCurrentThreadPseudo), 0xFFFFFFFFU,
-             "threads: suspending is refused");
-    check_eq(winabi::k32_GetLastError(), kErrorCallNotImplemented,
-             "threads: suspending names ERROR_CALL_NOT_IMPLEMENTED");
+             "threads: suspending the caller's own thread is refused");
+    check_eq(winabi::k32_GetLastError(), kErrorInvalidHandle,
+             "threads: the pseudo handle names ERROR_INVALID_HANDLE");
     check_eq(k32p_CreateThread(nullptr, 0, 0, nullptr, 0, nullptr), 0,
              "threads: creating is refused");
     check_eq(winabi::k32_GetLastError(), kErrorCallNotImplemented,

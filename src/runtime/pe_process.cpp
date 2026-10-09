@@ -1217,6 +1217,21 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
 
     winabi::set_guest_state(&state);
     winabi::install_terminate_path(&guest_terminate);
+
+    // The image's static TLS. The module is given its index -- written into
+    // the image's own `_tls_index` -- and the thread that is about to run
+    // gets the block that index names. Both have to be in place before the
+    // entry point, because the first `__declspec(thread)` variable the
+    // guest touches is reached through them.
+    // An image that declares no TLS answers false to the first call and has
+    // nothing to build in the second, so a false here is the ordinary case
+    // rather than a failure. A block that could not be allocated is the
+    // other way to get false, and it needs no report of its own: the guest
+    // faults at the first `__declspec(thread)` access and the fault path
+    // says where.
+    static_cast<void>(winabi::register_module_tls(state, image.module.base));
+    static_cast<void>(winabi::install_thread_tls(state));
+
     g_run_frame.state = &state;
 
     // --- the fault plumbing ----------------------------------------------

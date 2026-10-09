@@ -62,14 +62,41 @@ namespace winabi {
 // The guest execution state
 // --------------------------------------------------------------------------
 
+// One module's static TLS, as its image's TLS directory describes it.
+//
+// A `__declspec(thread)` variable is reached through two levels: a
+// per-module index, which the loader writes into the image's own
+// `_tls_index` variable, and a per-thread block of storage, which the TEB's
+// TLS array points at. Every thread needs a block of its own, even though
+// every block is copied from the same template.
+struct GuestTlsModule {
+    // The image the TLS belongs to, which is the handle a callback is
+    // called with.
+    std::uint64_t image_base = 0;
+    // The slot in the TEB's TLS array this module's block lives in.
+    std::uint32_t index = 0;
+    // Where the template is: the initialised bytes every block starts as.
+    std::uint64_t raw_start = 0;
+    std::uint64_t raw_end = 0;
+    // The address the loader writes `index` to, which is the image's
+    // `_tls_index`.
+    std::uint64_t index_va = 0;
+    // The module's TLS callbacks, which a thread runs when it attaches and
+    // detaches. Zero means the image has none.
+    std::uint64_t callbacks = 0;
+    // How many zero bytes follow the template.
+    std::uint32_t zero_fill = 0;
+};
+
 // Everything a host-implemented export needs to know about the guest it is
 // serving.
 //
-// One per running guest, installed before `enter_guest` jumps into the image
-// and read by every thunk through `guest_state()`. The process runs the
-// guest on one thread -- the design has one TEB, one stack and one entry --
-// so a thread-local pointer is the whole of the dispatch and there is no
-// handle-passing ceremony in any thunk signature.
+// One per running guest thread, installed before `enter_guest` jumps into
+// the image and read by every thunk through `guest_state()`. Every thread
+// has its own -- the last error and the TLS slots live in the TEB, and a
+// thread that wrote through another thread's TEB would be writing another
+// thread's error code -- and the thread-local pointer is the whole of the
+// dispatch, so no thunk signature carries it.
 struct GuestState {
     // The address space the guest lives in. `VirtualProtect` and
     // `VirtualQuery` answer from the same ledger the loader used, which is
@@ -85,6 +112,12 @@ struct GuestState {
     std::uint64_t teb = 0;
     std::uint64_t peb = 0;
     std::uint64_t image_base = 0;
+
+    // The static TLS of every module the process carries, which is what a
+    // new thread's blocks are built from. Empty for a process whose images
+    // declare none, which is the common case and the one where a thread
+    // needs nothing beyond its TEB.
+    std::vector<GuestTlsModule> tls_modules;
 
     // The command line and what it parses to. Built once, before the guest
     // starts, so that `GetCommandLineA`, `GetCommandLineW` and
@@ -204,6 +237,102 @@ void set_guest_state(GuestState* state) noexcept;
 // it is installed the only exit available is the process's own.
 using TerminateFn = void(std::uint32_t code) noexcept;
 void install_terminate_path(TerminateFn* fn) noexcept;
+
+// --------------------------------------------------------------------------
+// Guest threads
+// --------------------------------------------------------------------------
+
+// What `CreateThread` asks for: the guest address to call, the value to pass
+// it, the stack the caller wants, and whether the thread should start
+// running or wait to be resumed.
+struct GuestThreadRequest {
+    // The guest's thread procedure, an address in the image, called with the
+    // Windows ABI.
+    std::uint64_t start = 0;
+    std::uint64_t parameter = 0;
+    // The stack to reserve, or zero for this runtime's default.
+    std::uint64_t stack_size = 0;
+    // Whether the thread waits at the gate until `resume_guest_thread`.
+    bool suspended = false;
+};
+
+// Creates a guest thread and answers the handle for it, or zero. The id the
+// guest will read back through `GetCurrentThreadId` is written through
+// `thread_id` when it is not null.
+//
+// The thread gets its own TEB, its own stack in the guest's address space,
+// and its own `GuestState`; what it shares with the thread that created it
+// is the address space, the PEB and the modules, which is what a process is.
+[[nodiscard]] std::uint64_t create_guest_thread(
+    const GuestThreadRequest& request, std::uint32_t* thread_id) noexcept;
+
+// Ends the thread this call is running on, with the code the guest asked
+// for. On the process's first thread this ends the process, which is what
+// ending the last thread means.
+[[noreturn]] void exit_current_guest_thread(std::uint32_t code) noexcept;
+
+// Whether a handle names a thread this runtime created.
+[[nodiscard]] bool is_guest_thread_handle(std::uint64_t handle) noexcept;
+
+// The thread's exit code, or `STILL_ACTIVE` while it runs. Answers
+// `WAIT_FAILED` for a handle that names no thread.
+[[nodiscard]] std::uint32_t guest_thread_exit_code(std::uint64_t handle,
+                                                   std::uint32_t* code) noexcept;
+
+// Waits for the thread to end. A negative timeout waits without a bound;
+// the result is `WAIT_OBJECT_0`, `WAIT_TIMEOUT` or `WAIT_FAILED`.
+[[nodiscard]] std::uint32_t wait_guest_thread(std::uint64_t handle,
+                                              std::int64_t milliseconds) noexcept;
+
+// Ends the handle's claim on the thread. The thread itself, and the record
+// that describes it, are released once it has stopped.
+[[nodiscard]] bool close_guest_thread(std::uint64_t handle) noexcept;
+
+// Releases a thread created suspended, or decrements the suspend count of a
+// running one. `previous` receives the count from before the call.
+[[nodiscard]] std::uint32_t resume_guest_thread(std::uint64_t handle,
+                                                std::uint32_t* previous) noexcept;
+
+// Stops the thread where it stands. A thread executing guest code has no
+// point the runtime controls, so it is stopped by a signal whose handler
+// parks it until the count reaches zero.
+[[nodiscard]] std::uint32_t suspend_guest_thread(std::uint64_t handle) noexcept;
+
+// The handle for a thread id, or zero when no thread of this process has it.
+[[nodiscard]] std::uint64_t open_guest_thread(std::uint32_t thread_id) noexcept;
+
+// How many guest threads exist, and the id and exit code of the one at an
+// index. This is what `Thread32First` and `Thread32Next` enumerate.
+[[nodiscard]] std::size_t guest_thread_count() noexcept;
+[[nodiscard]] bool guest_thread_at(std::size_t index,
+                                   std::uint32_t* thread_id) noexcept;
+[[nodiscard]] bool guest_thread_exit_code_at(std::size_t index,
+                                             std::uint32_t* code) noexcept;
+
+// --------------------------------------------------------------------------
+// Static TLS
+// --------------------------------------------------------------------------
+
+// Reads an image's TLS directory and records it on the state, writing the
+// index the module was given into the image's own `_tls_index` variable.
+//
+// Answers false when the image declares no TLS, which is not a failure: an
+// image that uses no `__declspec(thread)` variable has no directory and
+// needs no block.
+[[nodiscard]] bool register_module_tls(GuestState& state,
+                                       std::uint64_t image_base) noexcept;
+
+// Builds the calling thread's TLS blocks from the recorded templates, points
+// the TEB's TLS array at them, and runs the modules' attach callbacks.
+//
+// This is the step that makes a second thread able to use a
+// `__declspec(thread)` variable at all: the array slot is what the compiled
+// `mov %gs:0x58` sequence reads, and a slot holding zero is a thread that
+// dereferences address zero the first time it touches one.
+[[nodiscard]] bool install_thread_tls(GuestState& state) noexcept;
+
+// Runs the recorded modules' TLS callbacks for a thread that is detaching.
+void run_thread_detach_callbacks(GuestState& state) noexcept;
 
 // --------------------------------------------------------------------------
 // Module registration

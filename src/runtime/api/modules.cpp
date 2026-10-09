@@ -52,6 +52,21 @@ void add_module_crypt32(ExportModule& module) {
     add_crypt32(module.host_exports);
 }
 
+void add_module_bcrypt(ExportModule& module) {
+    module.name = "BCRYPT.dll";
+    add_bcrypt(module.host_exports);
+}
+
+void add_module_ws2_32(ExportModule& module) {
+    module.name = "WS2_32.dll";
+    add_ws2_32(module.host_exports);
+}
+
+void add_module_iphlpapi(ExportModule& module) {
+    module.name = "IPHLPAPI.dll";
+    add_iphlpapi(module.host_exports);
+}
+
 void add_module_ole32(ExportModule& module) {
     module.name = "OLE32.dll";
     add_ole32(module.host_exports);

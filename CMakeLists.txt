@@ -572,6 +572,8 @@ add_library(occ_core STATIC
     src/runtime/pe_process.cpp
     src/runtime/seh.cpp
     src/runtime/winabi.cpp
+    src/runtime/guest_thread.cpp
+    src/runtime/guest_tls.cpp
     src/runtime/api_common.cpp
     src/runtime/apiset.cpp
     src/runtime/api/path.cpp
@@ -602,6 +604,10 @@ add_library(occ_core STATIC
     src/runtime/api/kernel32_file2.cpp
     src/runtime/api/kernel32_state2.cpp
     src/runtime/api/kernel32_ctx2.cpp
+    src/runtime/api/kernel32_io2.cpp
+    src/runtime/api/bcrypt.cpp
+    src/runtime/api/ws2_32.cpp
+    src/runtime/api/iphlpapi.cpp
     src/runtime/api/advapi32_reg.cpp
     src/runtime/api/advapi32_sec.cpp
     src/runtime/api/ntdll_rtl_str.cpp

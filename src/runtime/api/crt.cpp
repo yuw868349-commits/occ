@@ -51,14 +51,21 @@ extern "C" __attribute__((ms_abi)) void k32_ExitProcess(
     std::uint32_t code) noexcept;
 extern "C" __attribute__((ms_abi)) void* k32s2_GetEnvironmentStringsW(
     void) noexcept;
+// The line the loader gave the image. The argument vector is built from it
+// here rather than from the host's own arguments, because the two are not
+// the same line: the guest's was assembled for a Windows program, with the
+// program path first and Microsoft's quoting rules applied.
+extern "C" __attribute__((ms_abi)) const char* k32_GetCommandLineA() noexcept;
 extern "C" __attribute__((ms_abi)) void cr_ucrt_set_app_type(
     std::int32_t type) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ucrt_configure_wide_argv(
+    std::int32_t mode) noexcept;
 extern "C" __attribute__((ms_abi)) int* cr_ucrt_p_argc() noexcept;
 extern "C" __attribute__((ms_abi)) char16_t*** cr_ucrt_p_wargv() noexcept;
 extern "C" __attribute__((ms_abi)) int* cr_ucrt_p_commode() noexcept;
 extern "C" __attribute__((ms_abi)) int cr_ucrt_set_fmode(int mode) noexcept;
 extern "C" __attribute__((ms_abi)) int cr_ucrt_configthreadlocale( int type) noexcept;
-extern "C" __attribute__((ms_abi)) void cr_ucrt_initterm_e( GuestInitFn* first, GuestInitFn* last) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ucrt_initterm_e( GuestInitFn* first, GuestInitFn* last) noexcept;
 extern "C" __attribute__((ms_abi)) void cr_ucrt_crt_atexit( GuestPvfv function) noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t cr_ucrt_initialize_onexit_table( void* table) noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t cr_ucrt_register_onexit_function( void* table, GuestPvfv function) noexcept;
@@ -255,6 +262,8 @@ void add_crt_exports(ExportList& out) {
         e("__p___wargv", reinterpret_cast<void*>(&cr_ucrt_p_wargv)),
         e("__p__commode", reinterpret_cast<void*>(&cr_ucrt_p_commode)),
         e("_set_fmode", reinterpret_cast<void*>(&cr_ucrt_set_fmode)),
+        e("_configure_wide_argv",
+          reinterpret_cast<void*>(&cr_ucrt_configure_wide_argv)),
         e("_configthreadlocale",
           reinterpret_cast<void*>(&cr_ucrt_configthreadlocale)),
         e("_initterm_e", reinterpret_cast<void*>(&cr_ucrt_initterm_e)),
@@ -336,11 +345,10 @@ std::vector<GuestPvfv>& crt_atexit_list() noexcept {
     return list;
 }
 
-// What `_set_app_type` recorded. The value selects the startup path in a
-// Windows runtime; here it is stored because a caller may read it back
-// through `__p___argc`'s siblings, and because a value that was accepted and
-// forgotten is a value the next reader gets wrong.
-std::int32_t g_app_type = 0;
+// What `_set_app_type` recorded lives in the guest's own state -- the
+// `GuestState::app_type` field -- rather than in a file-scope variable,
+// because the value is a fact about the *guest* and a second copy here would
+// be a second answer to the same question.
 
 // The thread-local-locale setting `_configthreadlocale` returns and stores.
 std::int32_t g_thread_locale = 0;
@@ -358,7 +366,13 @@ char16_t** g_crt_wargv = nullptr;
 
 extern "C" __attribute__((ms_abi)) void cr_ucrt_set_app_type(
     std::int32_t type) noexcept {
-    g_app_type = type;
+    // The value selects the startup path in a Windows runtime, and it is
+    // observable: a caller that reads the guest's state back sees what the
+    // startup set.
+    GuestState* g = guest_state();
+    if (g != nullptr) {
+        g->app_type = static_cast<std::uint32_t>(type);
+    }
 }
 
 extern "C" __attribute__((ms_abi)) int* cr_ucrt_p_argc() noexcept {
@@ -393,16 +407,28 @@ extern "C" __attribute__((ms_abi)) int cr_ucrt_configthreadlocale(
     return previous;
 }
 
-extern "C" __attribute__((ms_abi)) void cr_ucrt_initterm_e(
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ucrt_initterm_e(
     GuestInitFn* first, GuestInitFn* last) noexcept {
     // The error-returning form: each initialiser answers an error code and
-    // the walk stops at the first that fails. The value is the caller's to
-    // interpret, so it is passed through rather than logged.
+    // the walk stops at the first that fails, whose code becomes this
+    // call's answer.
+    //
+    // A walk that reaches the end answers zero, and that zero is the whole
+    // of the contract rather than a formality. The startup around this call
+    // tests the answer and ends the process with a failure when it is not
+    // zero, so a value left behind in the register would end a program
+    // whose initialisers had all succeeded -- and it would end it before
+    // `main`, which is a failure with no sign of what produced it.
     for (GuestInitFn* p = first; p < last; ++p) {
-        if (*p != nullptr && (*p)() != 0) {
-            return;
+        if (*p == nullptr) {
+            continue;
+        }
+        const std::int32_t status = (*p)();
+        if (status != 0) {
+            return status;
         }
     }
+    return 0;
 }
 
 extern "C" __attribute__((ms_abi)) void cr_ucrt_crt_atexit(
@@ -574,6 +600,106 @@ extern "C" __attribute__((ms_abi)) void cr_ucrt_register_tls_atexit(
     }
 }
 
+
+// The wide argument vector the startup reads.
+//
+// `_configure_wide_argv` takes a mode, not an array. The mode says how much
+// of the command line becomes arguments: none of it, all of it as written,
+// or all of it with the wildcards the shell would have expanded. What the
+// call does with that answer is build `__wargv` and count `__argc`, and the
+// array it builds is the one `__p___wargv` hands out -- so that a program
+// reading the arguments through either name reads the same ones.
+//
+// The split follows the rules `CommandLineToArgvW` implements, because the
+// two are the same question asked twice: a program that takes its arguments
+// from `__wargv` and one that calls `CommandLineToArgvW` on the same line
+// must see the same arguments in the same places, or the startup and the
+// program disagree about what the command line said.
+//
+// The blocks come from this runtime's arena because the array and its
+// strings live in the guest's address space: the guest reads them with a
+// pointer it was handed, and memory from anywhere else would be an address
+// it cannot follow.
+
+namespace {
+
+// The mode that says the program wants no arguments at all. The other two
+// differ only in whether wildcards are expanded, and this runtime expands
+// none -- the guest receives the line the way the loader wrote it.
+constexpr std::int32_t kArgvNoArguments = 0;
+
+// The array and its strings, in one allocation: the pointers first, then
+// each argument's characters, so that the whole of what the guest reads is
+// one block and nothing has to be freed piecemeal.
+void build_wide_arguments() noexcept {
+    const char* line = k32_GetCommandLineA();
+    if (line == nullptr) {
+        return;
+    }
+    const std::vector<std::string> parts = split_command_line(line);
+    if (parts.empty()) {
+        return;
+    }
+
+    std::size_t total = (parts.size() + 1) * sizeof(char16_t*);
+    std::vector<std::size_t> offsets;
+    offsets.reserve(parts.size());
+    for (const std::string& part : parts) {
+        offsets.push_back(total);
+        total += (part.size() + 1) * sizeof(char16_t);
+    }
+
+    auto* block = static_cast<std::uint8_t*>(heap_alloc(0, total));
+    if (block == nullptr) {
+        return;
+    }
+    std::memset(block, 0, total);
+
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        auto* text = reinterpret_cast<char16_t*>(block + offsets[i]);
+        for (std::size_t c = 0; c < parts[i].size(); ++c) {
+            // The command line is read as bytes and each becomes one wide
+            // character. An argument that was not ASCII in the guest's own
+            // encoding arrives here already converted by the loader, which
+            // is the only place that knows what encoding the line was in.
+            text[c] = static_cast<char16_t>(
+                static_cast<unsigned char>(parts[i][c]));
+        }
+        text[parts[i].size()] = u'\0';
+        write_ptr(block, i * sizeof(char16_t*),
+                  reinterpret_cast<std::uint64_t>(text));
+    }
+    write_ptr(block, parts.size() * sizeof(char16_t*), 0);
+
+    g_crt_wargv = reinterpret_cast<char16_t**>(block);
+}
+
+}  // namespace
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_ucrt_configure_wide_argv(
+    std::int32_t mode) noexcept {
+    if (mode == kArgvNoArguments) {
+        // The program asked for no arguments. The count is what the startup
+        // reads, and the array is left as it was rather than cleared --
+        // a later call with a different mode has to find the line it was
+        // given, not a null it wrote over it.
+        g_crt_argc = 0;
+        return 0;
+    }
+
+    if (g_crt_wargv == nullptr) {
+        build_wide_arguments();
+    }
+
+    g_crt_argc = 0;
+    if (g_crt_wargv == nullptr) {
+        return 0;
+    }
+    while (g_crt_wargv[g_crt_argc] != nullptr) {
+        ++g_crt_argc;
+    }
+    return 0;
+}
 
 // ------------------------------------------------------ the floating point
 //
