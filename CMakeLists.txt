@@ -574,6 +574,8 @@ add_library(occ_core STATIC
     src/runtime/winabi.cpp
     src/runtime/guest_thread.cpp
     src/runtime/guest_tls.cpp
+    src/inspect/inspect.cpp
+    src/inspect/disasm.cpp
     src/runtime/api_common.cpp
     src/runtime/apiset.cpp
     src/runtime/api/path.cpp
@@ -628,6 +630,7 @@ add_executable(occ
     src/cmd_run.cpp
     src/cmd_attach.cpp
     src/cmd_stop.cpp
+    src/cmd_inspect.cpp
 )
 
 target_link_libraries(occ PRIVATE occ_core)

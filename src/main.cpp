@@ -29,6 +29,8 @@ void print_usage(const char* argv0) {
         "observer\n"
         "  attach <session>   reconnect to a running session\n"
         "  stop <session>     tear down a session\n"
+        "  inspect <path>     static report: headers, sections, imports,\n"
+        "                     exports, tls, exceptions, resources, strings\n"
         "  doctor             report host capabilities and limitations\n"
         "\n"
         "options:\n"
@@ -77,6 +79,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "stop") {
         return occ::cmd_stop(argc - 2, argv + 2);
+    }
+    if (cmd == "inspect") {
+        return occ::cmd_inspect(argc - 2, argv + 2);
     }
 
     // The PE runner, reached only by occ's own exec of itself: the engine's
