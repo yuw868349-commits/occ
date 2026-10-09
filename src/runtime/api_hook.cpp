@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace occ::runtime::api_hook {
@@ -28,6 +29,10 @@ constexpr std::uint32_t kCapacity = 65536;
 
 std::uint64_t g_targets[kCapacity] = {};
 std::vector<std::string> g_names;
+// Address to slot, so a rebuilt import slot can be named from the address
+// it holds. Built as the surface is registered; a duplicate address keeps
+// the first registration, which is the rule the name table uses too.
+std::unordered_map<std::uint64_t, std::uint32_t> g_by_address;
 std::uint32_t g_count = 0;
 bool g_overflowed = false;
 
@@ -57,6 +62,7 @@ std::uint32_t note(std::string_view module, std::string_view name,
     }
     const std::uint32_t slot = g_count++;
     g_targets[slot] = address;
+    g_by_address.emplace(address, slot);
 
     // The name is stored in slot order, so the report needs no lookup
     // structure: the slot is the index.
@@ -67,6 +73,25 @@ std::uint32_t note(std::string_view module, std::string_view name,
     full.append(name);
     g_names.push_back(std::move(full));
     return slot;
+}
+
+const char* name_for_address(std::uint64_t address) noexcept {
+    const auto it = g_by_address.find(address);
+    if (it == g_by_address.end()) {
+        return nullptr;
+    }
+    return g_names[it->second].c_str();
+}
+
+void note_trampoline(std::uint64_t address, std::uint32_t slot) noexcept {
+    if (slot >= g_count || address == 0) {
+        return;
+    }
+    // A trampoline address that collides with an implementation's keeps
+    // whichever was registered first, which is the implementation: the
+    // module surface is built before its trampolines are placed, so the
+    // entry can only already be there for a reason that matters.
+    g_by_address.emplace(address, slot);
 }
 
 // What the hook calls. One line per call: the export the slot belongs to

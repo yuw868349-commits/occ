@@ -2,6 +2,7 @@
 
 #include "occ/parser/pe.h"
 #include "occ/runtime/exports.h"
+#include "occ/runtime/iat_rebuild.h"
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/pe_process.h"
 #include "occ/runtime/winabi.h"
@@ -205,8 +206,13 @@ int run_pe_runner(int argc, char** argv) noexcept {
     // together. Taken before the exit below, because after it there is
     // nothing to read.
     if (runtime::image_dump::enabled()) {
-        static_cast<void>(runtime::image_dump::dump(
-            process->image().module.base, runtime::image_dump::path()));
+        const std::uint64_t base = process->image().module.base;
+        const std::string out = runtime::image_dump::path();
+        static_cast<void>(runtime::image_dump::dump(base, out));
+        // The dump has the bytes; this says what they call. Written beside
+        // the image so that the two travel together and a reader of one
+        // has the other's answer to hand.
+        static_cast<void>(runtime::iat_rebuild::report(base, out + ".iat.txt"));
     }
 
     // A fault the guest's own filter declined never gets here -- the process

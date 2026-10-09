@@ -310,6 +310,10 @@ namespace {
     // trampoline -- the first registration wins, as it does in the name
     // table.
     std::map<std::string, std::uint32_t> function_index;
+    // The slot each trampoline carries, in trampoline order, so that the
+    // addresses the guest will actually hold can be registered once the
+    // image is placed and those addresses are known.
+    std::vector<std::uint32_t> slot_of_index;
     const bool traced = api_hook::enabled();
     std::uint32_t index = 0;
     for (const Export& entry : module.exports) {
@@ -319,14 +323,13 @@ namespace {
         const std::uint32_t rva = static_cast<std::uint32_t>(
             text_rva + static_cast<std::uint64_t>(index) * kTrampolineStride);
         const std::uint64_t at = rva;
+        // The slot is claimed whether or not the calls are traced. The
+        // table behind it is what lets a dump name the address a rebuilt
+        // import slot holds, and that answer is wanted from a run that
+        // traces nothing -- so the registration is not part of the trace.
+        [[maybe_unused]] const std::uint32_t slot =
+            api_hook::note(module.name, entry.name, entry.address);
         if (traced) {
-            // The slot is claimed before the bytes that name it are
-            // written, because the trampoline carries the slot and the
-            // hook resolves it through the table -- so the two have to be
-            // the same number, and the only way to be sure is to write the
-            // one this call answered with.
-            const std::uint32_t slot =
-                api_hook::note(module.name, entry.name, entry.address);
             put8(image, at, 0x49);       // REX.WB
             put8(image, at + 1, 0xBB);   // mov r11, imm64
             put64(image, at + 2, slot);
@@ -351,6 +354,7 @@ namespace {
         }
         put32(image, functions_rva + static_cast<std::uint64_t>(index) * 4, rva);
         function_index.emplace(entry.name, index);
+        slot_of_index.push_back(slot);
         ++index;
     }
 
@@ -422,6 +426,18 @@ namespace {
     // and the directory's module-name pointer, whose string is written
     // into the same buffer before the whole image is copied across.
     put64(image, 0xb0, base);
+
+    // The addresses the guest will actually hold, now that they exist. A
+    // walk of the loader list reads the export table and stores the
+    // trampoline it finds there, so a trampoline -- and not the
+    // implementation behind it -- is what a rebuilt import slot contains.
+    // Registering both is what lets the same slot name the same function
+    // whichever of the two it happens to hold.
+    for (std::size_t i = 0; i < slot_of_index.size(); ++i) {
+        api_hook::note_trampoline(
+            base + text_rva + static_cast<std::uint64_t>(i) * kTrampolineStride,
+            slot_of_index[i]);
+    }
     put_string(image, module_name_rva, module.name);
     put32(image, dir_rva + 0x0c, static_cast<std::uint32_t>(module_name_rva));
     put32(image, 0x108, static_cast<std::uint32_t>(dir_rva));

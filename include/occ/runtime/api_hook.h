@@ -74,6 +74,28 @@ extern "C" void occ_api_note(std::uint64_t index, std::uint64_t a0,
 // symbol whose value the C++ side owns.
 extern "C" std::uint64_t* occ_api_targets;
 
+// The name an implementation address was registered under, or nullptr when
+// the address was not registered.
+//
+// This is the reverse of the table the hook reads, and it is what makes a
+// rebuilt import slot nameable: a packed image has no import directory to
+// read, so the only record of "this address is KERNEL32!CreateFileW" is
+// the one made when the module surface was built. The registration happens
+// whether or not the trace is on -- the answer is wanted for a dump that
+// traces nothing -- so this is available in either mode.
+[[nodiscard]] const char* name_for_address(std::uint64_t address) noexcept;
+
+// Registers an address that resolves to an already-claimed slot.
+//
+// A module's exports are reached through the trampolines in its image, and
+// a guest that walks the loader list reads the export table and stores what
+// it finds there -- so the address an image calls through, and the address
+// a rebuilt import slot holds, are the trampoline's and not the
+// implementation's. Both are registered so that either one names the same
+// function: the implementation when the trace names what ran, the
+// trampoline when a dump names what was stored.
+void note_trampoline(std::uint64_t address, std::uint32_t slot) noexcept;
+
 }  // namespace occ::runtime::api_hook
 
 #endif  // OCC_RUNTIME_API_HOOK_H_
