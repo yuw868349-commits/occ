@@ -491,6 +491,13 @@ void add_user32_extra(ExportList& out);
 // station keeps them.
 void add_user32_windows(ExportList& out);
 
+// The process-status surface: the module list, the memory counters and
+// the performance view, answered from this runtime's own state.
+void add_psapi(ExportList& out);
+
+// The version-information surface, read from the file itself.
+void add_version(ExportList& out);
+
 // The Rtl* half of ntdll: memory, strings, bits, sections, version.
 void add_ntdll_rtl(ExportList& out);
 

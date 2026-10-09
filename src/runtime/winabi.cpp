@@ -5415,6 +5415,18 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_io2(module.host_exports);
 }
 
+void add_module_psapi(ExportModule& module) {
+    module.name = "PSAPI.dll";
+    add_psapi(module.host_exports);
+    // The two names the family is also reached under: the shim module
+    // and the kernel's own export surface both carry the same calls.
+}
+
+void add_module_version(ExportModule& module) {
+    module.name = "VERSION.dll";
+    add_version(module.host_exports);
+}
+
 void add_user32(ExportModule& module) {
     module.name = "USER32.dll";
     const auto e = [](const char* n, void* fn) {
@@ -5485,6 +5497,9 @@ void register_host_modules(ExportRegistry& registry) {
         {"KERNELBASE.dll", &add_kernelbase},
         {"msvcrt.dll", &add_msvcrt},
         {"USER32.dll", &add_user32},
+        {"PSAPI.dll", &add_module_psapi},
+        {"PSAPI.DLL", &add_module_psapi},
+        {"VERSION.dll", &add_module_version},
         {"SHLWAPI.dll", &add_shlwapi},
         {"NTDLL.dll", &add_module_ntdll},
         {"GDI32.dll", &add_module_gdi32},
