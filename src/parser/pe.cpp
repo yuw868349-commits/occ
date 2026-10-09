@@ -86,6 +86,7 @@ constexpr std::size_t kOff64NumberOfRvaAndSizes = 108;
 constexpr std::size_t kDirSize = 8;
 constexpr std::size_t kDirExport = 0;
 constexpr std::size_t kDirImport = 1;
+constexpr std::size_t kDirException = 3;
 constexpr std::size_t kDirReloc = 5;
 constexpr std::size_t kOff32Directories = 96;
 constexpr std::size_t kOff64Directories = 112;
@@ -712,9 +713,14 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             }
         }
         // An empty SEH table is a valid configuration, so its presence is
-        // only asserted when the file states one.
-        const std::size_t seh_at = dirs_at + 4 * kDirSize;
-        if (usable > 4 && rd32(bytes, seh_at) != 0) {
+        // only asserted when the file states one. The directory read here is
+        // the exception table -- index 3, the one an x64 image's `.pdata`
+        // hangs off -- and not the certificate table at index 4. Reading the
+        // wrong one is a quiet failure in exactly one direction: a file with
+        // exception data and no signature was answered as having no SEH at
+        // all, which is the shape most x64 executables have.
+        const std::size_t seh_at = dirs_at + kDirException * kDirSize;
+        if (usable > kDirException && rd32(bytes, seh_at) != 0) {
             out.seh_ = true;
         }
     }

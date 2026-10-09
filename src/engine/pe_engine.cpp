@@ -115,7 +115,14 @@ public:
             e.add("ok", image.ok());
             if (image.ok()) {
                 e.add("format", image.is_pe32_plus() ? "pe32+" : "pe32");
-                e.add("kind", image.is_dll() ? "dll" : "executable");
+                // Not `kind`, which is the key every event in this stream
+                // uses to say what it is. A second `kind` in the same object
+                // collides with that one, and a consumer reading `kind` to
+                // tell one record from another reads this field instead --
+                // the image_loaded record then looks like an event named
+                // `executable`. The name mirrors `type` on the ELF branch,
+                // which is the same fact spelled for that format.
+                e.add("image_kind", image.is_dll() ? "dll" : "executable");
                 e.add("machine", static_cast<std::uint64_t>(image.machine()));
                 e.add("machine_raw",
                       static_cast<std::uint64_t>(image.machine_raw()));
