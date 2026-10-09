@@ -534,6 +534,10 @@ void add_ntdll_rtl_mem3(ExportList& out);
 // The Nt* and Zw* half of ntdll. In user mode the two are one function.
 void add_ntdll_nt(ExportList& out);
 
+// The debug object, the CSR client, the ALPC message shapes and the
+// SHA-1 the boot-time code hashes with.
+void add_ntdll_debug(ExportList& out);
+
 // The GDI32 surface.
 void add_gdi32(ExportList& out);
 
