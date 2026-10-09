@@ -35,6 +35,23 @@ int runner_failure(const char* what, const std::string& detail) noexcept {
 // `const std::string&` parameters it was declared with -- because a member
 // function taking `string_view` cannot sit in that pointer and a converting
 // wrapper would be a second signature to keep in step with the first.
+// Whether the run records the APIs the guest resolves.
+//
+// A packed image resolves what it needs at run time -- the import table it
+// shipped with is encrypted, empty, or both -- so the list of names it asks
+// for, in the order it asks, is the first thing a reader wants and the
+// thing no static report can give: the names are not in the file. This is
+// the guest-side counterpart of the observer's probes, and it exists
+// because the observer cannot see this process's guest at all -- `ptrace`
+// does not reach code the runtime runs in-process.
+[[nodiscard]] bool api_trace_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = ::getenv("OCC_API_TRACE");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return enabled;
+}
+
 std::uint64_t resolve_thunk(void* state, const std::string& dll,
                             const std::string& name, std::uint16_t ordinal,
                             bool by_ordinal) noexcept {
@@ -47,6 +64,22 @@ std::uint64_t resolve_thunk(void* state, const std::string& dll,
     const runtime::ExportLookup found =
         by_ordinal ? registry->find_by_ordinal(dll, ordinal)
                    : registry->find_by_name(dll, name, 0);
+    if (api_trace_enabled()) {
+        // The ordinal form names the request the way the guest made it: a
+        // resolver reached by ordinal did not supply the name, and printing
+        // one would invent the answer the guest never wrote.
+        if (by_ordinal) {
+            std::fprintf(stderr, "occ api: %s!#%u -> 0x%llx%s\n", dll.c_str(),
+                         static_cast<unsigned>(ordinal),
+                         static_cast<unsigned long long>(found.address),
+                         found.address == 0 ? " (unresolved)" : "");
+        } else {
+            std::fprintf(stderr, "occ api: %s!%s -> 0x%llx%s\n", dll.c_str(),
+                         name.c_str(),
+                         static_cast<unsigned long long>(found.address),
+                         found.address == 0 ? " (unresolved)" : "");
+        }
+    }
     return found.address;
 }
 
