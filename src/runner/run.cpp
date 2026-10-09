@@ -425,6 +425,26 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         }
     }
 
+    // A dump has to come back out of the container, and the container's
+    // root is its own: a path the caller named on the host does not exist
+    // inside it, which is why a dump written to the path as given cannot
+    // be opened. The directory the caller named is bound in writable at a
+    // fixed point and the runner is told to write there instead, so the
+    // switch it reads names a path this file chose and the two name the
+    // same bytes on either side of the boundary.
+    if (const char* dump = ::getenv("OCC_DUMP_IMAGE");
+        dump != nullptr && dump[0] != '\0') {
+        const std::string full(dump);
+        const std::size_t slash = full.find_last_of('/');
+        const std::string dir = slash == std::string::npos
+                                    ? std::string(".")
+                                    : full.substr(0, slash);
+        const std::string base =
+            slash == std::string::npos ? full : full.substr(slash + 1);
+        config.extra_mounts.push_back({dir, "/occ-dump-out", true});
+        env.emplace_back("OCC_DUMP_IMAGE=/occ-dump-out/" + base);
+    }
+
     // An observed run has to have its target stop at the exec boundary, or
     // the target can complete before the observer reaches it.
     config.stop_at_exec = options.observe;

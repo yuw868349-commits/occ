@@ -2,6 +2,7 @@
 
 #include "occ/parser/pe.h"
 #include "occ/runtime/exports.h"
+#include "occ/runtime/image_dump.h"
 #include "occ/runtime/pe_process.h"
 #include "occ/runtime/winabi.h"
 #include "occ/util/fs.h"
@@ -196,6 +197,17 @@ int run_pe_runner(int argc, char** argv) noexcept {
     // --- the run -----------------------------------------------------------
 
     const runtime::RunOutcome outcome = runtime::run_pe_process(*process);
+
+    // The image as the run left it. For a program that decrypts itself --
+    // which is the whole reason to ask for this -- the state that matters
+    // exists only here: the file's copy of the payload is the encrypted
+    // one, and the mapping is the only place the decrypted bytes were ever
+    // together. Taken before the exit below, because after it there is
+    // nothing to read.
+    if (runtime::image_dump::enabled()) {
+        static_cast<void>(runtime::image_dump::dump(
+            process->image().module.base, runtime::image_dump::path()));
+    }
 
     // A fault the guest's own filter declined never gets here -- the process
     // is dead by the signal and the parent sees that. This is the fault the

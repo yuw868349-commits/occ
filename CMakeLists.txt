@@ -580,6 +580,7 @@ add_library(occ_core STATIC
     src/runtime/api_common.cpp
     src/runtime/api_hook.cpp
     src/runtime/apiset.cpp
+    src/runtime/image_dump.cpp
     src/runtime/api/path.cpp
     src/runtime/api/string.cpp
     src/runtime/api/file.cpp
