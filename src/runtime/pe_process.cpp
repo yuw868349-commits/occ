@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -1215,13 +1216,98 @@ extern "C" bool occ_vectored_dispatch(const void* record,
 //
 // The handler runs on the alternate stack, which is what makes a fault in
 // the guest's own stack survivable long enough to be reported.
+// ---------------------------------------------------------------------------
+// The guest trace
+//
+// `OCC_GUEST_TRACE` turns on a stderr trace of the run's mechanical events:
+// the jump into the entry point and every fault the handler sees, with the
+// dispatch verdict each fault earned. The trace exists because a guest that
+// runs to a stop without ever reporting anything is the one state a person
+// outside the process cannot diagnose from the observer's event stream --
+// the observer sees a process that spawned and did not exit, and nothing
+// between. The trace is opt-in, writes to stderr rather than the event
+// stream (the stream belongs to the observer's schema; this belongs to the
+// person debugging the run), and costs one `getenv` per run and one write
+// per event.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The trace's switch, read once per run. The value is not graded -- any
+// non-empty value turns the trace on -- because a person setting this wants
+// the trace and not a negotiation about how much of it. The one refinement
+// is `stop`: a value of `stop` also turns the trace on and asks the run to
+// stop itself rather than die on the fault no filter accepted, which is
+// how a person reaches the crash site with a debugger before the process
+// is gone.
+[[nodiscard]] bool guest_trace_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = ::getenv("OCC_GUEST_TRACE");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return enabled;
+}
+
+// Whether the run asked to be stopped at the crash site rather than end by
+// the signal. Separate from the trace's switch because the two are set for
+// different reasons: the trace is for reading after the fact, the stop is
+// for being there while it happens.
+[[nodiscard]] bool guest_trace_stop() noexcept {
+    static const bool stop = [] {
+        const char* value = ::getenv("OCC_GUEST_TRACE");
+        return value != nullptr && std::string_view{value} == "stop";
+    }();
+    return stop;
+}
+
+// The signal's name, for the trace line. A number is correct and a name is
+// readable, and the trace is for a person.
+[[nodiscard]] const char* signal_name(int sig) noexcept {
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGILL: return "SIGILL";
+    case SIGFPE: return "SIGFPE";
+    case SIGBUS: return "SIGBUS";
+    case SIGTRAP: return "SIGTRAP";
+    default: return "SIG?";
+    }
+}
+
+}  // namespace
+
 void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcept {
     auto* uc = static_cast<::ucontext_t*>(context_void);
     const ::greg_t* g = uc->uc_mcontext.gregs;
     const std::uint64_t rip = static_cast<std::uint64_t>(g[REG_RIP]);
+
+    // A breakpoint trap is the one fault Windows reports against the
+    // instruction itself: the CONTEXT an int3 handler reads names the
+    // one-byte breakpoint, and the handler that resumes past it writes
+    // Rip+1. The kernel here traps past it -- the rip the signal saved is
+    // already the byte after -- so a context built from it unchanged would
+    // land the guest one byte into the instruction that follows. Naming
+    // the breakpoint is the fix: the saved rip steps back over the 0xCC,
+    // in the saved state itself, so the context the handler sees, the
+    // record's address and the resume all name the same instruction, the
+    // way Windows names them. The judge is the byte itself rather than the
+    // signal's cause code, because kernels disagree on the cause they name
+    // a user int3 with -- some say TRAP_BRKPT and some say SI_KERNEL --
+    // while none of them put anything but a breakpoint one byte before a
+    // rip that traps onto a 0xCC. A trace trap stays where the kernel put
+    // it, because single-step is a trap on both sides.
+    if (sig == SIGTRAP && rip >= 1 &&
+        (info == nullptr || info->si_code != TRAP_TRACE)) {
+        const volatile std::uint8_t* breakpoint =
+            reinterpret_cast<const volatile std::uint8_t*>(rip - 1);
+        if (*breakpoint == 0xCC) {
+            uc->uc_mcontext.gregs[REG_RIP] = static_cast<::greg_t>(rip - 1);
+        }
+    }
+
     const bool from_memory = (sig == SIGSEGV || sig == SIGBUS) && info != nullptr;
     const std::uint64_t address =
-        from_memory ? reinterpret_cast<std::uint64_t>(info->si_addr) : rip;
+        from_memory ? reinterpret_cast<std::uint64_t>(info->si_addr)
+                    : static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
 
     winabi::GuestState* state = g_run_frame.state;
     if (state != nullptr) {
@@ -1233,6 +1319,17 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     const std::uint32_t code =
         exception_code_for(sig, info != nullptr ? *info : ::siginfo_t{},
                            g_run_frame, address);
+
+    if (guest_trace_enabled()) {
+        std::fprintf(stderr,
+                     "occ trace: %s at guest rip 0x%llx, fault address "
+                     "0x%llx, status 0x%08x\n",
+                     signal_name(sig),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RIP]),
+                     static_cast<unsigned long long>(address),
+                     code);
+    }
 
     // The frame walk comes first, which is the order Windows keeps: the
     // exception dispatches through the frames whose language handlers ask
@@ -1252,6 +1349,12 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         GuestExceptionRecord record;
         fill_exception_record(record, code, address, sig, *uc);
         if (occ_vectored_dispatch(&record, context)) {
+            if (guest_trace_enabled()) {
+                std::fprintf(stderr,
+                             "occ trace: a vectored handler resumed the "
+                             "fault at guest rip 0x%llx\n",
+                             static_cast<unsigned long long>(rip));
+            }
             ::sigset_t mask;
             std::memcpy(&mask, &uc->uc_sigmask, sizeof(mask));
             ::sigprocmask(SIG_SETMASK, &mask, nullptr);
@@ -1280,6 +1383,12 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
             // The guest resolved the condition. The mask the fault
             // blocked comes back before the state it interrupted does,
             // or the guest that caught the fault could not fault again.
+            if (guest_trace_enabled()) {
+                std::fprintf(stderr,
+                             "occ trace: the frame walk resumed the fault "
+                             "at guest rip 0x%llx\n",
+                             static_cast<unsigned long long>(rip));
+            }
             ::sigset_t mask;
             std::memcpy(&mask, state->resume_mask, sizeof(mask));
             ::sigprocmask(SIG_SETMASK, &mask, nullptr);
@@ -1308,6 +1417,18 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         // same faulting instruction, and Windows itself treats the combination
         // as a defect in the filter. Both end here, the way the loader ends
         // them: with the signal.
+    }
+
+    // A run that asked to stop at the crash site stops here, with the
+    // faulting state still on the stack the debugger will find it on.
+    if (guest_trace_stop()) {
+        std::fprintf(stderr,
+                     "occ trace: the fault at guest rip 0x%llx was not "
+                     "accepted; the process stops itself for inspection\n",
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RIP]));
+        ::fflush(stderr);
+        ::raise(SIGSTOP);
     }
 
     ::signal(sig, SIG_DFL);
@@ -1463,6 +1584,16 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // the code below it runs with the host's registers exactly as they were
     // saved, GS base included.
     if (::sigsetjmp(g_host_return, 1) == 0) {
+        if (guest_trace_enabled()) {
+            std::fprintf(stderr,
+                         "occ trace: entering the guest at rip 0x%llx, "
+                         "rsp 0x%llx, teb 0x%llx, peb 0x%llx\n",
+                         static_cast<unsigned long long>(image.entry_point),
+                         static_cast<unsigned long long>(
+                             image.initial_stack_pointer),
+                         static_cast<unsigned long long>(image.teb),
+                         static_cast<unsigned long long>(image.peb));
+        }
         ::syscall(SYS_arch_prctl, kArchSetGs, state.teb);
         enter_guest_asm(image.entry_point, image.initial_stack_pointer);
         __builtin_unreachable();

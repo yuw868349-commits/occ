@@ -2273,8 +2273,15 @@ extern "C" bool occ_vectored_dispatch(const void* record,
         if (handler == nullptr) {
             continue;
         }
-        using VectoredFn = std::int32_t(const void*) noexcept;
-        auto* const call = reinterpret_cast<VectoredFn*>(handler);
+        // The handler is the guest's code, and the guest speaks the Windows
+        // x64 convention: the one pointer argument travels in RCX, not in
+        // the host convention's RDI. The attribute on the function type is
+        // what puts it there -- the same bridge every other call back into
+        // the guest carries, and without it a handler reads whatever the
+        // host's last RCX held as its EXCEPTION_POINTERS.
+        using VectoredFn =
+            std::int32_t (__attribute__((ms_abi))*)(const void*) noexcept;
+        auto* const call = reinterpret_cast<VectoredFn>(handler);
         if (call(argument) == -1) {  // EXCEPTION_CONTINUE_EXECUTION
             return true;
         }
