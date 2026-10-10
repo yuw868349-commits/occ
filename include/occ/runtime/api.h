@@ -502,6 +502,17 @@ void add_psapi(ExportList& out);
 // The version-information surface, read from the file itself.
 void add_version(ExportList& out);
 
+// The Visual C++ runtime surfaces: the exception machinery, the secure
+// memory calls and the initialization hooks of VCRUNTIME140, and the
+// frame handler and entropy call of VCRUNTIME140_1.
+void add_vcruntime140(ExportList& out);
+void add_vcruntime140_1(ExportList& out);
+
+// The Microsoft C++ standard-library runtime: the allocation operators,
+// the standard stream objects and the insertion and manipulator calls of
+// MSVCP140.
+void add_msvcp140(ExportList& out);
+
 // The image-help and symbol surface: what an image is, and the symbol
 // handler's own state, with the stack walk a debugger makes without
 // symbols.

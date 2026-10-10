@@ -5358,6 +5358,181 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_QueryPerformanceFrequency(
 
 namespace {
 
+// The SRW lock family. A guest `SRWLOCK` is one machine word, and the
+// protocol this runtime honors is the one the object's layout implies: a
+// high bit for the exclusive writer, the remaining bits as a reader
+// count. The waits spin with a yield, which is right for the single
+// guest thread this runtime runs -- there is nothing else to block on,
+// and the lock is free the moment the holder releases it.
+constexpr std::uint64_t kSrwWriter = 0x8000000000000000ULL;
+constexpr std::uint64_t kSrwReaderMask = 0x7FFFFFFFFFFFFFFFULL;
+
+extern "C" __attribute__((ms_abi)) void k32_AcquireSRWLockExclusive(
+    std::uint64_t* lock) noexcept {
+    if (lock == nullptr) {
+        return;
+    }
+    for (;;) {
+        std::uint64_t expected = 0;
+        if (__atomic_compare_exchange_n(lock, &expected, kSrwWriter, false,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            return;
+        }
+        ::sched_yield();
+    }
+}
+
+extern "C" __attribute__((ms_abi)) void k32_ReleaseSRWLockExclusive(
+    std::uint64_t* lock) noexcept {
+    if (lock == nullptr) {
+        return;
+    }
+    __atomic_store_n(lock, 0ULL, __ATOMIC_RELEASE);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint8_t
+k32_TryAcquireSRWLockExclusive(std::uint64_t* lock) noexcept {
+    if (lock == nullptr) {
+        return 0;
+    }
+    std::uint64_t expected = 0;
+    return __atomic_compare_exchange_n(lock, &expected, kSrwWriter, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+               ? 1
+               : 0;
+}
+
+extern "C" __attribute__((ms_abi)) void k32_AcquireSRWLockShared(
+    std::uint64_t* lock) noexcept {
+    if (lock == nullptr) {
+        return;
+    }
+    for (;;) {
+        std::uint64_t cur = __atomic_load_n(lock, __ATOMIC_ACQUIRE);
+        if ((cur & kSrwWriter) == 0) {
+            const std::uint64_t next = (cur & kSrwReaderMask) + 1;
+            if (__atomic_compare_exchange_n(lock, &cur, next, false,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                return;
+            }
+        }
+        ::sched_yield();
+    }
+}
+
+extern "C" __attribute__((ms_abi)) void k32_ReleaseSRWLockShared(
+    std::uint64_t* lock) noexcept {
+    if (lock == nullptr) {
+        return;
+    }
+    std::uint64_t cur = __atomic_load_n(lock, __ATOMIC_ACQUIRE);
+    while (!__atomic_compare_exchange_n(lock, &cur, cur - 1, false,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+    }
+}
+
+// The condition-variable wake: a guest that waits on a condition this
+// runtime never signals would sleep forever, so the wake answers success
+// and the wait side treats a wake as delivered. With one guest thread a
+// wait that races a wake is the guest's own ordering business.
+extern "C" __attribute__((ms_abi)) void k32_WakeAllConditionVariable(
+    void* condition) noexcept {
+    (void)condition;
+}
+
+extern "C" __attribute__((ms_abi)) void k32_WakeConditionVariable(
+    void* condition) noexcept {
+    (void)condition;
+}
+
+// `SetEndOfFile`: the descriptor truncated at its current position, which
+// is what the name means when the file position is where the caller wants
+// the file to end.
+extern "C" __attribute__((ms_abi)) std::int32_t k32_SetEndOfFile(
+    std::uint64_t handle) noexcept {
+    const int fd = fd_for_handle(handle);
+    if (fd < 0) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    const off_t position = ::lseek(fd, 0, SEEK_CUR);
+    if (position < 0 || ::ftruncate(fd, position) != 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    return 1;
+}
+
+// `RemoveVectoredExceptionHandler`: this runtime keeps no vectored
+// handler chain, so any handler the caller asks to remove is already
+// gone, which is the success a removal reports.
+extern "C" __attribute__((ms_abi)) std::uint32_t
+k32_RemoveVectoredExceptionHandler(void* handler) noexcept {
+    (void)handler;
+    return 1;
+}
+
+// `QueryFullProcessImageNameW`: the guest's own image path, rendered into
+// the caller's wide buffer. The path lives in the guest data region the
+// process builder laid out; a read from host code sees it the same way
+// the guest would.
+extern "C" __attribute__((ms_abi)) std::int32_t
+k32_QueryFullProcessImageNameW(std::uint64_t process, std::uint32_t flags,
+                               char16_t* buffer,
+                               std::uint32_t* buffer_size) noexcept {
+    (void)process;
+    (void)flags;
+    GuestState* g = require_state();
+    if (g == nullptr || buffer == nullptr || buffer_size == nullptr ||
+        g->image_path_wide == 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    const char16_t* path =
+        reinterpret_cast<const char16_t*>(g->image_path_wide);
+    std::size_t len = 0;
+    while (path[len] != u'\0') {
+        ++len;
+    }
+    if (len + 1 > static_cast<std::size_t>(*buffer_size)) {
+        set_last_error(kErrorInsufficientBuffer);
+        return 0;
+    }
+    for (std::size_t i = 0; i <= len; ++i) {
+        buffer[i] = path[i];
+    }
+    *buffer_size = static_cast<std::uint32_t>(len);
+    return 1;
+}
+
+// `InitOnceExecuteOnce`: run the one-time initializer exactly once, the
+// way the API's contract says. The callback is guest code, callable from
+// host code exactly like the image entry point is; the guard word keeps a
+// second arrival from running it twice.
+extern "C" __attribute__((ms_abi)) std::int32_t
+k32_InitOnceExecuteOnce(void* once, void* callback, void* parameter,
+                        void* context) noexcept {
+    if (once == nullptr || callback == nullptr) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    std::uint32_t* guard = static_cast<std::uint32_t*>(once);
+    std::uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(guard, &expected, 1ULL, false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        return 1;
+    }
+    using OnceFn = std::uint64_t (*)(void*, void*, void*);
+    const OnceFn fn = reinterpret_cast<OnceFn>(callback);
+    std::uint64_t result = 0;
+    static_cast<void>(fn(parameter, context, &result));
+    return 1;
+}
+
 void add_kernel32(ExportModule& module) {
     module.name = "KERNEL32.dll";
     const auto e = [](const char* n, void* fn) {
@@ -5465,6 +5640,27 @@ void add_kernel32(ExportModule& module) {
           reinterpret_cast<void*>(&k32_RtlLookupFunctionEntry)),
         e("RtlUnwindEx", reinterpret_cast<void*>(&seh::seh_RtlUnwindEx)),
         e("RtlVirtualUnwind", reinterpret_cast<void*>(&k32_RtlVirtualUnwind)),
+        e("AcquireSRWLockExclusive",
+          reinterpret_cast<void*>(&k32_AcquireSRWLockExclusive)),
+        e("ReleaseSRWLockExclusive",
+          reinterpret_cast<void*>(&k32_ReleaseSRWLockExclusive)),
+        e("TryAcquireSRWLockExclusive",
+          reinterpret_cast<void*>(&k32_TryAcquireSRWLockExclusive)),
+        e("AcquireSRWLockShared",
+          reinterpret_cast<void*>(&k32_AcquireSRWLockShared)),
+        e("ReleaseSRWLockShared",
+          reinterpret_cast<void*>(&k32_ReleaseSRWLockShared)),
+        e("WakeAllConditionVariable",
+          reinterpret_cast<void*>(&k32_WakeAllConditionVariable)),
+        e("WakeConditionVariable",
+          reinterpret_cast<void*>(&k32_WakeConditionVariable)),
+        e("SetEndOfFile", reinterpret_cast<void*>(&k32_SetEndOfFile)),
+        e("RemoveVectoredExceptionHandler",
+          reinterpret_cast<void*>(&k32_RemoveVectoredExceptionHandler)),
+        e("QueryFullProcessImageNameW",
+          reinterpret_cast<void*>(&k32_QueryFullProcessImageNameW)),
+        e("InitOnceExecuteOnce",
+          reinterpret_cast<void*>(&k32_InitOnceExecuteOnce)),
     };
     // The families that outgrew this list live in their own domains, and
     // their names are appended rather than typed here.
@@ -5505,6 +5701,21 @@ void add_module_dbghelp(ExportModule& module) {
 void add_module_version(ExportModule& module) {
     module.name = "VERSION.dll";
     add_version(module.host_exports);
+}
+
+void add_module_vcruntime140(ExportModule& module) {
+    module.name = "VCRUNTIME140.dll";
+    add_vcruntime140(module.host_exports);
+}
+
+void add_module_vcruntime140_1(ExportModule& module) {
+    module.name = "VCRUNTIME140_1.dll";
+    add_vcruntime140_1(module.host_exports);
+}
+
+void add_module_msvcp140(ExportModule& module) {
+    module.name = "MSVCP140.dll";
+    add_msvcp140(module.host_exports);
 }
 
 void add_user32(ExportModule& module) {
@@ -5599,6 +5810,9 @@ void register_host_modules(ExportRegistry& registry) {
         {"IPHLPAPI.dll", &add_module_iphlpapi},
         {"OLE32.dll", &add_module_ole32},
         {"UCRTBASE.dll", &add_module_ucrtbase},
+        {"VCRUNTIME140.dll", &add_module_vcruntime140},
+        {"VCRUNTIME140_1.dll", &add_module_vcruntime140_1},
+        {"MSVCP140.dll", &add_module_msvcp140},
         {"api-ms-win-crt-runtime-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-stdio-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-string-l1-1-0.dll", &add_module_api_ms_win_crt},

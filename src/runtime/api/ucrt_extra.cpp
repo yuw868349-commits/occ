@@ -25,10 +25,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cctype>
+#include <cwchar>
+#include <clocale>
 #include <malloc.h>
 #include <string>
 #include <thread>
 #include <vector>
+
+extern "C" char** environ;
 
 namespace occ::runtime::winabi {
 
@@ -676,6 +681,566 @@ void out_finish(Out& o) noexcept {
 }
 
 }  // namespace
+
+// The `__p___argv` data export's backing: a pointer to the argv table the
+// process builder lays out in guest memory, wired there at startup. A
+// guest that reads through the export reads guest memory, which is what a
+// C startup that walks its own arguments expects.
+char** g_u32_argv_ptr = nullptr;
+
+// The guest's `wchar_t` is sixteen bits, which is not the host's. Every
+// wide conversion below parses or copies the guest's own code units
+// rather than handing the host a buffer it would read as thirty-two-bit
+// wide characters.
+
+// The integer conversions, one core walk shared by all four widths. The
+// walk is the C one -- optional sign, optional base prefix, digits until
+// a character that is not one -- with the accumulation checked against
+// the caller's width so the answer wraps the way the real function's
+// does instead of silently overflowing.
+template <typename T>
+T u32_wcstox(const char16_t* nptr, char16_t** end, int base, T minimum,
+             T maximum) noexcept {
+    if (nptr == nullptr) {
+        if (end != nullptr) {
+            *end = nullptr;
+        }
+        return 0;
+    }
+    const char16_t* p = nptr;
+    for (;; ++p) {
+        const char16_t c = *p;
+        if (c != u' ' && c != u'\t' && c != u'\n' && c != u'\r' &&
+            c != u'\f' && c != u'\v') {
+            break;
+        }
+    }
+    int sign = 1;
+    if (*p == u'+') {
+        ++p;
+    } else if (*p == u'-') {
+        sign = -1;
+        ++p;
+    }
+    int radix = base;
+    if (radix == 0) {
+        radix = 10;
+        if (*p == u'0') {
+            radix = 8;
+            ++p;
+            if (*p == u'x' || *p == u'X') {
+                radix = 16;
+                ++p;
+            }
+        }
+    } else if (radix == 16 && *p == u'0' && (p[1] == u'x' || p[1] == u'X')) {
+        p += 2;
+    }
+    unsigned long long acc = 0;
+    bool any = false;
+    for (;; ++p) {
+        const char16_t c = *p;
+        int digit;
+        if (c >= u'0' && c <= u'9') {
+            digit = static_cast<int>(c - u'0');
+        } else if (c >= u'a' && c <= u'z') {
+            digit = static_cast<int>(c - u'a') + 10;
+        } else if (c >= u'A' && c <= u'Z') {
+            digit = static_cast<int>(c - u'A') + 10;
+        } else {
+            break;
+        }
+        if (digit >= radix) {
+            break;
+        }
+        acc = acc * static_cast<unsigned long long>(radix) +
+              static_cast<unsigned long long>(digit);
+        any = true;
+    }
+    if (end != nullptr) {
+        *end = const_cast<char16_t*>(p);
+    }
+    if (!any) {
+        return 0;
+    }
+    if (sign < 0) {
+        // The negated accumulator, saturated at the caller's minimum so a
+        // run that overflows the width reports the extreme rather than a
+        // wrap that looks like a smaller number.
+        const unsigned long long neg =
+            acc > static_cast<unsigned long long>(-(minimum + 1)) + 1
+                ? static_cast<unsigned long long>(-(minimum + 1)) + 1
+                : acc;
+        return static_cast<T>(-static_cast<long long>(neg));
+    }
+    return acc > static_cast<unsigned long long>(maximum)
+               ? maximum
+               : static_cast<T>(acc);
+}
+
+extern "C" __attribute__((ms_abi)) long u32u_wcstol(const char16_t* nptr,
+                                                    char16_t** end,
+                                                    int base) noexcept {
+    return u32_wcstox<long>(nptr, end, base, LONG_MIN, LONG_MAX);
+}
+
+extern "C" __attribute__((ms_abi)) unsigned long u32u_wcstoul(
+    const char16_t* nptr, char16_t** end, int base) noexcept {
+    return u32_wcstox<unsigned long>(nptr, end, base, 0UL, ULONG_MAX);
+}
+
+extern "C" __attribute__((ms_abi)) long long u32u_wcstoll(
+    const char16_t* nptr, char16_t** end, int base) noexcept {
+    return u32_wcstox<long long>(nptr, end, base, LLONG_MIN, LLONG_MAX);
+}
+
+extern "C" __attribute__((ms_abi)) unsigned long long u32u_wcstoull(
+    const char16_t* nptr, char16_t** end, int base) noexcept {
+    return u32_wcstox<unsigned long long>(nptr, end, base, 0ULL,
+                                          ULLONG_MAX);
+}
+
+// The wide floating conversion: the leading run of characters the host's
+// `strtod` would accept is copied to a narrow buffer and handed to it,
+// and the end pointer lands on the same position the copied run stopped.
+extern "C" __attribute__((ms_abi)) double u32u_wcstod(
+    const char16_t* nptr, char16_t** end) noexcept {
+    if (nptr == nullptr) {
+        if (end != nullptr) {
+            *end = nullptr;
+        }
+        return 0.0;
+    }
+    const char16_t* p = nptr;
+    for (;; ++p) {
+        const char16_t c = *p;
+        if (c != u' ' && c != u'\t' && c != u'\n' && c != u'\r' &&
+            c != u'\f' && c != u'\v') {
+            break;
+        }
+    }
+    char narrow[512];
+    std::size_t n = 0;
+    const char16_t* q = p;
+    if (*q == u'+' || *q == u'-') {
+        narrow[n++] = static_cast<char>(*q++);
+    }
+    bool mantissa = false;
+    while ((*q >= u'0' && *q <= u'9') || *q == u'.') {
+        narrow[n++] = static_cast<char>(*q++);
+        mantissa = true;
+    }
+    if (mantissa && (*q == u'e' || *q == u'E')) {
+        narrow[n++] = static_cast<char>(*q++);
+        if (*q == u'+' || *q == u'-') {
+            narrow[n++] = static_cast<char>(*q++);
+        }
+        while (*q >= u'0' && *q <= u'9') {
+            narrow[n++] = static_cast<char>(*q++);
+        }
+    }
+    narrow[n] = '\0';
+    char* narrow_end = nullptr;
+    const double value = ::strtod(narrow, &narrow_end);
+    const std::size_t consumed =
+        narrow_end == nullptr ? n : static_cast<std::size_t>(narrow_end - narrow);
+    if (end != nullptr) {
+        *end = const_cast<char16_t*>(p + consumed);
+    }
+    return value;
+}
+
+extern "C" __attribute__((ms_abi)) float u32u_strtof(const char* nptr,
+                                                     char** end) noexcept {
+    return ::strtof(nptr, end);
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u_wcrtomb(
+    char* s, char16_t wc, mbstate_t* ps) noexcept {
+    (void)ps;
+    if (s == nullptr) {
+        return 1;
+    }
+    // A BMP code unit below 0x100, which is what this runtime's wide
+    // strings carry in practice; a value outside that is an encoding this
+    // side does not claim to produce.
+    *s = static_cast<char>(wc & 0xFFu);
+    return 1;
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u_wcrtomb_s(
+    char* s, std::size_t size, char16_t wc, mbstate_t* ps) noexcept {
+    if (s == nullptr || size == 0) {
+        return static_cast<std::size_t>(-1);
+    }
+    (void)ps;
+    *s = static_cast<char>(wc & 0xFFu);
+    return 1;
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u_mbrtowc(
+    char16_t* pwc, const char* s, std::size_t n, mbstate_t* ps) noexcept {
+    (void)ps;
+    if (s == nullptr) {
+        return 0;
+    }
+    if (n == 0) {
+        return static_cast<std::size_t>(-2);
+    }
+    if (pwc != nullptr) {
+        *pwc = static_cast<unsigned char>(s[0]);
+    }
+    return 1;
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u_mbrlen(
+    const char* s, std::size_t n, mbstate_t* ps) noexcept {
+    return u32u_mbrtowc(nullptr, s, n, ps);
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u_mbsrtowcs(
+    char16_t* dst, const char** src, std::size_t len,
+    mbstate_t* ps) noexcept {
+    (void)ps;
+    if (src == nullptr || *src == nullptr) {
+        return 0;
+    }
+    const char* s = *src;
+    std::size_t i = 0;
+    while (s[i] != '\0' && i < len) {
+        dst[i] = static_cast<unsigned char>(s[i]);
+        ++i;
+    }
+    if (s[i] == '\0') {
+        *src = nullptr;
+    } else {
+        *src = s + i;
+    }
+    if (i < len) {
+        dst[i] = u'\0';
+    }
+    return i;
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u__mbtowc_l(
+    int* pwc, const char* s, std::size_t n, void* locale) noexcept {
+    (void)locale;
+    if (s == nullptr) {
+        return 0;
+    }
+    if (n == 0 || s[0] == '\0') {
+        return 0;
+    }
+    if (pwc != nullptr) {
+        *pwc = static_cast<unsigned char>(s[0]);
+    }
+    return 1;
+}
+
+extern "C" __attribute__((ms_abi)) double u32u__strtod_l(
+    const char* nptr, char** end, void* locale) noexcept {
+    (void)locale;
+    return ::strtod(nptr, end);
+}
+
+extern "C" __attribute__((ms_abi)) char* u32u__strdup(const char* s) noexcept {
+    if (s == nullptr) {
+        return nullptr;
+    }
+    const std::size_t n = ::strlen(s) + 1;
+    char* copy = static_cast<char*>(::malloc(n));
+    if (copy != nullptr) {
+        ::memcpy(copy, s, n);
+    }
+    return copy;
+}
+
+// The locale-qualified single-byte case and classification calls. The
+// locale argument is carried because the caller passed one; this runtime
+// has one locale (the host's "C"), so the answer ignores it.
+extern "C" __attribute__((ms_abi)) int u32u__tolower_l(
+    int c, void* locale) noexcept {
+    (void)locale;
+    return ::tolower(c);
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__toupper_l(
+    int c, void* locale) noexcept {
+    (void)locale;
+    return ::toupper(c);
+}
+
+extern "C" __attribute__((ms_abi)) wint_t u32u__towlower_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return static_cast<wint_t>(::towlower(static_cast<wint_t>(c)));
+}
+
+extern "C" __attribute__((ms_abi)) wint_t u32u__towupper_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return static_cast<wint_t>(::towupper(static_cast<wint_t>(c)));
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswalnum_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') ||
+           (c >= L'A' && c <= L'Z');
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswalpha_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z');
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswcntrl_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return c < 0x20 || c == 0x7F;
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswdigit_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return c >= L'0' && c <= L'9';
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswlower_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return c >= L'a' && c <= L'z';
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswprint_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return c >= 0x20 && c != 0x7F;
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswpunct_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) ||
+           (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswspace_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return c == L' ' || (c >= 0x09 && c <= 0x0D);
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswupper_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return c >= L'A' && c <= L'Z';
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__iswxdigit_l(
+    wint_t c, void* locale) noexcept {
+    (void)locale;
+    return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') ||
+           (c >= L'A' && c <= L'F');
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__strcoll_l(
+    const char* a, const char* b, void* locale) noexcept {
+    (void)locale;
+    return ::strcoll(a, b);
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__wcscoll_l(
+    const char16_t* a, const char16_t* b, void* locale) noexcept {
+    (void)locale;
+    std::size_t i = 0;
+    for (;; ++i) {
+        const unsigned int ca = static_cast<unsigned int>(a[i]);
+        const unsigned int cb = static_cast<unsigned int>(b[i]);
+        if (ca != cb) {
+            return ca < cb ? -1 : 1;
+        }
+        if (ca == 0) {
+            return 0;
+        }
+    }
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u__strxfrm_l(
+    char* dst, const char* src, std::size_t n, void* locale) noexcept {
+    (void)locale;
+    return ::strxfrm(dst, src, n);
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u__wcsxfrm_l(
+    char16_t* dst, const char16_t* src, std::size_t n,
+    void* locale) noexcept {
+    (void)locale;
+    std::size_t i = 0;
+    for (; i < n && src[i] != u'\0'; ++i) {
+        dst[i] = src[i];
+    }
+    if (i < n) {
+        dst[i] = u'\0';
+    }
+    return i;
+}
+
+extern "C" __attribute__((ms_abi)) std::size_t u32u__strftime_l(
+    char* buffer, std::size_t max, const char* format, const void* tm,
+    void* locale) noexcept {
+    (void)locale;
+    return ::strftime(buffer, max, format, static_cast<const std::tm*>(tm));
+}
+
+// The stdio calls the modern CRT asks for by name. The stream argument is
+// the host's own `FILE*`, the same object the formatted-output path
+// writes through; the narrow versions are the host's own calls, and the
+// wide ones move code units this runtime's wide strings carry.
+extern "C" __attribute__((ms_abi)) void u32u_setbuf(void* stream,
+                                                    char* buffer) noexcept {
+    ::setbuf(static_cast<FILE*>(stream), buffer);
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__setmode(int fd,
+                                                     int mode) noexcept {
+    // The host has no text/binary mode on a descriptor; every stream is
+    // binary. The call is honored as a no-op that reports the previous
+    // mode as text, which is the mode everything is already in.
+    (void)fd;
+    (void)mode;
+    return 0;
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__fileno(void* stream) noexcept {
+    return ::fileno(static_cast<FILE*>(stream));
+}
+
+extern "C" __attribute__((ms_abi)) int u32u_ungetc(int c,
+                                                   void* stream) noexcept {
+    return ::ungetc(c, static_cast<FILE*>(stream));
+}
+
+extern "C" __attribute__((ms_abi)) wint_t u32u_ungetwc(
+    wint_t c, void* stream) noexcept {
+    return ::ungetwc(c, static_cast<FILE*>(stream));
+}
+
+extern "C" __attribute__((ms_abi)) wint_t u32u_fgetwc(void* stream) noexcept {
+    // A guest `wint_t` is the same width as the host's, and the code unit
+    // the host reads is thirty-two bits; a value outside the guest's BMP
+    // is one this runtime's wide strings never carried.
+    return ::fgetwc(static_cast<FILE*>(stream));
+}
+
+extern "C" __attribute__((ms_abi)) wint_t u32u_fputwc(
+    wint_t c, void* stream) noexcept {
+    return ::fputwc(static_cast<wchar_t>(c), static_cast<FILE*>(stream));
+}
+
+extern "C" __attribute__((ms_abi)) int u32u__fseeki64(
+    void* stream, long long offset, int origin) noexcept {
+    return ::fseeko(static_cast<FILE*>(stream),
+                    static_cast<off_t>(offset), origin);
+}
+
+extern "C" __attribute__((ms_abi)) long long u32u__ftelli64(
+    void* stream) noexcept {
+    return static_cast<long long>(::ftello(static_cast<FILE*>(stream)));
+}
+
+extern "C" __attribute__((ms_abi)) void u32u__lock_file(
+    void* stream) noexcept {
+    (void)stream;
+}
+
+extern "C" __attribute__((ms_abi)) void u32u__unlock_file(
+    void* stream) noexcept {
+    (void)stream;
+}
+
+extern "C" __attribute__((ms_abi)) void* u32u___acrt_iob_func(
+    std::uint32_t index) noexcept {
+    if (index == 0) {
+        return stdin;
+    }
+    if (index == 1) {
+        return stdout;
+    }
+    if (index == 2) {
+        return stderr;
+    }
+    return nullptr;
+}
+
+// The environment and process-data exports. The argv pointer is wired by
+// the process builder; the environment table is the host's own, which is
+// the narrow environment this runtime started with.
+extern "C" __attribute__((ms_abi)) char*** u32u___p___argv() noexcept {
+    return &g_u32_argv_ptr;
+}
+
+extern "C" __attribute__((ms_abi)) char** u32u__get_initial_narrow_environment() noexcept {
+    return environ;
+}
+
+extern "C" __attribute__((ms_abi)) void u32u__initialize_narrow_environment() noexcept {}
+
+extern "C" __attribute__((ms_abi)) void u32u__configure_narrow_argv() noexcept {}
+
+extern "C" __attribute__((ms_abi)) const unsigned short* u32u___pctype_func() noexcept {
+    return *::__ctype_b_loc();
+}
+
+int u32u_sys_nerr = 107;
+
+extern "C" __attribute__((ms_abi)) int* u32u___p__fmode() noexcept {
+    return &g_fmode;
+}
+
+extern "C" __attribute__((ms_abi)) char*** u32u___p__environ() noexcept {
+    return &g_environ_ptr;
+}
+
+// The secure error text: the host's `strerror` rendered into the caller's
+// buffer with the same truncation rules `strerror_s` applies.
+extern "C" __attribute__((ms_abi)) int u32u_strerror_s(
+    char* buffer, std::size_t size, int errnum) noexcept {
+    if (buffer == nullptr || size == 0) {
+        return EINVAL;
+    }
+    if (size == 1) {
+        buffer[0] = '\0';
+        return EINVAL;
+    }
+    const char* text = ::strerror(errnum);
+    const std::size_t len = ::strnlen(text, size - 1);
+    ::memcpy(buffer, text, len);
+    buffer[len] = '\0';
+    return 0;
+}
+
+// The assertion and watson failure paths, which a program that reaches
+// them cannot recover from. The message goes to stderr and the process
+// terminates the way `abort` does.
+extern "C" __attribute__((ms_abi)) void u32u__assert(
+    const char* message, const char* file, unsigned line) noexcept {
+    ::fprintf(stderr, "Assertion failed: %s, file %s, line %u\n", message,
+              file, line);
+    ::abort();
+}
+
+extern "C" __attribute__((ms_abi)) void u32u__invoke_watson(
+    const wchar_t* expression, const wchar_t* function, const wchar_t* file,
+    unsigned line, std::uintptr_t reserved) noexcept {
+    (void)expression;
+    (void)function;
+    (void)file;
+    (void)line;
+    (void)reserved;
+    ::abort();
+}
 
 extern "C" __attribute__((ms_abi)) std::int32_t
 u32u___stdio_common_vfprintf(std::uint64_t options, void* stream,
@@ -1451,6 +2016,74 @@ void add_ucrt_extra(ExportList& out) {
     e("localtime_s", reinterpret_cast<void*>(&u32u_localtime_s));
     e("gmtime_s", reinterpret_cast<void*>(&u32u_gmtime_s));
     e("ctime_s", reinterpret_cast<void*>(&u32u_ctime_s));
+    // The wide conversions, parsed on the guest's own sixteen-bit code
+    // units rather than the host's thirty-two-bit ones.
+    e("wcstol", reinterpret_cast<void*>(&u32u_wcstol));
+    e("wcstoul", reinterpret_cast<void*>(&u32u_wcstoul));
+    e("wcstoll", reinterpret_cast<void*>(&u32u_wcstoll));
+    e("wcstoull", reinterpret_cast<void*>(&u32u_wcstoull));
+    e("wcstod", reinterpret_cast<void*>(&u32u_wcstod));
+    e("strtof", reinterpret_cast<void*>(&u32u_strtof));
+    e("wcrtomb", reinterpret_cast<void*>(&u32u_wcrtomb));
+    e("wcrtomb_s", reinterpret_cast<void*>(&u32u_wcrtomb_s));
+    e("mbrtowc", reinterpret_cast<void*>(&u32u_mbrtowc));
+    e("mbrlen", reinterpret_cast<void*>(&u32u_mbrlen));
+    e("mbsrtowcs", reinterpret_cast<void*>(&u32u_mbsrtowcs));
+    e("_mbtowc_l", reinterpret_cast<void*>(&u32u__mbtowc_l));
+    e("_strtod_l", reinterpret_cast<void*>(&u32u__strtod_l));
+    e("_strdup", reinterpret_cast<void*>(&u32u__strdup));
+    e("strdup", reinterpret_cast<void*>(&u32u__strdup));
+    // The locale-qualified case and classification family. The locale
+    // object is the one this runtime has, so the answers are the host's
+    // "C" answers with the argument carried.
+    e("_tolower_l", reinterpret_cast<void*>(&u32u__tolower_l));
+    e("_toupper_l", reinterpret_cast<void*>(&u32u__toupper_l));
+    e("_towlower_l", reinterpret_cast<void*>(&u32u__towlower_l));
+    e("_towupper_l", reinterpret_cast<void*>(&u32u__towupper_l));
+    e("_iswalnum_l", reinterpret_cast<void*>(&u32u__iswalnum_l));
+    e("_iswalpha_l", reinterpret_cast<void*>(&u32u__iswalpha_l));
+    e("_iswcntrl_l", reinterpret_cast<void*>(&u32u__iswcntrl_l));
+    e("_iswdigit_l", reinterpret_cast<void*>(&u32u__iswdigit_l));
+    e("_iswlower_l", reinterpret_cast<void*>(&u32u__iswlower_l));
+    e("_iswprint_l", reinterpret_cast<void*>(&u32u__iswprint_l));
+    e("_iswpunct_l", reinterpret_cast<void*>(&u32u__iswpunct_l));
+    e("_iswspace_l", reinterpret_cast<void*>(&u32u__iswspace_l));
+    e("_iswupper_l", reinterpret_cast<void*>(&u32u__iswupper_l));
+    e("_iswxdigit_l", reinterpret_cast<void*>(&u32u__iswxdigit_l));
+    e("_strcoll_l", reinterpret_cast<void*>(&u32u__strcoll_l));
+    e("_wcscoll_l", reinterpret_cast<void*>(&u32u__wcscoll_l));
+    e("_strxfrm_l", reinterpret_cast<void*>(&u32u__strxfrm_l));
+    e("_wcsxfrm_l", reinterpret_cast<void*>(&u32u__wcsxfrm_l));
+    e("_strftime_l", reinterpret_cast<void*>(&u32u__strftime_l));
+    // The stream calls the modern CRT asks for by name.
+    e("setbuf", reinterpret_cast<void*>(&u32u_setbuf));
+    e("_setmode", reinterpret_cast<void*>(&u32u__setmode));
+    e("_fileno", reinterpret_cast<void*>(&u32u__fileno));
+    e("ungetc", reinterpret_cast<void*>(&u32u_ungetc));
+    e("ungetwc", reinterpret_cast<void*>(&u32u_ungetwc));
+    e("fgetwc", reinterpret_cast<void*>(&u32u_fgetwc));
+    e("fputwc", reinterpret_cast<void*>(&u32u_fputwc));
+    e("_fseeki64", reinterpret_cast<void*>(&u32u__fseeki64));
+    e("_ftelli64", reinterpret_cast<void*>(&u32u__ftelli64));
+    e("_lock_file", reinterpret_cast<void*>(&u32u__lock_file));
+    e("_unlock_file", reinterpret_cast<void*>(&u32u__unlock_file));
+    e("__acrt_iob_func", reinterpret_cast<void*>(&u32u___acrt_iob_func));
+    // The environment and process-data exports.
+    e("__p___argv", reinterpret_cast<void*>(&u32u___p___argv));
+    e("_get_initial_narrow_environment",
+      reinterpret_cast<void*>(&u32u__get_initial_narrow_environment));
+    e("_initialize_narrow_environment",
+      reinterpret_cast<void*>(&u32u__initialize_narrow_environment));
+    e("_configure_narrow_argv",
+      reinterpret_cast<void*>(&u32u__configure_narrow_argv));
+    e("__pctype_func", reinterpret_cast<void*>(&u32u___pctype_func));
+    e("__p__fmode", reinterpret_cast<void*>(&u32u___p__fmode));
+    e("__p__environ", reinterpret_cast<void*>(&u32u___p__environ));
+    e("__sys_nerr", &u32u_sys_nerr);
+    // The failure and error-text paths.
+    e("strerror_s", reinterpret_cast<void*>(&u32u_strerror_s));
+    e("_assert", reinterpret_cast<void*>(&u32u__assert));
+    e("_invoke_watson", reinterpret_cast<void*>(&u32u__invoke_watson));
 }
 
 }  // namespace occ::runtime::winabi

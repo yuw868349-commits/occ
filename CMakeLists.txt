@@ -610,6 +610,8 @@ add_library(occ_core STATIC
     src/runtime/api/version.cpp
     src/runtime/api/dbghelp.cpp
     src/runtime/api/ucrt_extra.cpp
+    src/runtime/api/vcruntime.cpp
+    src/runtime/api/msvcp140.cpp
     src/runtime/api/ntdll_debug.cpp
     src/runtime/api/ntdll_antidebug.cpp
     src/runtime/api/kernel32_debug.cpp

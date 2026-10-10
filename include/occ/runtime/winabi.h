@@ -616,6 +616,12 @@ extern char** g_environ_ptr;
 // through the export reads guest memory, exactly like the real runtime's.
 extern char* g_acmdln_value;
 
+// The argv-table pointer the Universal CRT's `__p___argv` data export
+// hands out. Wired by the process builder into the guest data region,
+// the same way `g_acmdln_value` is, so a program that reads through it
+// reads guest memory.
+extern char** g_u32_argv_ptr;
+
 // The remaining C runtime entry points. Each is the one
 // implementation the runtime presents under every module name the C
 // runtime answers to, and the declarations live here because this is

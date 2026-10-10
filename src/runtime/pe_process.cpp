@@ -1897,6 +1897,13 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         // own memory.
         winabi::g_acmdln_value =
             reinterpret_cast<char*>(state.cmdline_ansi);
+
+        // The Universal CRT's `__p___argv` reads through the argv table
+        // the same way: the pointer the export hands out points at the
+        // table in guest memory, and a startup that walks its arguments
+        // walks guest memory.
+        winabi::g_u32_argv_ptr =
+            reinterpret_cast<char**>(state.argv_table_guest);
     }
 
     for (const ProcessImage::RegionRecord& region : image.regions) {
