@@ -291,10 +291,18 @@ void wr64(std::uint8_t* p, std::size_t at, std::uint64_t v) noexcept {
         if (!found) {
             continue;
         }
+        // The displacement's offset within the site, and the instruction's
+        // length: a call or jump starts its disp at +2 over six bytes, a
+        // mov at +3 over seven. The disp is measured from the end of the
+        // instruction, which is where the two forms differ.
+        const std::uint64_t disp_at =
+            call.form == occ::runtime::iat_rebuild::RefForm::Mov ? 3 : 2;
+        const std::uint64_t insn_len =
+            call.form == occ::runtime::iat_rebuild::RefForm::Mov ? 7 : 6;
         const std::int64_t disp =
             static_cast<std::int64_t>(iat_rva) -
-            static_cast<std::int64_t>(call.site_rva + 6);
-        wr32(f, static_cast<std::size_t>(file_off) + 2,
+            static_cast<std::int64_t>(call.site_rva + insn_len);
+        wr32(f, static_cast<std::size_t>(file_off) + disp_at,
              static_cast<std::uint32_t>(disp));
     }
 
@@ -331,7 +339,8 @@ std::string path() {
     return value != nullptr ? std::string(value) : std::string();
 }
 
-bool dump(std::uint64_t image_base, const std::string& out_path) noexcept {
+bool dump(std::uint64_t image_base, const std::string& out_path,
+          const EntryRegs* regs) noexcept {
     const auto* img = reinterpret_cast<const std::uint8_t*>(image_base);
     if (img == nullptr) {
         std::fprintf(stderr, "occ dump: no image to dump\n");
@@ -450,6 +459,54 @@ bool dump(std::uint64_t image_base, const std::string& out_path) noexcept {
                      "occ dump: %zu data exports corrected (one byte out of "
                      "place)\n",
                      static_cast<std::size_t>(fixed));
+    }
+
+    // The entry registers, last of all: the moment that captured them is
+    // the moment the dump is for, and a section appended after the
+    // corrected bytes carries the state a later load restores. A plain
+    // dump -- one not taken at the entry trap -- has no such moment and
+    // writes none.
+    if (regs != nullptr) {
+        const std::uint16_t nsec = rd16(out.data(), pe_at + 6);
+        const std::uint32_t image_size_now = rd32(out.data(), optional + 0x38);
+        const std::uint32_t section_align =
+            rd32(out.data(), optional + 0x20) == 0
+                ? 0x1000
+                : rd32(out.data(), optional + 0x20);
+        const std::uint64_t new_rva =
+            align_up(image_size_now, section_align == 0 ? 0x1000
+                                                        : section_align);
+        const std::uint64_t new_virtual =
+            align_up(sizeof(EntryRegs), section_align == 0 ? 0x1000
+                                                           : section_align);
+        const std::uint64_t raw_at = align_up(out.size(), file_align == 0
+                                                              ? 0x200
+                                                              : file_align);
+        const std::uint64_t raw_size =
+            align_up(sizeof(EntryRegs), file_align == 0 ? 0x200 : file_align);
+        out.resize(static_cast<std::size_t>(raw_at + raw_size), 0);
+        const std::uint8_t* base = out.data();
+        std::uint8_t* entry =
+            out.data() + section_table +
+            static_cast<std::size_t>(nsec) * kSectionSize;
+        std::memcpy(entry, ".occregs", 8);
+        const std::size_t entry_off = static_cast<std::size_t>(entry - base);
+        wr32(out.data(), entry_off + kSectionVirtualSize,
+             static_cast<std::uint32_t>(sizeof(EntryRegs)));
+        wr32(out.data(), entry_off + kSectionVirtualAddress,
+             static_cast<std::uint32_t>(new_rva));
+        wr32(out.data(), entry_off + kSectionRawSize,
+             static_cast<std::uint32_t>(raw_size));
+        wr32(out.data(), entry_off + kSectionRawPointer,
+             static_cast<std::uint32_t>(raw_at));
+        wr32(out.data(), entry_off + kSectionCharacteristics, 0x40000040);
+        wr16(out.data(), static_cast<std::size_t>(pe_at) + 6, nsec + 1);
+        wr32(out.data(), optional + 0x38,
+             static_cast<std::uint32_t>(new_rva + new_virtual));
+        std::memcpy(out.data() + raw_at, regs, sizeof(EntryRegs));
+        std::fprintf(stderr,
+                     "occ dump: entry registers kept (.occregs at rva 0x%x)\n",
+                     static_cast<unsigned>(new_rva));
     }
 
     std::FILE* file = std::fopen(out_path.c_str(), "wb");

@@ -45,6 +45,41 @@ namespace occ::runtime::image_dump {
 [[nodiscard]] bool enabled() noexcept;
 [[nodiscard]] std::string path();
 
+// The entry registers of a packed image, captured at the moment the stub
+// hands control to the real entry point.
+//
+// The real entry point of a packed image is not a plain Windows entry: the
+// stub has been running in the image and hands over with a register state
+// that only exists at run time -- this run's unpacked layout, this run's
+// branch decisions. Windows calls an entry with undefined registers and the
+// loader cannot guess what a stub left; only the moment itself knows. The
+// OEP trap is that moment, and the dump keeps the state so that a later
+// load of the unpacked image can hand the same registers to the same entry
+// point and take the same branch.
+//
+// The order is fixed and the loader's restore reads by offset, so the
+// layout is spelled out rather than derived: r12 is last because the
+// restore uses r12 as its own pointer and can only take its saved value
+// after every other register.
+struct EntryRegs {
+    std::uint64_t rdx = 0;
+    std::uint64_t rcx = 0;
+    std::uint64_t r8 = 0;
+    std::uint64_t r9 = 0;
+    std::uint64_t r10 = 0;
+    std::uint64_t r11 = 0;
+    std::uint64_t rbx = 0;
+    std::uint64_t rbp = 0;
+    std::uint64_t rsi = 0;
+    std::uint64_t rdi = 0;
+    std::uint64_t r13 = 0;
+    std::uint64_t r14 = 0;
+    std::uint64_t r15 = 0;
+    std::uint64_t r12 = 0;
+};
+static_assert(sizeof(EntryRegs) == 14 * sizeof(std::uint64_t),
+              "the loader restores by offset and needs the layout flat");
+
 // Writes the image at `image_base` out as a PE file.
 //
 // Everything needed is read from the image's own headers rather than from
@@ -52,8 +87,13 @@ namespace occ::runtime::image_dump {
 // depend on which fields the runtime happened to keep. False means the
 // headers did not parse, the file could not be written, or a section's
 // bytes were not readable; the reason is printed rather than guessed at.
+//
+// When `regs` is not null the dump appends a `.occregs` section holding
+// the entry register state, and the section is what a later load restores
+// from -- see the loader's handling of the same name.
 [[nodiscard]] bool dump(std::uint64_t image_base,
-                        const std::string& out_path) noexcept;
+                        const std::string& out_path,
+                        const EntryRegs* regs = nullptr) noexcept;
 
 }  // namespace occ::runtime::image_dump
 

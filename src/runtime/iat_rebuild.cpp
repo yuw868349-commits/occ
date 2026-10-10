@@ -69,10 +69,15 @@ std::vector<CallRef> collect(std::uint64_t image_base) noexcept {
     const std::uint64_t image_end = image_base + size_of_image;
 
     // Every slot the code names, keyed by the slot's own address, with the
-    // sites that reach it. A slot called from five places is one slot and
-    // five references, and a rebuild wants both: the slot to build the
-    // table from, and the sites to repoint at the rebuilt table.
-    std::map<std::uint64_t, std::vector<std::uint64_t>> slots;
+    // sites that reach it and the form of each. A slot called from five
+    // places is one slot and five references, and a rebuild wants both:
+    // the slot to build the table from, and the sites to repoint at the
+    // rebuilt table -- each patched at its own form's displacement byte.
+    struct Site {
+        std::uint64_t va = 0;
+        RefForm form = RefForm::Call;
+    };
+    std::map<std::uint64_t, std::vector<Site>> slots;
 
     for (std::uint16_t i = 0; i < section_count; ++i) {
         const std::size_t entry =
@@ -113,7 +118,49 @@ std::vector<CallRef> collect(std::uint64_t image_base) noexcept {
             if (target < image_base || target + 8 > image_end) {
                 continue;
             }
-            slots[target].push_back(code_va + off);
+            slots[target].push_back(
+                Site{code_va + off, modrm == 0x25 ? RefForm::Jump
+                                                  : RefForm::Call});
+        }
+
+        // The load form, `mov reg,[rip+disp32]`, in both the plain and the
+        // REX.R spellings. This is the other way a packed image reaches its
+        // imports: a `call [rip+disp32]` through a slot, and a `mov` of a
+        // slot into a register followed by an indirect call, are two
+        // spellings of the same resolution, and a rebuild that repointed
+        // only the direct form would leave the load form calling an address
+        // from the packed run -- an address that means nothing in a later
+        // load. The slot is only kept when its value lives outside the
+        // image: the runtime's own export surface is a host address, and a
+        // slot holding an image address is data, not an import.
+        for (std::uint64_t off = 0; off + 7 <= virtual_size; ++off) {
+            if (code[off] != 0x48 && code[off] != 0x4C) {
+                continue;
+            }
+            if (code[off + 1] != 0x8B) {
+                continue;
+            }
+            const std::uint8_t modrm = code[off + 2];
+            if ((modrm & 0xC7) != 0x05) {  // mod=00, rm=101; reg is free
+                continue;
+            }
+            const std::int32_t disp = static_cast<std::int32_t>(
+                rd32(code, static_cast<std::size_t>(off) + 3));
+            const std::int64_t signed_disp = static_cast<std::int64_t>(disp);
+            const std::uint64_t target =
+                signed_disp >= 0
+                    ? code_va + off + 7 + static_cast<std::uint64_t>(signed_disp)
+                    : code_va + off + 7 -
+                          static_cast<std::uint64_t>(-signed_disp);
+            if (target < image_base || target + 8 > image_end) {
+                continue;
+            }
+            const std::uint64_t value =
+                rd64(img, static_cast<std::size_t>(target - image_base));
+            if (value >= image_base && value < image_end) {
+                continue;  // an image address; the slot is data, not an import
+            }
+            slots[target].push_back(Site{code_va + off, RefForm::Mov});
         }
     }
 
@@ -128,8 +175,8 @@ std::vector<CallRef> collect(std::uint64_t image_base) noexcept {
         if (name == nullptr) {
             continue;
         }
-        for (const std::uint64_t site_va : sites) {
-            out.push_back(CallRef{site_va - image_base, offset,
+        for (const Site& site : sites) {
+            out.push_back(CallRef{site.va - image_base, offset, site.form,
                                   std::string(name)});
         }
     }

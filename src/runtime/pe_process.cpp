@@ -858,6 +858,63 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
                                                    section.raw_size
                                                ? section.virtual_size
                                                : section.raw_size);
+        } else if (section.name == ".occregs") {
+            // A dump's entry registers. The section is this runtime's own
+            // addition -- it only appears in a dumped image -- and the
+            // state it carries is what the packed run's stub left at the
+            // real entry point. The bytes are read straight from the
+            // mapping, like every other store in this build: the image is
+            // loaded before this walk, so the section is resident.
+            if (section.virtual_size >= sizeof(image_out.entry_regs)) {
+                const std::uint64_t regs_va =
+                    image_out.module.base + section.virtual_address;
+                std::memcpy(image_out.entry_regs,
+                            reinterpret_cast<const void*>(regs_va),
+                            sizeof(image_out.entry_regs));
+                image_out.has_entry_regs = true;
+                // The registers the stub left at the real entry belong to
+                // the run that produced the dump. An address in them that
+                // is neither the image nor the guest stack belonged to
+                // that run -- the host's stack, a host mapping -- and is
+                // meaningless in this one: the image is the same, but the
+                // process around it is not. Windows itself makes no
+                // promise about entry registers beyond the stack, so a
+                // saved value that cannot be a guest address is replaced
+                // with the one address the entry is entitled to: its own
+                // stack top. `rbp` is the register the mingw startup
+                // actually consumes -- it walks its argument block off a
+                // frame base the entry path is expected to provide -- and
+                // the same rule covers the rest, because a stale host
+                // pointer is stale in whatever register it lands in.
+                const std::uint64_t guest_lo = image_out.module.base;
+                const std::uint64_t guest_hi =
+                    image_out.module.base + image_out.module.size;
+                const std::uint64_t stack_lo =
+                    image_out.initial_stack_pointer >= 0x200000
+                        ? image_out.initial_stack_pointer - 0x200000
+                        : 0;
+                const std::uint64_t stack_hi =
+                    image_out.initial_stack_pointer;
+                for (std::size_t i = 0; i < 14; ++i) {
+                    const std::uint64_t v = image_out.entry_regs[i];
+                    // A small value is a flag or a count, not an address,
+                    // and a value inside the guest belongs to it. Only a
+                    // high-half address outside the guest -- the host's
+                    // stack, a host mapping, a host TLS slot -- is a stale
+                    // pointer from the run that produced the dump.
+                    if (v == 0 || v < 0x800000000000ULL ||
+                        (v >= guest_lo && v < guest_hi) ||
+                        (v >= stack_lo && v < stack_hi)) {
+                        continue;
+                    }
+                    image_out.entry_regs[i] = i == 7 ? stack_hi : 0;
+                }
+                std::fprintf(stderr,
+                             "occ load: entry registers restored from "
+                             ".occregs (rdx=0x%llx)\n",
+                             static_cast<unsigned long long>(
+                                 image_out.entry_regs[0]));
+            }
         }
     }
 
@@ -1095,15 +1152,51 @@ void guest_terminate(std::uint32_t code) noexcept {
 // callee-saved ones besides; that is why the return leg is a `siglongjmp`,
 // which restores the register set `sigsetjmp` saved. Control "returns" from
 // this function only through that jump, never through the epilogue.
-void enter_guest_asm(std::uint64_t entry, std::uint64_t stack_top) noexcept {
-    __asm__ volatile("movq %1, %%rsp\n\t"
-                     "subq $32, %%rsp\n\t"
-                     "xorl %%ebp, %%ebp\n\t"
-                     "call *%0\n\t"
-                     "ud2\n\t"
-                     :
-                     : "r"(entry), "r"(stack_top)
-                     : "memory");
+// The jump into the guest, with the entry registers the run captured.
+//
+// The third argument is a pointer to the captured state, or null. A
+// packed image's dump keeps the registers the stub left at the real entry
+// point, and restoring them here is what makes the unpacked image take the
+// same branch the packed run did -- Windows calls an entry with undefined
+// registers and cannot make that promise, so the loader carries the state
+// instead. The layout is the one `image_dump::EntryRegs` spells out:
+// r12 is last because this stub needs a scratch register to reach the
+// buffer and r12 is the one it uses.
+//
+// The restore happens after the stack is set and the frame is open, so
+// the register state at the call is the captured state and nothing else:
+// rbp is set to zero first, as the x64 ABI requires of a function entry,
+// then the captured values come in over the callee-saved registers the
+// entry will itself save.
+void enter_guest_asm(std::uint64_t entry, std::uint64_t stack_top,
+                     const std::uint64_t* regs) noexcept {
+    __asm__ volatile(
+        "movq %1, %%rsp\n\t"
+        "subq $32, %%rsp\n\t"
+        "xorl %%ebp, %%ebp\n\t"
+        "testq %2, %2\n\t"
+        "jz 1f\n\t"
+        "movq %2, %%r12\n\t"
+        "movq 0(%%r12), %%rdx\n\t"
+        "movq 8(%%r12), %%rcx\n\t"
+        "movq 16(%%r12), %%r8\n\t"
+        "movq 24(%%r12), %%r9\n\t"
+        "movq 32(%%r12), %%r10\n\t"
+        "movq 40(%%r12), %%r11\n\t"
+        "movq 48(%%r12), %%rbx\n\t"
+        "movq 56(%%r12), %%rbp\n\t"
+        "movq 64(%%r12), %%rsi\n\t"
+        "movq 72(%%r12), %%rdi\n\t"
+        "movq 80(%%r12), %%r13\n\t"
+        "movq 88(%%r12), %%r14\n\t"
+        "movq 96(%%r12), %%r15\n\t"
+        "movq 104(%%r12), %%r12\n\t"
+        "1:\n\t"
+        "call *%0\n\t"
+        "ud2\n\t"
+        :
+        : "r"(entry), "r"(stack_top), "r"(regs)
+        : "memory");
 }
 
 // ------------------------------------------------------------------ bytes
@@ -1421,8 +1514,37 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                          "occ oep: dumping the image as it stands at the "
                          "entry point, to %s\n",
                          oep_path.c_str());
+            // The moment is now, and the registers are in the faulting
+            // frame: the stub's branch decisions live in them, and a load
+            // of the unpacked image has to hand the same state to the same
+            // entry point. The general-purpose half is captured here -- rsp
+            // and rip are the loader's own job -- and the dump writes them
+            // out as its `.occregs` section.
+            image_dump::EntryRegs captured{};
+            captured.rdx = static_cast<std::uint64_t>(g[REG_RDX]);
+            captured.rcx = static_cast<std::uint64_t>(g[REG_RCX]);
+            captured.r8 = static_cast<std::uint64_t>(g[REG_R8]);
+            captured.r9 = static_cast<std::uint64_t>(g[REG_R9]);
+            captured.r10 = static_cast<std::uint64_t>(g[REG_R10]);
+            captured.r11 = static_cast<std::uint64_t>(g[REG_R11]);
+            captured.rbx = static_cast<std::uint64_t>(g[REG_RBX]);
+            captured.rbp = static_cast<std::uint64_t>(g[REG_RBP]);
+            captured.rsi = static_cast<std::uint64_t>(g[REG_RSI]);
+            captured.rdi = static_cast<std::uint64_t>(g[REG_RDI]);
+            captured.r13 = static_cast<std::uint64_t>(g[REG_R13]);
+            captured.r14 = static_cast<std::uint64_t>(g[REG_R14]);
+            captured.r15 = static_cast<std::uint64_t>(g[REG_R15]);
+            captured.r12 = static_cast<std::uint64_t>(g[REG_R12]);
+            std::fprintf(stderr,
+                         "occ oep: entry registers rdx=0x%llx rcx=0x%llx "
+                         "r8=0x%llx r12=0x%llx\n",
+                         static_cast<unsigned long long>(captured.rdx),
+                         static_cast<unsigned long long>(captured.rcx),
+                         static_cast<unsigned long long>(captured.r8),
+                         static_cast<unsigned long long>(captured.r12));
             static_cast<void>(
-                image_dump::dump(memwatch::image_base(), oep_path));
+                image_dump::dump(memwatch::image_base(), oep_path,
+                                 &captured));
         }
         return;
     }
@@ -1552,6 +1674,75 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                          state != nullptr ? state->xdata_bytes : 0),
                      static_cast<unsigned long long>(
                          state != nullptr ? state->unhandled_filter : 0));
+        // The frame's own return chain, read from the faulting stack: the
+        // guest walked into something it was not walking into, and the
+        // return address on top of the stack is the call site that sent it
+        // there. A fault whose rip is not even in the image -- the case a
+        // dead IAT slot produces -- is diagnosed by that site, so the
+        // reader is handed both numbers.
+        std::fprintf(stderr,
+                     "occ trace: fault frame regs rax=0x%llx rbx=0x%llx "
+                     "rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx "
+                     "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx r12=0x%llx "
+                     "r13=0x%llx r14=0x%llx r15=0x%llx\n",
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RAX]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RBX]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RCX]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RDX]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RSI]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RDI]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_RBP]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R8]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R9]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R10]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R11]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R12]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R13]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R14]),
+                     static_cast<unsigned long long>(
+                         uc->uc_mcontext.gregs[REG_R15]));
+        // The mapping the faulting instruction came from, read from the
+        // process's own map: a fault whose rip is not in the image is
+        // usually a call into a slot that held an address from another
+        // run, and the map says whose address space the target was in
+        // before the contents were gone.
+        ::FILE* maps = ::fopen("/proc/self/maps", "r");
+        if (maps != nullptr) {
+            const std::uint64_t fault_rip = static_cast<std::uint64_t>(
+                uc->uc_mcontext.gregs[REG_RIP]);
+            char line[256];
+            while (::fgets(line, sizeof(line), maps) != nullptr) {
+                unsigned long long lo = 0;
+                unsigned long long hi = 0;
+                char perms[8] = {};
+                if (std::sscanf(line, "%llx-%llx %7s",
+                                &lo, &hi, perms) == 3) {
+                    if (fault_rip >= lo && fault_rip < hi) {
+                        std::fprintf(
+                            stderr, "occ trace: fault rip 0x%llx is in "
+                                    "mapping 0x%llx-0x%llx %s (rest: %s)",
+                            static_cast<unsigned long long>(fault_rip),
+                            lo, hi, perms, line);
+                        break;
+                    }
+                }
+            }
+            ::fclose(maps);
+        }
     }
 
     // The frame walk comes first, which is the order Windows keeps: the
@@ -2029,7 +2220,8 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                              :
                              : "memory");
         }
-        enter_guest_asm(image.entry_point, image.initial_stack_pointer);
+        enter_guest_asm(image.entry_point, image.initial_stack_pointer,
+                        image.has_entry_regs ? image.entry_regs : nullptr);
         __builtin_unreachable();
     }
 

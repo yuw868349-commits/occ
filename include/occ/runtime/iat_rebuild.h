@@ -37,15 +37,29 @@ namespace occ::runtime::iat_rebuild {
 
 // One rip-relative reference the code makes to an import slot.
 //
-// `site_rva` is where the `call [rip+disp32]` lives, `slot_rva` is the
-// slot it names, and `name` is what the registry says the slot's value
-// was. A rebuild needs all three: the slots to build the import table
-// from, and the sites to repoint at the rebuilt table -- because a rebuilt
-// table does not have to keep the guest's own layout, and the code has to
+// `site_rva` is where the reference lives, `slot_rva` is the slot it
+// names, and `name` is what the registry says the slot's value was. A
+// rebuild needs all three: the slots to build the import table from, and
+// the sites to repoint at the rebuilt table -- because a rebuilt table
+// does not have to keep the guest's own layout, and the code has to
 // follow it.
+//
+// The reference forms differ in the byte the displacement starts at and
+// the length of the instruction: a `call [rip+disp32]` or `jmp
+// [rip+disp32]` is six bytes with the disp at +2, a `mov reg,[rip+disp32]`
+// is seven with it at +3. A repoint that did not know which form a site
+// was would patch the wrong byte half the time, so the form is part of
+// the record.
+enum class RefForm {
+    Call,  // `call [rip+disp32]` -- the disp at site+2, six bytes
+    Jump,  // `jmp  [rip+disp32]` -- the disp at site+2, six bytes
+    Mov,   // `mov  reg,[rip+disp32]` -- the disp at site+3, seven bytes
+};
+
 struct CallRef {
     std::uint64_t site_rva = 0;
     std::uint64_t slot_rva = 0;
+    RefForm form = RefForm::Call;
     std::string name;  // "MODULE!function", as the registry registered it
 };
 

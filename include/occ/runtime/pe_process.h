@@ -176,6 +176,18 @@ struct ProcessImage {
     std::uint64_t entry_point = 0;
     std::uint64_t initial_stack_pointer = 0;
 
+    // The entry registers a dump captured, when the image carries them.
+    //
+    // A packed image's stub hands the real entry point a register state
+    // that only exists at run time -- this run's unpacked layout, this
+    // run's branch decisions. `occ dump` keeps that state in the image's
+    // `.occregs` section, and this run restores it before the jump, so the
+    // unpacked image takes the same branch the packed run did. Empty when
+    // the image has no such section, in which case the entry is jumped to
+    // the way Windows does -- undefined registers and no promises.
+    bool has_entry_regs = false;
+    std::uint64_t entry_regs[14] = {};
+
     // The image's own exports, at absolute addresses. `GetProcAddress` on
     // the image's module answers from here, and the run hands the table to
     // the guest state. An image that exports nothing leaves it empty.

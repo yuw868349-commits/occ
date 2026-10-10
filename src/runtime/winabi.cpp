@@ -1642,6 +1642,10 @@ extern "C" __attribute__((ms_abi)) void k32_ExitProcess_impl(
     // Nothing after this runs: the guest has said it is done, and the exit
     // path belongs to the process layer from here.
     ::fflush(nullptr);
+    std::fprintf(stderr, "occ k32: ExitProcess(%u) from guest 0x%llx\n",
+                 static_cast<unsigned>(code),
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<std::uint64_t>(__builtin_return_address(0))));
     terminate(code);
     __builtin_unreachable();
 }
@@ -3486,6 +3490,10 @@ extern "C" __attribute__((ms_abi)) void cr_exit(
     std::int32_t code) noexcept {
     run_exit_lists();
     ::fflush(nullptr);
+    std::fprintf(stderr, "occ crt: exit(%d) from guest 0x%llx\n",
+                 static_cast<int>(code),
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<std::uint64_t>(__builtin_return_address(0))));
     terminate(static_cast<std::uint32_t>(code));
     __builtin_unreachable();
 }
@@ -3494,6 +3502,10 @@ extern "C" __attribute__((ms_abi)) void cr__amsg_exit(
     std::int32_t code) noexcept {
     // The startup's fast failure. The message the real library prints names
     // an internal error code; the exit code it leaves is the code itself.
+    std::fprintf(stderr, "occ crt: _amsg_exit(%d) from guest 0x%llx\n",
+                 static_cast<int>(code),
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<std::uint64_t>(__builtin_return_address(0))));
     terminate(static_cast<std::uint32_t>(code));
     __builtin_unreachable();
 }
