@@ -418,7 +418,9 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // than absent. Appending after the merge is deliberate: an --env of the
     // same name is a caller trying to set a variable for the target, and it
     // must not displace the switch that describes how this run is observed.
-    for (const char* name : {"OCC_GUEST_TRACE", "OCC_API_TRACE"}) {
+    for (const char* name :
+         {"OCC_GUEST_TRACE", "OCC_API_TRACE", "OCC_MEMWATCH",
+          "OCC_TRACE_STEPS"}) {
         const char* value = ::getenv(name);
         if (value != nullptr && value[0] != '\0') {
             env.emplace_back(std::string(name) + "=" + value);

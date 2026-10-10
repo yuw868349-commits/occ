@@ -43,6 +43,7 @@
 
 #include <chrono>
 #include <thread>
+#include "occ/runtime/memwatch.h"
 #include "occ/runtime/winabi.h"
 
 namespace occ::runtime {
@@ -1331,6 +1332,63 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     const ::greg_t* g = uc->uc_mcontext.gregs;
     const std::uint64_t rip = static_cast<std::uint64_t>(g[REG_RIP]);
 
+    // The watch's own single step comes before everything the guest could
+    // see, because it is not the guest's exception: it is the second half
+    // of a store the watch interrupted, and no handler the guest
+    // registered has any business being shown it. A guest that
+    // single-steps on purpose raises the same signal, which is why the
+    // watch's outstanding store is what decides -- its step, its
+    // handling; anything else belongs to the guest.
+    if (sig == SIGTRAP && memwatch::step_outstanding() &&
+        (info == nullptr || info->si_code == TRAP_TRACE)) {
+        if (memwatch::service_step()) {
+            // The flag the watch set is the watch's to clear: leaving it
+            // set would step the guest's next instruction too, and the
+            // watch does not get to choose which instruction the guest
+            // inspects.
+            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+            return;
+        }
+        // The trap was not the watch's after all -- a guest that faults
+        // between the store and its step -- and this step belongs to the
+        // guest's own handling below.
+    }
+
+    // The instruction trace, while its budget lasts. The flag is left set
+    // so that the next instruction lands here too; the trace ends when
+    // the budget does, and the guest runs on untraced.
+    if (sig == SIGTRAP && (info == nullptr || info->si_code == TRAP_TRACE) &&
+        memwatch::step_trace_active()) {
+        memwatch::record_step(rip);
+        if (!memwatch::step_trace_active()) {
+            // The budget was spent by this record. The flag is the
+            // trace's, and leaving it set would keep trapping with nothing
+            // left to record -- a loop the guest could not escape.
+            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+        }
+        return;
+    }
+
+    // A store into a watched page. Handled before the guest's dispatch for
+    // the same reason the watch's step is: this fault is the watch's, and
+    // showing it to the guest would end badly in both directions -- the
+    // program would see its own decryption as an access violation, and its
+    // own handler would eat that fault, the store would never be re-run,
+    // and the decryption would be silently corrupted. Only a store can be
+    // here: the watch takes the write permission and leaves read and
+    // execute, so a fetch or a load into one of these pages does not
+    // fault at all.
+    if (sig == SIGSEGV && info != nullptr &&
+        memwatch::handles(reinterpret_cast<std::uint64_t>(info->si_addr))) {
+        memwatch::service_write(
+            reinterpret_cast<std::uint64_t>(info->si_addr), rip);
+        // Trap flag: the store re-runs on the way out of this handler, and
+        // the step that follows lands back here, where the page is
+        // re-protected and the flag cleared.
+        uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
+        return;
+    }
+
     // A breakpoint trap is the one fault Windows reports against the
     // instruction itself: the CONTEXT an int3 handler reads names the
     // one-byte breakpoint, and the handler that resumes past it writes
@@ -1661,6 +1719,14 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         ::sigaction(kFaultSignals[i], &action, &previous[i]);
     }
 
+    // The watch, if the run asked for one, goes on here -- after the
+    // handlers that will service it are installed, before the guest runs.
+    // Arming after the entry point would miss every write the program
+    // makes on its way in, and a decryption loop is exactly the kind of
+    // write that starts early. The arm reads the image's own headers for
+    // its ranges, so it needs nothing from the caller but the base.
+    static_cast<void>(memwatch::arm(image.module.base));
+
     // The host's GS base, kept so the process that continues after this run
     // -- the same thread, with its own TLS conventions -- finds the segment
     // base it left behind.
@@ -1688,6 +1754,21 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                          static_cast<unsigned long long>(image.peb));
         }
         ::syscall(SYS_arch_prctl, kArchSetGs, state.teb);
+        // The trace's first step has to be asked for before the handoff:
+        // the flag the guest inherits is the host's own -- the handoff is
+        // a `call`, which does not build an EFLAGS of its own -- so the
+        // first instruction the guest runs lands in the trace only if the
+        // flag is already set when that call happens. The `sigsetjmp`
+        // above restores the host's own state on the way home, which is
+        // what keeps this flag from outliving the run.
+        if (memwatch::step_trace_active()) {
+            __asm__ volatile("pushfq\n\t"
+                             "orq $0x100, (%%rsp)\n\t"
+                             "popfq"
+                             :
+                             :
+                             : "memory");
+        }
         enter_guest_asm(image.entry_point, image.initial_stack_pointer);
         __builtin_unreachable();
     }
