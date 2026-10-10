@@ -618,13 +618,40 @@ TlsResult commit_tls_index(const TlsModule& m, AddressSpace& space,
         return out;
     }
     if ((protection_to_prot(r->protection) & PROT_WRITE) == 0) {
-        release();
-        out.error = TlsError::MalformedDirectory;
-        out.detail = "the TLS index at " + hex_of(m.index_va) +
-                     " is in " + (r->section.empty() ? "an unnamed section"
-                                                     : r->section) +
-                     ", which the file declared read-only, so no slot number "
-                     "can ever be written there";
+        // The loader writes the module's TLS slot during process setup.
+        // Windows grants that write even into a section the file declared
+        // read-only -- the slot is the loader's own, not the image's -- so
+        // mirror it here: raise the containing page, store the index, put
+        // the protection back. A packed image is the case this exists for:
+        // its sections are merged and a stub often marks them all read-only.
+        const PageProtection saved = r->protection;
+        const std::uint32_t base = protection_base(saved);
+        const PageProtection raised =
+            base == static_cast<std::uint32_t>(PageProtection::ReadOnly)
+                ? PageProtection::ReadWrite
+                : base == static_cast<std::uint32_t>(
+                              PageProtection::ExecuteRead)
+                      ? PageProtection::ExecuteReadWrite
+                      : base == static_cast<std::uint32_t>(
+                                    PageProtection::Execute)
+                            ? PageProtection::ExecuteReadWrite
+                            : saved;
+        const std::uint64_t page = m.index_va & ~0xFFFull;
+        const auto res = space.set_protection(page, raised);
+        if (!res.ok()) {
+            release();
+            out.error = TlsError::MalformedDirectory;
+            out.detail = "the TLS index at " + hex_of(m.index_va) +
+                         " is in " +
+                         (r->section.empty() ? "an unnamed section"
+                                             : r->section) +
+                         ", which the file declared read-only, and the "
+                         "loader could not raise the page to write it";
+            return out;
+        }
+        store_u32(m.index_va, m.index);
+        static_cast<void>(space.set_protection(page, saved));
+        out.ok = true;
         return out;
     }
     store_u32(m.index_va, m.index);
