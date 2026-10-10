@@ -1,15 +1,22 @@
 #include "occ/runner/pe_runner.h"
 
+#include "occ/inspect/disasm.h"
 #include "occ/parser/pe.h"
 #include "occ/runtime/exports.h"
+#include "occ/runtime/guestdbg.h"
 #include "occ/runtime/iat_rebuild.h"
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/pe_process.h"
 #include "occ/runtime/winabi.h"
 #include "occ/util/fs.h"
 
+#include <pthread.h>
+
+#include <atomic>
+
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,35 +94,43 @@ std::uint64_t resolve_thunk(void* state, const std::string& dll,
 
 } // namespace
 
-int run_pe_runner(int argc, char** argv) noexcept {
-    if (argc < 2 || argv[1] == nullptr || argv[1][0] == '\0') {
-        std::fprintf(stderr, "usage: occ %s <image> [arguments...]\n",
-                     kPeRunnerCommand);
-        return 2;
-    }
-    const std::string image_path = argv[1];
-    std::vector<std::string> guest_args;
-    guest_args.reserve(static_cast<std::size_t>(argc > 2 ? argc - 2 : 0));
-    for (int i = 2; i < argc; ++i) {
-        guest_args.emplace_back(argv[i]);
-    }
+namespace {
 
-    // --- the image --------------------------------------------------------
+// The registry the built process resolves through. A file-scope pointer
+// rather than a member of the session, because the process's resolver
+// state points into it and both runners want the same lifetime rule: the
+// registry outlives the guest.
+std::unique_ptr<runtime::ExportRegistry> g_session_registry;
+
+// Everything a session needs before the guest can run: the image parsed,
+// the registry built, the process assembled. Both the plain run and the
+// debug session want exactly this, which is why it is one function rather
+// than a second copy of a hundred lines that would drift.
+struct Session {
+    std::unique_ptr<runtime::PeProcess> process;
+    std::string error;
+    bool ok() const noexcept { return process != nullptr; }
+};
+
+[[nodiscard]] Session build_session(const std::string& image_path,
+                                    const std::vector<std::string>& guest_args) {
+    Session session;
 
     auto bytes = fs::read_file_bytes(image_path);
     if (!bytes || bytes->empty()) {
-        return runner_failure("the image could not be read", image_path);
+        session.error = "the image could not be read: " + image_path;
+        return session;
     }
     const ByteSpan span{bytes->data(), bytes->size()};
 
     const parser::PeImage image = parser::PeImage::parse(span);
     if (!image.ok()) {
-        return runner_failure("the image is not a PE this runtime can load",
-                              std::string(parser::pe_error_name(image.error())) +
-                                  ": " + image.error_detail());
+        session.error =
+            "the image is not a PE this runtime can load: " +
+            std::string(parser::pe_error_name(image.error())) + ": " +
+            image.error_detail();
+        return session;
     }
-
-    // --- the API the guest imports ----------------------------------------
 
     // The registry answers from the host implementations in `runtime/winabi`:
     // every KERNEL32 and msvcrt export the import table names is a host
@@ -125,10 +140,12 @@ int run_pe_runner(int argc, char** argv) noexcept {
     // registry's own rule is that the host table is preferred over whatever
     // the file's export directory names, and there is no file export
     // directory to prefer it over.
-    runtime::ExportRegistry registry;
-    runtime::winabi::register_host_modules(registry);
-
-    // --- the process -------------------------------------------------------
+    auto registry = std::make_unique<runtime::ExportRegistry>();
+    runtime::winabi::register_host_modules(*registry);
+    // The session keeps the registry alive past the process's build, because
+    // the process's resolver points into it and the guest resolves imports
+    // for as long as it runs.
+    g_session_registry = std::move(registry);
 
     // The paths and the command line are the DOS forms the guest expects:
     // the image under the `Z:` drive the runtime maps the host's root onto,
@@ -147,10 +164,9 @@ int run_pe_runner(int argc, char** argv) noexcept {
     // where in the guest's address space the process heap was placed. The
     // runner does not name it here: a handle spelled before the process
     // exists would be a second answer to a question the loader answers once.
-    // The environment the container handed this process, unchanged: the
-    // caller's `--env` entries, the runner's defaults, and nothing the
-    // runner invents. A Windows program reads its environment through the
-    // PEB, and the PEB is built from these strings.
+    // The environment, unchanged: the caller's entries, the runner's
+    // defaults, and nothing the runner invents. A Windows program reads its
+    // environment through the PEB, and the PEB is built from these strings.
     for (char** e = environ; *e != nullptr; ++e) {
         options.environment.emplace_back(*e);
     }
@@ -181,19 +197,43 @@ int run_pe_runner(int argc, char** argv) noexcept {
     for (const char* variable : kWindowsStandardVariables) {
         options.environment.emplace_back(variable);
     }
-    options.resolver_state = &registry;
+    options.resolver_state = g_session_registry.get();
     options.resolve = &resolve_thunk;
 
     runtime::ProcessImage failure;
-    std::unique_ptr<runtime::PeProcess> process =
+    session.process =
         runtime::PeProcess::build(image, span, options, &failure);
-    if (process == nullptr || !process->ok()) {
-        return runner_failure(
-            "the image could not be built into a process",
-            failure.detail.empty() ? std::string(runtime::process_error_name(
-                                         failure.error))
-                                   : failure.detail);
+    if (session.process == nullptr || !session.process->ok()) {
+        session.process.reset();
+        session.error = failure.detail.empty()
+                            ? std::string(runtime::process_error_name(
+                                  failure.error))
+                            : failure.detail;
     }
+    return session;
+}
+
+} // namespace
+
+int run_pe_runner(int argc, char** argv) noexcept {
+    if (argc < 2 || argv[1] == nullptr || argv[1][0] == '\0') {
+        std::fprintf(stderr, "usage: occ %s <image> [arguments...]\n",
+                     kPeRunnerCommand);
+        return 2;
+    }
+    const std::string image_path = argv[1];
+    std::vector<std::string> guest_args;
+    guest_args.reserve(static_cast<std::size_t>(argc > 2 ? argc - 2 : 0));
+    for (int i = 2; i < argc; ++i) {
+        guest_args.emplace_back(argv[i]);
+    }
+
+    Session session = build_session(image_path, guest_args);
+    if (!session.ok()) {
+        return runner_failure("the image could not be built into a process",
+                              session.error);
+    }
+    runtime::PeProcess* const process = session.process.get();
 
     // --- the run -----------------------------------------------------------
 
@@ -235,4 +275,372 @@ int run_pe_runner(int argc, char** argv) noexcept {
     ::_exit(static_cast<int>(outcome.exit_code & 0xFFu));
 }
 
-} // namespace occ::runner
+// ------------------------------------------------------------ the debugger
+
+namespace {
+
+// The guest thread's result, and the flag that says it is in. The driving
+// thread polls these from its REPL; the guest thread writes them once,
+// when run_pe_process returns.
+::pthread_t g_guest_thread;
+std::atomic<bool> g_guest_started{false};
+std::atomic<bool> g_guest_finished{false};
+runtime::RunOutcome g_guest_outcome{};
+
+void* guest_thread_main(void* arg) noexcept {
+    auto* process = static_cast<runtime::PeProcess*>(arg);
+    g_guest_outcome = runtime::run_pe_process(*process);
+    g_guest_finished.store(true, std::memory_order_seq_cst);
+    return nullptr;
+}
+
+// Starts the guest on a thread with a stack big enough to be the guest's
+// own -- the image names an initial stack, but the thread's stack is what
+// the runtime's host side lives on while the guest runs, and a default
+// pthread stack is thinner than a Windows program's habits.
+[[nodiscard]] bool start_guest(runtime::PeProcess* process) noexcept {
+    if (g_guest_started.exchange(true)) {
+        return true;  // already started
+    }
+    ::pthread_attr_t attr;
+    ::pthread_attr_init(&attr);
+    ::pthread_attr_setstacksize(&attr, 64ULL * 1024 * 1024);
+    const int made = ::pthread_create(&g_guest_thread, &attr,
+                                      guest_thread_main, process);
+    ::pthread_attr_destroy(&attr);
+    return made == 0;
+}
+
+// Waits until the guest is either stopped at a breakpoint or finished.
+// Polling, because the two states live on the other side of an atomic
+// and there is nothing to block on that belongs to both threads.
+void wait_for_event() noexcept {
+    while (!g_guest_finished.load(std::memory_order_seq_cst) &&
+           !runtime::guestdbg::guest_stopped()) {
+        ::usleep(2000);
+    }
+}
+
+// One hexdump line, in the form a reader can line up against a listing.
+void hexdump(std::uint64_t address, const std::uint8_t* data,
+             std::size_t bytes) noexcept {
+    for (std::size_t row = 0; row < bytes; row += 16) {
+        std::fprintf(stdout, "  %012llx  ",
+                     static_cast<unsigned long long>(address + row));
+        for (std::size_t i = 0; i < 16; ++i) {
+            if (row + i < bytes) {
+                std::fprintf(stdout, "%02x ", data[row + i]);
+            } else {
+                std::fprintf(stdout, "   ");
+            }
+            if (i == 7) {
+                std::fprintf(stdout, " ");
+            }
+        }
+        std::fprintf(stdout, " |");
+        for (std::size_t i = 0; i < 16 && row + i < bytes; ++i) {
+            const std::uint8_t c = data[row + i];
+            std::fputc(c >= 0x20 && c < 0x7F ? c : '.', stdout);
+        }
+        std::fprintf(stdout, "|\n");
+    }
+}
+
+// The registers a `regs` command names, in the order the guest thinks of
+// them. The indices are the gregs order; naming them here once keeps the
+// print honest about which number is which.
+struct RegName {
+    const char* name;
+    int index;
+};
+constexpr RegName kRegNames[] = {
+    {"rip", REG_RIP},   {"rsp", REG_RSP},  {"rbp", REG_RBP},
+    {"rax", REG_RAX},   {"rbx", REG_RBX},  {"rcx", REG_RCX},
+    {"rdx", REG_RDX},   {"rsi", REG_RSI},  {"rdi", REG_RDI},
+    {"r8", REG_R8},     {"r9", REG_R9},    {"r10", REG_R10},
+    {"r11", REG_R11},   {"r12", REG_R12},  {"r13", REG_R13},
+    {"r14", REG_R14},   {"r15", REG_R15},  {"efl", REG_EFL},
+};
+
+// Waits for the guest after a start or a release, and reports what it
+// came back as: a stop, with the reason and the rip; or an exit, with the
+// code; or a fault, with the signal. Answers false when the session
+// should end -- the guest is gone and the commands that read its state
+// have nothing left to read.
+[[nodiscard]] bool report_event() noexcept {
+    wait_for_event();
+    if (runtime::guestdbg::guest_stopped()) {
+        const auto& stop = runtime::guestdbg::current_stop();
+        if (stop.breakpoint != 0) {
+            std::fprintf(stdout, "stop: breakpoint at 0x%llx\n",
+                         static_cast<unsigned long long>(stop.breakpoint));
+        } else {
+            std::fprintf(stdout, "stop: step at 0x%llx\n",
+                         static_cast<unsigned long long>(stop.rip));
+        }
+        return true;
+    }
+    if (g_guest_finished.load(std::memory_order_seq_cst)) {
+        if (g_guest_outcome.exited) {
+            std::fprintf(stdout, "exit: %d\n", g_guest_outcome.exit_code);
+        } else {
+            std::fprintf(stdout, "fault: signal %d at 0x%llx\n",
+                         g_guest_outcome.signal,
+                         static_cast<unsigned long long>(
+                             g_guest_outcome.fault_address));
+        }
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+int dbg_pe_runner(int argc, char** argv) noexcept {
+    std::string image_path;
+    std::vector<std::string> guest_args;
+    std::vector<std::uint64_t> initial_breaks;
+    const char* script_path = nullptr;
+    for (int i = 0; i < argc; ++i) {
+        const char* a = argv[i];
+        if (std::strcmp(a, "--script") == 0 && i + 1 < argc) {
+            script_path = argv[++i];
+        } else if ((std::strcmp(a, "--break") == 0 ||
+                    std::strcmp(a, "-b") == 0) &&
+                   i + 1 < argc) {
+            initial_breaks.push_back(
+                std::strtoull(argv[++i], nullptr, 0));
+        } else if (image_path.empty()) {
+            image_path = a;
+        } else {
+            guest_args.emplace_back(a);
+        }
+    }
+    if (image_path.empty()) {
+        std::fprintf(stderr,
+                     "usage: occ dbg <image> [--script <file>] "
+                     "[--break <rva>]... [arguments...]\n");
+        return 2;
+    }
+
+    // The debugger switches the runtime into its debugging shape before
+    // anything reads it: the fault handler consults this once per trap.
+    // stdout goes unbuffered with it: a session that dies in the guest's
+    // signal path takes its buffered answers with it otherwise, and the
+    // transcript up to the death is the part worth keeping.
+    ::setenv("OCC_DEBUG_ACTIVE", "1", 1);
+    ::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    Session session = build_session(image_path, guest_args);
+    if (!session.ok()) {
+        std::fprintf(stderr, "occ dbg: %s\n", session.error.c_str());
+        return 2;
+    }
+    const std::uint64_t base = session.process->image().module.base;
+    std::fprintf(stdout, "image at 0x%llx, entry rva 0x%llx\n",
+                 static_cast<unsigned long long>(base),
+                 static_cast<unsigned long long>(
+                     session.process->image().entry_point - base));
+
+    // The breakpoints the command line named, before the guest runs --
+    // the usual way in, because a first stop is the point of the session.
+    for (const std::uint64_t rva : initial_breaks) {
+        if (!runtime::guestdbg::set_breakpoint(base + rva)) {
+            std::fprintf(stderr,
+                         "occ dbg: cannot arm a breakpoint at rva "
+                         "0x%llx\n",
+                         static_cast<unsigned long long>(rva));
+        }
+    }
+
+    // The command source: a script, or the terminal. A script is the
+    // session a person can keep -- the same commands, replayed against a
+    // fixed image, answer the same questions.
+    std::FILE* input = stdin;
+    if (script_path != nullptr) {
+        input = std::fopen(script_path, "r");
+        if (input == nullptr) {
+            std::fprintf(stderr, "occ dbg: cannot read the script %s\n",
+                         script_path);
+            return 2;
+        }
+    }
+
+    char line[512];
+    bool guest_ended = false;
+    while (!guest_ended) {
+        if (script_path == nullptr) {
+            std::fprintf(stdout, "occ dbg> ");
+            std::fflush(stdout);
+        }
+        if (std::fgets(line, sizeof(line), input) == nullptr) {
+            break;
+        }
+        // Comments and blanks are the script's punctuation, not commands.
+        char* text = line;
+        while (*text == ' ' || *text == '\t') {
+            ++text;
+        }
+        if (*text == '#' || *text == '\n' || *text == '\0') {
+            continue;
+        }
+        char cmd[32] = {};
+        unsigned long long a = 0;
+        unsigned long long b = 0;
+        const int fields = std::sscanf(text, "%31s %llx %llx", cmd,
+                                       &a, &b);
+        if (fields <= 0) {
+            continue;
+        }
+
+        if (std::strcmp(cmd, "quit") == 0 || std::strcmp(cmd, "q") == 0) {
+            break;
+        }
+        if (std::strcmp(cmd, "break") == 0 || std::strcmp(cmd, "b") == 0) {
+            if (fields < 2) {
+                std::fprintf(stdout, "break: needs an rva\n");
+            } else if (runtime::guestdbg::set_breakpoint(base + a)) {
+                std::fprintf(stdout, "breakpoint at 0x%llx\n",
+                             static_cast<unsigned long long>(base + a));
+            } else {
+                std::fprintf(stdout, "breakpoint at rva 0x%llx: the "
+                                     "bytes are not readable\n",
+                             static_cast<unsigned long long>(a));
+            }
+            continue;
+        }
+        if (std::strcmp(cmd, "delete") == 0 ||
+            std::strcmp(cmd, "del") == 0) {
+            if (fields < 2) {
+                std::fprintf(stdout, "delete: needs an rva\n");
+            } else {
+                static_cast<void>(runtime::guestdbg::clear_breakpoint(base + a));
+            }
+            continue;
+        }
+        if (std::strcmp(cmd, "breaks") == 0) {
+            const std::size_t count = runtime::guestdbg::breakpoint_count();
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto info = runtime::guestdbg::breakpoint_at(i);
+                std::fprintf(stdout, "  0x%llx (replaced 0x%02x)\n",
+                             static_cast<unsigned long long>(info.address),
+                             info.displaced);
+            }
+            if (count == 0) {
+                std::fprintf(stdout, "  (none)\n");
+            }
+            continue;
+        }
+        if (std::strcmp(cmd, "run") == 0 || std::strcmp(cmd, "r") == 0 ||
+            std::strcmp(cmd, "continue") == 0 ||
+            std::strcmp(cmd, "c") == 0) {
+            if (!g_guest_started.load()) {
+                if (!start_guest(session.process.get())) {
+                    std::fprintf(stderr, "occ dbg: the guest thread could "
+                                         "not start\n");
+                    return 2;
+                }
+            } else if (runtime::guestdbg::guest_stopped()) {
+                runtime::guestdbg::release(false);
+            } else {
+                std::fprintf(stdout, "the guest is already running\n");
+                continue;
+            }
+            guest_ended = !report_event();
+            continue;
+        }
+        if (std::strcmp(cmd, "step") == 0 || std::strcmp(cmd, "s") == 0) {
+            if (!runtime::guestdbg::guest_stopped()) {
+                std::fprintf(stdout,
+                             "step: the guest is not stopped\n");
+                continue;
+            }
+            runtime::guestdbg::release(true);
+            guest_ended = !report_event();
+            continue;
+        }
+        if (std::strcmp(cmd, "regs") == 0) {
+            if (!runtime::guestdbg::guest_stopped()) {
+                std::fprintf(stdout, "regs: the guest is not stopped\n");
+                continue;
+            }
+            const auto& stop = runtime::guestdbg::current_stop();
+            for (const RegName& reg : kRegNames) {
+                // The rip a stop names is the breakpoint's address, one
+                // below the rip the kernel saved; the stop's own field is
+                // the answer, and the raw slot would print the byte after
+                // the trap as if the guest were executing there.
+                const std::uint64_t value =
+                    reg.index == REG_RIP ? stop.rip : stop.regs[reg.index];
+                std::fprintf(stdout, "  %-4s 0x%016llx%s", reg.name,
+                             static_cast<unsigned long long>(value),
+                             (reg.index == REG_RSP || reg.index == REG_RDI)
+                                 ? "\n"
+                                 : "   ");
+            }
+            std::fprintf(stdout, "\n");
+            continue;
+        }
+        if (std::strcmp(cmd, "x") == 0) {
+            if (fields < 2) {
+                std::fprintf(stdout, "x: needs an rva (and a length)\n");
+                continue;
+            }
+            const std::uint64_t length = fields >= 3 ? b : 64;
+            std::uint8_t buffer[512];
+            const std::uint64_t address = base + a;
+            const std::size_t got = runtime::guestdbg::read_memory(
+                address, buffer,
+                length < sizeof(buffer) ? static_cast<std::size_t>(length)
+                                        : sizeof(buffer));
+            if (got == 0) {
+                std::fprintf(stdout, "x: 0x%llx is not readable\n",
+                             static_cast<unsigned long long>(address));
+            } else {
+                hexdump(address, buffer, got);
+            }
+            continue;
+        }
+        if (std::strcmp(cmd, "disas") == 0) {
+            if (fields < 2) {
+                std::fprintf(stdout,
+                             "disas: needs an rva (and a count)\n");
+                continue;
+            }
+            const std::uint64_t count = fields >= 3 ? b : 8;
+            std::uint8_t buffer[256];
+            const std::uint64_t address = base + a;
+            const std::size_t got = runtime::guestdbg::read_memory(
+                address, buffer, sizeof(buffer));
+            if (got < 16) {
+                std::fprintf(stdout, "disas: 0x%llx is not readable\n",
+                             static_cast<unsigned long long>(address));
+                continue;
+            }
+            std::fputs(occ::inspect::x64_disassemble_json(
+                           occ::ByteSpan{buffer, got}, address,
+                           static_cast<std::uint32_t>(count))
+                           .c_str(),
+                       stdout);
+            continue;
+        }
+        std::fprintf(stdout,
+                     "unknown command: %s (break, delete, breaks, "
+                     "run, continue, step, regs, x, disas, quit)\n",
+                     cmd);
+    }
+
+    if (script_path != nullptr) {
+        std::fclose(input);
+    }
+    // A guest still running is a thread the process exit will collect; a
+    // guest parked in its handler is likewise. The session ends here
+    // either way, and the exit code is the guest's when there is one.
+    return g_guest_finished.load(std::memory_order_seq_cst)
+               ? (g_guest_outcome.exited
+                      ? g_guest_outcome.exit_code & 0xFF
+                      : 133)
+               : 0;
+}
+
+}  // namespace occ::runner

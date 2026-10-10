@@ -43,6 +43,7 @@
 
 #include <chrono>
 #include <thread>
+#include "occ/runtime/guestdbg.h"
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/memwatch.h"
 #include "occ/runtime/winabi.h"
@@ -1403,6 +1404,46 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         return;
     }
 
+    // The debugger's traps, before anything the guest could see -- a
+    // breakpoint the driving thread set is the debugger's, not the
+    // guest's exception, and a trace the driving thread asked for is not
+    // a trace the guest made.
+    //
+    // The trace trap is judged first, because a release past a breakpoint
+    // produces one on its way to re-arming: the INT3 goes back over the
+    // instruction that just executed, and the flag comes down unless the
+    // release also wanted the next instruction to stop. A step that
+    // wanted stopping publishes a new stop and parks here again -- the
+    // handler is the parked thread, and the driving thread is already
+    // waiting on the other side of the atomic.
+    if (guestdbg::active() && sig == SIGTRAP &&
+        (info == nullptr || info->si_code == TRAP_TRACE)) {
+        if (guestdbg::rearm_pending()) {
+            guestdbg::complete_rearm(uc);
+            if (!guestdbg::step_requested()) {
+                return;
+            }
+        }
+        if (guestdbg::step_requested()) {
+            // The flag was the step's, and the stop it produced has no
+            // reason to carry it: the published copy is what `regs`
+            // shows and what a later release restores, and a flag left
+            // set there would send the guest straight back into a trace
+            // storm the moment it was let go.
+            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+            guestdbg::enter_stop(uc, rip);
+            return;
+        }
+    }
+    if (guestdbg::active() && sig == SIGTRAP &&
+        (info == nullptr || info->si_code != TRAP_TRACE) &&
+        guestdbg::is_breakpoint_hit(rip)) {
+        // The hit names the breakpoint one below the saved rip, which is
+        // where the INT3 sits and where the resume has to come back to.
+        guestdbg::enter_stop(uc, rip - 1);
+        return;
+    }
+
     // A store into a watched page. Handled before the guest's dispatch for
     // the same reason the watch's step is: this fault is the watch's, and
     // showing it to the guest would end badly in both directions -- the
@@ -1614,6 +1655,18 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                          uc->uc_mcontext.gregs[REG_RIP]));
         ::fflush(stderr);
         ::raise(SIGSTOP);
+    }
+
+    // A debugging session keeps its process: the guest shares it with
+    // the driving thread, and killing the process on an unhandled fault
+    // would take the REPL, the transcript and the breakpoint state down
+    // with the guest. The terminate path returns the fault as the run's
+    // outcome instead, which is what the session reports and what the
+    // exit code is built from -- the same answer a plain run's parent
+    // reads, delivered without a signal.
+    if (guestdbg::active()) {
+        ::fflush(nullptr);
+        guest_terminate(128 + static_cast<std::uint32_t>(sig));
     }
 
     ::signal(sig, SIG_DFL);

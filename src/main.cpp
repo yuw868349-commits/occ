@@ -83,6 +83,9 @@ int main(int argc, char** argv) {
     if (cmd == "inspect") {
         return occ::cmd_inspect(argc - 2, argv + 2);
     }
+    if (cmd == "dbg") {
+        return occ::runner::dbg_pe_runner(argc - 2, argv + 2);
+    }
 
     // The PE runner, reached only by occ's own exec of itself: the engine's
     // plan names this binary with this token, the container exec's the pair,

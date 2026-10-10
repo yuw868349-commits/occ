@@ -40,4 +40,24 @@ inline constexpr char kPeRunnerProgram[] = "/proc/self/exe";
 // that.
 [[nodiscard]] int run_pe_runner(int argc, char** argv) noexcept;
 
+// Debugs the image named by `argv[1]`, in this process, on a thread of its
+// own, with the driving thread reading commands from `--script <file>` or
+// the terminal.
+//
+// This session deliberately does not go through the container: a debugger
+// is the one observer that has to share the guest's address space rather
+// than watch it from outside, and the exec boundary that isolates a plain
+// run would also strand the driving thread on the far side of it. What the
+// session gives up by staying in one process is the isolation a plain run
+// gets; what it gains is the only debugger that can reach this guest at
+// all -- no external tool has a handle on code this process runs natively.
+//
+// Commands, one per line: `break <rva>` and `delete <rva>` arm and remove
+// INT3 breakpoints, `run`/`continue` starts or resumes the guest, `step`
+// resumes to the next instruction, `regs` prints the stopped registers,
+// `x <rva> <len>` and `disas <rva> <count>` read the guest's memory, and
+// `quit` ends the session. Lines starting with `#` are comments, which is
+// what makes a script file a record of a session as well as one.
+[[nodiscard]] int dbg_pe_runner(int argc, char** argv) noexcept;
+
 } // namespace occ::runner
