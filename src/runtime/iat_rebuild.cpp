@@ -50,6 +50,92 @@ constexpr std::uint32_t kSectionExecute = 0x20000000;
 
 }  // namespace
 
+std::vector<CallRef> collect(std::uint64_t image_base) noexcept {
+    std::vector<CallRef> out;
+    const auto* img = reinterpret_cast<const std::uint8_t*>(image_base);
+    if (img == nullptr || rd16(img, 0) != 0x5A4D) {
+        return out;
+    }
+    const std::uint32_t pe_at = rd32(img, 0x3C);
+    if (rd32(img, pe_at) != 0x00004550) {
+        return out;
+    }
+    const std::uint16_t section_count = rd16(img, pe_at + 6);
+    const std::uint16_t optional_size = rd16(img, pe_at + 20);
+    const std::size_t optional = static_cast<std::size_t>(pe_at) + 24;
+    const std::uint32_t size_of_image = rd32(img, optional + 0x38);
+    const std::size_t section_table =
+        optional + static_cast<std::size_t>(optional_size);
+    const std::uint64_t image_end = image_base + size_of_image;
+
+    // Every slot the code names, keyed by the slot's own address, with the
+    // sites that reach it. A slot called from five places is one slot and
+    // five references, and a rebuild wants both: the slot to build the
+    // table from, and the sites to repoint at the rebuilt table.
+    std::map<std::uint64_t, std::vector<std::uint64_t>> slots;
+
+    for (std::uint16_t i = 0; i < section_count; ++i) {
+        const std::size_t entry =
+            section_table + static_cast<std::size_t>(i) * kSectionSize;
+        if ((rd32(img, entry + kSectionCharacteristics) & kSectionExecute) == 0) {
+            continue;
+        }
+        const std::uint32_t virtual_size = rd32(img, entry + kSectionVirtualSize);
+        const std::uint32_t virtual_address =
+            rd32(img, entry + kSectionVirtualAddress);
+        if (virtual_size < 6) {
+            continue;
+        }
+        const std::uint8_t* code = img + virtual_address;
+        const std::uint64_t code_va = image_base + virtual_address;
+
+        for (std::uint64_t off = 0; off + 6 <= virtual_size; ++off) {
+            if (code[off] != 0xFF) {
+                continue;
+            }
+            const std::uint8_t modrm = code[off + 1];
+            // 0x15 is `call [rip+disp32]`; 0x25 is `jmp [rip+disp32]`.
+            if (modrm != 0x15 && modrm != 0x25) {
+                continue;
+            }
+            const std::int32_t disp = static_cast<std::int32_t>(
+                rd32(code, static_cast<std::size_t>(off) + 2));
+            // The displacement is signed and the sum is not, so the two
+            // directions are spelled separately: adding a negative to an
+            // address would compile to the same value but reads as a
+            // conversion the compiler is right to question.
+            const std::int64_t signed_disp = static_cast<std::int64_t>(disp);
+            const std::uint64_t target =
+                signed_disp >= 0
+                    ? code_va + off + 6 + static_cast<std::uint64_t>(signed_disp)
+                    : code_va + off + 6 -
+                          static_cast<std::uint64_t>(-signed_disp);
+            if (target < image_base || target + 8 > image_end) {
+                continue;
+            }
+            slots[target].push_back(code_va + off);
+        }
+    }
+
+    for (auto& [slot_va, sites] : slots) {
+        const std::uint64_t offset = slot_va - image_base;
+        const std::uint64_t value =
+            rd64(img, static_cast<std::size_t>(offset));
+        if (value == 0) {
+            continue;
+        }
+        const char* name = api_hook::name_for_address(value);
+        if (name == nullptr) {
+            continue;
+        }
+        for (const std::uint64_t site_va : sites) {
+            out.push_back(CallRef{site_va - image_base, offset,
+                                  std::string(name)});
+        }
+    }
+    return out;
+}
+
 bool report(std::uint64_t image_base, const std::string& out_path) noexcept {
     const auto* img = reinterpret_cast<const std::uint8_t*>(image_base);
     if (img == nullptr || rd16(img, 0) != 0x5A4D) {

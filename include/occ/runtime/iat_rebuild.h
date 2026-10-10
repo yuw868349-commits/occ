@@ -31,8 +31,33 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace occ::runtime::iat_rebuild {
+
+// One rip-relative reference the code makes to an import slot.
+//
+// `site_rva` is where the `call [rip+disp32]` lives, `slot_rva` is the
+// slot it names, and `name` is what the registry says the slot's value
+// was. A rebuild needs all three: the slots to build the import table
+// from, and the sites to repoint at the rebuilt table -- because a rebuilt
+// table does not have to keep the guest's own layout, and the code has to
+// follow it.
+struct CallRef {
+    std::uint64_t site_rva = 0;
+    std::uint64_t slot_rva = 0;
+    std::string name;  // "MODULE!function", as the registry registered it
+};
+
+// Scans the image's executable sections and answers every slot the code
+// reaches through a rip-relative indirect call or jump, named, with the
+// site that reaches it.
+//
+// This is the whole of the scan; the report and the import rebuild are
+// two renderings of the same answer, which is why the scan lives here and
+// they do not.
+[[nodiscard]] std::vector<CallRef> collect(
+    std::uint64_t image_base) noexcept;
 
 // Writes the report to `out_path`. False means the headers did not parse
 // or the file could not be written; the reason is printed.
