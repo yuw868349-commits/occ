@@ -1606,7 +1606,28 @@ char** g_environ_ptr = nullptr;
 
 // ---- process and module -------------------------------------------------
 
-extern "C" __attribute__((ms_abi)) void k32_ExitProcess(
+// The process-ending exports tolerate a misaligned stack from the caller.
+// A packer's hand-written stub that ends the process -- UPX's
+// `push 0; jmp [ExitProcess]` is the shape -- is not required to hold the
+// x64 ABI's entry alignment (rsp eight below sixteen), and the real
+// kernel32's exit path never touches a sixteen-byte-aligned store, so the
+// same call survives there. The C++ bodies below, compiled with the ms_abi
+// prologue that saves the vector registers with `movaps`, would fault on
+// that misaligned stack; the naked entries re-align the stack before
+// handing over. The correction is return-address-safe because these
+// functions never return: the caller's return slot is never read back.
+extern "C" __attribute__((ms_abi, naked)) void k32_ExitProcess(
+    std::uint32_t /*code*/) noexcept {
+    __asm__ volatile(
+        "testl $0x0f, %esp\n\t"
+        "jz 1f\n\t"
+        "jmp k32_ExitProcess_impl\n\t"
+        "1:\n\t"
+        "subq $8, %rsp\n\t"
+        "jmp k32_ExitProcess_impl\n");
+}
+
+extern "C" __attribute__((ms_abi)) void k32_ExitProcess_impl(
     std::uint32_t code) noexcept {
     // Nothing after this runs: the guest has said it is done, and the exit
     // path belongs to the process layer from here.
@@ -1615,7 +1636,18 @@ extern "C" __attribute__((ms_abi)) void k32_ExitProcess(
     __builtin_unreachable();
 }
 
-extern "C" __attribute__((ms_abi)) std::int32_t k32_TerminateProcess(
+extern "C" __attribute__((ms_abi, naked)) void k32_TerminateProcess(
+    std::uint64_t /*handle*/, std::uint32_t /*code*/) noexcept {
+    __asm__ volatile(
+        "testl $0x0f, %esp\n\t"
+        "jz 1f\n\t"
+        "jmp k32_TerminateProcess_impl\n\t"
+        "1:\n\t"
+        "subq $8, %rsp\n\t"
+        "jmp k32_TerminateProcess_impl\n");
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t k32_TerminateProcess_impl(
     std::uint64_t handle, std::uint32_t code) noexcept {
     if (handle != kCurrentProcessHandle) {
         // Another process's handle is one this runtime cannot name, and
