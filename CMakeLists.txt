@@ -590,6 +590,7 @@ add_library(occ_core STATIC
     src/runtime/api_hook.cpp
     src/runtime/apiset.cpp
     src/runtime/iat_rebuild.cpp
+    src/runtime/i386.cpp
     src/runtime/image_dump.cpp
     src/runtime/guestdbg.cpp
     src/runtime/memwatch.cpp

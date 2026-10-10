@@ -60,4 +60,11 @@ inline constexpr char kPeRunnerProgram[] = "/proc/self/exe";
 // what makes a script file a record of a session as well as one.
 [[nodiscard]] int dbg_pe_runner(int argc, char** argv) noexcept;
 
+// Runs a 32-bit image under the interpreter: the loader, the memory and
+// the CPU are the runtime's own, and the exit is the guest's. This is the
+// 32-bit counterpart of `run_pe_runner`, with the container deliberately
+// absent -- the interpreter is the isolation, and the seams it exposes are
+// the host calls, which are named in the run's output when one is missing.
+[[nodiscard]] int run_pe_32(const char* image_path) noexcept;
+
 } // namespace occ::runner

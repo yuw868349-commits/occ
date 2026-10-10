@@ -6,6 +6,7 @@
 #include "occ/runtime/guestdbg.h"
 #include "occ/runtime/iat_rebuild.h"
 #include "occ/runtime/minidump.h"
+#include "occ/runtime/i386.h"
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/pe_process.h"
 #include "occ/runtime/winabi.h"
@@ -664,6 +665,91 @@ int dbg_pe_runner(int argc, char** argv) noexcept {
                       ? g_guest_outcome.exit_code & 0xFF
                       : 133)
                : 0;
+}
+
+// ------------------------------------------------- the 32-bit interpreter
+
+namespace {
+
+// The interpreter's host seam, first mile: the calls a CRT-less 32-bit
+// image makes. ExitProcess is the run's exit; the console family goes
+// through the same host implementations the 64-bit guest reaches, with
+// the 32-bit stack's words widened into the host convention. Everything
+// else is named as unhosted -- which is the interpreter's way of growing:
+// each refusal names the call, and the next oracle needs it.
+bool i386_host_call(void* state, const char* dll, const char* name,
+                    runtime::i386::Machine& m,
+                    runtime::i386::Memory& mem) noexcept {
+    (void)state;
+    const std::uint32_t esp = m.regs[runtime::i386::Machine::kEsp];
+    const std::uint32_t arg1 = mem.read32(esp + 4);
+    const std::uint32_t arg2 = mem.read32(esp + 8);
+    if (std::strcmp(dll, "KERNEL32.dll") == 0 &&
+        std::strcmp(name, "ExitProcess") == 0) {
+        m.exit_code = arg1;
+        m.halted = true;
+        return true;
+    }
+    if (std::strcmp(dll, "KERNEL32.dll") == 0 &&
+        std::strcmp(name, "GetStdHandle") == 0) {
+        m.esp_adjust = 4;  // stdcall: the one argument
+        // The handles the runtime's console answers: output first, error
+        // second, input third -- the Windows numbers.
+        m.regs[runtime::i386::Machine::kEax] =
+            arg1 == 0xFFFFFFF5u ? 0x1001
+                                : (arg1 == 0xFFFFFFF6u ? 0x1000 : 0x1002);
+        m.esp_adjust = 4;
+        return true;
+    }
+    if (std::strcmp(dll, "KERNEL32.dll") == 0 &&
+        std::strcmp(name, "WriteFile") == 0) {
+        // (handle, buffer, bytes, *written, overlapped) -- the bytes go to
+        // stdout raw, whatever they encode; the written count is stored.
+        std::uint32_t len = mem.read32(m.regs[runtime::i386::Machine::kEsp] + 12);
+        std::uint32_t buf = arg2;
+        while (len != 0) {
+            const std::uint8_t ch = mem.read8(buf++);
+            std::fputc(ch, stdout);
+            --len;
+        }
+        const std::uint32_t written_at = mem.read32(m.regs[runtime::i386::Machine::kEsp] + 16);
+        if (written_at != 0) {
+            mem.write32(written_at, mem.read32(m.regs[runtime::i386::Machine::kEsp] + 12));
+        }
+        m.regs[runtime::i386::Machine::kEax] = 1;
+        m.esp_adjust = 20;  // stdcall: five arguments
+        return true;
+    }
+    return false;
+}
+
+bool i386_resolve(void*, const char*, const char*) noexcept {
+    // Every import is servable as a magic: the host seam answers or the
+    // run says which call it could not.
+    return true;
+}
+
+}  // namespace
+
+[[nodiscard]] int run_pe_32(const char* image_path) noexcept {
+    auto bytes = fs::read_file_bytes(image_path);
+    if (!bytes || bytes->empty()) {
+        std::fprintf(stderr, "occ run32: the image could not be read\n");
+        return 2;
+    }
+    runtime::i386::Machine machine;
+    std::string fault;
+    const bool done = runtime::i386::run(
+        bytes->data(), bytes->size(), image_path, &i386_resolve, nullptr,
+        &i386_host_call, nullptr, machine, 50000000, &fault);
+    if (!done) {
+        std::fprintf(stderr, "occ run32: the interpreter stopped: %s\n",
+                     fault.c_str());
+        std::fflush(nullptr);
+        return 2;
+    }
+    std::fflush(nullptr);
+    return static_cast<int>(machine.exit_code & 0xFFu);
 }
 
 }  // namespace occ::runner

@@ -84,6 +84,13 @@ int main(int argc, char** argv) {
     if (cmd == "inspect") {
         return occ::cmd_inspect(argc - 2, argv + 2);
     }
+    if (cmd == "run32") {
+        if (argc < 3) {
+            std::fprintf(stderr, "usage: occ run32 <image>\n");
+            return 2;
+        }
+        return occ::runner::run_pe_32(argv[2]);
+    }
     if (cmd == "dbg") {
         return occ::runner::dbg_pe_runner(argc - 2, argv + 2);
     }
