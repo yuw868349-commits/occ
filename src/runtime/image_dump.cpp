@@ -101,8 +101,10 @@ void wr32(std::uint8_t* p, std::size_t at, std::uint32_t v) noexcept {
     }
     const std::uint16_t optional_size = rd16(f, pe_at + 20);
     const std::size_t optional = static_cast<std::size_t>(pe_at) + 24;
-    if (rd16(f, optional) != 0x20B) {
-        std::fprintf(stderr, "occ dump: import rebuild is PE32+ only\n");
+    const std::uint16_t magic = rd16(f, optional);
+    if (magic != 0x20B && magic != 0x10B) {
+        std::fprintf(stderr,
+                     "occ dump: import rebuild is neither PE32 nor PE32+\n");
         return false;
     }
     const std::uint32_t section_align =
@@ -114,7 +116,10 @@ void wr32(std::uint8_t* p, std::size_t at, std::uint32_t v) noexcept {
     const std::uint16_t section_count = rd16(f, pe_at + 6);
     const std::size_t section_table =
         optional + static_cast<std::size_t>(optional_size);
-    const std::size_t directories = optional + 0x70;
+    // 0x70 into the optional header is PE32+'s data directory; PE32's is
+    // at 0x60, because its ImageBase is four bytes, not eight.
+    const std::size_t directories =
+        optional + (magic == 0x20B ? 0x70 : 0x60);
 
     // The slots, deduplicated and ordered; then grouped by the DLL each
     // name names. A descriptor speaks for one DLL, so the grouping is the
@@ -341,11 +346,17 @@ bool dump(std::uint64_t image_base, const std::string& out_path) noexcept {
     const std::uint16_t optional_size = rd16(img, pe_at + 20);
     const std::size_t optional = static_cast<std::size_t>(pe_at) + 24;
     const std::uint16_t magic = rd16(img, optional);
-    if (magic != 0x20B) {
-        // A PE32 dump is a different layout and would be written wrong by
-        // this code rather than refused by it, so it is refused here.
+    // Both optional-header layouts are dumped, and the whole difference
+    // between them that this file cares about is where the data directory
+    // sits: every other field it reads -- file alignment, size of headers,
+    // the section table and its entries -- is at the same offset in both.
+    // A PE32 dump was refused once on the grounds that the layouts differ;
+    // they differ in one offset, and the refusal cost every 32-bit sample
+    // -- which is most of the sample sets worth running -- its dump.
+    if (magic != 0x20B && magic != 0x10B) {
         std::fprintf(stderr,
-                     "occ dump: only PE32+ is dumped; this image says 0x%x\n",
+                     "occ dump: neither PE32 nor PE32+; this image says "
+                     "0x%x\n",
                      static_cast<unsigned>(magic));
         return false;
     }
