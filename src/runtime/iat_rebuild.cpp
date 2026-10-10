@@ -136,6 +136,86 @@ std::vector<CallRef> collect(std::uint64_t image_base) noexcept {
     return out;
 }
 
+std::vector<DataExport> collect_data_exports(
+    std::uint64_t image_base) noexcept {
+    std::vector<DataExport> out;
+    const auto* img = reinterpret_cast<const std::uint8_t*>(image_base);
+    if (img == nullptr || rd16(img, 0) != 0x5A4D) {
+        return out;
+    }
+    const std::uint32_t pe_at = rd32(img, 0x3C);
+    if (rd32(img, pe_at) != 0x00004550) {
+        return out;
+    }
+    const std::uint16_t section_count = rd16(img, pe_at + 6);
+    const std::uint16_t optional_size = rd16(img, pe_at + 20);
+    const std::size_t optional = static_cast<std::size_t>(pe_at) + 24;
+    const std::uint32_t size_of_image = rd32(img, optional + 0x38);
+    const std::size_t section_table =
+        optional + static_cast<std::size_t>(optional_size);
+    const std::uint64_t image_end = image_base + size_of_image;
+
+    // The `mov reg,[rip+disp32]` form, in both the plain and the REX.R
+    // spellings: `48 8B` for rax..rdi and `4C 8B` for r8..r15. The modrm
+    // is `00 xxx 101` -- a rip-relative operand -- so only the register
+    // field varies, and the mask over that field is the whole of the test
+    // beyond the opcode pair.
+    for (std::uint16_t i = 0; i < section_count; ++i) {
+        const std::size_t entry =
+            section_table + static_cast<std::size_t>(i) * kSectionSize;
+        if ((rd32(img, entry + kSectionCharacteristics) & kSectionExecute) == 0) {
+            continue;
+        }
+        const std::uint32_t virtual_size = rd32(img, entry + kSectionVirtualSize);
+        const std::uint32_t virtual_address =
+            rd32(img, entry + kSectionVirtualAddress);
+        if (virtual_size < 7) {
+            continue;
+        }
+        const std::uint8_t* code = img + virtual_address;
+        const std::uint64_t code_va = image_base + virtual_address;
+
+        for (std::uint64_t off = 0; off + 7 <= virtual_size; ++off) {
+            if (code[off] != 0x48 && code[off] != 0x4C) {
+                continue;
+            }
+            if (code[off + 1] != 0x8B) {
+                continue;
+            }
+            const std::uint8_t modrm = code[off + 2];
+            if ((modrm & 0xC7) != 0x05) {  // mod=00, rm=101; reg is free
+                continue;
+            }
+            const std::int32_t disp = static_cast<std::int32_t>(
+                rd32(code, static_cast<std::size_t>(off) + 3));
+            const std::int64_t signed_disp = static_cast<std::int64_t>(disp);
+            const std::uint64_t slot =
+                signed_disp >= 0
+                    ? code_va + off + 7 + static_cast<std::uint64_t>(signed_disp)
+                    : code_va + off + 7 -
+                          static_cast<std::uint64_t>(-signed_disp);
+            if (slot < image_base || slot + 8 > image_end) {
+                continue;
+            }
+            const std::uint64_t value =
+                rd64(img, static_cast<std::size_t>(slot - image_base));
+            if (value == 0 || value == image_base) {
+                continue;
+            }
+            // One byte out of place: the value the slot should hold, when
+            // shifted back, lands inside the image. Anything else is left
+            // alone -- the slot may simply hold a high address on purpose.
+            const std::uint64_t fixed = value >> 8;
+            if (fixed < image_base || fixed >= image_end) {
+                continue;
+            }
+            out.push_back(DataExport{code_va + off - image_base,
+                                     slot - image_base, fixed});
+        }
+    }
+    return out;
+}
+
 bool report(std::uint64_t image_base, const std::string& out_path) noexcept {
     const auto* img = reinterpret_cast<const std::uint8_t*>(image_base);
     if (img == nullptr || rd16(img, 0) != 0x5A4D) {

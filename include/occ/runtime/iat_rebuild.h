@@ -49,6 +49,22 @@ struct CallRef {
     std::string name;  // "MODULE!function", as the registry registered it
 };
 
+// One rip-relative data reference the code makes to a slot, where the
+// slot's value at dump time is one byte out of place.
+//
+// A packed image exports whole globals the way it exports functions: the
+// code loads `mov reg,[rip+disp32]`, the slot names a data address, and
+// the dump's copy of that slot sometimes holds the address shifted one
+// byte left -- 0x140008040 arrives as 0x14000804000. The fix is the
+// reverse shift, and it is only offered when the shifted value lands back
+// inside the image; a value that does not is left alone rather than
+// guessed at.
+struct DataExport {
+    std::uint64_t site_rva = 0;  // where the `mov [rip+disp32]` lives
+    std::uint64_t slot_rva = 0;  // the slot that names the global
+    std::uint64_t fixed = 0;     // the value the slot should hold
+};
+
 // Scans the image's executable sections and answers every slot the code
 // reaches through a rip-relative indirect call or jump, named, with the
 // site that reaches it.
@@ -57,6 +73,15 @@ struct CallRef {
 // two renderings of the same answer, which is why the scan lives here and
 // they do not.
 [[nodiscard]] std::vector<CallRef> collect(
+    std::uint64_t image_base) noexcept;
+
+// Scans the same sections for the `mov reg,[rip+disp32]` form and answers
+// the slots whose values are one byte out of place, with the corrected
+// value each should hold. The call-slot scan and this one are separate
+// passes because they answer different questions: calls name functions and
+// the registry names them back, while these name data and the image itself
+// holds the answer.
+[[nodiscard]] std::vector<DataExport> collect_data_exports(
     std::uint64_t image_base) noexcept;
 
 // Writes the report to `out_path`. False means the headers did not parse

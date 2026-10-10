@@ -60,6 +60,11 @@ void wr32(std::uint8_t* p, std::size_t at, std::uint32_t v) noexcept {
     p[at + 3] = static_cast<std::uint8_t>(v >> 24);
 }
 
+void wr64(std::uint8_t* p, std::size_t at, std::uint64_t v) noexcept {
+    wr32(p, at, static_cast<std::uint32_t>(v));
+    wr32(p, at + 4, static_cast<std::uint32_t>(v >> 32));
+}
+
 [[nodiscard]] std::uint64_t align_up(std::uint64_t value,
                                      std::uint64_t unit) noexcept {
     if (unit == 0) {
@@ -415,6 +420,36 @@ bool dump(std::uint64_t image_base, const std::string& out_path) noexcept {
     const auto calls = occ::runtime::iat_rebuild::collect(image_base);
     if (!calls.empty()) {
         static_cast<void>(rebuild_imports(out, calls));
+    }
+
+    // The data exports, after the imports: a packed image leaves some
+    // globals one byte out of place in the dump, and the scan names them.
+    // The corrected values land inside the image, so rewriting the slot in
+    // the file is the whole of the fix -- no new section, no code change.
+    const auto data = occ::runtime::iat_rebuild::collect_data_exports(image_base);
+    if (!data.empty()) {
+        std::size_t fixed = 0;
+        for (const auto& d : data) {
+            // The slot's file offset: walk the sections as they were
+            // written, exactly as the import rebuild's repointing does.
+            for (std::uint16_t s = 0; s < section_count; ++s) {
+                const std::size_t se =
+                    section_table + static_cast<std::size_t>(s) * kSectionSize;
+                const std::uint32_t va = rd32(img, se + kSectionVirtualAddress);
+                const std::uint32_t vs = rd32(img, se + kSectionVirtualSize);
+                if (d.slot_rva >= va && d.slot_rva < va + vs) {
+                    const std::uint32_t rp = rd32(img, se + kSectionRawPointer);
+                    wr64(out.data(), static_cast<std::size_t>(rp) +
+                                         (d.slot_rva - va), d.fixed);
+                    ++fixed;
+                    break;
+                }
+            }
+        }
+        std::fprintf(stderr,
+                     "occ dump: %zu data exports corrected (one byte out of "
+                     "place)\n",
+                     static_cast<std::size_t>(fixed));
     }
 
     std::FILE* file = std::fopen(out_path.c_str(), "wb");
