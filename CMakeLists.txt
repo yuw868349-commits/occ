@@ -488,7 +488,16 @@ if(OCC_ENABLE_FUZZ OR OCC_SANITIZED_BUILD)
 endif()
 
 if(OCC_STATIC_LINK)
-    add_link_options(-static)
+    # Static and position-independent together. The position-independence
+    # is not a hardening checkbox: the loader places guest images at the
+    # base their headers name, and the base a classic x64 image names is
+    # 0x400000 -- the address a static executable occupies by default. A
+    # fixed-load-address occ sits on the one address most guests ask for
+    # first and then refuses them for having no relocations, a refusal the
+    # guest would not have earned anywhere but here. Built as a static PIE,
+    # the kernel picks occ's load address out of the mmap region and
+    # 0x400000 is free for the guest that wants it, which is most of them.
+    add_link_options(-static-pie)
 endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion

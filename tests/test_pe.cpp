@@ -2427,26 +2427,43 @@ void test_seh_directory() {
     Spec s = base_spec();
     s.dir_count = 16;
     Built b = build(s);
-    // Directory 4 is the SEH table. A nonzero first field means the file
-    // declares one.
+    // Directory 3 is the exception table -- the SEH table on x64 -- and
+    // directory 4 is the certificate table, a different thing that shares
+    // the array. A nonzero first field in the third entry means the file
+    // declares one; the earlier version of this test wrote the fourth
+    // entry, which is the same wrong slot the reader once read, and the
+    // two agreed with each other and not with the format.
     const std::size_t dirs = b.opt + 96;
-    put32(b.bytes, dirs + 4 * 8, 0x3000);
-    put32(b.bytes, dirs + 4 * 8 + 4, 0x40);
+    constexpr std::size_t kExceptionDir = 3;
+    constexpr std::size_t kSecurityDir = 4;
+    put32(b.bytes, dirs + kExceptionDir * 8, 0x3000);
+    put32(b.bytes, dirs + kExceptionDir * 8 + 4, 0x40);
 
     check(parse_image(b.bytes).has_seh(), "seh: declared table is seen");
 
     // Zero means absent. An empty table is a valid configuration, so its
     // absence is not an error.
-    put32(b.bytes, dirs + 4 * 8, 0);
+    put32(b.bytes, dirs + kExceptionDir * 8, 0);
     check(!parse_image(b.bytes).has_seh(), "seh: zero means absent");
+
+    // A certificate is not an exception table. A file that signs itself
+    // declares the fourth entry, and a reader that took that entry as the
+    // SEH table reported unsigned images as signed and signed images as
+    // having unwind data.
+    put32(b.bytes, dirs + kSecurityDir * 8, 0x3000);
+    put32(b.bytes, dirs + kSecurityDir * 8 + 4, 0x40);
+    check(!parse_image(b.bytes).has_seh(),
+          "seh: a certificate directory is not a seh table");
 
     // A directory count that stops before the SEH entry means the file never
     // claimed to have one. Reading it anyway would find the section table's
-    // bytes and report them as a table.
+    // bytes and report them as a table. The entry past the count is the
+    // certificate slot at four -- with a count of four the walk stops at
+    // three, and the fourth entry's bytes belong to whatever follows.
     Spec t = base_spec();
     t.dir_count = 4;
     Built tb = build(t);
-    put32(tb.bytes, tb.opt + 96 + 4 * 8, 0x3000);
+    put32(tb.bytes, tb.opt + 96 + kSecurityDir * 8, 0x3000);
     check(!parse_image(tb.bytes).has_seh(),
           "seh: not read when the count stops short of it");
 }

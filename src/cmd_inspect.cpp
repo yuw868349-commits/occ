@@ -125,7 +125,16 @@ int occ::cmd_inspect(int argc, char** argv) {
     const occ::ByteSpan span{bytes->data(), bytes->size()};
     const occ::parser::PeImage image = occ::parser::PeImage::parse(span);
     if (!image.ok()) {
-        return inspect_failure("not a PE this inspector reads", path);
+        // The refusal names the parser's own verdict and the detail it
+        // recorded, because "not a PE this inspector reads" without the
+        // why is the difference between a diagnosis and a dead end: the
+        // parser decided this file unreadable for a reason it can state,
+        // and the reason is what the reader came for.
+        std::fprintf(stderr, "occ inspect: not a PE this inspector reads "
+                             "(%s): %s: %s\n",
+                     occ::parser::pe_error_name(image.error()),
+                     image.error_detail().c_str(), path.c_str());
+        return 2;
     }
 
     // The structural report, or -- with --disasm and no byte form -- the

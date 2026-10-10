@@ -882,12 +882,18 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         }
         const std::size_t room = bytes.size() - static_cast<std::size_t>(dir_off);
 
-        // The directory's declared size bounds the walk, and the bound is
-        // read as a count of whole descriptors. A directory that declares
-        // fewer bytes than one descriptor needs is a claim the file cannot
-        // keep: there is no arrangement of a 20-byte record inside 8 bytes,
-        // so this is reported rather than reported as "no imports".
-        if (out.import_size_ < kImportDescriptorSize) {
+        // The directory's declared size bounds the walk -- except when it
+        // is zero. A zero size beside a non-zero RVA is not a contradiction
+        // to report: the Windows loader resolves the RVA and walks to the
+        // null terminator without consulting Size, and corkami's
+        // normal64.exe -- a file Windows runs -- ships exactly this shape.
+        // Refusing it refused every such file on the word of a rule the
+        // system's own loader does not have. The walk is then bounded by
+        // what fits in the file and by the cap, which is the bound the
+        // terminator would supply eventually anyway. A size that is
+        // non-zero and smaller than one descriptor is still a claim the
+        // file cannot keep, and still a contradiction.
+        if (out.import_size_ != 0 && out.import_size_ < kImportDescriptorSize) {
             return fail(PeError::TruncatedImportTable,
                         "the import directory declares " +
                             decimal(out.import_size_) +
@@ -926,8 +932,13 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                             " fit in the file");
         }
         // Every declared descriptor was established to fit above, by division
-        // rather than by an addition that could wrap.
-        const std::size_t limit = declared;
+        // rather than by an addition that could wrap. A zero declared size
+        // leaves the walk to the terminator, bounded by the file's room and
+        // the same cap -- the two bounds a declared count would have named.
+        const std::size_t limit =
+            declared != 0 ? declared
+                          : (fitting < kMaxImportDescriptors ? fitting
+                                                             : kMaxImportDescriptors);
 
         for (std::size_t n = 0; n < limit; ++n) {
             // `limit` descriptors were established to fit above, by
