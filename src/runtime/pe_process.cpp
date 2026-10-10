@@ -46,6 +46,7 @@
 #include "occ/runtime/guestdbg.h"
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/memwatch.h"
+#include "occ/runtime/minidump.h"
 #include "occ/runtime/winabi.h"
 
 namespace occ::runtime {
@@ -1059,6 +1060,13 @@ thread_local RunFrame g_run_frame;
 thread_local ::sigjmp_buf g_host_return;
 thread_local volatile std::uint32_t g_guest_exit_code = 0;
 
+// The dump's facts about the module, set before the handoff and read by
+// the fault path, which has no other way to reach the image's size or
+// path -- the handler sees the guest's registers, not the run's plan.
+std::uint64_t g_dump_base = 0;
+std::uint64_t g_dump_size = 0;
+const char* g_dump_module = "";
+
 // The exit path the thunks reach through `winabi::terminate`. The flush is
 // the callers' duty -- `ExitProcess` and `exit` flush before they get here,
 // and the fault handler flushes before it does -- so this is the jump and
@@ -1324,6 +1332,21 @@ namespace {
     case SIGBUS: return "SIGBUS";
     case SIGTRAP: return "SIGTRAP";
     default: return "SIG?";
+    }
+}
+
+// The Windows exception code the signal stands for. The fault the guest
+// will see -- in a dump a reader opens on Windows, in an analysis tool --
+// is the code Windows would have raised, not the number Linux uses
+// internally for the same hardware event.
+[[nodiscard]] std::uint32_t windows_exception_code(int sig) noexcept {
+    switch (sig) {
+    case SIGSEGV: return 0xC0000005;  // access violation
+    case SIGFPE: return 0xC0000094;   // integer divide by zero
+    case SIGILL: return 0xC000001D;   // illegal instruction
+    case SIGTRAP: return 0x80000003;  // breakpoint
+    case SIGBUS: return 0xC0000142;   // the closest named thing
+    default: return 0xC0000409;       // fail fast, the honest bucket
     }
 }
 
@@ -1657,6 +1680,26 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         ::raise(SIGSTOP);
     }
 
+    // The crash dump, at the moment the fault was declined and before
+    // anything unwinds: the registers in the handler's frame are the
+    // state the analysis wants, and every later copy of them is a copy.
+    if (minidump::enabled()) {
+        minidump::Context dump_context;
+        for (int i = 0; i < NGREG; ++i) {
+            dump_context.regs[i] =
+                static_cast<std::uint64_t>(uc->uc_mcontext.gregs[i]);
+        }
+        dump_context.valid = true;
+        static_cast<void>(minidump::write(
+            minidump::path(), g_dump_base, g_dump_size, dump_context,
+            windows_exception_code(sig),
+            static_cast<std::uint64_t>(
+                reinterpret_cast<std::uintptr_t>(info != nullptr
+                                                     ? info->si_addr
+                                                     : nullptr)),
+            g_dump_module));
+    }
+
     // A debugging session keeps its process: the guest shares it with
     // the driving thread, and killing the process on an unhandled fault
     // would take the REPL, the transcript and the breakpoint state down
@@ -1813,6 +1856,14 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // write that starts early. The arm reads the image's own headers for
     // its ranges, so it needs nothing from the caller but the base.
     static_cast<void>(memwatch::arm(image.module.base));
+    // The dump's module facts, while the image is at hand: the fault
+    // handler that writes the minidump sees only its own frame.
+    g_dump_base = image.module.base;
+    g_dump_size = image.module.size;
+    // The module record's name comes from the image path the run was
+    // built with: LoadedModule::path is a field the loader never fills,
+    // which the first dump exposed as a module with no name.
+    g_dump_module = process.options().image_path.c_str();
 
     // The host's GS base, kept so the process that continues after this run
     // -- the same thread, with its own TLS conventions -- finds the segment

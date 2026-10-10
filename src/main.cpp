@@ -1,5 +1,6 @@
 #include "occ/commands.h"
 #include "occ/runner/pe_runner.h"
+#include "occ/runtime/minidump.h"
 #include "occ/util/log.h"
 
 #include <cstdio>
@@ -85,6 +86,13 @@ int main(int argc, char** argv) {
     }
     if (cmd == "dbg") {
         return occ::runner::dbg_pe_runner(argc - 2, argv + 2);
+    }
+    if (cmd == "mdmp") {
+        if (argc < 3) {
+            std::fprintf(stderr, "usage: occ mdmp <file>\n");
+            return 2;
+        }
+        return occ::runtime::minidump::summarize(argv[2]) ? 0 : 2;
     }
 
     // The PE runner, reached only by occ's own exec of itself: the engine's

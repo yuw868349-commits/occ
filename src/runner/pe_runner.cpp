@@ -5,6 +5,7 @@
 #include "occ/runtime/exports.h"
 #include "occ/runtime/guestdbg.h"
 #include "occ/runtime/iat_rebuild.h"
+#include "occ/runtime/minidump.h"
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/pe_process.h"
 #include "occ/runtime/winabi.h"
@@ -599,6 +600,28 @@ int dbg_pe_runner(int argc, char** argv) noexcept {
             } else {
                 hexdump(address, buffer, got);
             }
+            continue;
+        }
+        if (std::strcmp(cmd, "mdmp") == 0) {
+            if (!runtime::guestdbg::guest_stopped()) {
+                std::fprintf(stdout, "mdmp: the guest is not stopped\n");
+                continue;
+            }
+            if (fields < 2) {
+                std::fprintf(stdout, "mdmp: needs a path\n");
+                continue;
+            }
+            const auto& stop = runtime::guestdbg::current_stop();
+            runtime::minidump::Context ctx{};
+            for (int i = 0; i < NGREG; ++i) {
+                ctx.regs[i] = stop.regs[i];
+            }
+            ctx.regs[REG_RIP] = stop.rip;
+            ctx.valid = true;
+            const std::string p(text + std::strlen(cmd) + 1);
+            static_cast<void>(runtime::minidump::write(
+                p, base, session.process->image().module.size, ctx,
+                0x80000003, stop.rip, image_path.c_str()));
             continue;
         }
         if (std::strcmp(cmd, "disas") == 0) {

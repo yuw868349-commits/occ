@@ -446,6 +446,18 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         config.extra_mounts.push_back({dir, "/occ-dump-out", true});
         env.emplace_back("OCC_DUMP_IMAGE=/occ-dump-out/" + base);
     }
+    if (const char* mdmp = ::getenv("OCC_MINIDUMP");
+        mdmp != nullptr && mdmp[0] != '\0') {
+        const std::string full(mdmp);
+        const std::size_t slash = full.find_last_of('/');
+        const std::string dir = slash == std::string::npos
+                                    ? std::string(".")
+                                    : full.substr(0, slash);
+        const std::string base =
+            slash == std::string::npos ? full : full.substr(slash + 1);
+        config.extra_mounts.push_back({dir, "/occ-mdmp-out", true});
+        env.emplace_back("OCC_MINIDUMP=/occ-mdmp-out/" + base);
+    }
 
     // An observed run has to have its target stop at the exec boundary, or
     // the target can complete before the observer reaches it.
