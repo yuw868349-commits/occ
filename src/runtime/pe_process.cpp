@@ -1784,6 +1784,121 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     }
     state.env_table.push_back(nullptr);
 
+    // The guest's own view of the process data. Everything a thunk hands
+    // the guest as a pointer -- the command line, the image path, the argv
+    // and environment tables -- must live in guest memory: a guest that
+    // walks `argv[0]` or reads `GetCommandLineA()` reads the address it
+    // was given, and an address into the host's heap would be read back as
+    // guest memory and fault. One region above the stack holds all of it,
+    // and the thunks answer from the offsets recorded here.
+    {
+        std::u16string image_path_u16;
+        (void)winabi::utf8_to_utf16(state.image_path_dos, image_path_u16);
+
+        const std::uint64_t ansi_cmd = state.command_line.size() + 1;
+        const std::uint64_t ansi_path = state.image_path_dos.size() + 1;
+        const std::uint64_t wide_cmd =
+            (static_cast<std::uint64_t>(state.command_line_u16.size()) + 1) *
+            2;
+        const std::uint64_t wide_path =
+            (static_cast<std::uint64_t>(image_path_u16.size()) + 1) * 2;
+
+        std::uint64_t arg_bytes = 0;
+        for (const std::string& argument : state.arguments) {
+            arg_bytes += argument.size() + 1;
+        }
+        std::uint64_t env_bytes = 0;
+        for (const std::string& entry : options.environment) {
+            env_bytes += entry.size() + 1;
+        }
+        const std::uint64_t arg_ptr_bytes =
+            (state.arguments.size() + 1) * sizeof(std::uint64_t);
+        const std::uint64_t env_ptr_bytes =
+            (options.environment.size() + 1) * sizeof(std::uint64_t);
+
+        const std::uint64_t data_bytes = AddressSpace::round_up(
+            ansi_cmd + ansi_path + wide_cmd + wide_path + arg_bytes +
+                env_bytes + arg_ptr_bytes + env_ptr_bytes,
+            AddressSpace::kPageSize);
+
+        std::uint64_t floor = 0;
+        for (const ProcessImage::RegionRecord& region : image.regions) {
+            if (region.kind == RegionKind::Stack &&
+                region.base + region.size > floor) {
+                floor = region.base + region.size;
+            }
+        }
+        const Result<std::uint64_t> guest_data = process.mapper().map_above(
+            AddressSpace::round_up(floor, AddressSpace::kGranularity),
+            data_bytes, PageProtection::ReadWrite, RegionKind::Private);
+        if (!guest_data.ok()) {
+            outcome.detail = "the guest data region could not be placed: " +
+                             std::string(status_name(guest_data.status));
+            return outcome;
+        }
+
+        std::uint64_t cursor = guest_data.value;
+        const auto put_string = [&](const std::string& s) -> std::uint64_t {
+            const std::uint64_t here = cursor;
+            std::memcpy(reinterpret_cast<void*>(cursor), s.data(), s.size());
+            *reinterpret_cast<char*>(cursor + s.size()) = '\0';
+            cursor += s.size() + 1;
+            return here;
+        };
+        const auto put_wide = [&](const std::u16string& s) -> std::uint64_t {
+            const std::uint64_t here = cursor;
+            auto* p = reinterpret_cast<std::uint16_t*>(cursor);
+            for (std::size_t i = 0; i < s.size(); ++i) {
+                p[i] = static_cast<std::uint16_t>(s[i]);
+            }
+            p[s.size()] = 0;
+            cursor += (s.size() + 1) * 2;
+            return here;
+        };
+        const auto align8 = [&]() { cursor = AddressSpace::round_up(cursor, 8); };
+
+        state.cmdline_ansi = put_string(state.command_line);
+        state.image_path_ansi = put_string(state.image_path_dos);
+        state.cmdline_wide = put_wide(state.command_line_u16);
+        state.image_path_wide = put_wide(image_path_u16);
+
+        // The argv table: the strings first, then a null-terminated array
+        // of pointers to them. The order is the order a C startup reads
+        // them in -- the pointers are contiguous and the strings anywhere.
+        align8();
+        std::vector<std::uint64_t> arg_ptrs;
+        for (const std::string& argument : state.arguments) {
+            arg_ptrs.push_back(put_string(argument));
+        }
+        align8();
+        state.argv_table_guest = cursor;
+        for (std::size_t i = 0; i < arg_ptrs.size(); ++i) {
+            store_u64(cursor, i * 8, arg_ptrs[i], data_bytes);
+        }
+        store_u64(cursor, arg_ptrs.size() * 8, 0, data_bytes);
+        cursor += (arg_ptrs.size() + 1) * 8;
+
+        // The environment table, shaped the same way.
+        align8();
+        std::vector<std::uint64_t> env_ptrs;
+        for (const std::string& entry : options.environment) {
+            env_ptrs.push_back(put_string(entry));
+        }
+        align8();
+        state.env_table_guest = cursor;
+        for (std::size_t i = 0; i < env_ptrs.size(); ++i) {
+            store_u64(cursor, i * 8, env_ptrs[i], data_bytes);
+        }
+        store_u64(cursor, env_ptrs.size() * 8, 0, data_bytes);
+        cursor += (env_ptrs.size() + 1) * 8;
+
+        // The classic runtime's `_acmdln` data export reads through this
+        // buffer, so the ANSI command line it answers with is the guest's
+        // own memory.
+        winabi::g_acmdln_value =
+            reinterpret_cast<char*>(state.cmdline_ansi);
+    }
+
     for (const ProcessImage::RegionRecord& region : image.regions) {
         if (region.kind == RegionKind::Stack) {
             g_run_frame.stack_low = region.base;

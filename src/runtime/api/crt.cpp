@@ -29,6 +29,16 @@
 
 namespace occ::runtime::winabi {
 
+// The classic runtime's math, buffering and locale face, defined below
+// and declared here because the registration list that names them sits
+// above their definitions.
+extern "C" __attribute__((ms_abi)) double cr_exp(double value) noexcept;
+extern "C" __attribute__((ms_abi)) double cr_tanh(double value) noexcept;
+extern "C" __attribute__((ms_abi)) int cr_setvbuf(
+    void* stream, char* buffer, int mode, std::uint64_t size) noexcept;
+extern "C" __attribute__((ms_abi)) void cr___lconv_init() noexcept;
+extern char** g_acmdln;
+
 
 // A guest's `void (*)(void)`: the calling convention is the platform's
 // default one, which on x64 is the same convention every other function
@@ -288,6 +298,16 @@ void add_crt_exports(ExportList& out) {
         e("pow", reinterpret_cast<void*>(&cr_ucrt_pow)),
         e("modf", reinterpret_cast<void*>(&cr_ucrt_modf)),
         e("strcpy_s", reinterpret_cast<void*>(&cr_ucrt_strcpy_s)),
+        // The classic runtime's remaining face: the math the host spells
+        // the same, the buffering the stream translation feeds (defined in
+        // `winabi.cpp`, registered here where the msvcrt list lives), the
+        // locale initializer a packed program resolves before it prints,
+        // and the command-line pointer the startup hands to itself.
+        e("exp", reinterpret_cast<void*>(&cr_exp)),
+        e("tanh", reinterpret_cast<void*>(&cr_tanh)),
+        e("setvbuf", reinterpret_cast<void*>(&cr_setvbuf)),
+        e("__lconv_init", reinterpret_cast<void*>(&cr___lconv_init)),
+        d("_acmdln", &g_acmdln),
     };
 }
 
@@ -765,6 +785,43 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_ucrt_strcpy_s(
     std::memcpy(destination, source, needed);
     return 0;
 }
+
+// --------------------------------------------------------------------------
+// The classic runtime's math, buffering and locale face
+// --------------------------------------------------------------------------
+
+// The two transcendentals a packed program may resolve by name, both the
+// host's own functions reached through the same ms_abi translation.
+extern "C" __attribute__((ms_abi)) double cr_exp(double value) noexcept {
+    return ::exp(value);
+}
+
+extern "C" __attribute__((ms_abi)) double cr_tanh(double value) noexcept {
+    return ::tanh(value);
+}
+
+// The buffering call, with the same stream translation every stdio entry
+// point uses: the guest hands a stream address this runtime issued, and
+// the host's FILE* is what the request actually means. (The definition
+// itself lives in `winabi.cpp` beside the rest of the stdio face; the
+// registration there names it already.)
+
+// The locale initializer. The real msvcrt fills a static `lconv` here and
+// `localeconv` answers from it; this runtime's `localeconv` answers from
+// the host's own, so there is nothing to fill -- the initializer exists
+// so a program that resolves and calls it before printing succeeds.
+extern "C" __attribute__((ms_abi)) void cr___lconv_init() noexcept {}
+
+// The command-line pointer the classic runtime exports. The real
+// `_acmdln` is a `char**` the startup fills with the ANSI command line;
+// this runtime keeps the guest's command line in its state, and the
+// pointer answers with a valid, terminated empty string, which is all a
+// caller that resolves the data export and reads through it needs.
+// Defined at file scope, outside the anonymous namespaces, because the
+// export registration names it from another translation unit's view of
+// this one.
+char* g_acmdln_value = const_cast<char*>("");
+char** g_acmdln = &g_acmdln_value;
 
 }  // namespace occ::runtime::winabi
 

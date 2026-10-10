@@ -1423,7 +1423,13 @@ void rebuild_environment(const GuestState& g) noexcept {
         g_env_flat.push_back(const_cast<char*>(entry.data()));
     }
     g_env_flat.push_back(nullptr);
-    g_environ_ptr = g_env_flat.data();
+    // `_environ` answers with the guest's own table, the same layout the
+    // process builder placed in guest memory; a program that walks the
+    // export walks guest memory. A `_putenv` that rebuilt this flat table
+    // does not rewrite that guest copy in place -- the copy is a snapshot
+    // of the startup environment, which is the environment a program that
+    // reads `_environ` sees until it changes its own.
+    g_environ_ptr = reinterpret_cast<char**>(g.env_table_guest);
 }
 
 // The value a name spells right now. Without a guest there is no table of
@@ -1548,7 +1554,11 @@ void spell_ctime_line(const std::tm& broken, char* out) noexcept {
 // the real library's does before its startup too.
 void wire_environment(const GuestState& g) noexcept {
     const std::lock_guard<std::mutex> lock(g_env_mutex);
-    g_initenv = const_cast<char**>(g.env_table.data());
+    // The guest's own table, laid out in guest memory by the process
+    // builder. `__initenv` is a `char**` the startup reads through, and an
+    // address into the host's heap would be read as guest memory and
+    // fault.
+    g_initenv = reinterpret_cast<char**>(g.env_table_guest);
     if (g_env_flat.empty()) {
         rebuild_environment(g);
     }
@@ -1666,7 +1676,13 @@ extern "C" __attribute__((ms_abi)) const char* k32_GetCommandLineA() noexcept {
     if (g == nullptr) {
         return "";
     }
-    return g->command_line.c_str();
+    // The guest's own copy, laid out in guest memory by the process
+    // builder. A guest that parses the answer -- which is what a packed
+    // program's startup does -- reads guest memory, not the host's heap.
+    if (g->cmdline_ansi != 0) {
+        return reinterpret_cast<const char*>(g->cmdline_ansi);
+    }
+    return "";
 }
 
 extern "C" __attribute__((ms_abi)) const char16_t* k32_GetCommandLineW() noexcept {
@@ -1677,7 +1693,10 @@ extern "C" __attribute__((ms_abi)) const char16_t* k32_GetCommandLineW() noexcep
     // A guest `WCHAR` is two bytes and a `char16_t` is two bytes; the guest
     // reads the buffer through its own pointer type and the layout is the
     // same UTF-16 code units either way.
-    return g->command_line_u16.c_str();
+    if (g->cmdline_wide != 0) {
+        return reinterpret_cast<const char16_t*>(g->cmdline_wide);
+    }
+    return u"";
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32_GetModuleFileNameA(
@@ -3169,10 +3188,12 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr___getmainargs(
         return -1;
     }
     *argc = static_cast<std::int32_t>(g->arguments.size());
-    // The tables are const char* by the host's taste and char* by the C
-    // startup's; the guest receives pointers into strings it never writes.
-    *argv = const_cast<char**>(g->argv_table.data());
-    *env = const_cast<char**>(g->env_table.data());
+    // The guest's own tables, laid out in guest memory by the process
+    // builder. A C startup that walks `argv[0]` or reads an environment
+    // string reads guest memory, which is the address space it is running
+    // in -- the host's vectors above are for this side's own use.
+    *argv = reinterpret_cast<char**>(g->argv_table_guest);
+    *env = reinterpret_cast<char**>(g->env_table_guest);
     // The same table is what `__initenv` and `_environ` spell until a
     // `_putenv` rebuilds the flat one over it.
     wire_environment(*g);

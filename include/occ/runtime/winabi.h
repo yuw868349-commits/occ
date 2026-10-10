@@ -135,6 +135,21 @@ struct GuestState {
     std::string image_path_dos;
     std::vector<std::string> arguments;
 
+    // The guest's own copies of the process data, laid out in guest memory
+    // so that every pointer this runtime hands the guest -- the command
+    // line, the image path, the argv and environment tables -- is an
+    // address the guest can read back. The host keeps the std::string
+    // views above for the thunks that want text; these are the addresses
+    // the string-returning thunks answer with, and a guest that walks
+    // `argv[0]` or reads `GetCommandLineA()` through is walking guest
+    // memory, never the host's heap.
+    std::uint64_t cmdline_ansi = 0;
+    std::uint64_t cmdline_wide = 0;
+    std::uint64_t image_path_ansi = 0;
+    std::uint64_t image_path_wide = 0;
+    std::uint64_t argv_table_guest = 0;
+    std::uint64_t env_table_guest = 0;
+
     // The C form of the arguments, pointing into `arguments`, and the
     // environment as a null-terminated table pointing into storage that
     // lives as long as the state does.
@@ -594,6 +609,12 @@ extern int g_fmode;
 extern int g_commode;
 extern char** g_initenv;
 extern char** g_environ_ptr;
+
+// The ANSI command-line buffer the classic runtime's `_acmdln` data
+// export hands out. The process builder points it into the guest's own
+// memory once the guest data region is laid out, so a program that reads
+// through the export reads guest memory, exactly like the real runtime's.
+extern char* g_acmdln_value;
 
 // The remaining C runtime entry points. Each is the one
 // implementation the runtime presents under every module name the C
