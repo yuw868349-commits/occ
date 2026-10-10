@@ -61,6 +61,13 @@ constexpr std::size_t kMbiBytes = 48;
 
 constexpr std::uint32_t kMemCommit = 0x00001000;
 constexpr std::uint32_t kMemReserve = 0x00002000;
+// The state of a page the runtime has never handed out, and the two region
+// kinds a query reports alongside the private one: the `State` and `Type`
+// words of MEMORY_BASIC_INFORMATION, kept together because a query answers
+// with both and they are the two a walker of the space branches on.
+constexpr std::uint32_t kMemFree = 0x00010000;
+constexpr std::uint32_t kMemMapped = 0x00040000;
+constexpr std::uint32_t kMemImage = 0x01000000;
 // The placement hint: a large reservation asked for this way wants the
 // highest address range the window still has, not the lowest.
 constexpr std::uint32_t kMemTopDown = 0x00200000;
@@ -391,6 +398,23 @@ template <typename T>
     return 1;
 }
 
+// The `Type` word a region answers with, from what the region was made for.
+// Windows reports three kinds to a query -- a private allocation, a mapped
+// section and an image section -- and the thread's own stack and the control
+// blocks are private allocations there too, which is what the default is for:
+// private is the type a program most often sees, and naming the two kinds a
+// reader can tell apart from it is all the switch has to do.
+[[nodiscard]] std::uint32_t region_type(RegionKind kind) noexcept {
+    switch (kind) {
+    case RegionKind::Image:
+        return kMemImage;
+    case RegionKind::Mapped:
+        return kMemMapped;
+    default:
+        return kMemPrivate;
+    }
+}
+
 template <typename T>
 [[nodiscard]] std::uint64_t virtual_query(const T* address,
                                           std::uint8_t* out,
@@ -399,24 +423,95 @@ template <typename T>
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    (void)address;
-    // The host's view of a region is in `/proc/self/maps`, which is a Linux
-    // interface rather than a portable one, and reading it is what would make
-    // this answer true rather than descriptive. Until that is done, what this
-    // reports is the region Windows would describe for memory this runtime
-    // handed out -- committed, private, read-write -- and a guest walking the
-    // space with it is walking a description this runtime can stand behind
-    // rather than a guess about the host's maps. The caller that needs the
-    // host's answer is the observation layer, which reads the maps directly
-    // and does not go through this call.
     std::memset(out, 0, kMbiBytes);
-    put_u64(out, kMbiBase, reinterpret_cast<std::uint64_t>(address));
+    const std::uint64_t addr =
+        reinterpret_cast<std::uint64_t>(address);
+
+    // Past the top of the user window the query fails, as it does on
+    // Windows: the address is not in user space, no region can contain it,
+    // and there is nothing to describe. A walker probing the edge of its
+    // world reads the failure as the boundary -- an answer of MEM_FREE
+    // here would send it on into the kernel's half of the address space,
+    // walking addresses that do not exist and never finding the end.
+    if (addr > AddressSpace::kUserMax) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+
+    // The answer comes from the ledger the loader used, which is the promise
+    // GuestState's comment makes and the only ledger this runtime can stand
+    // behind: a region the loader recorded is described by its record, and an
+    // address no record covers is free, exactly as Windows describes an
+    // address the kernel has never handed out. The host's own map -- what the
+    // kernel actually did -- is the observation layer's question, and that
+    // layer reads `/proc/self/maps` directly instead of asking here.
+    //
+    // The answer this used to give, one committed region for every address,
+    // was a description of nothing: it reported committed, private,
+    // read-write memory at an address the runtime had never touched, and a
+    // walker of the space -- a packer's page guard, say -- could never find
+    // the free page it was looking for, because this runtime kept telling it
+    // every page was live. A guard that asks Windows "is the null page there"
+    // and is told "yes, committed" loops forever; told "no, free" it moves
+    // on. The whole point of the query is to let that walker see the shape
+    // of the space, and a shape with no free pages is not a shape.
+    const GuestState* g = guest_state();
+    const AddressSpace* space = g != nullptr ? g->space : nullptr;
+    if (space != nullptr) {
+        if (const Region* r = space->find(addr); r != nullptr) {
+            put_u64(out, kMbiBase, r->base);
+            // One allocation can be split into several regions -- a partial
+            // protect or a decommit cuts it -- and Windows reports the
+            // allocation's base for all of them. This ledger keeps no
+            // allocation chain, so a region reports itself, with one
+            // exception: the sections of an image all answer with the image
+            // base, which is the split a program can actually see.
+            const std::uint64_t allocation_base =
+                r->kind == RegionKind::Image && g->image_base != 0
+                    ? g->image_base
+                    : r->base;
+            put_u64(out, kMbiAllocationBase, allocation_base);
+            put_u32(out, kMbiAllocationProtect,
+                    static_cast<std::uint32_t>(r->initial_protection));
+            put_u64(out, kMbiRegionSize, r->size);
+            put_u32(out, kMbiState,
+                    r->committed ? kMemCommit : kMemReserve);
+            put_u32(out, kMbiProtect,
+                    static_cast<std::uint32_t>(r->protection));
+            put_u32(out, kMbiType, region_type(r->kind));
+            set_last_error(0);
+            return kMbiBytes;
+        }
+    }
+
+    // Free. The region reaches from the page the address fell in down to the
+    // next region the ledger knows, or to the top of the user window when
+    // the address is past the last of them; the base is that same page,
+    // which is what Windows returns for a free query. There is no guest
+    // here only when a test asks, and then every address is free, which is
+    // the same rule with an empty ledger.
+    const std::uint64_t page =
+        AddressSpace::round_down(addr, AddressSpace::kPageSize);
+    std::uint64_t next = AddressSpace::kUserMax + 1;
+    if (space != nullptr) {
+        for (const Region& r : space->regions()) {
+            if (r.base > page) {
+                next = r.base;
+                break;
+            }
+        }
+    }
+    // `next` is past every page the ledger can contain and the address was
+    // checked against the window above, so the region is never empty: it
+    // reaches from the queried page to the next known region, or to the
+    // top of the window when the page is the last one.
+    put_u64(out, kMbiBase, page);
     put_u64(out, kMbiAllocationBase, 0);
-    put_u32(out, kMbiAllocationProtect, kPageReadWrite);
-    put_u64(out, kMbiRegionSize, 0);
-    put_u32(out, kMbiState, kMemCommit);
-    put_u32(out, kMbiProtect, kPageReadWrite);
-    put_u32(out, kMbiType, kMemPrivate);
+    put_u32(out, kMbiAllocationProtect, 0);
+    put_u64(out, kMbiRegionSize, next - page);
+    put_u32(out, kMbiState, kMemFree);
+    put_u32(out, kMbiProtect, kPageNoAccess);
+    put_u32(out, kMbiType, 0);
     set_last_error(0);
     return kMbiBytes;
 }
