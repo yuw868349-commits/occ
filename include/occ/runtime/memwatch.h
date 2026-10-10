@@ -74,8 +74,12 @@ void service_write(std::uint64_t fault_address, std::uint64_t rip) noexcept;
 // Completes the single step: re-protects the page, records the store's
 // effect, and clears the outstanding step. Answers false when the trap
 // was not the watch's -- a guest that single-steps on purpose traps too,
-// and its step belongs to it.
-[[nodiscard]] bool service_step() noexcept;
+// and its step belongs to it. `rip` is the instruction that stepped: the
+// OEP trap uses it to leave the page without execute permission, except
+// when the guest is already executing in that page, because a stub that
+// patches itself in place would otherwise fault on its own next fetch and
+// the trap would report the stub as its own entry point.
+[[nodiscard]] bool service_step(std::uint64_t rip) noexcept;
 
 // Whether instruction tracing is on, and how it is bounded.
 // `OCC_TRACE_STEPS` carries a count; the trace stops after that many.
@@ -84,6 +88,56 @@ void service_write(std::uint64_t fault_address, std::uint64_t rip) noexcept;
 // Records one traced instruction -- the address it sits at and the bytes
 // it is -- and spends the trace's budget.
 void record_step(std::uint64_t rip) noexcept;
+
+// The OEP trap, on top of the watch's machinery.
+//
+// An unpacker decrypts its payload into a page and then jumps into it, and
+// the moment of that jump is the original entry point -- the one state a
+// dump wants to be taken at, because from there on the program has begun
+// and the pristine decrypted image is already being consumed. The trap
+// makes the jump observable: when a watched page of an executable section
+// takes a store, the step that follows leaves the page *without* execute
+// permission rather than restoring it, and the first fetch that lands in
+// the page faults -- a fault whose address is the instruction pointer,
+// which is what distinguishes an execution from a data access. That fault
+// is the OEP.
+//
+// `OCC_DUMP_AT_OEP` turns the trap on. It rides on the watch, because the
+// watch's steps are what make the state changes safe: the store completed
+// before the permission drops, so the page the guest jumps into is the
+// page as written, whole.
+[[nodiscard]] bool oep_trap_enabled() noexcept;
+
+// Whether a fault is an execution into a page the trap holds. Answers
+// false for anything else -- a data fault into the same page is the
+// watch's write business, and a fetch into a page nobody wrote is the
+// guest's own fault.
+[[nodiscard]] bool service_fetch(std::uint64_t rip) noexcept;
+
+// The first OEP the trap caught, and whether one was caught at all. Zero
+// until then. A run whose guest never jumps into a page it wrote -- an
+// unpacker that decrypts in place, or no unpacker at all -- reports no
+// OEP, which is a finding and not a failure.
+[[nodiscard]] bool oep_taken() noexcept;
+[[nodiscard]] std::uint64_t oep_rip() noexcept;
+
+// The image base the watch armed over, kept so the fault handler can dump
+// at the OEP without the handler carrying state of its own.
+[[nodiscard]] std::uint64_t image_base() noexcept;
+
+// Re-asserts the watch over a range the guest itself re-protected.
+//
+// A packer makes its target page writable -- `VirtualProtect`, the same
+// call the oracle uses -- and if that change stood, the stores into the
+// page would not fault and the watch would go blind exactly on the
+// program whose writes it exists to see. After the guest's change takes
+// effect, the watched pages in the range go back to what the watch
+// requires: write permission taken away again, and the OEP-trapped pages
+// left without execute. The guest's request is recorded in what the page
+// becomes when the watch finally lets go; until then the watch wins,
+// because the watch's protection is not a permission, it is the
+// instrument.
+void note_protect(std::uint64_t address, std::uint64_t size) noexcept;
 
 }  // namespace occ::runtime::memwatch
 

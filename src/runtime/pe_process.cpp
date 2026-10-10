@@ -43,6 +43,7 @@
 
 #include <chrono>
 #include <thread>
+#include "occ/runtime/image_dump.h"
 #include "occ/runtime/memwatch.h"
 #include "occ/runtime/winabi.h"
 
@@ -1341,7 +1342,7 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // handling; anything else belongs to the guest.
     if (sig == SIGTRAP && memwatch::step_outstanding() &&
         (info == nullptr || info->si_code == TRAP_TRACE)) {
-        if (memwatch::service_step()) {
+        if (memwatch::service_step(rip)) {
             // The flag the watch set is the watch's to clear: leaving it
             // set would step the guest's next instruction too, and the
             // watch does not get to choose which instruction the guest
@@ -1365,6 +1366,39 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
             // trace's, and leaving it set would keep trapping with nothing
             // left to record -- a loop the guest could not escape.
             uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+        }
+        return;
+    }
+
+    // An execution into a page the OEP trap holds. The discriminator
+    // against every other SIGSEGV is that a fetch faults on the address of
+    // the instruction itself -- the saved rip names the same byte
+    // `si_addr` does -- where a data access faults on the data, which is
+    // somewhere else by definition. This trap is the runtime's and not the
+    // guest's: the guest jumped into code it wrote, and the handler owes
+    // it a working page, not an access violation.
+    //
+    // The first catch is the original entry point, and if the run asked
+    // for an OEP dump this is the moment it means: the payload is whole,
+    // nothing of the program has consumed it, and the image in memory is
+    // as close to "unpacked and not yet run" as a running guest can be.
+    // The dump happens here, inside the handler, which is not
+    // async-signal-safe by the letter -- the same letter the trace lines
+    // already break, for the same reason: there is no other thread to
+    // hand the moment to, and the moment is the point.
+    if (sig == SIGSEGV && info != nullptr &&
+        static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(info->si_addr)) == rip &&
+        memwatch::service_fetch(rip)) {
+        if (memwatch::oep_taken() && memwatch::oep_rip() == rip &&
+            image_dump::enabled()) {
+            const std::string oep_path = image_dump::path() + ".oep";
+            std::fprintf(stderr,
+                         "occ oep: dumping the image as it stands at the "
+                         "entry point, to %s\n",
+                         oep_path.c_str());
+            static_cast<void>(
+                image_dump::dump(memwatch::image_base(), oep_path));
         }
         return;
     }

@@ -28,6 +28,7 @@
 
 #include "occ/runtime/api.h"
 #include "occ/runtime/mapper.h"
+#include "occ/runtime/memwatch.h"
 #include "occ/runtime/winabi.h"
 
 #include <cerrno>
@@ -112,14 +113,21 @@ void put_u64(std::uint8_t* base, std::size_t at, std::uint64_t value) noexcept {
     case kPageNoAccess:
         return PROT_NONE;
     case kPageReadOnly:
+        return PROT_READ;
     case kPageExecute:
     case kPageExecuteRead:
-        return PROT_READ;
+        // The execute modifiers carry their execution through: a page the
+        // guest asks to make executable is executable after the call, and
+        // one that answers "protected" while stripping the bit is a lie
+        // the next fetch will collect as a fault. Runtime-decrypted code
+        // goes through exactly this call on its way to being run.
+        return PROT_READ | PROT_EXEC;
     case kPageWriteCopy:
+        return PROT_READ | PROT_WRITE;
     case kPageReadWrite:
     case kPageExecuteWriteCopy:
     case kPageExecuteReadWrite:
-        return PROT_READ | PROT_WRITE;
+        return PROT_READ | PROT_WRITE | PROT_EXEC;
     default:
         return PROT_READ | PROT_WRITE;
     }
@@ -367,6 +375,12 @@ template <typename T>
                                        : kErrorInvalidParameter);
         return 0;
     }
+    // The watch rides on page protection, and this call just changed page
+    // protection under it: without the re-assert, a packer's
+    // VirtualProtect before it decrypts would silence the watch on
+    // exactly the stores it turned on to see.
+    memwatch::note_protect(reinterpret_cast<std::uint64_t>(address),
+                           rounded);
     // A protection word that asked for execution on a host that will not
     // grant it is a request that failed, not one that succeeded quietly.
     if (wants_execute(protect) && (host & PROT_EXEC) == 0) {

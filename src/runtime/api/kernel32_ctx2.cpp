@@ -466,6 +466,12 @@ void add_kernel32_ctx2(ExportList& out) {
       reinterpret_cast<void*>(&k32c2_AddVectoredContinueHandler));
     e("AddVectoredExceptionHandler",
       reinterpret_cast<void*>(&k32c2_AddVectoredExceptionHandler));
+    // The scope-table walker. mingw imports it from this module by name,
+    // so an image built by it does not load unless the registry answers --
+    // the implementation is the runtime's own SEH walker, already behind
+    // msvcrt's registration of the same name.
+    e("__C_specific_handler",
+      reinterpret_cast<void*>(&seh::seh_C_specific_handler));
     e("FreeLibrary", reinterpret_cast<void*>(&k32c2_FreeLibrary));
     e("GetEnabledXStateFeatures",
       reinterpret_cast<void*>(&k32c2_GetEnabledXStateFeatures));

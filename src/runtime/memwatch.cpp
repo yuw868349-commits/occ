@@ -41,6 +41,17 @@ constexpr std::uint64_t kPage = 0x1000;
 // and the page the answer names is recovered from the address itself.
 std::set<std::uint64_t> g_pages;
 
+// The watched pages that belong to an executable section, and the pages
+// the OEP trap currently holds without execute permission. The first set
+// is decided once, from the section table at arm time; the second grows
+// as stores land in executable pages and shrinks when a fetch trips it.
+std::set<std::uint64_t> g_exec_pages;
+std::set<std::uint64_t> g_exec_trapped;
+
+// The image base the watch armed over, and the first OEP the trap caught.
+std::uint64_t g_image_base = 0;
+std::uint64_t g_oep_rip = 0;
+
 // The page a recorded store is waiting on -- the one whose write
 // permission was re-admitted so the store could complete -- and the
 // address the store was writing to, kept so the step can record what the
@@ -196,6 +207,14 @@ bool arm(std::uint64_t image_base) noexcept {
 
     g_range = parse_range(::getenv("OCC_MEMWATCH"));
 
+    // The image base is kept for the OEP trap's reporting, and the
+    // executable sections are recorded now, from the table, because that
+    // is the only moment the table is trustworthy as a statement of
+    // intent: once the guest has run, a section's characteristics describe
+    // a mapping the guest may itself have altered.
+    g_image_base = image_base;
+    constexpr std::uint32_t kSectionExecute = 0x20000000;
+
     std::size_t armed = 0;
     std::size_t refused = 0;
     for (std::uint16_t i = 0; i < section_count; ++i) {
@@ -207,6 +226,8 @@ bool arm(std::uint64_t image_base) noexcept {
         if (virtual_size == 0 || !in_range(virtual_address, virtual_size)) {
             continue;
         }
+        const bool executable =
+            (rd32(img, entry + kSectionCharacteristics) & kSectionExecute) != 0;
         // Page by page, because a section whose size is not a multiple of
         // the page size shares its last page with whatever follows it, and
         // protecting past the section would watch bytes the section does
@@ -218,6 +239,9 @@ bool arm(std::uint64_t image_base) noexcept {
                 image_base + virtual_address + page * kPage;
             if (set_protection(address, PROT_READ | PROT_EXEC)) {
                 g_pages.insert(address);
+                if (executable) {
+                    g_exec_pages.insert(address);
+                }
                 ++armed;
             } else {
                 ++refused;
@@ -225,6 +249,17 @@ bool arm(std::uint64_t image_base) noexcept {
         }
     }
 
+    if (oep_trap_enabled()) {
+        std::fprintf(stderr,
+                     "occ memwatch: OEP trap armed over %zu executable "
+                     "pages\n",
+                     g_exec_pages.size());
+        if (g_exec_pages.empty()) {
+            std::fprintf(stderr,
+                         "occ memwatch: no executable section to trap; "
+                         "there will be no OEP\n");
+        }
+    }
     std::fprintf(stderr,
                  "occ memwatch: %zu pages watched (%zu refused)%s\n", armed,
                  refused,
@@ -272,7 +307,7 @@ bool step_outstanding() noexcept {
     return g_pending_page != 0;
 }
 
-bool service_step() noexcept {
+bool service_step(std::uint64_t rip) noexcept {
     if (g_pending_page == 0) {
         return false;
     }
@@ -289,8 +324,84 @@ bool service_step() noexcept {
                  "(page re-protected)\n",
                  static_cast<unsigned long long>(address),
                  static_cast<unsigned long long>(new_value));
+    // The OEP trap's move: a store into an executable section's page is
+    // the unpacker writing the code it is about to jump into, so the page
+    // goes back *without* execute permission -- the jump will fault, and
+    // the fault is the entry point. The page the guest is executing in is
+    // left alone: a stub that patches itself where it stands would fault
+    // on its own next fetch, and the trap would name the stub as the
+    // payload it exists to unpack.
+    if (oep_trap_enabled() && g_exec_pages.contains(page) &&
+        page != (rip & ~(kPage - 1))) {
+        static_cast<void>(set_protection(page, PROT_READ | PROT_WRITE));
+        g_exec_trapped.insert(page);
+        return true;
+    }
     static_cast<void>(set_protection(page, PROT_READ | PROT_EXEC));
     return true;
+}
+
+bool oep_trap_enabled() noexcept {
+    static const bool on = [] {
+        const char* value = ::getenv("OCC_DUMP_AT_OEP");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+bool service_fetch(std::uint64_t rip) noexcept {
+    const std::uint64_t page = rip & ~(kPage - 1);
+    if (!g_exec_trapped.contains(page)) {
+        return false;
+    }
+    g_exec_trapped.erase(page);
+    // The page goes back to read-execute: this fetch is the one the trap
+    // existed to catch, and every fetch after it must run like the guest's
+    // own, which it now is.
+    static_cast<void>(set_protection(page, PROT_READ | PROT_EXEC));
+    if (g_oep_rip == 0) {
+        g_oep_rip = rip;
+        std::fprintf(stderr,
+                     "occ memwatch: OEP trap -- first fetch into a written "
+                     "page at rip 0x%llx\n",
+                     static_cast<unsigned long long>(rip));
+    }
+    return true;
+}
+
+bool oep_taken() noexcept {
+    return g_oep_rip != 0;
+}
+
+std::uint64_t oep_rip() noexcept {
+    return g_oep_rip;
+}
+
+std::uint64_t image_base() noexcept {
+    return g_image_base;
+}
+
+void note_protect(std::uint64_t address, std::uint64_t size) noexcept {
+    if (!enabled() || g_pages.empty() || size == 0) {
+        return;
+    }
+    const std::uint64_t first = address & ~(kPage - 1);
+    const std::uint64_t last = (address + size - 1) & ~(kPage - 1);
+    for (std::uint64_t page = first;; page += kPage) {
+        if (g_pages.contains(page)) {
+            // Trapped pages keep the execution hole the OEP trap is
+            // waiting at; every other watched page loses its write bit
+            // again. The guest's own request survives in the page's
+            // eventual state -- the watch restores what it asked for when
+            // the watch's business with the page is done.
+            static_cast<void>(set_protection(
+                page, g_exec_trapped.contains(page) ? (PROT_READ | PROT_WRITE)
+                                                    : (PROT_READ | PROT_EXEC)));
+        }
+        if (page >= last) {
+            break;
+        }
+    }
 }
 
 bool step_trace_active() noexcept {
