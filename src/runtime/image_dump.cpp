@@ -419,8 +419,8 @@ bool dump(std::uint64_t image_base, const std::string& out_path) noexcept {
 
     std::FILE* file = std::fopen(out_path.c_str(), "wb");
     if (file == nullptr) {
-        std::fprintf(stderr, "occ dump: cannot open %s for writing\n",
-                     out_path.c_str());
+        std::fprintf(stderr, "occ dump: cannot open %s for writing: %s\n",
+                     out_path.c_str(), std::strerror(errno));
         return false;
     }
     const std::size_t written =
