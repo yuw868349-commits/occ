@@ -20,6 +20,7 @@
 #define OCC_RUNTIME_I386_H_
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,17 @@ struct Machine {
     std::uint32_t eflags = 0x2;  // bit 1 is always set
     bool halted = false;
     std::uint32_t exit_code = 0;
+    // The fs segment base -- the 32-bit TEB, built by the loader and
+    // named here so the prefix handler can serve `mov %fs:0x18` with the
+    // answer Windows would: the TEB is where every thread-shaped question
+    // a CRT asks is answered from.
+    std::uint32_t fs_base = 0;
+    // The nested-call state: a host callback that must run guest code --
+    // the global-constructor walk, an atexit handler -- re-enters the
+    // interpreter's loop with this flag up, and the loop ends that nested
+    // run when the guest's return pops the sentinel the host pushed.
+    bool nest_active = false;
+    std::uint32_t nest_saved_eip = 0;
     // The bytes the host seam removed from the stack on a stdcall API's
     // behalf -- the arguments it consumed, not the return address, which
     // the interpreter's own return takes back.
@@ -97,13 +109,48 @@ using HostCall = bool (*)(void* state, const char* dll, const char* name,
 // reason in `*fault_detail`) when the run ended on something the
 // interpreter could not do -- an instruction outside the implemented set
 // names itself, which is how the set grows honestly.
+// A data import -- __argc, _iob, __initenv -- is a VARIABLE the guest
+// reads through its IAT slot, not a function it calls: the slot must
+// hold an address of guest memory the loader set aside, and the host
+// fills the value. is_data names them; data_init builds each one at the
+// address the loader reserved.
+using IsData = bool (*)(void* state, const char* dll, const char* name);
+using DataInit = void (*)(void* state, const char* dll, const char* name,
+                          std::uint32_t addr, Memory& mem);
+
 [[nodiscard]] bool run(const std::uint8_t* image_bytes, std::size_t bytes,
                        const std::string& image_path,
                        bool (*resolve)(void* state, const char* dll,
                                        const char* name),
                        void* resolve_state, HostCall host_call,
                        void* host_call_state, Machine& m,
-                       std::uint64_t step_budget, std::string* fault_detail);
+                       std::uint64_t step_budget, std::string* fault_detail,
+                       IsData is_data = nullptr, DataInit data_init = nullptr);
+
+// The nested-call executor the run hands back: runs a guest function to
+// completion -- arguments under the cdecl convention, the sentinel return
+// the interpreter itself removes -- and answers with eax. This is how a
+// host callback that the guest gave a function pointer to (the global
+// constructor walk, atexit) runs that pointer without leaving the
+// machine.
+// Registers a magic address the host handed out -- GetProcAddress's
+// answer -- so a call through it routes back to the host seam with the
+// pair it names.
+void note_magic(std::uint32_t address, const std::string& dll,
+                const std::string& name);
+
+// Runs a guest function to completion from inside a host call: the
+// arguments are pushed cdecl, a sentinel return marks the end, and the
+// answer is eax. The active run provides the machine; without one the
+// call fails and says so.
+[[nodiscard]] bool call_guest(Machine& m, Memory& mem, std::uint32_t func,
+                              std::uint32_t a1, std::uint32_t a2,
+                              std::uint64_t budget, std::string* fault_detail);
+
+using GuestExecutor =
+    bool (*)(void* ctx, Machine& m, Memory& mem, std::uint32_t func,
+             std::uint32_t a1, std::uint32_t a2, std::uint64_t budget,
+             std::string* fault_detail);
 
 }  // namespace occ::runtime::i386
 
