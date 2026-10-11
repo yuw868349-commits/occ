@@ -72,6 +72,12 @@ bool g_resolved = false;
 // The image base the trace armed against.
 std::uint64_t g_image_base = 0;
 
+// The virtual clock's epoch (real tick at the first dispatch) and the
+// clean dispatch rate the clock pretends. A thousand dispatches a
+// millisecond is the order of magnitude a clean interpreter keeps.
+constexpr std::uint64_t kDispatchesPerMs = 1000;
+std::uint64_t g_tick_epoch_ms = 0;
+
 // The trapped pages (dispatch pages without execute permission), and the
 // single step the last service_fetch armed to re-trap the page it
 // restored. A dispatch page holds ordinary code too -- the engine's own
@@ -119,6 +125,21 @@ std::uint64_t recorded() noexcept {
 
 std::uint64_t image_base() noexcept {
     return g_image_base;
+}
+
+std::uint64_t virtual_tick_ms() noexcept {
+    // The guest's clock, when the trace is driving it. A clean VM
+    // dispatches roughly a thousand instructions a millisecond; the
+    // instrumented one takes far longer per dispatch because of the page
+    // fault and the step. The guest must see the clean speed, so the
+    // clock is the epoch plus the dispatch count at the clean rate --
+    // not the wall clock, which would leak the instrumentation. The
+    // epoch is the first dispatch's wall time: absolute values the
+    // packer compares against a remembered baseline stay consistent.
+    if (!enabled() || g_recorded == 0) {
+        return 0;
+    }
+    return g_tick_epoch_ms + g_recorded / kDispatchesPerMs;
 }
 
 std::size_t dispatch_count() noexcept {
@@ -310,6 +331,14 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
         g_ring[g_ring_pos] = rec;
         g_ring_pos = (g_ring_pos + 1) % kRingDepth;
         ++g_recorded;
+        // The first dispatch anchors the virtual clock's epoch.
+        if (g_tick_epoch_ms == 0) {
+            struct ::timespec ts {};
+            ::clock_gettime(CLOCK_MONOTONIC, &ts);
+            g_tick_epoch_ms = static_cast<std::uint64_t>(ts.tv_sec) * 1000ull +
+                              static_cast<std::uint64_t>(ts.tv_nsec) /
+                                  1000000ull;
+        }
 
         if (g_file == nullptr && !g_to_stderr && !g_path.empty()) {
             g_file = std::fopen(g_path.c_str(), "w");

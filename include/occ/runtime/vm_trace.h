@@ -58,6 +58,14 @@ namespace occ::runtime::vm_trace {
 // dispatch reads the decrypted image from it.
 [[nodiscard]] std::uint64_t image_base() noexcept;
 
+// The virtual clock, milliseconds: the time the guest is made to believe
+// has passed. It is driven by the dispatch count at the rate a clean VM
+// dispatches (no trap flag, no page faults), so a timing check that the
+// packer runs -- GetTickCount between two dispatch points -- sees the
+// speed it would have seen with no instrumentation at all. Zero when the
+// trace is not running, in which case the real clock stands in.
+[[nodiscard]] std::uint64_t virtual_tick_ms() noexcept;
+
 // The dispatch addresses the trace will watch, resolved once. The first
 // element is also the trap's page anchor. Empty when no dispatch idiom
 // was found and none was named. `image_base` is the guest's image base,

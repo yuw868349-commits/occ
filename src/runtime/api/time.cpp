@@ -23,6 +23,7 @@
 
 #include "occ/runtime/api.h"
 #include "occ/runtime/winabi.h"
+#include "occ/runtime/vm_trace.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -511,6 +512,14 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32t_CompareFileTime(
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32t_GetTickCount() noexcept {
+    // A VM trace drives the clock: the instrumented dispatch loop runs
+    // far slower than the clean one, and a timing check inside the
+    // virtual program would read the instrumentation as a debugger. The
+    // virtual clock replaces the wall clock while the trace is live.
+    const std::uint64_t virtual_ms = vm_trace::virtual_tick_ms();
+    if (virtual_ms != 0) {
+        return static_cast<std::uint32_t>(virtual_ms & 0xFFFFFFFFull);
+    }
     struct timespec ts {};
     if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return 0;
@@ -523,6 +532,10 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32t_GetTickCount() noexcept {
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t k32t_GetTickCount64() noexcept {
+    const std::uint64_t virtual_ms = vm_trace::virtual_tick_ms();
+    if (virtual_ms != 0) {
+        return virtual_ms;
+    }
     struct timespec ts {};
     if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return 0;
