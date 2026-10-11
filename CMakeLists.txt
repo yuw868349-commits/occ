@@ -596,6 +596,7 @@ add_library(occ_core STATIC
     src/runtime/image_dump.cpp
     src/runtime/guestdbg.cpp
     src/runtime/memwatch.cpp
+    src/runtime/vm_trace.cpp
     src/runtime/minidump.cpp
     src/runtime/api/path.cpp
     src/runtime/api/string.cpp

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/stat.h>
 #include <map>
 #include <vector>
 
@@ -511,6 +512,17 @@ bool dump(std::uint64_t image_base, const std::string& out_path,
     }
 
     std::FILE* file = std::fopen(out_path.c_str(), "wb");
+    if (file == nullptr) {
+        // The directory the caller named may not exist yet -- the run is
+        // where the directory gets made. A dump that fails on the way in
+        // is worse than one that creates the path it needs.
+        const std::size_t slash = out_path.find_last_of('/');
+        if (slash != std::string::npos && slash != 0) {
+            const std::string dir = out_path.substr(0, slash);
+            static_cast<void>(::mkdir(dir.c_str(), 0755));
+            file = std::fopen(out_path.c_str(), "wb");
+        }
+    }
     if (file == nullptr) {
         std::fprintf(stderr, "occ dump: cannot open %s for writing: %s\n",
                      out_path.c_str(), std::strerror(errno));

@@ -46,6 +46,7 @@
 #include "occ/runtime/guestdbg.h"
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/memwatch.h"
+#include "occ/runtime/vm_trace.h"
 #include "occ/runtime/minidump.h"
 #include "occ/runtime/winabi.h"
 
@@ -1520,6 +1521,20 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         return;
     }
 
+    // The VM dispatch trace. It uses the page trap, not the trap flag:
+    // the dispatch page is non-execute, the fetch into it faults with the
+    // dispatch address as the instruction pointer, the record is taken
+    // from that frame, and the single step that follows re-traps the page
+    // for the next dispatch. A guest that single-steps on purpose is not
+    // confused by this -- the step here belongs to the trap, not to it.
+    if (sig == SIGTRAP && (info == nullptr || info->si_code == TRAP_TRACE) &&
+        vm_trace::step_outstanding()) {
+        if (vm_trace::service_step(uc, rip)) {
+            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+            return;
+        }
+    }
+
     // An execution into a page the OEP trap holds. The discriminator
     // against every other SIGSEGV is that a fetch faults on the address of
     // the instruction itself -- the saved rip names the same byte
@@ -1580,6 +1595,38 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                                  &captured));
         }
         return;
+    }
+
+    // The VM dispatch trace's fetch. Same discriminator as the OEP trap:
+    // the fault is an execution when the faulting address is the saved
+    // instruction pointer, which is what a fetch into a non-execute page
+    // looks like. The trace records the virtual instruction from this
+    // frame and re-arms the trap; it is not the guest's exception.
+    if (sig == SIGSEGV && info != nullptr &&
+        static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(info->si_addr)) == rip &&
+        vm_trace::active() && vm_trace::handles_fetch(rip)) {
+        // The first dispatch is the proof that the engine has finished
+        // decrypting itself: nothing dispatches before its own code and
+        // handler tables are plain in memory. That is the moment the
+        // image is worth dumping -- the `.vmp0` bytes on disk are the
+        // encrypted shell, and the bytes in memory now are the engine the
+        // guest is actually running. Only the fetch that made the first
+        // record dumps; a fetch into the dispatch page that was not a
+        // dispatch leaves the count where it was.
+        const std::uint64_t before = vm_trace::recorded();
+        if (vm_trace::service_fetch(uc, rip)) {
+            if (vm_trace::recorded() > before &&
+                vm_trace::recorded() == 1 && image_dump::enabled()) {
+                const std::string vm_path = image_dump::path() + ".vm";
+                std::fprintf(stderr,
+                             "occ vm: dumping the decrypted image to %s\n",
+                             vm_path.c_str());
+                static_cast<void>(image_dump::dump(
+                    vm_trace::image_base(), vm_path, nullptr));
+            }
+            return;
+        }
     }
 
     // The debugger's traps, before anything the guest could see -- a
@@ -1869,6 +1916,27 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         std::fprintf(stderr,
                      "occ trace: no top-level filter; the fault is the "
                      "loader's to end\n");
+    }
+    // The VM trace's tail, before the fault ends the run: the dispatches
+    // that led here are the last thing the trace can contribute, and the
+    // crash site is unreachable without them.
+    //
+    // And if the run was tracing a VM, the fault is also the end of the
+    // engine's life: the image as it stands now is the most fully
+    // decrypted it will ever be -- VMProtect decrypts its sections
+    // piecemeal as the virtual program reaches them, so the first
+    // dispatch's dump misses whatever the program had not touched yet,
+    // and the fault's dump is the complete engine. Same handoff as the
+    // OEP dump: written here, in the handler, or not at all.
+    vm_trace::flush_on_fault();
+    if (vm_trace::enabled() && image_dump::enabled()) {
+        const std::string vm_path = image_dump::path() + ".vmf";
+        std::fprintf(stderr,
+                     "occ vm: dumping the fully-decrypted image at the "
+                     "fault, to %s\n",
+                     vm_path.c_str());
+        static_cast<void>(
+            image_dump::dump(vm_trace::image_base(), vm_path, nullptr));
     }
     if (filter != 0) {
         alignas(16) std::uint8_t context[kContextSize];
@@ -2202,6 +2270,10 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // write that starts early. The arm reads the image's own headers for
     // its ranges, so it needs nothing from the caller but the base.
     static_cast<void>(memwatch::arm(image.module.base));
+    // The VM dispatch trace, armed at the same moment: the scan reads the
+    // same mapped image, and the dispatch pages go non-execute before the
+    // guest runs so the first dispatch faults into the trace.
+    static_cast<void>(vm_trace::arm_trap(image.module.base));
     // The dump's module facts, while the image is at hand: the fault
     // handler that writes the minidump sees only its own frame.
     g_dump_base = image.module.base;

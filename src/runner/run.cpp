@@ -511,11 +511,14 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // switch it reads names a path this file chose and the two name the
     // same bytes on either side of the boundary.
     //
-    // When the path names no directory that can be bound this way, the run
-    // is not silently left without a dump: the reason is recorded as a
-    // degradation, and the switch keeps the host path the caller gave it.
+    // The plain path has no boundary to cross: the guest shares the host's
+    // filesystem, so the switch keeps the path the caller gave it. When
+    // the container path names no directory that can be bound this way,
+    // the run is not silently left without a dump: the reason is recorded
+    // as a degradation, and the switch keeps the host path the caller gave
+    // it.
     if (const char* dump = ::getenv("OCC_DUMP_IMAGE");
-        dump != nullptr && dump[0] != '\0') {
+        dump != nullptr && dump[0] != '\0' && !options.container_optional) {
         std::string dir;
         std::string base;
         std::string why;
@@ -530,7 +533,7 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         }
     }
     if (const char* mdmp = ::getenv("OCC_MINIDUMP");
-        mdmp != nullptr && mdmp[0] != '\0') {
+        mdmp != nullptr && mdmp[0] != '\0' && !options.container_optional) {
         std::string dir;
         std::string base;
         std::string why;
@@ -543,6 +546,28 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
                 std::string("OCC_MINIDUMP \"") + mdmp + "\" " + why +
                 "; the minidump will not be exported from the container");
         }
+    }
+
+    // The VM dispatch trace and its dispatch address, passed through to the
+    // guest's runner the same way the dump knobs are: the runner is an exec
+    // of this binary, and an environment the host set for this run is not
+    // inherited by the child unless it is written into the run's own
+    // environment, which is built from the list below rather than borrowed.
+    if (const char* vt = ::getenv("OCC_VM_TRACE");
+        vt != nullptr && vt[0] != '\0') {
+        env = merge_environment(env, {std::string("OCC_VM_TRACE=") + vt});
+    }
+    if (const char* vd = ::getenv("OCC_VM_DISPATCH");
+        vd != nullptr && vd[0] != '\0') {
+        env = merge_environment(env, {std::string("OCC_VM_DISPATCH=") + vd});
+    }
+    // The dump knob is passed through for the plain path; the container
+    // path rewrote it above into the mounted directory, and a merge here
+    // would undo the rewrite, so the plain path is the one that gets the
+    // caller's value.
+    if (const char* dmp = ::getenv("OCC_DUMP_IMAGE");
+        dmp != nullptr && dmp[0] != '\0' && options.container_optional) {
+        env = merge_environment(env, {std::string("OCC_DUMP_IMAGE=") + dmp});
     }
 
     // An observed run has to have its target stop at the exec boundary, or
