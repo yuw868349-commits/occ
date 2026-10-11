@@ -17,12 +17,13 @@
 // are: a program that calls `NtSetInformationThread` with
 // `ThreadHideFromDebugger` is not asking for a service -- it is measuring
 // the process it runs in. The honest answer is the one the kernel gives a
-// process with no debugger attached: the call succeeds, the flag is kept,
-// and nobody observes it, because there is nothing here to observe it. A
-// class this runtime does not carry state for answers success with no
-// effect for the same reason -- the state a real kernel would keep has no
-// reader in this one -- and a length that cannot hold the class's answer
-// is the invalid-parameter error the kernel names it.
+// process with no debugger attached: the call succeeds and the flag is
+// kept on the thread that set it, and the only reader it has is the query
+// itself -- which is exactly what an anti-debug probe measures. A class
+// this runtime does not carry state for answers success with no effect for
+// the same reason -- the state a real kernel would keep has no reader in
+// this one -- and a length that cannot hold the class's answer is the
+// invalid-parameter error the kernel names it.
 
 #include "occ/runtime/api.h"
 #include "occ/runtime/winabi.h"
@@ -45,34 +46,45 @@ constexpr std::uint32_t kStatusInfoLengthMismatch = 0xC0000004u;
 // reader sees what a class number is, not so the runtime tracks them.
 constexpr std::uint32_t kThreadHideFromDebugger = 0x11;
 
+// The hide flag for a caller with no per-thread state. Every live thunk
+// runs with a `GuestState` installed, so the runtime itself never lands
+// here; the bare function call -- what the tests and the doctor probes
+// use -- does, and its flag is kept per calling thread the same way the
+// real one is.
+thread_local bool bare_caller_hide_from_debugger = false;
+
 }  // namespace
 
-// NtSetInformationThread. The handle is trusted the way the kernel trusts
-// it -- a self or current-thread handle is the ordinary case -- and the
-// classes are accepted rather than policed, because the state each would
-// set has no reader in this runtime. A hide request is kept: it is
-// observable in principle to a debugger, and this runtime has none, but
-// the flag is part of what a thread carries and a later query should
-// agree with what was set.
+// NtSetInformationThread. The handle names the thread the flag lands on:
+// one the thread table minted lands on that thread, and the pseudo-current
+// handle -- the ordinary case -- lands on the calling thread. The classes
+// are accepted rather than policed, because the state each would set has
+// no reader in this runtime; the hiding class is the exception, and its
+// request is kept so a later query agrees with what was set.
 extern "C" __attribute__((ms_abi)) std::uint32_t
 nt_NtSetInformationThread(std::uint64_t thread_handle,
                           std::uint32_t information_class,
                           const void* information,
                           std::uint32_t length) noexcept {
-    (void)thread_handle;
     (void)information;
     (void)length;
     if (information_class == kThreadHideFromDebugger) {
-        // The flag is remembered per guest state so a query can echo it.
-        // A process with no debugger never sees the difference, and that
-        // is the point: the call succeeding without changing anything a
-        // reader can reach is what the same call does on the kernel.
+        // The class takes no buffer, so `information` and `length` carry
+        // nothing to store. The flag goes to the thread and stays there.
+        GuestState* state = guest_thread_state_for(thread_handle);
+        if (state != nullptr) {
+            state->hide_from_debugger = true;
+        } else {
+            bare_caller_hide_from_debugger = true;
+        }
     }
     return kStatusSuccess;
 }
 
-// NtQueryInformationThread. The class this runtime tracks answers a
-// four-byte boolean; the classes it does not track answer success with a
+// NtQueryInformationThread. The class this runtime tracks answers with the
+// flag the set call left on the thread -- one for a thread that hid
+// itself, zero for a fresh one, which is the answer a process with no
+// debugger sees. The classes it does not track answer success with a
 // zeroed buffer when the caller's buffer can hold the answer and the
 // length-mismatch code when it cannot, which is the kernel's own shape.
 extern "C" __attribute__((ms_abi)) std::uint32_t
@@ -80,15 +92,21 @@ nt_NtQueryInformationThread(std::uint64_t thread_handle,
                             std::uint32_t information_class, void* information,
                             std::uint32_t length,
                             std::uint32_t* returned_length) noexcept {
-    (void)thread_handle;
-    (void)information_class;
     if (information == nullptr) {
         return kStatusInvalidParameter;
     }
     if (length < 4) {
         return kStatusInfoLengthMismatch;
     }
-    *static_cast<std::uint32_t*>(information) = 0;
+    std::uint32_t value = 0;
+    if (information_class == kThreadHideFromDebugger) {
+        const GuestState* state = guest_thread_state_for(thread_handle);
+        const bool hidden = state != nullptr
+                                ? state->hide_from_debugger
+                                : bare_caller_hide_from_debugger;
+        value = hidden ? 1u : 0u;
+    }
+    *static_cast<std::uint32_t*>(information) = value;
     if (returned_length != nullptr) {
         *returned_length = 4;
     }

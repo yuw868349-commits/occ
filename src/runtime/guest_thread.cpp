@@ -674,6 +674,30 @@ std::uint64_t open_guest_thread(std::uint32_t thread_id) noexcept {
     return 0;
 }
 
+GuestState* guest_thread_state_for(std::uint64_t handle) noexcept {
+    // A handle this file minted names its thread directly. The record is
+    // reached under the table lock, like every other lookup.
+    if (handle >= kThreadHandleBase &&
+        handle < kThreadHandleBase + kThreadHandleSpan) {
+        std::lock_guard<std::mutex> lock(table_lock());
+        ThreadRecord* record = record_of(handle);
+        if (record != nullptr && record->handle_open &&
+            record->state != nullptr) {
+            return record->state.get();
+        }
+        // A handle the table does not resolve -- unknown, closed, or a
+        // thread still starting -- falls through to the calling thread,
+        // by the trust these calls show a self handle.
+    }
+    // The pseudo-current handle lands here too. The self record is a
+    // thread-local read, so it needs no lock; the first thread, which owns
+    // no record, falls through to its thread-local state pointer.
+    if (g_self_record != nullptr && g_self_record->state != nullptr) {
+        return g_self_record->state.get();
+    }
+    return guest_state();
+}
+
 std::size_t guest_thread_count() noexcept {
     std::lock_guard<std::mutex> lock(table_lock());
     return thread_table().size();

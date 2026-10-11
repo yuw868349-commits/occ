@@ -84,7 +84,6 @@ using Lock = std::unique_lock<std::mutex>;
 struct CaptureBuffer {
     std::vector<std::uint8_t> bytes;
     std::size_t used = 0;
-    std::size_t remaining_allocs = 0;
 };
 
 struct CsrState {
@@ -255,16 +254,9 @@ constexpr std::uint32_t kPortMessageSize = 0x28;
 // walk `AlpcGetMessageAttribute` performs picks the *index*th set bit.
 constexpr std::size_t kMaxAttributes = 32;
 
-// The number of attributes a mask names.
-[[nodiscard]] std::size_t attribute_count(std::uint32_t mask) noexcept {
-    std::size_t n = 0;
-    for (std::size_t i = 0; i < kMaxAttributes; ++i) {
-        if ((mask & (1u << i)) != 0) {
-            ++n;
-        }
-    }
-    return n;
-}
+// The number of attributes a mask names is not kept as a helper: the only
+// walk over the mask is `AlpcGetMessageAttribute`'s, which counts as it
+// goes.
 
 }  // namespace
 
@@ -421,7 +413,6 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32n_CsrAllocateCaptureBuffer(
     const std::uint64_t handle = s.next_handle++;
     CaptureBuffer buf;
     buf.bytes.assign(bytes, 0);
-    buf.remaining_allocs = 0xFFFFFFFF;  // the calls decide the count
     s.buffers.emplace(handle, std::move(buf));
     return handle;
 }
@@ -695,18 +686,6 @@ extern "C" __attribute__((ms_abi)) std::uint32_t u32n_AlpcMaxAllowedMessageLengt
     // The largest message the port allows, which is the message size the
     // kernel's own port object caps at.
     return 0x10000;
-}
-
-extern "C" __attribute__((ms_abi)) std::uint32_t u32n_AlpcGetMessageAttribute2(
-    const AlpcAttributes* buffer, std::uint32_t index) noexcept {
-    // The count of attributes the structure says are valid, which is what
-    // the walk above consumes.
-    if (buffer == nullptr) {
-        return 0;
-    }
-    return static_cast<std::uint32_t>(attribute_count(buffer->valid)) > index
-               ? 1
-               : 0;
 }
 
 // ===========================================================================

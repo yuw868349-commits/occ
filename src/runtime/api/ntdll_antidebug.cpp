@@ -1047,8 +1047,9 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtQuerySystemInformation(
 
     case kSystemKernelDebuggerInformationEx: {
         // SYSTEM_KERNEL_DEBUGGER_INFORMATION_EX: allowed, enabled, present.
-        // A machine that permits a kernel debugger but has none running
-        // answers "not enabled, not present".
+        // A stock machine permits a kernel debugger -- the entitlement is
+        // there -- but has none configured and none running, which is the
+        // answer a machine that was never booted with `/debug` gives.
         constexpr std::uint32_t kNeed = 3;
         report(kNeed);
         if (information == nullptr) {
@@ -1057,7 +1058,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtQuerySystemInformation(
         if (length < kNeed) {
             return kStatusInfoLengthMismatch;
         }
-        write_u8(out, 0, 0);  // DebuggerAllowed
+        write_u8(out, 0, 1);  // DebuggerAllowed
         write_u8(out, 1, 0);  // DebuggerEnabled
         write_u8(out, 2, 0);  // DebuggerPresent
         return kStatusSuccess;
@@ -1245,10 +1246,13 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtClose(
     }
     // A handle in the range this runtime issues is released through the same
     // path `CloseHandle` uses, so that one close and the other cannot leave
-    // the object table in two different states.
+    // the object table in two different states. A handle the close rejects
+    // names nothing this runtime issued, and the kernel's answer for that --
+    // the one an exception-based check is written against -- is the status,
+    // not a success.
     if (handle < 0x10000000) {
-        (void)k32_CloseHandle(handle);
-        return kStatusSuccess;
+        return k32_CloseHandle(handle) != 0 ? kStatusSuccess
+                                            : kStatusInvalidHandle;
     }
     // Anything above the range this runtime issues names no object here, and
     // the kernel's answer for that is the invalid-handle status.
@@ -1342,9 +1346,9 @@ nt_NtQueryInformationJobObject(std::uint64_t job_handle,
 // The modern thread creation, whose flags a hardened program sets to hide a
 // worker thread from a debugger. The thread is created through the same path
 // `CreateThread` uses, so that a thread made here and a thread made there are
-// one kind of thread; the hide-from-debugger flag is accepted without an
-// observer to hide from, which is the same shape the thread-information setter
-// takes.
+// one kind of thread. The hide-from-debugger flag is kept on the thread it
+// names, the same state `NtSetInformationThread` writes, so a query about
+// that thread answers what the creation asked for.
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtCreateThreadEx(
     void* thread_handle, std::uint32_t desired_access, void* object_attributes,
@@ -1364,10 +1368,12 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtCreateThreadEx(
         write_u64(thread_handle, 0, 0);
         return kStatusInvalidHandle;
     }
-    // THREAD_CREATE_FLAGS_CREATE_SUSPENDED is bit 0 of the create flags; the
-    // rest -- hide-from-debugger, skip-attach -- select behaviours this
-    // runtime has no observer for and no second thread to attach.
+    // THREAD_CREATE_FLAGS_CREATE_SUSPENDED is bit 0 of the create flags and
+    // THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER is bit 2; the rest -- skip
+    // attach and the breakpoints that do not fire -- select behaviours this
+    // runtime has no second debugger to serve.
     constexpr std::uint32_t kCreateSuspended = 0x00000001;
+    constexpr std::uint32_t kHideFromDebugger = 0x00000004;
     GuestThreadRequest request;
     request.start = start_routine;
     request.parameter = reinterpret_cast<std::uint64_t>(argument);
@@ -1378,6 +1384,14 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtCreateThreadEx(
     if (handle == 0) {
         write_u64(thread_handle, 0, 0);
         return kStatusNoMemory;
+    }
+    if ((create_flags & kHideFromDebugger) != 0) {
+        // The flag lands on the created thread's own state, where a later
+        // query through `NtQueryInformationThread` reads it back.
+        GuestState* state = guest_thread_state_for(handle);
+        if (state != nullptr) {
+            state->hide_from_debugger = true;
+        }
     }
     write_u64(thread_handle, 0, handle);
     return kStatusSuccess;

@@ -38,6 +38,7 @@ constexpr std::uint32_t kStatusSuccess = 0x00000000u;
 constexpr std::uint32_t kStatusInvalidInfoClass = 0xC0000003u;
 constexpr std::uint32_t kStatusInfoLengthMismatch = 0xC0000004u;
 constexpr std::uint32_t kStatusInvalidHandle = 0xC0000008u;
+constexpr std::uint32_t kStatusInvalidParameter = 0xC000000Du;
 constexpr std::uint32_t kStatusPortNotSet = 0xC0000353u;
 
 // The process-information classes named, so the calls below read the way a
@@ -60,6 +61,15 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtQuerySystemInformation(
     std::uint32_t, void*, std::uint32_t, std::uint32_t*) noexcept;
 extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtClose(
     std::uint64_t) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtCreateThreadEx(
+    void*, std::uint32_t, void*, std::uint64_t, std::uint64_t, void*,
+    std::uint32_t, std::uint64_t, std::uint64_t, std::uint64_t,
+    void*) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtQueryInformationThread(
+    std::uint64_t, std::uint32_t, void*, std::uint32_t,
+    std::uint32_t*) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtSetInformationThread(
+    std::uint64_t, std::uint32_t, const void*, std::uint32_t) noexcept;
 extern "C" __attribute__((ms_abi)) std::uint32_t nt_NtQueryVirtualMemory(
     std::uint64_t, const void*, std::uint32_t, void*, std::uint64_t,
     std::uint64_t*) noexcept;
@@ -317,6 +327,46 @@ void test_query_memory_without_state() {
     install_state();
 }
 
+void test_create_thread_guards() {
+    // A creation with nowhere to answer the handle is refused before
+    // anything is built -- the parameter check runs first.
+    const std::uint32_t s = nt_NtCreateThreadEx(
+        nullptr, 0, nullptr, ~std::uint64_t{0}, 0, nullptr, 0, 0, 0, 0,
+        nullptr);
+    check(s == kStatusInvalidParameter,
+          "anti: a creation without a handle slot is refused");
+    // The creation needs an address space to place the thread's control
+    // region and stack in, and this suite runs with none: the call fails
+    // and answers no handle, which is the shape a failed creation has.
+    std::uint64_t handle = 0x1234;
+    const std::uint32_t failed = nt_NtCreateThreadEx(
+        &handle, 0, nullptr, ~std::uint64_t{0}, 0, nullptr, 0, 0, 0, 0,
+        nullptr);
+    check(failed != kStatusSuccess,
+          "anti: a creation with no address space fails");
+    check(handle == 0, "anti: the failed creation answers no handle");
+}
+
+void test_thread_information_round_trip() {
+    // The thread query reads back what the thread's own set call left. The
+    // flag lands on the state the handle resolves to -- here, the caller's
+    // -- and a fresh read before any set answers clear.
+    std::uint32_t out = 0xFFFFFFFFu;
+    std::uint32_t written = 0;
+    check(nt_NtQueryInformationThread(~std::uint64_t{1}, 0x11, &out, 4,
+                                      &written) == kStatusSuccess,
+          "anti: the thread flag query succeeds");
+    check(out == 0, "anti: the flag reads clear before any set");
+    check(nt_NtSetInformationThread(~std::uint64_t{1}, 0x11, nullptr, 0) ==
+              kStatusSuccess,
+          "anti: the hide-from-debugger set succeeds");
+    out = 0xFFFFFFFFu;
+    check(nt_NtQueryInformationThread(~std::uint64_t{1}, 0x11, &out, 4,
+                                      &written) == kStatusSuccess,
+          "anti: the query after the set succeeds");
+    check(out == 1, "anti: the flag reads back as set");
+}
+
 }  // namespace
 
 int main() {
@@ -334,6 +384,8 @@ int main() {
     test_job_object();
     test_kernel32_debugger_calls();
     test_query_memory_without_state();
+    test_create_thread_guards();
+    test_thread_information_round_trip();
     set_guest_state(nullptr);
 
     std::printf("antidebug: %d checks, %d failures\n", checks, failures);

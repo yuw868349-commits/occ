@@ -238,6 +238,13 @@ struct GuestState {
     // What `__set_app_type` was told, recorded because the value is observable
     // state on Windows and a runtime that drops it drops a fact.
     std::uint32_t app_type = 0;
+
+    // The thread-hide-from-debugger bit. `NtSetInformationThread` sets it on
+    // the thread the handle names and `NtQueryInformationThread` reads it
+    // back, and that round trip is what an anti-debug probe measures. The
+    // state is per thread because the flag is: it is a bit a thread carries,
+    // and a fresh thread starts with it clear.
+    bool hide_from_debugger = false;
 };
 
 // The state the thunks serve, or nullptr before the guest has been installed.
@@ -343,6 +350,15 @@ struct GuestThreadRequest {
 
 // The handle for a thread id, or zero when no thread of this process has it.
 [[nodiscard]] std::uint64_t open_guest_thread(std::uint32_t thread_id) noexcept;
+
+// The state of the thread a handle names, or nullptr when the runtime has
+// none for the caller. A handle the thread table minted names that thread;
+// the pseudo-current handle -- and, by the trust these calls show a self
+// handle, any handle the table does not know -- names the calling thread.
+// This is what the thread-information calls in the API layer resolve their
+// handle through, so a flag set on one thread is read back on that thread
+// and not on whoever asked.
+[[nodiscard]] GuestState* guest_thread_state_for(std::uint64_t handle) noexcept;
 
 // How many guest threads exist, and the id and exit code of the one at an
 // index. This is what `Thread32First` and `Thread32Next` enumerate.
