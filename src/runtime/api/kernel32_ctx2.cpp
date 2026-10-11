@@ -76,11 +76,24 @@ constexpr std::uint32_t kModuleHandleUnchangedRefcount = 0x00000002u;
 constexpr std::uint32_t kModuleHandleFromAddress = 0x00000004u;
 
 // PROCESS_MEMORY_COUNTERS: the page faults, the peak and current working
-// set, the page file use and the private bytes.
+// set, the four pool quotas, the page file use and the private bytes.
+// The structure is `cb`, `PageFaultCount`, then eight size-width fields;
+// the `Ex` spelling appends a ninth, `PrivateUsage`, for eighty bytes in
+// all, and the base spelling stops at seventy-two.
+constexpr std::size_t kMemoryCountersBaseBytes = 72;
 constexpr std::size_t kMemoryCountersBytes = 80;
 
 // A CONDITION_VARIABLE is one pointer, and zero is "no waiters".
 constexpr std::uint64_t kConditionUnset = 0;
+
+// CONTEXT_XSTATE: the flag a caller sets to ask for the extended-state
+// record. Without it a CONTEXT carries no XState slot, and the two calls
+// below have nowhere to record or read a feature mask.
+constexpr std::uint32_t kContextXstateFlag = 0x00100040u;
+// The XState mask slot within a CONTEXT. The base record is 1232 bytes and
+// the mask lives in its final word, which is the slot the extended form of
+// the record reserves for it.
+constexpr std::size_t kContextXState = 0x4C8;
 
 }  // namespace
 
@@ -175,15 +188,28 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32c2_SetXStateFeaturesMask(
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    // The mask says which components of the extended state the record
-    // carries. A mask naming a component this machine does not have is
-    // refused, because recording it would leave the caller reading state
-    // that no capture will ever fill.
+    // The mask is only meaningful for a record whose flags asked for the
+    // extended state. A record that did not is one with no XState slot, and
+    // writing the mask anyway would either be lost or land in a field that
+    // is not its -- so the call is refused, which is what a context without
+    // CONTEXT_XSTATE gets on Windows too.
+    const std::uint32_t flags = read_u32(context, seh::kContextFlags);
+    if ((flags & kContextXstateFlag) == 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    // A mask naming a component this machine does not have is refused too,
+    // because recording it would leave the caller reading state that no
+    // capture will ever fill.
     const std::uint64_t enabled = nr2_RtlGetEnabledExtendedFeatures(~std::uint64_t{0});
     if ((mask & ~enabled) != 0) {
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
+    // The mask is written into the record's own XState slot, which is what
+    // the matching reader reads back -- a call that validated the mask and
+    // wrote nothing would leave the caller believing the state was enabled.
+    write_u64(context, kContextXState, mask);
     set_last_error(kErrorSuccess);
     return 1;
 }
@@ -396,7 +422,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32c2_FreeLibrary(
 extern "C" __attribute__((ms_abi)) std::int32_t k32c2_K32GetProcessMemoryInfo(
     std::uint64_t process, void* counters, std::uint32_t size) noexcept {
     static_cast<void>(process);
-    if (counters == nullptr || size < kMemoryCountersBytes) {
+    if (counters == nullptr || size < kMemoryCountersBaseBytes) {
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
@@ -419,22 +445,39 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32c2_K32GetProcessMemoryInfo(
     ::getrusage(RUSAGE_SELF, &usage);
 
     const std::uint64_t page = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
-    const auto working_set =
+    const std::uint64_t working_set =
         static_cast<std::uint64_t>(resident_pages) * page;
+    // The page file use is the committed size, which is the program's whole
+    // virtual extent; the peak RSS the kernel keeps is the only high-water
+    // mark available, and it is used for the peak working set.
+    const std::uint64_t commit =
+        static_cast<std::uint64_t>(total_pages) * page;
+    const std::uint64_t peak_working_set =
+        usage.ru_maxrss > 0
+            ? static_cast<std::uint64_t>(usage.ru_maxrss) * 1024
+            : working_set;
 
-    std::memset(counters, 0, kMemoryCountersBytes);
-    write_u32(counters, 0, kMemoryCountersBytes);
-    write_u32(counters, 4, static_cast<std::uint32_t>(usage.ru_minflt));
-    write_u32(counters, 8, static_cast<std::uint32_t>(usage.ru_majflt));
+    // The caller's `cb` decides which structure it knows: the base one ends
+    // at 72 bytes, and only a caller that offered room for the `Ex` form
+    // gets `PrivateUsage` at 72.
+    const std::uint32_t take =
+        size < kMemoryCountersBytes ? static_cast<std::uint32_t>(kMemoryCountersBaseBytes)
+                                    : static_cast<std::uint32_t>(kMemoryCountersBytes);
+    std::memset(counters, 0, take);
+    write_u32(counters, 0, take);
+    write_u32(counters, 4,
+              static_cast<std::uint32_t>(usage.ru_minflt + usage.ru_majflt));
+    write_u64(counters, 8, peak_working_set);
     write_u64(counters, 16, working_set);
-    write_u64(counters, 24, working_set);  // peak: the host keeps no high-water
-    write_u64(counters, 32,
-              static_cast<std::uint64_t>(total_pages) * page * 2);
-    write_u64(counters, 40, working_set);
-    write_u64(counters, 48, usage.ru_maxrss > 0
-                                ? static_cast<std::uint64_t>(usage.ru_maxrss) *
-                                      1024
-                                : 0);
+    write_u64(counters, 24, 0);  // pool quotas: not a host quantity
+    write_u64(counters, 32, 0);
+    write_u64(counters, 40, 0);
+    write_u64(counters, 48, 0);
+    write_u64(counters, 56, commit);
+    write_u64(counters, 64, commit);
+    if (take >= kMemoryCountersBytes) {
+        write_u64(counters, 72, commit);
+    }
     set_last_error(kErrorSuccess);
     return 1;
 }

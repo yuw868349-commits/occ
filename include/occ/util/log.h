@@ -7,7 +7,6 @@
 // command impossible to diff. When a consumer needs ordering it takes it
 // from the event stream, which carries monotonic times as data.
 
-#include <cstddef>
 #include <string_view>
 
 namespace occ::log {

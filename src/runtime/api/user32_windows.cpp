@@ -561,6 +561,28 @@ void ensure_timer_thread() noexcept {
     return atom;
 }
 
+// The predefined window classes Windows keeps registered before any program
+// runs. The dialog class, `#32770`, is the one this runtime needs: a guest
+// never calls `RegisterClass` for it, because no program has to on Windows,
+// and `DialogBoxParam` creates its window through the ordinary
+// `CreateWindowEx` path. Without the class here that lookup fails, every
+// `DialogBoxParam` returns -1, and the procedure it was given is never run.
+// The class carries no procedure of its own -- the dialog procedure is
+// installed on the window after creation -- so the slot is left zero.
+void ensure_builtin_classes(const Lock&) noexcept {
+    Station& s = station();
+    const std::u16string dialog_class = u"#32770";
+    if (s.class_by_name.count(dialog_class) != 0) {
+        return;
+    }
+    GuestClass c;
+    c.name = dialog_class;
+    c.proc = 0;
+    c.atom = s.next_atom++;
+    s.class_by_name.emplace(dialog_class, c.atom);
+    s.classes.emplace(c.atom, std::move(c));
+}
+
 // The creation all four `CreateWindowEx` spellings share.
 [[nodiscard]] std::uint64_t window_create(std::uint32_t ex_style,
                                           const std::u16string& class_name,
@@ -573,7 +595,11 @@ void ensure_timer_thread() noexcept {
                                           std::uint64_t instance,
                                           void* param) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
+    // The built-in classes are registered on first use, which is what makes
+    // the predefined `#32770` dialog class resolvable without the guest
+    // having called `RegisterClass` for it.
+    ensure_builtin_classes(held);
     const auto by_name = s.class_by_name.find(class_name);
     if (by_name == s.class_by_name.end()) {
         set_last_error(kErrNoWindowClass);
@@ -617,15 +643,24 @@ void ensure_timer_thread() noexcept {
                        : std::size_t{0},
                    0);
     const std::uint64_t hwnd = w.hwnd;
+    const std::uint64_t proc = cls.proc;
     s.windows.emplace(hwnd, std::move(w));
 
     // The creation messages, in Windows' order, with the creation
     // parameters in `lParam` the way a real `CREATESTRUCT` pointer rides.
-    GuestWindow* live = &s.windows.at(hwnd);
-    (void)deliver(live, kMsgNcCreate, 0, reinterpret_cast<uint64_t>(param));
-    (void)deliver(live, kMsgCreate, 0, reinterpret_cast<uint64_t>(param));
+    // The window is already in the table, so a procedure that looks itself
+    // up still finds itself. The procedure is guest code, and the lock is
+    // dropped before it runs: a procedure that calls back into the station
+    // -- which the interesting ones do -- would otherwise deadlock on the
+    // lock its own message is delivered under.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    (void)deliver(&live, kMsgNcCreate, 0, reinterpret_cast<uint64_t>(param));
+    (void)deliver(&live, kMsgCreate, 0, reinterpret_cast<uint64_t>(param));
     if (cx != 0 || cy != 0) {
-        (void)deliver(live, kMsgSize, 0,
+        (void)deliver(&live, kMsgSize, 0,
                       (static_cast<std::uint64_t>(
                            static_cast<std::uint16_t>(cy))
                        << 16) |
@@ -958,7 +993,7 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32w_CreateWindowExA(
 extern "C" __attribute__((ms_abi)) std::int32_t u32w_DestroyWindow(
     std::uint64_t hwnd) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     GuestWindow* w = hwnd_find(held, hwnd);
     if (w == nullptr) {
         set_last_error(kErrBadHwnd);
@@ -967,11 +1002,25 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32w_DestroyWindow(
     if (w->destroyed) {
         return kTrue;
     }
+    // The flag makes a re-entrant destroy -- a procedure that destroys its
+    // own window from `WM_DESTROY` -- a no-op, which is what the nested call
+    // has to see now that the messages below run with the lock dropped.
+    w->destroyed = true;
+    const std::uint64_t proc = w->proc;
     // The destruction messages in Windows' order: `WM_DESTROY` first,
     // `WM_NCDESTROY` last, the removal after both -- a procedure that
-    // looks itself up from `WM_DESTROY` still finds itself.
-    (void)deliver(w, kMsgDestroy, 0, 0);
-    (void)deliver(w, kMsgNcDestroy, 0, 0);
+    // looks itself up from `WM_DESTROY` still finds itself. The procedure
+    // is guest code, called with the lock released.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    (void)deliver(&live, kMsgDestroy, 0, 0);
+    (void)deliver(&live, kMsgNcDestroy, 0, 0);
+    // Re-taken to remove the window the procedures had access to. The
+    // handle is checked again because a procedure could have destroyed and
+    // recreated a window at the same address while the lock was free.
+    Lock again(s.lock);
     s.windows.erase(hwnd);
     set_last_error(kErrOk);
     return kTrue;
@@ -1086,28 +1135,42 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32w_SetWindowLongA(
 extern "C" __attribute__((ms_abi)) std::int32_t u32w_SetWindowTextW(
     std::uint64_t hwnd, const char16_t* text) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     GuestWindow* w = hwnd_find(held, hwnd);
     if (w == nullptr) {
         set_last_error(kErrBadHwnd);
         return kFalse;
     }
     w->text = read_wide_z(text);
-    (void)deliver(w, kMsgSetText, 0, reinterpret_cast<std::uint64_t>(text));
+    const std::uint64_t proc = w->proc;
+    // `WM_SETTEXT` reaches the procedure, which is guest code, so the lock
+    // is dropped for the delivery.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    (void)deliver(&live, kMsgSetText, 0, reinterpret_cast<std::uint64_t>(text));
     return kTrue;
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t u32w_SetWindowTextA(
     std::uint64_t hwnd, const char* text) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     GuestWindow* w = hwnd_find(held, hwnd);
     if (w == nullptr) {
         set_last_error(kErrBadHwnd);
         return kFalse;
     }
     w->text = utf8_to_wide(text);
-    (void)deliver(w, kMsgSetText, 0, reinterpret_cast<std::uint64_t>(text));
+    const std::uint64_t proc = w->proc;
+    // The narrow spelling delivers the same message, so the lock is dropped
+    // for the same reason the wide one gives.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    (void)deliver(&live, kMsgSetText, 0, reinterpret_cast<std::uint64_t>(text));
     return kTrue;
 }
 
@@ -1270,7 +1333,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32w_MoveWindow(
     std::int32_t cy, std::int32_t repaint) noexcept {
     (void)repaint;
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     GuestWindow* w = hwnd_find(held, hwnd);
     if (w == nullptr) {
         set_last_error(kErrBadHwnd);
@@ -1282,15 +1345,22 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32w_MoveWindow(
     w->y = y;
     w->cx = cx;
     w->cy = cy;
+    const std::uint64_t proc = w->proc;
+    // `WM_MOVE` and `WM_SIZE` reach the procedure, which is guest code, so
+    // the lock is dropped for the deliveries.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
     if (moved) {
-        (void)deliver(w, kMsgMove, 0,
+        (void)deliver(&live, kMsgMove, 0,
                       (static_cast<std::uint64_t>(
                            static_cast<std::uint16_t>(y))
                        << 16) |
                           static_cast<std::uint16_t>(x));
     }
     if (sized) {
-        (void)deliver(w, kMsgSize, 0,
+        (void)deliver(&live, kMsgSize, 0,
                       (static_cast<std::uint64_t>(
                            static_cast<std::uint16_t>(cy))
                        << 16) |
@@ -1376,7 +1446,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32w_IsZoomed(
 extern "C" __attribute__((ms_abi)) std::int32_t u32w_ShowWindow(
     std::uint64_t hwnd, std::int32_t cmd) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     GuestWindow* w = hwnd_find(held, hwnd);
     if (w == nullptr) {
         set_last_error(kErrBadHwnd);
@@ -1404,7 +1474,14 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32w_ShowWindow(
     default:
         break;
     }
-    (void)deliver(w, kMsgShowWindow, static_cast<std::uint64_t>(cmd), 0);
+    const std::uint64_t proc = w->proc;
+    // `WM_SHOWWINDOW` reaches the procedure, which is guest code, so the
+    // lock is dropped for the delivery.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    (void)deliver(&live, kMsgShowWindow, static_cast<std::uint64_t>(cmd), 0);
     return was ? kTrue : kFalse;
 }
 
@@ -1462,29 +1539,61 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32w_GetForegroundWindow()
 extern "C" __attribute__((ms_abi)) std::int32_t u32w_SetForegroundWindow(
     std::uint64_t hwnd) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
-    if (hwnd_find(held, hwnd) == nullptr) {
+    Lock held(s.lock);
+    GuestWindow* w = hwnd_find(held, hwnd);
+    if (w == nullptr) {
         return kFalse;
     }
     s.fg = hwnd;
-    (void)deliver(&s.windows.at(hwnd), 0x0006 /* WM_ACTIVATE */,
-                  2 /* WA_ACTIVE */, 0);
+    const std::uint64_t proc = w->proc;
+    // `WM_ACTIVATE` reaches the procedure, which is guest code, so the lock
+    // is dropped for the delivery.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    (void)deliver(&live, 0x0006 /* WM_ACTIVATE */, 2 /* WA_ACTIVE */, 0);
     return kTrue;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t u32w_SetFocus(
     std::uint64_t hwnd) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     const std::uint32_t thread = k32_GetCurrentThreadId();
     std::uint64_t& slot = s.focus[thread];
     const std::uint64_t old = slot;
     slot = hwnd;
-    if (hwnd != 0 && hwnd_find(held, hwnd) != nullptr) {
-        (void)deliver(&s.windows.at(hwnd), 0x0007 /* WM_SETFOCUS */, 0, 0);
+    // The procedures of both windows are read under the lock and delivered
+    // outside it: `WM_SETFOCUS` and `WM_KILLFOCUS` are guest code, and a
+    // procedure that moves the focus itself must not deadlock on the lock
+    // this call would still hold.
+    std::uint64_t new_proc = 0;
+    if (hwnd != 0) {
+        const GuestWindow* nw = hwnd_find(held, hwnd);
+        if (nw != nullptr) {
+            new_proc = nw->proc;
+        }
     }
-    if (old != 0 && hwnd_find(held, old) != nullptr) {
-        (void)deliver(&s.windows.at(old), 0x0008 /* WM_KILLFOCUS */, 0, 0);
+    std::uint64_t old_proc = 0;
+    if (old != 0) {
+        const GuestWindow* ow = hwnd_find(held, old);
+        if (ow != nullptr) {
+            old_proc = ow->proc;
+        }
+    }
+    held.unlock();
+    if (new_proc != 0) {
+        GuestWindow live;
+        live.hwnd = hwnd;
+        live.proc = new_proc;
+        (void)deliver(&live, 0x0007 /* WM_SETFOCUS */, 0, 0);
+    }
+    if (old_proc != 0) {
+        GuestWindow live;
+        live.hwnd = old;
+        live.proc = old_proc;
+        (void)deliver(&live, 0x0008 /* WM_KILLFOCUS */, 0, 0);
     }
     return old;
 }
@@ -1999,12 +2108,20 @@ extern "C" __attribute__((ms_abi)) std::int64_t u32w_DispatchMessageW(
         return 0;
     }
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     GuestWindow* w = hwnd_find(held, hwnd);
     if (w == nullptr) {
         return 0;
     }
-    return deliver(w, message, wparam, lparam);
+    const std::uint64_t proc = w->proc;
+    // The window procedure is guest code; it is called with the lock
+    // released so a procedure that dispatches another message, or reads the
+    // window back, does not deadlock on the lock this call would still hold.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    return deliver(&live, message, wparam, lparam);
 }
 
 extern "C" __attribute__((ms_abi)) std::int64_t u32w_DispatchMessageA(
@@ -2023,13 +2140,21 @@ extern "C" __attribute__((ms_abi)) std::int64_t u32w_SendMessageW(
     std::uint64_t hwnd, std::uint32_t message, std::uint64_t wparam,
     std::uint64_t lparam) noexcept {
     Station& s = station();
-    const Lock held(s.lock);
+    Lock held(s.lock);
     GuestWindow* w = hwnd_find(held, hwnd);
     if (w == nullptr) {
         set_last_error(kErrBadHwnd);
         return 0;
     }
-    return deliver(w, message, wparam, lparam);
+    const std::uint64_t proc = w->proc;
+    // The procedure is guest code and is called with the lock released: a
+    // procedure that calls back into the station -- `SendMessage` from
+    // inside a handler is the ordinary case -- would otherwise deadlock.
+    held.unlock();
+    GuestWindow live;
+    live.hwnd = hwnd;
+    live.proc = proc;
+    return deliver(&live, message, wparam, lparam);
 }
 
 extern "C" __attribute__((ms_abi)) std::int64_t u32w_SendMessageA(
@@ -2743,38 +2868,46 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32w_LoadCursorA(
 
 extern "C" __attribute__((ms_abi)) std::int32_t u32w_GetSystemMetrics(
     std::int32_t index) noexcept {
-    // The metrics of the 1920x1080 station. The ones a checker reads are
-    // the screen's own; the rest are the values the SDK documents for the
-    // default display driver.
+    // The metrics of the 1920x1080 station. Each case is the `SM_*` constant
+    // of the same name: the index is the value `winuser.h` gives it --
+    // SM_CXSCREEN is 0, SM_CYSCREEN is 1, SM_CXVSCROLL is 2 -- so a caller
+    // that passes the header's constant reaches the metric it names. The
+    // table before this one ran a short entry ahead of the constants from
+    // SM_CYCAPTION onwards, so a caller asking for the caption height read
+    // the vertical-scroll width and the frame metrics answered for their
+    // neighbours.
     switch (index) {
-    case 0: return kScreenW;      // SM_CXSCREEN
-    case 1: return kScreenH;      // SM_CYSCREEN
-    case 2: return 17;            // SM_CXVSCROLL
-    case 3: return 17;            // SM_CYHSCROLL
-    case 4: return 19;            // SM_CYVSCROLL
-    case 5: return 19;            // SM_CXBORDER
-    case 6: return 1;             // SM_CXDLGFRAME
-    case 7: return 1;             // SM_CYDLGFRAME
-    case 8: return 18;            // SM_CYVTHUMB
-    case 9: return 18;            // SM_CXHTHUMB
-    case 10: return 32;           // SM_CXICON
-    case 11: return 32;           // SM_CYICON
-    case 12: return 32;           // SM_CXCURSOR
-    case 13: return 32;           // SM_CYCURSOR
-    case 14: return 0;            // SM_CYMENU
-    case 15: return kScreenW - 2; // SM_CXFULLSCREEN
-    case 16: return kScreenH;     // SM_CYFULLSCREEN
-    case 17: return 0;            // SM_CYKANJIWINDOW
-    case 18: return 1;            // SM_MOUSEPRESENT
-    case 19: return 1;            // SM_CYVSCROLL
-    case 20: return 1;            // SM_CXHSCROLL
-    case 23: return 0;            // SM_SECURE
-    case 29: return 1;            // SM_SHOWSOUNDS
-    case 42: return 0;            // SM_NETWORK
-    case 43: return 0;            // SM_SLOWMACHINE
-    case 45: return 0;            // SM_REMOTESESSION
-    case 76: return kScreenW;     // SM_CXMAXTRACK
-    case 77: return kScreenH;     // SM_CYMAXTRACK
+    case 0:  return kScreenW;     // SM_CXSCREEN
+    case 1:  return kScreenH;     // SM_CYSCREEN
+    case 2:  return 17;           // SM_CXVSCROLL
+    case 3:  return 17;           // SM_CYHSCROLL
+    case 4:  return 19;           // SM_CYCAPTION
+    case 5:  return 1;            // SM_CXBORDER
+    case 6:  return 1;            // SM_CYBORDER
+    case 7:  return 3;            // SM_CXDLGFRAME
+    case 8:  return 3;            // SM_CYDLGFRAME
+    case 9:  return 17;           // SM_CYVTHUMB
+    case 10: return 17;           // SM_CXHTHUMB
+    case 11: return 32;           // SM_CXICON
+    case 12: return 32;           // SM_CYICON
+    case 13: return 32;           // SM_CXCURSOR
+    case 14: return 32;           // SM_CYCURSOR
+    case 15: return 19;           // SM_CYMENU
+    case 16: return kScreenW;     // SM_CXFULLSCREEN
+    case 17: return kScreenH;     // SM_CYFULLSCREEN
+    case 18: return 0;            // SM_CYKANJIWINDOW
+    case 19: return 1;            // SM_MOUSEPRESENT
+    case 20: return 17;           // SM_CYVSCROLL
+    case 21: return 17;           // SM_CXHSCROLL
+    case 22: return 0;            // SM_DEBUG
+    case 23: return 0;            // SM_SWAPBUTTON
+    case 44: return 0;            // SM_SECURE
+    case 59: return kScreenW;     // SM_CXMAXTRACK
+    case 60: return kScreenH;     // SM_CYMAXTRACK
+    case 63: return 0;            // SM_NETWORK
+    case 70: return 0;            // SM_SHOWSOUNDS
+    case 73: return 0;            // SM_SLOWMACHINE
+    case 0x1000: return 0;        // SM_REMOTESESSION
     default: return 0;
     }
 }

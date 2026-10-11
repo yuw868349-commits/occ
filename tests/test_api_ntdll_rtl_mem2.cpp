@@ -126,7 +126,11 @@ extern "C" __attribute__((ms_abi)) std::uint32_t
 nr2_RtlLengthSecurityDescriptor(const void* sd) noexcept;
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlMakeSelfRelativeSD(
     const void* absolute, void* relative, std::uint32_t* bytes) noexcept;
-extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlFirstFreeAce(
+// The return is a `BOOLEAN`, one byte. Declaring it as a 32-bit integer made
+// this call read the upper three bytes of the return register, which hold
+// whatever the previous call left there -- so the comparison against 1
+// failed for reasons that had nothing to do with the ACL.
+extern "C" __attribute__((ms_abi)) std::uint8_t nr2_RtlFirstFreeAce(
     const void* acl, void** ace) noexcept;
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetAce(
     const void* acl, std::uint32_t index, void** ace) noexcept;
@@ -301,11 +305,11 @@ nr2_RtlNewSecurityObjectWithMultipleInheritance(
     std::uint32_t count, void** descriptor) noexcept;
 extern "C" __attribute__((ms_abi)) void* nr2_RtlInitializeHandleTable(
     std::uint32_t size, std::uint32_t reserved, void* pool) noexcept;
-extern "C" __attribute__((ms_abi)) void* nr2_RtlIsValidHandle(
+extern "C" __attribute__((ms_abi)) std::uint8_t nr2_RtlIsValidHandle(
     std::uint64_t handle) noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlIsValidIndexHandle(
     std::uint64_t handle, void* table) noexcept;
-extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlProtectHeap(
+extern "C" __attribute__((ms_abi)) std::uint8_t nr2_RtlProtectHeap(
     std::uint64_t heap, std::uint32_t protect) noexcept;
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlInitializeGenericTable(
     void* table, void* pool, void* callback, void* context,
@@ -924,7 +928,9 @@ void test_security_descriptors() {
     check(nr2_RtlGetAce(relative + 40, 0, &ace) == kStatusInvalidParameter,
           "acl: an ACE whose size runs past the ACL is refused");
 
-    // The first free byte is after the last ACE.
+    // The first free byte is after the last ACE. The ACE size is restored to the
+    // real one first, so this walks a well-formed ACL rather than the
+    // malformed one the two refusals above were about.
     put_u16(relative, 50, 8);
     check(nr2_RtlFirstFreeAce(relative + 40, &ace) == 1,
           "acl: the first free byte is found");
@@ -1062,9 +1068,15 @@ void test_paths() {
         u"C:\\Windows\\..\\System32\\kernel32.dll", sizeof(buffer), buffer,
         &file_part);
     check(full != 0, "path: a rooted full path is answered");
-    const std::u16string_view got(buffer, full);
+    // The answer is a byte count, which is the unit the capacity parameter is
+    // in and the unit every sibling path query in this file answers in, so the
+    // view is built from half of it. Reading `full` characters instead would
+    // run twice as far as the answer and compare against uninitialised stack.
+    const std::u16string_view got(buffer, full / sizeof(char16_t));
     check(got == u"C:\\System32\\kernel32.dll",
           "path: and the .. segment is collapsed away");
+    check(full == (got.size() * sizeof(char16_t)),
+          "path: the answer is the byte count, not a character count");
     check(file_part != nullptr && file_part == buffer + 11,
           "path: and the file part points at the name after the directory");
 
@@ -1545,13 +1557,13 @@ void test_refusals() {
           "refuse: nor a multi-class inheritance builder");
     check(nr2_RtlInitializeHandleTable(0, 0, nullptr) == nullptr,
           "refuse: the handle table belongs to the modules that mint them");
-    check(nr2_RtlIsValidHandle(0x1234) == nullptr,
+    check(nr2_RtlIsValidHandle(0x1234) == 0,
           "refuse: a handle this file did not mint is not vouched for");
-    check(nr2_RtlIsValidHandle(0xFFFFFFFFFFFFFFFFull) != nullptr,
+    check(nr2_RtlIsValidHandle(0xFFFFFFFFFFFFFFFFull) == 1,
           "refuse: but the process pseudo-handle is one of the two known");
-    check(nr2_RtlIsValidHandle(0xFFFFFFFFFFFFFFFEull) != nullptr,
+    check(nr2_RtlIsValidHandle(0xFFFFFFFFFFFFFFFEull) == 1,
           "refuse: and so is the thread pseudo-handle");
-    check(nr2_RtlProtectHeap(0, 0) == 120,
+    check(nr2_RtlProtectHeap(0, 0) == 0,
           "refuse: heap protection is not a flag this allocator keeps");
 
     // The splay-tree family: a different balancing scheme would answer

@@ -22,11 +22,6 @@
 
 namespace occ::obs {
 
-// Defined in session.h. Only a reference appears here, so a forward
-// declaration is enough and the two headers do not have to include each
-// other.
-class DebugServer;
-
 // One accepted connection.
 //
 // The protocol is a request and response loop over a stream with no framing

@@ -44,7 +44,6 @@
 //     the loader holds, so a question about the loaded image is a lookup
 //     rather than a query.
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

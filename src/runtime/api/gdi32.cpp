@@ -44,6 +44,38 @@ namespace {
 [[maybe_unused]] constexpr std::uint32_t kErrOk = 0;
 constexpr std::uint32_t kErrParam = 87;
 
+// The widest character range one text call may name. The character APIs
+// take `first` and `last` and write one value per character between them,
+// and the pair is the guest's to choose; no real call asks for more than a
+// font's own code-unit space, so the constant is the whole of the BMP and
+// the ledger check is what ties the buffer to memory that exists.
+constexpr std::uint64_t kMaxCharRange = 1u << 16;
+
+// The size of the DIB header every `BITMAPINFO` begins with, and the largest
+// DIB this runtime will build from one. The header's fields decide the depth
+// and the stride, so the header is read from memory that has to exist first;
+// the pixel array's own size is `stride * lines`, which both factors shape,
+// so the product is bounded here and checked against the ledger before any
+// copy runs.
+constexpr std::uint64_t kBitmapInfoHeaderBytes = 40;
+constexpr std::uint64_t kMaxDibBytes = 1ull << 30;
+
+// The size of the `TEXTMETRICW` structure, which is the amount the metrics
+// call writes and therefore the amount the ledger has to hold.
+constexpr std::size_t kTextMetricBytes = 0x3C;
+
+// The two `*Indirect` structures: `LOGPEN` is four words, and `BITMAP` is
+// the type, width, height and width-in-bytes words, two sixteen-bit count
+// fields and the bits pointer.
+constexpr std::uint64_t kLogPenBytes = 16;
+constexpr std::uint64_t kBitmapBytes = 32;
+
+// The two `LOGFONT` structures: the wide one is the 0x1C-byte head plus a
+// face name of 32 wide characters, and the narrow one is the same head plus
+// 32 bytes.
+constexpr std::uint64_t kLogFontBytes = 0x5C;
+constexpr std::uint64_t kLogFontABytes = 0x3C;
+
 constexpr std::int32_t kTrue = 1;
 constexpr std::int32_t kFalse = 0;
 
@@ -777,31 +809,73 @@ void plot(DeviceContext& dc, int x, int y, std::uint32_t color) noexcept {
     surface_set(*s, x, y, color);
 }
 
-// The colour a drawing operation composites with, by the context's binary
-// raster operation. The common opcode is a straight copy; the others are the
-// bitwise combinations a blit or a pen can ask for.
+// The colour a pen-and-destination drawing operation composites, by the
+// context's binary raster operation. The opcode is one of the `R2_*` values
+// a program sets through `SetROP2`, and it names a boolean function of the
+// pen and the destination pixel -- the value the pen writes is the result of
+// that function, not an index into the ternary opcodes a blit uses. Keying
+// on the `R2_*` value is what makes `R2_NOT` and `R2_XORPEN` invert rather
+// than silently copy; the previous table keyed on the low byte of a ternary
+// opcode, so every opcode whose value did not collide with those bytes fell
+// through to the copy and every mixed operation degraded to it.
 [[nodiscard]] std::uint32_t rop2_apply(std::uint32_t rop, std::uint32_t pen,
                                        std::uint32_t dst) noexcept {
-    // Only the low byte of the opcode matters for the ternary raster ops the
-    // pen uses; the high bits carry the source selects.
-    switch (rop & 0xFF) {
-    case 0x00: return 0;                       // BLACK
-    case 0xFF: return 0xFFFFFF;                // WHITE
-    case 0x0F: return ~pen & 0xFFFFFF;         // NOTPEN
-    case 0x33: return ~dst & 0xFFFFFF;         // NOT
-    case 0x55: return dst ^ 0xFFFFFF;          // NOT
-    case 0x5A: return pen ^ dst;               // XORPEN
-    case 0x66: return pen ^ dst;               // XORPEN
-    case 0x99: return ~(pen ^ dst) & 0xFFFFFF; // NOTXORPEN
-    case 0xA5: return dst ^ 0xFFFFFF;          // NOT
-    case 0xC0: return 0;                       // BLACK
-    case 0xCC: return pen;                     // COPYPEN
-    case 0xF0: return pen;                     // COPYPEN
-    case 0xAA: return 0;                       // NOP
-    case 0x88: return pen & dst;               // MERGEPEN
-    case 0xEE: return pen | dst;               // MERGEPENNOT
-    case 0x02: return pen & ~dst & 0xFFFFFF;   // MASKPENNOT
-    default: return pen;                       // COPYPEN, the default
+    const std::uint32_t p = pen & 0xFFFFFF;
+    const std::uint32_t d = dst & 0xFFFFFF;
+    switch (rop) {
+    case 1:  return 0;                               // R2_BLACK
+    case 2:  return (~(p | d)) & 0xFFFFFF;           // R2_NOTMERGEPEN
+    case 3:  return (~p) & d;                        // R2_MASKNOTPEN
+    case 4:  return (~p) & 0xFFFFFF;                 // R2_NOTCOPYPEN
+    case 5:  return p & (~d) & 0xFFFFFF;             // R2_MASKPENNOT
+    case 6:  return (~d) & 0xFFFFFF;                 // R2_NOT
+    case 7:  return p ^ d;                           // R2_XORPEN
+    case 8:  return (~(p & d)) & 0xFFFFFF;           // R2_NOTMASKPEN
+    case 9:  return p & d;                           // R2_MASKPEN
+    case 10: return (~(p ^ d)) & 0xFFFFFF;           // R2_NOTXORPEN
+    case 11: return d;                               // R2_NOP
+    case 12: return (~p) | d;                        // R2_MERGENOTPEN
+    case 13: return p;                               // R2_COPYPEN
+    case 14: return (p | (~d)) & 0xFFFFFF;           // R2_MERGEPENNOT
+    case 15: return p | d;                           // R2_MERGEPEN
+    case 16: return 0xFFFFFF;                        // R2_WHITE
+    default: return p;                               // R2_COPYPEN, the default
+    }
+}
+
+// The colour a ternary raster operation composites, by the full opcode a
+// `BitBlt`, `StretchBlt` or `PatBlt` names. The opcode is one of the
+// `SRCCOPY`-family 32-bit codes; only its low twenty-four bits carry the
+// operation, and the high byte a `CAPTUREBLT` run may set is dropped.
+//
+// The three operands are the source bit, the destination bit and -- for the
+// pattern ops a `PatBlt` uses -- the brush. Every decode site in this file
+// shares this one function; the copies that preceded it each compared the
+// wrong byte of the opcode, so the source/destination ops and the pattern
+// ops alike degraded to a copy.
+[[nodiscard]] std::uint32_t rop3_apply(std::uint32_t rop, std::uint32_t src,
+                                       std::uint32_t dst,
+                                       std::uint32_t pattern = 0) noexcept {
+    const std::uint32_t s = src & 0xFFFFFF;
+    const std::uint32_t d = dst & 0xFFFFFF;
+    const std::uint32_t p = pattern & 0xFFFFFF;
+    switch (rop & 0x00FFFFFFu) {
+    case 0x00000042: return 0;                          // BLACKNESS
+    case 0x00FF0062: return 0xFFFFFF;                   // WHITENESS
+    case 0x001100A6: return (~(s | d)) & 0xFFFFFF;      // NOTSRCERASE
+    case 0x00330008: return (~s) & 0xFFFFFF;            // NOTSRCCOPY
+    case 0x00440328: return s & (~d) & 0xFFFFFF;        // SRCERASE
+    case 0x00550009: return (~d) & 0xFFFFFF;            // DSTINVERT
+    case 0x005A0049: return p ^ d;                      // PATINVERT
+    case 0x00660046: return s ^ d;                      // SRCINVERT
+    case 0x008800C6: return s & d;                      // SRCAND
+    case 0x00BB0226: return (~s) | d;                   // MERGEPAINT
+    case 0x00C000CA: return s & p;                      // MERGECOPY
+    case 0x00CC0020: return s;                          // SRCCOPY
+    case 0x00EE0086: return s | d;                      // SRCPAINT
+    case 0x00F00021: return p;                          // PATCOPY
+    case 0x00FB0A09: return (p | (~s) | d) & 0xFFFFFF;  // PATPAINT
+    default: return s;                                  // SRCCOPY, the default
     }
 }
 
@@ -1386,9 +1460,18 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_CreatePenIndirect(
         return 0;
     }
     const auto* p = static_cast<const std::uint8_t*>(log_pen);
+    // `LOGPEN` is the style word, then a `POINT` -- two `LONG`s -- and then
+    // the colour at 12. Reading the width from 8 and the colour from 16
+    // takes the `POINT`'s second word for the width and reaches four bytes
+    // past the structure for the colour; the ledger check is what says the
+    // structure exists before either read.
+    if (!guest_range_is_ours(log_pen, kLogPenBytes)) {
+        set_last_error(kErrParam);
+        return 0;
+    }
     const std::uint32_t style = read_u32(p, 0);
-    const std::int32_t width = static_cast<std::int32_t>(read_u32(p, 8));
-    const std::uint32_t color = read_u32(p, 16);
+    const std::int32_t width = static_cast<std::int32_t>(read_u32(p, 4));
+    const std::uint32_t color = read_u32(p, 12);
     return u32g_CreatePen(static_cast<std::int32_t>(style), width, color);
 }
 
@@ -1412,6 +1495,12 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_ExtCreatePen(
 [[nodiscard]] FontDesc font_from_logfont(const void* log_font) noexcept {
     FontDesc f;
     const auto* p = static_cast<const std::uint8_t*>(log_font);
+    // The whole `LOGFONTW` is read -- the numeric run, the flag bytes, and
+    // the 32-character face name that reaches 0x5C -- so the ledger check
+    // is what says all of it exists before the first field comes out of it.
+    if (!guest_range_is_ours(log_font, kLogFontBytes)) {
+        return f;
+    }
     f.height = static_cast<std::int32_t>(read_u32(p, 0));
     f.width = static_cast<std::int32_t>(read_u32(p, 4));
     f.escapement = static_cast<std::int32_t>(read_u32(p, 8));
@@ -1421,7 +1510,10 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_ExtCreatePen(
     f.underline = p[0x15] != 0;
     f.strikeout = p[0x16] != 0;
     f.char_set = p[0x17];
-    f.pitch_and_family = p[0x1A];
+    // The pitch byte is at 0x1B, one past `lfQuality` at 0x1A; reading it
+    // at 0x1A takes the quality byte and hands the field a value the caller
+    // never wrote.
+    f.pitch_and_family = p[0x1B];
     const auto* face = reinterpret_cast<const char16_t*>(p + 0x1C);
     std::u16string name;
     for (int i = 0; i < 32 && face[i] != u'\0'; ++i) {
@@ -1460,6 +1552,13 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_CreateFontIndirectA(
         return 0;
     }
     const auto* p = static_cast<const std::uint8_t*>(log_font);
+    // The narrow head is the same 0x1C bytes the wide one begins with, and
+    // the name that follows runs to a terminator inside the 0x3C-byte
+    // structure; the ledger check is what says the structure exists.
+    if (!guest_range_is_ours(log_font, kLogFontABytes)) {
+        set_last_error(kErrParam);
+        return 0;
+    }
     // `LOGFONTW` is 0x5C bytes -- the same 0x1C-byte head the narrow form
     // has, then a face name of 32 wide characters. A buffer sized as the
     // narrow structure holds 0x3C, and the name write below reaches 0x5A:
@@ -1560,11 +1659,21 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_CreateBitmapIndirect(
         return 0;
     }
     const auto* p = static_cast<const std::uint8_t*>(bitmap);
+    // `BITMAP` is the type word, the width, the height, the width in bytes,
+    // then two sixteen-bit fields -- planes at 16 and bits-per-pixel at 18 --
+    // and the bits pointer at 24. Reading the planes from 12 and the depth
+    // from 14 takes the width-in-bytes word and half of the planes field,
+    // and reading the pointer from 16 takes the two count fields together
+    // for an address.
+    if (!guest_range_is_ours(bitmap, kBitmapBytes)) {
+        set_last_error(kErrParam);
+        return 0;
+    }
     const std::int32_t width = static_cast<std::int32_t>(read_u32(p, 4));
     const std::int32_t height = static_cast<std::int32_t>(read_u32(p, 8));
-    const std::uint32_t planes = read_u32(p, 12);
-    const std::uint32_t bpp = read_u32(p, 14);
-    const std::uint64_t bits = read_ptr(p, 16);
+    const std::uint32_t planes = read_u16(p, 16);
+    const std::uint32_t bpp = read_u16(p, 18);
+    const std::uint64_t bits = read_ptr(p, 24);
     return u32g_CreateBitmap(width, height, planes, bpp,
                              reinterpret_cast<const void*>(bits));
 }
@@ -1777,6 +1886,46 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_DeleteObject(
         set_last_error(kErrParam);
         return kFalse;
     }
+    // A bitmap a context has selected cannot be deleted, and this is the
+    // one object kind Windows refuses outright: the context is drawing into
+    // the bitmap's pixels, so freeing them under it is a use-after-free
+    // rather than a stale handle. The walk below is what makes the refusal
+    // -- `DeleteObject` answers false for this kind where the others answer
+    // true.
+    if (it->second.surface != nullptr) {
+        for (const auto& entry : s.dcs) {
+            if (entry.second.bitmap == object) {
+                set_last_error(kErrParam);
+                return kFalse;
+            }
+        }
+    }
+    // A pen, brush, font, palette or region that a context has selected is
+    // deleted -- Windows allows that -- and the context is left holding a
+    // handle to nothing. The reference leaves the context in that state and
+    // makes the next draw undefined; this runtime cannot afford undefined,
+    // because the lookup the draw would make finds the handle still present
+    // and the object behind it gone. The reference is cleared here instead,
+    // and the draw that follows falls back to the stock object -- which is
+    // the state the comment below describes.
+    for (auto& entry : s.dcs) {
+        DeviceContext& dc = entry.second;
+        if (dc.brush == object) {
+            dc.brush = 0;
+        }
+        if (dc.pen == object) {
+            dc.pen = 0;
+        }
+        if (dc.font == object) {
+            dc.font = 0;
+        }
+        if (dc.palette == object) {
+            dc.palette = 0;
+        }
+        if (dc.region == object) {
+            dc.region = 0;
+        }
+    }
     // A DIB section's bits were handed to the guest and are released with it.
     if (it->second.surface && it->second.surface->is_dib &&
         it->second.surface->bits != nullptr) {
@@ -1838,7 +1987,8 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetObjectW(
     case ObjKind::Brush: {
         // LOGBRUSH is three fields, twenty-four bytes wide on the 64-bit ABI.
         const std::int32_t need = 0x18;
-        if (size < need) {
+        if (size < need ||
+            !guest_range_is_ours(p, static_cast<std::uint64_t>(need))) {
             return 0;
         }
         std::memset(p, 0, static_cast<std::size_t>(need));
@@ -1849,7 +1999,8 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetObjectW(
     }
     case ObjKind::Pen: {
         const std::int32_t need = 0x18;
-        if (size < need) {
+        if (size < need ||
+            !guest_range_is_ours(p, static_cast<std::uint64_t>(need))) {
             return 0;
         }
         std::memset(p, 0, static_cast<std::size_t>(need));
@@ -1861,7 +2012,8 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetObjectW(
     case ObjKind::Bitmap: {
         // BITMAP: type, width, height, width bytes, planes, bit count, bits.
         const std::int32_t need = 0x20;
-        if (size < need) {
+        if (size < need ||
+            !guest_range_is_ours(p, static_cast<std::uint64_t>(need))) {
             return 0;
         }
         std::memset(p, 0, static_cast<std::size_t>(need));
@@ -1869,8 +2021,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetObjectW(
         write_u32(p, 4, surf != nullptr ? static_cast<std::uint32_t>(surf->w) : 0);
         write_u32(p, 8, surf != nullptr ? static_cast<std::uint32_t>(surf->h) : 0);
         write_u32(p, 12, surf != nullptr ? static_cast<std::uint32_t>(surf->stride) : 0);
-        write_u32(p, 14, 1);
-        write_u32(p, 16, surf != nullptr ? static_cast<std::uint32_t>(surf->bpp) : 0);
+        // `bmPlanes` and `bmBitsPixel` are sixteen-bit fields at 16 and 18;
+        // writing them as words at 14 and 16, as an earlier spelling did,
+        // puts both values in the wrong field and overlaps the pair.
+        write_u16(p, 16, 1);
+        write_u16(p, 18, surf != nullptr ? static_cast<std::uint16_t>(surf->bpp) : 0);
         if (surf != nullptr) {
             write_ptr(p, 24,
                       surf->bits != nullptr
@@ -1885,7 +2040,8 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetObjectW(
         // LOGFONTW is 0x5C bytes: the numeric fields, the flags, and the face
         // name in UTF-16.
         const std::int32_t need = 0x5C;
-        if (size < need) {
+        if (size < need ||
+            !guest_range_is_ours(p, static_cast<std::uint64_t>(need))) {
             return 0;
         }
         std::memset(p, 0, static_cast<std::size_t>(need));
@@ -1898,7 +2054,12 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetObjectW(
         write_u8(p, 0x15, o->font.underline ? 1 : 0);
         write_u8(p, 0x16, o->font.strikeout ? 1 : 0);
         write_u8(p, 0x17, static_cast<std::uint8_t>(o->font.char_set));
-        write_u8(p, 0x1A, static_cast<std::uint8_t>(o->font.pitch_and_family));
+        // `lfPitchAndFamily` is the byte after `lfQuality`: the numeric run
+        // is height, width, escapement, orientation and weight (four bytes
+        // each), then the four one-byte flags at 0x14, and then precision,
+        // clip precision and quality at 0x18, 0x19 and 0x1A -- which puts
+        // the pitch byte at 0x1B, not at 0x1A.
+        write_u8(p, 0x1B, static_cast<std::uint8_t>(o->font.pitch_and_family));
         const std::size_t chars = std::min<std::size_t>(o->font.face.size(), 31);
         std::memcpy(p + 0x1C, o->font.face.data(), chars * 2);
         return need;
@@ -2443,7 +2604,9 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_PatBlt(
     for (int yy = y; yy < y + height; ++yy) {
         for (int xx = x; xx < x + width; ++xx) {
             const std::uint32_t dst = surface_get(*dc->target, xx, yy);
-            plot(*dc, xx, yy, rop2_apply(rop, pattern, dst));
+            // `PatBlt` names a pattern opcode, so the brush is the source
+            // slot its `PATCOPY`/`PATINVERT`/`PATPAINT` combinations read.
+            plot(*dc, xx, yy, rop3_apply(rop, pattern, dst, pattern));
         }
     }
     return kTrue;
@@ -2829,6 +2992,12 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetTextExtentPoint32W(
     if (size == nullptr || (text == nullptr && count > 0)) {
         return kFalse;
     }
+    // `size` is a two-word SIZE the caller named, and the ledger is what
+    // says the words are the caller's to write.
+    if (!guest_range_is_ours(size, 8)) {
+        set_last_error(kErrParam);
+        return kFalse;
+    }
     const int chars = count < 0 ? static_cast<int>(std::u16string(text).size())
                                 : count;
     write_u32(size, 0, static_cast<std::uint32_t>(text_advance(
@@ -2841,6 +3010,10 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetTextExtentPoint32A(
     std::uint64_t hdc, const char* text, std::int32_t count,
     void* size) noexcept {
     if (size == nullptr) {
+        return kFalse;
+    }
+    if (!guest_range_is_ours(size, 8)) {
+        set_last_error(kErrParam);
         return kFalse;
     }
     int chars = 0;
@@ -2925,10 +3098,17 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetTextMetricsW(
     if (metrics == nullptr) {
         return kFalse;
     }
+    // The whole TEXTMETRIC is written, so the ledger has to hold the whole
+    // of it: the structure is the caller's, and the clear below is a write
+    // like any other.
+    if (!guest_range_is_ours(metrics, kTextMetricBytes)) {
+        set_last_error(kErrParam);
+        return kFalse;
+    }
     constexpr std::int32_t kAscent = 13;
     constexpr std::int32_t kDescent = 3;
     auto* p = static_cast<std::uint8_t*>(metrics);
-    std::memset(p, 0, 0x3C);
+    std::memset(p, 0, kTextMetricBytes);
     write_u32(p, 0x00, kFontCellH);                     // tmHeight
     write_u32(p, 0x04, kAscent);                        // tmAscent
     write_u32(p, 0x08, kDescent);                       // tmDescent
@@ -2969,6 +3149,14 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetTextFaceW(
     const std::u16string name = f != nullptr ? f->font.face : u"Courier New";
     const std::size_t take =
         std::min<std::size_t>(name.size(), static_cast<std::size_t>(count) - 1);
+    // `count` is the guest's number and `face` is the guest's pointer: the
+    // two together describe the buffer this writes, and the ledger is what
+    // says the buffer exists. The width is the face's own -- two bytes per
+    // unit for the wide form -- and the terminator is part of the write.
+    if (!guest_range_is_ours(face, (take + 1) * sizeof(char16_t))) {
+        set_last_error(kErrParam);
+        return 0;
+    }
     std::memcpy(face, name.data(), take * 2);
     face[take] = u'\0';
     return static_cast<std::int32_t>(take);
@@ -2988,6 +3176,10 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetTextFaceA(
     static_cast<void>(utf16_to_utf8(name, narrow));
     const std::size_t take =
         std::min<std::size_t>(narrow.size(), static_cast<std::size_t>(count) - 1);
+    if (!guest_range_is_ours(face, take + 1)) {
+        set_last_error(kErrParam);
+        return 0;
+    }
     std::memcpy(face, narrow.data(), take);
     face[take] = '\0';
     return static_cast<std::int32_t>(take);
@@ -2998,6 +3190,17 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetCharWidthW(
     std::int32_t* widths) noexcept {
     (void)hdc;
     if (widths == nullptr || last < first) {
+        return kFalse;
+    }
+    // `first` and `last` are the guest's numbers and `widths` is the
+    // guest's buffer, one `int` per character in the range. The span is
+    // what the two numbers say and the ledger is what says the buffer holds
+    // it: a `last` of 0xFFFFFFFF would otherwise be a walk that writes
+    // gigabytes past whatever pointer the caller passed.
+    const std::uint64_t span = static_cast<std::uint64_t>(last) - first + 1;
+    if (span > kMaxCharRange ||
+        !guest_range_is_ours(widths, span * sizeof(std::int32_t))) {
+        set_last_error(kErrParam);
         return kFalse;
     }
     for (std::uint32_t c = first; c <= last; ++c) {
@@ -3019,6 +3222,15 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetCharABCWidthsW(
     void* abc) noexcept {
     (void)hdc;
     if (abc == nullptr || last < first) {
+        return kFalse;
+    }
+    // Three `LONG`s per character, and the same span check the width call
+    // makes: the range is the guest's number and the buffer is the guest's
+    // pointer, and only the ledger can say the second holds the first.
+    const std::uint64_t span = static_cast<std::uint64_t>(last) - first + 1;
+    if (span > kMaxCharRange ||
+        !guest_range_is_ours(abc, span * 3 * sizeof(std::uint32_t))) {
+        set_last_error(kErrParam);
         return kFalse;
     }
     auto* p = static_cast<std::uint8_t*>(abc);
@@ -3162,22 +3374,9 @@ void blit(DeviceContext& dst_dc, Surface& src, int dx, int dy, int w, int h,
             const std::uint32_t s = surface_get(src, sx + x, sy + y);
             const std::uint32_t d =
                 dst_dc.target ? surface_get(*dst_dc.target, dx + x, dy + y) : 0;
-            std::uint32_t out = s;
-            switch (rop & 0xFF) {
-            case 0x00: out = 0; break;                       // BLACKNESS
-            case 0xFF: out = 0xFFFFFF; break;                // WHITENESS
-            case 0x55: out = d ^ 0xFFFFFF; break;            // DSTINVERT
-            case 0x66: out = ~(s ^ d) & 0xFFFFFF; break;     // SRCINVERT
-            case 0x88: out = s & d; break;                   // SRCAND
-            case 0xA6: out = (s ^ d) & 0xFFFFFF; break;      // NOTSRCERASE
-            case 0xBB: out = (s | d) & 0xFFFFFF; break;      // MERGEPAINT
-            case 0xC6: out = s | d; break;                   // SRCPAINT
-            case 0x28: out = ~s & 0xFFFFFF; break;           // SRCERASE
-            case 0xEE: out = s | (~d & 0xFFFFFFu); break;       // MERGECOPY-ish
-            case 0xCC:
-            default: out = s; break;                         // SRCCOPY
-            }
-            plot(dst_dc, dx + x, dy + y, out);
+            // The blit carries no brush, so the pattern slot of the opcode
+            // is left empty; the source/destination ops below ignore it.
+            plot(dst_dc, dx + x, dy + y, rop3_apply(rop, s, d));
         }
     }
 }
@@ -3201,7 +3400,9 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_BitBlt(
         for (int yy = 0; yy < height; ++yy) {
             for (int xx = 0; xx < width; ++xx) {
                 const std::uint32_t d = surface_get(*ddc->target, x + xx, y + yy);
-                plot(*ddc, x + xx, y + yy, rop2_apply(rop, pattern, d));
+                // A null source makes the brush the pattern the opcode
+                // combines, which is the fill `BitBlt` with no source is.
+                plot(*ddc, x + xx, y + yy, rop3_apply(rop, pattern, d, pattern));
             }
         }
         return kTrue;
@@ -3248,17 +3449,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_StretchBlt(
             const int my = sh != 0 ? sy + yy * sh / std::abs(height) : sy;
             const std::uint32_t sv = surface_get(*src_surf, mx, my);
             const std::uint32_t dv = surface_get(*ddc->target, x + xx, y + yy);
-            std::uint32_t out = sv;
-            switch (rop & 0xFF) {
-            case 0x00: out = 0; break;
-            case 0xFF: out = 0xFFFFFF; break;
-            case 0x55: out = dv ^ 0xFFFFFF; break;
-            case 0x66: out = ~(sv ^ dv) & 0xFFFFFF; break;
-            case 0x88: out = sv & dv; break;
-            case 0xC6: out = sv | dv; break;
-            default: out = sv; break;
-            }
-            plot(*ddc, x + xx, y + yy, out);
+            plot(*ddc, x + xx, y + yy, rop3_apply(rop, sv, dv));
         }
     }
     return kTrue;
@@ -3295,12 +3486,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_StretchDIBits(
             const int my = hs != 0 ? ys + yy * hs / std::abs(hd) : ys;
             const std::uint32_t sv = surface_get(temp, mx, my);
             const std::uint32_t dv = surface_get(*dc->target, xd + xx, yd + yy);
-            std::uint32_t out = sv;
-            if ((rop & 0xFF) == 0x00) out = 0;
-            else if ((rop & 0xFF) == 0xFF) out = 0xFFFFFF;
-            else if ((rop & 0xFF) == 0x88) out = sv & dv;
-            else if ((rop & 0xFF) == 0xC6) out = sv | dv;
-            plot(*dc, xd + xx, yd + yy, out);
+            plot(*dc, xd + xx, yd + yy, rop3_apply(rop, sv, dv));
         }
     }
     return std::abs(hd);
@@ -3336,17 +3522,31 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_SetDIBits(
         info == nullptr) {
         return 0;
     }
+    // `info` names a `BITMAPINFOHEADER` and the depth read out of it shapes
+    // everything below, so the ledger check is what makes those fields
+    // readable at all. The pixel array is `stride * lines` bytes with both
+    // factors shaped by the guest: the product is taken in sixty-four bits,
+    // bounded by the largest DIB this runtime builds, and checked against
+    // the ledger -- and that last check is also what bounds `lines`, since
+    // a count whose product is not backed by memory fails it.
+    if (!guest_range_is_ours(info, kBitmapInfoHeaderBytes)) {
+        return 0;
+    }
     const auto* p = static_cast<const std::uint8_t*>(info);
     const int bpp = read_u16(p, 14);
     const int w = bmp->surface->w;
     const int stride = dib_stride(w, bpp);
+    const std::uint64_t need = static_cast<std::uint64_t>(stride) *
+                               static_cast<std::uint64_t>(lines);
+    if (need > kMaxDibBytes || !guest_range_is_ours(bits, need)) {
+        return 0;
+    }
     Surface temp;
     temp.w = w;
     temp.h = static_cast<int>(lines);
     temp.bpp = bpp;
     temp.stride = stride;
-    temp.owned.assign(static_cast<std::size_t>(stride) *
-                          static_cast<std::size_t>(temp.h), 0);
+    temp.owned.assign(static_cast<std::size_t>(need), 0);
     std::memcpy(temp.owned.data(), bits, temp.owned.size());
     default_palette_for(temp);
     for (std::uint32_t r = 0; r < lines; ++r) {
@@ -3369,28 +3569,44 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetDIBits(
     if (bmp == nullptr || bmp->surface == nullptr || info == nullptr) {
         return 0;
     }
+    if (!guest_range_is_ours(info, kBitmapInfoHeaderBytes)) {
+        return 0;
+    }
     const auto* p = static_cast<const std::uint8_t*>(info);
     const int bpp = read_u16(p, 14);
     const int w = bmp->surface->w;
     const int stride = dib_stride(w, bpp);
+    const std::uint64_t need = static_cast<std::uint64_t>(stride) *
+                               static_cast<std::uint64_t>(lines);
+    if (need > kMaxDibBytes) {
+        return 0;
+    }
     auto* header = static_cast<std::uint8_t*>(info);
     write_u32(header, 4, static_cast<std::uint32_t>(w));
     write_u32(header, 8, static_cast<std::uint32_t>(lines));
     write_u16(header, 12, 1);
     write_u16(header, 14, static_cast<std::uint16_t>(bpp));
-    write_u32(header, 20, static_cast<std::uint32_t>(stride) * lines);
+    // The header reports the image's own size, and it is the same
+    // sixty-four-bit product the copy below is bounded by rather than the
+    // thirty-two-bit product the two fields would form if multiplied in
+    // place.
+    write_u32(header, 20, static_cast<std::uint32_t>(need));
     if (bits == nullptr) {
         // The probe: a caller asks for the size by passing no buffer, and the
         // answer is the number of scan lines the image has.
         return static_cast<std::int32_t>(lines);
+    }
+    // A caller that brought a buffer has to have brought one the ledger
+    // backs, because the copy below writes the whole image into it.
+    if (!guest_range_is_ours(bits, need)) {
+        return 0;
     }
     Surface temp;
     temp.w = w;
     temp.h = static_cast<int>(lines);
     temp.bpp = bpp;
     temp.stride = stride;
-    temp.owned.assign(static_cast<std::size_t>(stride) *
-                          static_cast<std::size_t>(temp.h), 0);
+    temp.owned.assign(static_cast<std::size_t>(need), 0);
     default_palette_for(temp);
     for (std::uint32_t r = 0; r < lines; ++r) {
         for (int xx = 0; xx < w; ++xx) {
@@ -3767,40 +3983,48 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetDeviceCaps(
     const Lock l(s.lock);
     const DeviceContext* dc = dc_find(l, hdc);
     const bool screen = dc == nullptr || dc->is_screen;
-    // BITSPIXEL and PLANES: the screen is 32-bit true colour.
+    // BITSPIXEL and PLANES: the screen is 32-bit true colour. Each case is
+    // the `wingdi.h` constant of the same name: the indices are the values
+    // Windows defines -- DRIVERVERSION is 0, TECHNOLOGY is 2, HORZSIZE is 4,
+    // and so on through the even numbers, then LOGPIXELSX at 88 -- so a
+    // caller that passes the header's constant reaches the entry it names.
+    // The table before this one compared those constants against a run of
+    // indices that had drifted, so most queries answered for the wrong
+    // capability.
     switch (index) {
     case 0: return 8;                     // DRIVERVERSION
-    case 2: return 4;                     // HORZSIZE (mm)
-    case 4: return 3;                     // VERTSIZE (mm)
+    case 2: return 1;                     // TECHNOLOGY: DT_RASDISPLAY
+    case 4: return 4;                     // HORZSIZE (mm)
+    case 6: return 3;                     // VERTSIZE (mm)
     case 8: return screen ? 1920 : (dc ? dc->w : 1920);  // HORZRES
     case 10: return screen ? 1080 : (dc ? dc->h : 1080); // VERTRES
     case 12: return 32;                   // BITSPIXEL
     case 14: return 1;                    // PLANES
     case 16: return 32;                   // NUMBRUSHES
     case 18: return 20;                   // NUMPENS
-    case 20: return 0;                    // NUMFONTS
+    case 20: return 0;                    // NUMMARKERS
+    case 22: return 0;                    // NUMFONTS
     case 24: return 0;                    // NUMCOLORS
-    case 26: return 96;                   // CURVECAPS
-    case 28: return 0x1F;                 // LINECAPS
-    case 30: return 0x1F;                 // POLYGONALCAPS
-    case 32: return 0x8000;               // TEXTCAPS
-    case 34: return 0;                    // CLIPCAPS
-    case 36: return 0x1F;                 // RASTERCAPS
-    case 38: return 1;                    // ASPECTX
-    case 40: return 1;                    // ASPECTY
-    case 42: return 0;                    // ASPECTXY
-    case 44: return 0;                    // LOGPIXELSX
-    case 88: return 96;                   // LOGPIXELSY
-    case 90: return 0x0100;               // SIZEPALETTE
-    case 104: return 0;                   // NUMRESERVED
-    case 106: return 0x00FFFFFF;          // COLORRES
-    case 108: return 0;                   // PHYSICALWIDTH
-    case 110: return 0;                   // PHYSICALHEIGHT
+    case 28: return 96;                   // CURVECAPS
+    case 30: return 0x1F;                 // LINECAPS
+    case 32: return 0x1F;                 // POLYGONALCAPS
+    case 34: return 0x8000;               // TEXTCAPS
+    case 36: return 0;                    // CLIPCAPS
+    case 38: return 0x1F;                 // RASTERCAPS
+    case 40: return 1;                    // ASPECTX
+    case 42: return 1;                    // ASPECTY
+    case 44: return 0;                    // ASPECTXY
+    case 88: return 96;                   // LOGPIXELSX
+    case 90: return 96;                   // LOGPIXELSY
+    case 104: return 0x0100;              // SIZEPALETTE
+    case 106: return 0;                   // NUMRESERVED
+    case 108: return 0x00FFFFFF;          // COLORRES
+    case 110: return 0;                   // PHYSICALWIDTH
+    case 111: return 0;                   // PHYSICALHEIGHT
     case 112: return 0;                   // PHYSICALOFFSETX
-    case 114: return 0;                   // PHYSICALOFFSETY
-    case 116: return 1;                   // SCALINGFACTORX
-    case 118: return 1;                   // SCALINGFACTORY
-    case 10 + 0x100: return 0;            // (out of range)
+    case 113: return 0;                   // PHYSICALOFFSETY
+    case 114: return 1;                   // SCALINGFACTORX
+    case 115: return 1;                   // SCALINGFACTORY
     default: return 0;
     }
 }
@@ -4687,6 +4911,15 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetPath(
         return -1;
     }
     if (points != nullptr) {
+        // A POINT is two `LONG`s per recorded point, and the ledger is what
+        // says the caller's array holds the count this context recorded: the
+        // count is the runtime's own but the buffer is the guest's, so the
+        // pair still has to be checked.
+        if (!guest_range_is_ours(
+                points, static_cast<std::uint64_t>(total) * 8)) {
+            set_last_error(kErrParam);
+            return -1;
+        }
         auto* p = static_cast<std::uint8_t*>(points);
         for (std::int32_t i = 0; i < total; ++i) {
             write_u32(p, static_cast<std::size_t>(i) * 8,
@@ -4696,6 +4929,12 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetPath(
         }
     }
     if (types != nullptr) {
+        // One type byte per point, and the same check for the same reason.
+        if (!guest_range_is_ours(types,
+                                 static_cast<std::uint64_t>(total))) {
+            set_last_error(kErrParam);
+            return -1;
+        }
         // PT_MOVETO for the first, PT_LINETO for the rest, which is what the
         // recorded path is.
         for (std::int32_t i = 0; i < total; ++i) {

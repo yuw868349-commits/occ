@@ -21,10 +21,11 @@
 
 #pragma once
 
-#include "occ/runtime/exports.h"
-
+#include <cstddef>
 #include <cstdint>
 #include <vector>
+
+#include "occ/runtime/exports.h"
 
 namespace occ::runtime::winabi {
 

@@ -26,6 +26,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <sys/random.h>
+
 namespace occ::runtime::winabi {
 
 namespace {
@@ -635,6 +637,94 @@ SecState& sec_state() noexcept {
 
 using Lock = std::unique_lock<std::mutex>;
 
+// The blocks this runtime allocated and handed to the guest for one of the
+// interface's free calls to release: `FreeContextBuffer` and
+// `LsaFreeReturnBuffer`. Only a block the ledger holds is freed; a free
+// pointed at an address the guest made up is not a block the host owns, and
+// freeing it would let the guest choose which address the host releases.
+std::mutex& buffer_ledger_mutex() noexcept {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<void*, bool>& buffer_ledger() noexcept {
+    static std::unordered_map<void*, bool> ledger;
+    return ledger;
+}
+
+// The blocks a tracked block owns. Releasing a tracked block releases these
+// first.
+//
+// The enumeration answers are composite: an array of structures, each with
+// pointers to its own name and comment. The guest is handed one pointer --
+// the array -- and the contract it frees is that one pointer. The strings
+// are therefore owned by the array, and without this map they were owned by
+// nobody: `FreeContextBuffer` freed the array and left every string behind,
+// so one enumeration leaked `1 + 2 * package_count` blocks, and the guest had
+// no documented way to release the rest.
+//
+// Recording the children is what makes the single documented release
+// complete. It also keeps the ledger's guarantee intact: a child can only be
+// reached through a parent the ledger already holds, so this adds no path by
+// which a guest-chosen address is freed.
+std::unordered_map<void*, std::vector<void*>>& buffer_children() noexcept {
+    static std::unordered_map<void*, std::vector<void*>> children;
+    return children;
+}
+
+void track_buffer(void* block) noexcept {
+    if (block == nullptr) {
+        return;
+    }
+    const std::lock_guard<std::mutex> guard(buffer_ledger_mutex());
+    buffer_ledger()[block] = true;
+}
+
+// Records `child` as owned by `parent`. Both are tracked in the same call so
+// the ledger can never hold a parent whose children it does not know about.
+void track_buffer_child(void* parent, void* child) noexcept {
+    if (parent == nullptr || child == nullptr) {
+        return;
+    }
+    const std::lock_guard<std::mutex> guard(buffer_ledger_mutex());
+    buffer_ledger()[child] = true;
+    buffer_children()[parent].push_back(child);
+}
+
+// Releases a block only when the ledger holds it, so a free call cannot be
+// aimed at memory the guest chose. Returns whether the block was released.
+bool release_buffer(void* block) noexcept {
+    if (block == nullptr) {
+        return false;
+    }
+    // The children come out first, and they are freed whether or not the
+    // parent itself turns out to be ours: by the time this point is reached
+    // the map lookup has already claimed the parent, so a child cannot be
+    // released twice and cannot be left behind.
+    std::vector<void*> owned;
+    bool ours = false;
+    {
+        const std::lock_guard<std::mutex> guard(buffer_ledger_mutex());
+        const auto kids = buffer_children().find(block);
+        if (kids != buffer_children().end()) {
+            owned = std::move(kids->second);
+            buffer_children().erase(kids);
+        }
+        const auto it = buffer_ledger().find(block);
+        if (it != buffer_ledger().end()) {
+            buffer_ledger().erase(it);
+            ours = true;
+        }
+    }
+    for (const void* child : owned) {
+        std::free(const_cast<void*>(child));
+    }
+    if (ours) {
+        std::free(block);
+    }
+    return ours;
+}
+
 // The two packages the interface offers, with the fields the query
 // answers with.
 struct PackageInfo {
@@ -718,6 +808,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_EnumerateSecurityPackagesA
     if (array == nullptr) {
         return kSecEInsufficientMemory;
     }
+    track_buffer(array);
     for (std::size_t i = 0; i < n; ++i) {
         std::uint8_t* entry = array + i * 0x20;
         std::memset(entry, 0, 0x20);
@@ -731,6 +822,11 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_EnumerateSecurityPackagesA
         auto* comment =
             static_cast<char*>(std::malloc(std::strlen(info.comment) + 1));
         std::memcpy(comment, info.comment, std::strlen(info.comment) + 1);
+        // The two strings belong to the array: the guest is handed the array
+        // and the contract frees the array, so recording them as its children
+        // is what makes that one documented release complete.
+        track_buffer_child(array, name);
+        track_buffer_child(array, comment);
         std::memcpy(entry + 0x10, &name, 8);
         std::memcpy(entry + 0x18, &comment, 8);
     }
@@ -754,6 +850,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_EnumerateSecurityPackagesW
     if (array == nullptr) {
         return kSecEInsufficientMemory;
     }
+    track_buffer(array);
     for (std::size_t i = 0; i < n; ++i) {
         std::uint8_t* entry = array + i * 0x20;
         std::memset(entry, 0, 0x20);
@@ -772,6 +869,10 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_EnumerateSecurityPackagesW
             std::malloc((comment.size() + 1) * 2));
         std::memcpy(comment_buffer, comment.data(), comment.size() * 2);
         comment_buffer[comment.size()] = u'\0';
+        // The strings belong to the array; see the sibling enumeration for
+        // why the one documented release has to reach them.
+        track_buffer_child(array, name_buffer);
+        track_buffer_child(array, comment_buffer);
         std::memcpy(entry + 0x10, &name_buffer, 8);
         std::memcpy(entry + 0x18, &comment_buffer, 8);
     }
@@ -795,6 +896,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_QuerySecurityPackageInfoA(
         if (entry == nullptr) {
             return kSecEInsufficientMemory;
         }
+        track_buffer(entry);
         std::memset(entry, 0, 0x20);
         std::memcpy(entry, &p.capabilities, 4);
         std::memcpy(entry + 4, &p.version, 2);
@@ -804,6 +906,8 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_QuerySecurityPackageInfoA(
         std::memcpy(n, p.name, std::strlen(p.name) + 1);
         auto* c = static_cast<char*>(std::malloc(std::strlen(p.comment) + 1));
         std::memcpy(c, p.comment, std::strlen(p.comment) + 1);
+        track_buffer_child(entry, n);
+        track_buffer_child(entry, c);
         std::memcpy(entry + 0x10, &n, 8);
         std::memcpy(entry + 0x18, &c, 8);
         *info = entry;
@@ -823,11 +927,11 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_QuerySecurityPackageInfoW(
 // exists for.
 extern "C" __attribute__((ms_abi)) std::uint32_t cr32_FreeContextBuffer(
     void* buffer) noexcept {
-    if (buffer != nullptr) {
-        // The allocations the interface makes are single blocks of their
-        // own, which is what this frees.
-        std::free(buffer);
-    }
+    // Only a block this runtime put in the ledger is released. A pointer the
+    // guest made up is not a block the host owns, so nothing is freed and
+    // the guest cannot aim the host's allocator at an address of its
+    // choosing.
+    (void)release_buffer(buffer);
     return kSecEOk;
 }
 
@@ -1067,20 +1171,21 @@ void write_output_token(void* output,
     std::memcpy(first, &written, 4);
 }
 
-// The challenge the server sends: eight bytes drawn from the kernel's
-// generator, which is where a real one comes from.
-void make_challenge(std::uint8_t out[8]) noexcept {
-    static FILE* source = ::fopen("/dev/urandom", "rb");
-    if (source != nullptr && ::fread(out, 1, 8, source) == 8) {
-        return;
+// The challenge the server sends: the eight bytes the kernel's own generator
+// answers with, which is where a real one comes from. There is deliberately
+// no fallback to the clock -- a challenge drawn from a source an attacker
+// can predict can be precomputed against, so a source that cannot be read is
+// reported as the failure it is rather than papered over.
+[[nodiscard]] bool make_challenge(std::uint8_t out[8]) noexcept {
+    std::size_t filled = 0;
+    while (filled < 8) {
+        const ::ssize_t got = ::getrandom(out + filled, 8 - filled, 0);
+        if (got <= 0) {
+            return false;
+        }
+        filled += static_cast<std::size_t>(got);
     }
-    // The fallback: the clock, mixed, which is a poorer source and is
-    // reached only when the kernel's is unavailable.
-    const std::uint64_t now = static_cast<std::uint64_t>(::time(nullptr));
-    for (int i = 0; i < 8; ++i) {
-        out[i] = static_cast<std::uint8_t>(now >> ((i % 8) * 8)) ^
-                 static_cast<std::uint8_t>(i * 31 + 7);
-    }
+    return true;
 }
 
 }  // namespace
@@ -1175,7 +1280,9 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_InitializeSecurityContextA
         std::uint8_t v2[16] = {};
         ntlmv2_hash(ctx->credential.domain, ctx->credential.user, nt, v2);
         std::uint8_t client_challenge[8] = {};
-        make_challenge(client_challenge);
+        if (!make_challenge(client_challenge)) {
+            return kSecEUnknown;
+        }
         const std::vector<std::uint8_t> response =
             ntlmv2_response(v2, ctx->challenge, target_info,
                             std::vector<std::uint8_t>(client_challenge,
@@ -1277,7 +1384,9 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_AcceptSecurityContext(
         ctx->flags = get32(token.data() + 8);
         ctx->state = 1;
         std::uint8_t challenge[8] = {};
-        make_challenge(challenge);
+        if (!make_challenge(challenge)) {
+            return kSecEUnknown;
+        }
         std::memcpy(ctx->challenge, challenge, 8);
         // The target information the challenge carries: the domain the
         // server belongs to and its terminator.
@@ -1420,6 +1529,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_QueryContextAttributesA(
         auto* names = static_cast<std::uint8_t*>(buffer);
         auto* user = static_cast<char*>(
             std::malloc(narrow_of(ctx.credential.user.c_str()).size() + 1));
+        track_buffer(user);
         const std::string narrow = narrow_of(ctx.credential.user.c_str());
         std::memcpy(user, narrow.data(), narrow.size());
         user[narrow.size()] = '\0';
@@ -1599,7 +1709,6 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_MakeSignature(
 extern "C" __attribute__((ms_abi)) std::uint32_t cr32_VerifySignature(
     void* context, void* buffers, std::uint32_t sequence,
     std::uint32_t* quality) noexcept {
-    (void)sequence;
     (void)quality;
     if (context == nullptr || buffers == nullptr) {
         return kSecEInvalidParameter;
@@ -1635,7 +1744,15 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_VerifySignature(
     if (trailer_ptr == 0 || trailer_len < 16) {
         return kSecEInvalidParameter;
     }
+    // The verification recomputes the signature `MakeSignature` wrote, so
+    // it has to feed the same thing into the HMAC: the sequence number and
+    // the data. Dropping the sequence here would make every signature the
+    // matching call produced fail, because the two computations would be
+    // over different inputs.
     std::vector<std::uint8_t> signed_over;
+    for (int i = 0; i < 4; ++i) {
+        signed_over.push_back(static_cast<std::uint8_t>(sequence >> (i * 8)));
+    }
     signed_over.insert(
         signed_over.end(), reinterpret_cast<const std::uint8_t*>(data_ptr),
         reinterpret_cast<const std::uint8_t*>(data_ptr) + data_len);
@@ -1945,9 +2062,9 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_LsaCallAuthenticationPacka
 
 extern "C" __attribute__((ms_abi)) std::uint32_t cr32_LsaFreeReturnBuffer(
     void* buffer) noexcept {
-    if (buffer != nullptr) {
-        std::free(buffer);
-    }
+    // The buffer is released only when the ledger holds it; a value the
+    // guest did not get from this interface is not the host's to free.
+    (void)release_buffer(buffer);
     return kStatusSuccess;
 }
 
@@ -1961,6 +2078,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_LsaEnumerateLogonSessions(
     if (ids == nullptr) {
         return kStatusNoMemory;
     }
+    track_buffer(ids);
     const std::uint64_t zero = 0;
     std::memcpy(ids, &zero, 8);
     *count = 1;
@@ -2014,6 +2132,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_SaslEnumerateProfilesA(
         // The list holds one string: the package the interface offers.
         *profiles = static_cast<char*>(std::malloc(5));
         std::memcpy(*profiles, "NTLM", 5);
+        track_buffer(*profiles);
     }
     return kWinTrue;
 }
@@ -2032,6 +2151,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_SaslEnumerateProfilesW(
         out[3] = u'M';
         out[4] = u'\0';
         *profiles = out;
+        track_buffer(out);
     }
     return kWinTrue;
 }

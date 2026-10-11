@@ -478,13 +478,28 @@ struct RelocFailure {
         // there is no second pass to defend against, and adding a bit to an
         // entry would mutate the file's image for a caller that did not ask
         // for that.
-        std::int32_t temp = static_cast<std::int32_t>(
-                                static_cast<std::uint32_t>(load_u16_at(va))
-                                << 16);
-        temp += static_cast<std::int32_t>(adjustment);
-        temp += static_cast<std::int32_t>(static_cast<std::uint32_t>(delta));
-        temp += 0x8000;
-        store_u16(va, static_cast<std::uint16_t>(temp >> 16));
+        // The rounding term and the two operands are combined in unsigned
+        // arithmetic and only the top half is taken, which is what makes
+        // this the `(S + A - (image - base)) >> 16` the format defines.
+        //
+        // Unsigned is not a style choice. The sum genuinely goes out of
+        // 32-bit range -- the rounding term alone is `0x8000`, and a
+        // relocation delta near the top of the address space carries it past
+        // `0x7fffffff` -- and doing that addition in `int32_t` is signed
+        // overflow, which is undefined rather than merely wrong. The bit
+        // pattern the signed computation would have produced is exactly the
+        // one the unsigned one produces here, because only the top sixteen
+        // bits survive and the arithmetic below never branches on a sign.
+        std::uint32_t sum = static_cast<std::uint32_t>(adjustment);
+        sum += static_cast<std::uint32_t>(delta);
+        sum += 0x8000u;
+        // The top half of the corrected field, folded into the value already
+        // in the low half.
+        const std::uint32_t carried =
+            static_cast<std::uint32_t>(
+                static_cast<std::uint32_t>(load_u16_at(va)) << 16) +
+            sum;
+        store_u16(va, static_cast<std::uint16_t>(carried >> 16));
         return f;
     }
     case kRelBasedDir64: {

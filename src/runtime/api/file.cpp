@@ -68,7 +68,6 @@ constexpr std::uint32_t kErrorFileNotFound = 2;
 constexpr std::uint32_t kErrorPathNotFound = 3;
 constexpr std::uint32_t kErrorAccessDenied = 5;
 constexpr std::uint32_t kErrorWriteFault = 29;
-constexpr std::uint32_t kErrorNotSupported = 50;
 constexpr std::uint32_t kErrorFileExists = 80;
 constexpr std::uint32_t kErrorInvalidParameter = 87;
 constexpr std::uint32_t kErrorDirectoryNotEmpty = 145;
@@ -321,19 +320,25 @@ template <typename C>
     // break a program that sets four attributes at once and cares about one,
     // and silently pretending the bits were stored would be a worse answer
     // than an effect that is stated here.
-    (void)(attributes & (kAttributeHidden | kAttributeSystem));
     mode_t mode = info.st_mode;
     // `NORMAL` means "none of the others", so a caller that asks for it is
     // asking for an ordinary file and its request wins over a read-only bit
     // set in the same word -- which is the order the two are read in here
-    // rather than an accident. A value that mentions neither clears the bit
-    // too, because that is what the caller's word is worth when it did not
-    // mention it.
-    const bool wants_read_only = (attributes & kAttributeReadOnly) != 0;
-    const bool wants_normal = (attributes & kAttributeNormal) != 0;
-    if (wants_read_only && !wants_normal) {
+    // rather than an accident. A word that mentions neither describes an
+    // ordinary file too, and clears the bit: that is what the caller's word
+    // is worth when it did not mention it.
+    const bool says_read_only = (attributes & kAttributeReadOnly) != 0;
+    const bool says_normal = (attributes & kAttributeNormal) != 0;
+    // A word that names only HIDDEN or SYSTEM asks about bits POSIX has
+    // nowhere to put. Those bits are not the read-only bit, so the request
+    // must leave the host's write bits where they were rather than clear a
+    // read-only bit the caller set earlier and never mentioned here.
+    const bool names_only_unstored =
+        !says_read_only && !says_normal &&
+        (attributes & (kAttributeHidden | kAttributeSystem)) != 0;
+    if (says_read_only && !says_normal) {
         mode &= ~static_cast<mode_t>(S_IWUSR | S_IWGRP | S_IWOTH);
-    } else {
+    } else if (!names_only_unstored) {
         mode |= S_IWUSR;
     }
     if (::chmod(host.c_str(), mode) != 0) {
@@ -673,11 +678,12 @@ template <typename C>
 // does; `MoveFileEx` refuses unless the caller asked to replace, which is
 // the flag a program that overwrites deliberately passes.
 //
-// A rename across file systems is `EXDEV` and the host's `rename` will not
-// do it. This layer does not either: copying and unlinking would give a
-// caller a different set of failure modes than the one it wrote against, and
-// reporting the failure is the honest answer for a move the host's own idea
-// of a volume cannot express.
+// The host's `rename` replaces an existing destination atomically, so the
+// destination is never unlinked first: a rename that failed after the unlink
+// would leave the caller with neither the name it moved onto nor the one it
+// moved. A rename across file systems is `EXDEV` and the host will not do
+// it; there the move is expressed as the copy the host's own volume model
+// forces on it, and the source is removed only once the copy has landed.
 template <typename C>
 [[nodiscard]] std::int32_t move_file_ex(const C* from, const C* to,
                                         std::uint32_t flags) noexcept {
@@ -700,14 +706,48 @@ template <typename C>
             set_last_error(kErrorAccessDenied);
             return 0;
         }
-        if (::unlink(dest.c_str()) != 0) {
-            set_last_error(error_from_errno(errno));
-            return 0;
-        }
     }
-    if (::rename(source.c_str(), dest.c_str()) != 0) {
-        set_last_error(errno == EXDEV ? kErrorNotSupported
-                                      : error_from_errno(errno));
+    if (::rename(source.c_str(), dest.c_str()) == 0) {
+        set_last_error(0);
+        return 1;
+    }
+    if (errno != EXDEV) {
+        set_last_error(error_from_errno(errno));
+        return 0;
+    }
+    // The names are on different volumes, which the host's `rename` cannot
+    // span. The source is opened before the destination is created so that a
+    // failure to read the source leaves no new name behind, and the partial
+    // destination is removed on a copy that fails part way, because a name
+    // holding half a file is a worse answer than the failure itself.
+    const int in = ::open(source.c_str(), O_RDONLY);
+    if (in < 0) {
+        set_last_error(error_from_errno(errno));
+        return 0;
+    }
+    const int out = ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out < 0) {
+        ::close(in);
+        set_last_error(error_from_errno(errno));
+        return 0;
+    }
+    const bool copied = copy_contents(in, out);
+    const int saved = errno;
+    ::close(in);
+    ::close(out);
+    if (!copied) {
+        ::unlink(dest.c_str());
+        set_last_error(error_from_errno(saved));
+        return 0;
+    }
+    // The copy carries the source's permissions, as `CopyFile` does, so that
+    // the moved name keeps the mode it had before the move.
+    struct stat source_info {};
+    if (::stat(source.c_str(), &source_info) == 0) {
+        ::chmod(dest.c_str(), source_info.st_mode & 07777);
+    }
+    if (::unlink(source.c_str()) != 0) {
+        set_last_error(error_from_errno(errno));
         return 0;
     }
     set_last_error(0);

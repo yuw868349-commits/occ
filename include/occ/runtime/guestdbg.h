@@ -26,6 +26,18 @@
 
 #include <cstddef>
 #include <cstdint>
+// <sys/ucontext.h> is included for NGREG alone. That is a deliberate cost,
+// not an oversight: the `Stop` below is the register file a fault handler
+// read out of a ucontext_t, so its width has to be the width of that
+// structure's gregs array, and this header is the only place that width is
+// stated. The cost is that the header does not compile against a libc that
+// does not provide <sys/ucontext.h>.
+//
+// Dropping the dependency is a change to make with the port in hand, not
+// ahead of it: `Stop` would hold a fixed-size register array under a
+// constant this project defines, the ucontext_t would stay behind the
+// handler code in the .cpp, and a static_assert there would pin the two
+// counts together so a drift still fails the build.
 #include <sys/ucontext.h>
 
 namespace occ::runtime::guestdbg {

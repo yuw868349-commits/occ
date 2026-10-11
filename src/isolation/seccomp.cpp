@@ -310,17 +310,19 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
     //   [4] jgt max_nr : over the ceiling jumps [5]
     //   [5] ret FALLBACK                         number out of range
     //   then, for each rule in order:
-    //     A_i  jeq nr_i : match skips the pad; a miss jumps past the block
-    //     P_i  ja +1    : the landing pad for a match
+    //     A_i  jeq nr_i : a match continues at the block, a miss jumps it
     //     B_i  the argument tests, then the rule's action
     //   [last] ret FALLBACK                      in range, matched nothing
     //
-    // The pad exists because a rule with no argument tests has a one
-    // instruction block, and without it the entry's two branches would need
-    // offsets that collide: a jump of 1 into the block and a jump of 1 past
-    // it are the same number. The pad makes the taken branch a constant 1 and
-    // the not-taken branch the block size plus one, and those are never
-    // equal.
+    // The entry's two outcomes are the two fields of one instruction --
+    // `jt` for a match and `jf` for a miss -- and each is encoded on its
+    // own, so they do not have to differ: a match continues at the next
+    // instruction (offset 0) and a miss jumps over the whole block (offset
+    // `block`). An earlier spelling inserted an unconditional-jump landing
+    // pad here to keep the two offsets apart; the pad was unreachable --
+    // `jt = 1` from the entry lands on the instruction after the pad, which
+    // is the block's first -- and the "colliding offsets" it was written to
+    // avoid cannot collide, because `jt` and `jf` are separate fields.
     //
     // An argument test that fails leaves rule i and resumes at the next
     // rule's entry, so a number that a rule mentions but whose arguments do
@@ -347,8 +349,8 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
     // last test of the rule has remaining == 1, which gives 3 and 1: past
     // the rule's action and to it respectively. A test with more tests
     // behind it has to clear them as well, and the formula widens with
-    // them, so a miss lands on the next test in the rule rather than on the
-    // next rule's entry.
+    // them, so a miss leaves the rule entirely and lands on the next rule's
+    // entry rather than on a later test of this one.
     //
     // Literals cannot express this. The distances 3 and 1 are correct for a
     // last test and wrong for every other one: with two tests, instruction 2
@@ -373,18 +375,16 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
         const auto& rule = policy.rules[i];
         const std::size_t args = rule.args.size();
         const std::size_t block = block_size(args);
-        const std::size_t skip = block + 1; // the pad and the block
 
-        if (skip > kMaxOffset) {
+        if (block > kMaxOffset) {
             out.error_ = "seccomp rule block exceeds the jump range";
             return out;
         }
 
-        // The entry: a match takes the pad, a miss skips pad and block.
-        insns.push_back(branch(BPF_JMP | BPF_JEQ | BPF_K, rule.nr, 1,
-                               static_cast<std::uint8_t>(skip)));
-        // The pad.
-        insns.push_back(branch(BPF_JMP | BPF_JA, 1, 0, 0));
+        // The entry: a match continues at the block's first instruction and
+        // a miss jumps over the whole block.
+        insns.push_back(branch(BPF_JMP | BPF_JEQ | BPF_K, rule.nr, 0,
+                               static_cast<std::uint8_t>(block)));
 
         for (std::size_t t = 0; t < args; ++t) {
             const auto& test = rule.args[t];
@@ -392,6 +392,11 @@ SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
 
             insns.push_back(ld_arg_hi(test.index));
             insns.push_back(branch(jump(BPF_JEQ), 0, 1, 0));
+            // `remaining * kInsnPerTest` cannot overflow the cast below: the
+            // block-size check above bounds `args` at fifty, so the product
+            // here is at most 248. Making that check the justification is
+            // the point -- the narrowing is one this line can account for,
+            // rather than one inherited from the jump range checked earlier.
             insns.push_back(branch(BPF_JMP | BPF_JA,
                                    static_cast<std::uint32_t>(remaining *
                                                               kInsnPerTest - 2),

@@ -322,6 +322,13 @@ void test_data_protection() {
     check(back.cb == in.cb &&
               std::memcmp(back.pb, secret, in.cb) == 0,
           "crypt32: the payload round-trips");
+
+    // Both out-parameter buffers belong to the caller, which releases them
+    // with LocalFree -- the contract the real call documents. Leaving them
+    // allocated is not a leak in the runtime; it is the test not doing the
+    // half of the contract it is exercising.
+    k32m_LocalFree(out.pb);
+    k32m_LocalFree(back.pb);
 }
 
 void test_system_store() {
@@ -352,10 +359,27 @@ void test_system_store() {
         // whose window the current time falls inside, or one the bundle
         // carries for a reason. The check is that the answer is one of
         // the three the call documents.
+        // `CERT_CONTEXT` is { dwCertEncodingType, pbCertEncoded, cbCertEncoded,
+//        pCertInfo, pvCertInfo }, so the certificate information structure
+//        is reached by *reading* the field at offset 0x18, not by treating
+//        that address as the structure. Handing over the field's own address
+//        reads whatever eight bytes of the context follow it, which for a
+//        64-bit build runs off the end of the allocation entirely.
+struct CertContextView {
+    std::uint32_t encoding_type;
+    std::uint32_t pad;
+    std::uint8_t* encoded;
+    std::uint32_t encoded_len;
+    std::uint32_t pad2;
+    const void* info;
+    std::uint64_t store;
+};
+        const auto* view =
+            static_cast<const CertContextView*>(first);
+        check(view->info != nullptr,
+              "crypt32: the context carries a certificate information block");
         const int validity =
-            cr32_CertVerifyTimeValidity(nullptr,
-                                        reinterpret_cast<
-                                            const std::uint8_t*>(first) + 0x18);
+            cr32_CertVerifyTimeValidity(nullptr, view->info);
         check(validity >= -1 && validity <= 1,
               "crypt32: the validity comparison answers");
 

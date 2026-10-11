@@ -90,18 +90,35 @@ placing the process means the process may run briefly unbounded.
 ### seccomp
 
 Generated as raw `struct sock_filter` arrays. The emitter is in
-`src/isolation/seccomp.cpp` and produces a jump table of the classic form:
-load architecture, load syscall number, binary search over the allowed
-set, return `SECCOMP_RET_ERRNO` with `EPERM` for anything unmatched.
+`src/isolation/seccomp.cpp` and produces a dispatch table of the classic
+form: load architecture, load syscall number, compare that number against
+each rule in turn, then fall through to the policy's fallback. The
+architecture check and the ceiling on the syscall number are in the
+preamble rather than in any rule, so a call from the wrong architecture or
+above the ceiling is refused before a rule is reached.
+
+The policy the container installs when the caller names none is
+`guest_default_policy()`, and it is a refusal list rather than an allow
+list. Its fallback is `SECCOMP_RET_ALLOW`, because the runtime's own thunks
+reach the kernel on the target's behalf and a target that needs a syscall
+the list forgot would otherwise stop for a reason invisible from inside the
+container. What the list refuses -- the mount family, the module family,
+kernel debugging and tracing, namespace changes, and the io_uring, keyring
+and cross-process memory interfaces -- returns `SECCOMP_RET_ERRNO` carrying
+`EPERM`.
+
+`SECCOMP_RET_KILL_PROCESS` is not the default. A sandboxed target that
+makes a refused syscall should learn that it failed, not die silently,
+because silent death is indistinguishable from a crash and wastes the
+analyst's time; kill-on-violation is opt-in. A caller that wants the
+stricter arrangement supplies its own policy instead: one that leaves
+`fallback` at its default of `SeccompDefault::Errno`, with `fallback_error`
+at its default of `ENOSYS`, refuses every call a rule does not name, and the
+container installs whatever policy it is handed.
 
 The filter is installed after the mount setup and immediately before
 `execve`. Installing it earlier would filter Occ's own setup syscalls.
 Installing it later would leave a window where the target runs unfiltered.
-
-`SECCOMP_RET_KILL_PROCESS` is not the default. A sandboxed target that
-makes a disallowed syscall should learn that it failed, not die silently,
-because silent death is indistinguishable from a crash and wastes the
-analyst's time. The default is `EPERM`; kill-on-violation is opt-in.
 
 ### Network
 

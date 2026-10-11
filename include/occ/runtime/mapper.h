@@ -31,7 +31,6 @@
 
 #include <sys/mman.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

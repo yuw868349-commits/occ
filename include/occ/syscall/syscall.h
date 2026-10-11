@@ -25,8 +25,12 @@
 namespace occ::sys {
 
 struct Result {
-    long value;
-    int error;
+    // Zero-initialised, so that a `Result` a caller declares and then fails
+    // to assign -- on the path where a helper returned early, which is the
+    // shape this whole error channel exists for -- reads as success with a
+    // zero value rather than as whatever was on the stack.
+    long value = 0;
+    int error = 0;
 
     [[nodiscard]] constexpr bool ok() const noexcept { return error == 0; }
     [[nodiscard]] constexpr bool failed() const noexcept { return error != 0; }

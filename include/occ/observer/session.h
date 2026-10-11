@@ -18,6 +18,7 @@
 // signal all arrive as the same kind of kernel event, and the session is
 // what knows which one it arranged and therefore which one it is looking at.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

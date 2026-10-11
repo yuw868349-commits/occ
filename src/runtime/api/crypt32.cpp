@@ -1820,6 +1820,10 @@ struct KeyObject {
     std::uint32_t algorithm = 0;
     std::uint32_t mode = 0;
     std::vector<std::uint8_t> iv;
+    // The cipher's block length in bytes, as `cipher_block_len` answers it.
+    // This is deliberately not the key's width: the two are different numbers
+    // for AES-256 (32 and 16) and conflating them made the initialisation
+    // vector query read past the caller's buffer.
     std::uint32_t block_len = 0;
 };
 
@@ -1940,6 +1944,39 @@ constexpr std::uint32_t kCalgAes256 = 0x0000660E;
 
 [[nodiscard]] std::size_t rsa_byte_len(const Big& modulus) noexcept {
     return (modulus.bits() + 7) / 8;
+}
+
+// The cipher's block length, which is not the key's length. The two differ
+// for every AES width: AES-256 has a 32-byte key and a 16-byte block, and a
+// key whose two lengths were the same field made `KP_IV` read twice the
+// caller's buffer -- the initialisation vector is one block, so a caller
+// passing sixteen bytes got thirty-two read out of them.
+//
+// A stream cipher has no block. RC4's answer is zero rather than one: it is
+// the honest "no such thing", and the callers below treat zero as "no IV is
+// in play" and leave the register zeroed.
+[[nodiscard]] std::uint32_t cipher_block_len(std::uint32_t alg) noexcept {
+    const std::uint32_t cipher = alg & 0x0000FFFFu;
+    if (cipher == 0x6801u || cipher == 0x6802u) {  // CALG_RC4 and its variant
+        return 0;
+    }
+    // The AES family, whatever its key width. Every one of these ciphers has
+    // a 128-bit block, which is a property of the algorithm rather than of
+    // the key it is used with.
+    return 16;
+}
+
+// The block length of a key object, for the queries that ask the cipher
+// rather than the key. An RSA key's "block" is its modulus, which is how
+// `KP_BLOCKLEN` answers it, and an object whose cipher this runtime does not
+// implement falls back to the AES block so a caller still gets a bounded
+// number rather than an unbounded read.
+[[nodiscard]] std::uint32_t object_block_len(const KeyObject& object) noexcept {
+    if (object.is_rsa) {
+        return static_cast<std::uint32_t>(rsa_byte_len(object.rsa.modulus));
+    }
+    const std::uint32_t block = cipher_block_len(object.algorithm);
+    return block != 0 ? block : 16;
 }
 
 [[nodiscard]] std::vector<std::uint8_t> export_public_blob(
@@ -2717,7 +2754,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptGenKey(
             return kFalse;
         }
         object.algorithm = alg_id;
-        object.block_len = static_cast<std::uint32_t>(bytes);
+        object.block_len = cipher_block_len(alg_id);
     }
     const std::uint64_t handle = s.next_handle++;
     s.keys.emplace(handle, std::move(object));
@@ -2908,7 +2945,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptImportKey(
         }
         object.algorithm = alg;
         object.secret.assign(data + 12, data + 12 + size);
-        object.block_len = size;
+        object.block_len = cipher_block_len(alg);
     } else {
         set_last_error(kErrInvalidData);
         return kFalse;
@@ -2951,10 +2988,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptGetKeyParam(
         return kTrue;
     }
     case 8: {  // KP_BLOCKLEN
-        const std::uint32_t block = object.is_rsa
-                                        ? static_cast<std::uint32_t>(
-                                              rsa_byte_len(object.rsa.modulus))
-                                        : object.block_len;
+        const std::uint32_t block = object_block_len(object);
         if (data == nullptr || *length < 4) {
             *length = 4;
             set_last_error(kErrMoreData);
@@ -3010,9 +3044,18 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptSetKeyParam(
             set_last_error(kErrInvalidParameter);
             return kFalse;
         }
-        const std::size_t len = it->second.block_len != 0
-                                    ? it->second.block_len
-                                    : 16;
+        // The initialisation vector is exactly one block, and this API has no
+        // length parameter to check a caller's buffer against -- which is why
+        // the block length has to be the block length. Reading the key's width
+        // here read twice the buffer for an AES-256 key, which is a read of
+        // whatever followed it in the caller's frame.
+        const std::size_t len = object_block_len(it->second);
+        if (len == 0) {
+            // A stream cipher has no initialisation vector, so there is
+            // nothing for the caller to set and nothing to store.
+            set_last_error(kErrInvalidParameter);
+            return kFalse;
+        }
         it->second.iv.assign(data, data + len);
         return kTrue;
     }
@@ -3106,11 +3149,13 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptEncrypt(
         for (std::uint32_t i = 0; i < *length; ++i) {
             std::uint8_t keystream[16];
             aes_encrypt_block(expanded, feedback, keystream);
-            const std::uint8_t plain = data[i];
             data[i] ^= keystream[0];
-            // The feedback shifts in the ciphertext byte.
+            // The feedback shifts in the ciphertext byte, which is what CFB
+            // defines and what the decrypt side shifts in to recover the
+            // same keystream: feeding it the plaintext would make the two
+            // sides disagree from the second byte on.
             std::memmove(feedback, feedback + 1, 15);
-            feedback[15] = plain;
+            feedback[15] = data[i];
         }
         return kTrue;
     }
@@ -3314,7 +3359,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptDeriveKey(
     for (std::size_t i = 0; i < need; ++i) {
         object.secret[i] = digest[i % digest.size()];
     }
-    object.block_len = static_cast<std::uint32_t>(need);
+    object.block_len = cipher_block_len(alg_id);
     const std::uint64_t handle = s.next_handle++;
     s.keys.emplace(handle, std::move(object));
     *key = handle;
@@ -3469,6 +3514,19 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptFormatObject(
 // The memory the surface hands out
 // ===========================================================================
 
+// The allocator a `DATA_BLOB` this surface fills in goes through.
+//
+// It has to be the runtime's heap rather than `std::malloc`, because the
+// contract for a filled-in blob is that the caller releases it with
+// `LocalFree`, and `LocalFree` closes blocks this runtime's heap knows about.
+// A `std::malloc` block handed out here is invisible to it: the guest's
+// documented release fails and the block leaks, which is a runtime defect
+// rather than a guest's mistake, and one that turns every protected blob a
+// program ever made into a permanent leak.
+//
+// `k32m_HeapAlloc` is declared in `occ/runtime/api.h`, which this file
+// includes; the declaration is not repeated here.
+
 extern "C" __attribute__((ms_abi)) void* cr32_CryptMemAlloc(
     std::size_t size) noexcept {
     return std::malloc(size);
@@ -3575,8 +3633,10 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptProtectData(
         std::memcpy(iv, enc, 16);
     }
     std::memset(key, 0, sizeof(key));
-    // The answer blob: the runtime's own allocation holds the bytes.
-    auto* result = static_cast<std::uint8_t*>(std::malloc(out.size()));
+    // The answer blob, in the allocator `LocalFree` recognises. See the
+    // declaration of `k32m_HeapAlloc` above for why this is not `malloc`.
+    auto* result = static_cast<std::uint8_t*>(
+        k32m_HeapAlloc(0, 0x00000008 /* HEAP_ZERO_MEMORY */, out.size()));
     if (result == nullptr) {
         set_last_error(kErrNoMem);
         return kFalse;
@@ -3738,8 +3798,14 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CryptUnprotectData(
     }
     plain.resize(plain.size() - pad);
     std::memset(key, 0, sizeof(key));
+    // The same allocator as the protecting call's answer, for the same
+    // reason: the caller releases this one with `LocalFree` too. An empty
+    // payload still asks for one byte, because a zero-byte request is
+    // refused by the heap and the caller would then free a null pointer the
+    // contract says it owns.
     auto* result = static_cast<std::uint8_t*>(
-        std::malloc(plain.empty() ? 1 : plain.size()));
+        k32m_HeapAlloc(0, 0x00000008 /* HEAP_ZERO_MEMORY */,
+                       plain.empty() ? 1 : plain.size()));
     if (result == nullptr) {
         set_last_error(kErrNoMem);
         return kFalse;
@@ -3955,13 +4021,47 @@ void build_cert_backing(CertBacking& backing, const CertInfo& info) {
     backing.context_layout.store = 0;
 }
 
+// Re-points the self-referential fields at wherever the object now lives.
+//
+// `build_cert_backing` fills the layout with pointers into the object it was
+// given, and that is correct while the object stays put. It does not stay
+// put: `CertSlot` is built as a local and then moved into the map, and every
+// pointer taken before the move addresses the local's frame. A certificate
+// read after that -- the validity window, the name, the encoded bytes --
+// dereferences a returned stack frame, which is a read of whatever the next
+// call left there.
+//
+// Rebuilding the pointers is the fix rather than making the caller hold the
+// object still, because the alternative is a container whose elements cannot
+// be moved, which is a constraint every future insertion would have to
+// honour and this one place would not be the last.
+void rebind_cert_pointers(CertBacking& backing) noexcept {
+    CertInfoLayout& layout = backing.info_layout;
+    layout.serial.pb =
+        backing.serial_der.empty() ? nullptr : backing.serial_der.data();
+    layout.signature_algorithm.oid = backing.signature_oid.data();
+    layout.issuer.pb =
+        backing.issuer_der.empty() ? nullptr : backing.issuer_der.data();
+    layout.subject.pb =
+        backing.subject_der.empty() ? nullptr : backing.subject_der.data();
+    layout.subject_public_key_info.key.pb =
+        backing.public_key.empty() ? nullptr : backing.public_key.data();
+    backing.context_layout.encoded = backing.encoded.data();
+    backing.context_layout.info = &backing.info_layout;
+}
+
 void build_cert_backing(CertBacking& backing, const CertInfo& info);
 
 // The handle a new context is registered under.
 [[nodiscard]] std::uint64_t new_cert_handle(const Lock&, const CertSlot& slot) {
     CertState& s = certs();
     const std::uint64_t handle = s.next_handle++;
-    s.certs.emplace(handle, slot);
+    // The re-bind happens on the stored object rather than on the argument:
+    // an `unordered_map` gives its elements stable addresses, so the address
+    // the map hands back is the one that has to be pointed at, and it is not
+    // the address the copy came from.
+    auto [it, _] = s.certs.emplace(handle, slot);
+    rebind_cert_pointers(it->second.backing);
     return handle;
 }
 
@@ -4010,7 +4110,10 @@ void load_system_certificates(const Lock&) {
         slot.backing.encoded = der;
         build_cert_backing(slot.backing, info);
         const std::uint64_t handle = s.next_handle++;
-        s.certs.emplace(handle, std::move(slot));
+        // The same re-bind the other insertion path performs: `slot` is a
+        // local, and the pointers its layout carries address this frame.
+        auto [it, _] = s.certs.emplace(handle, std::move(slot));
+        rebind_cert_pointers(it->second.backing);
     }
 }
 
@@ -4429,9 +4532,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr32_CertFreeCertificateContext(
         }
         return kTrue;
     }
-    // A context this runtime did not hand out is one the caller allocated
-    // for `CertCreateCertificateContext`, which the free call owns.
-    std::free(context);
+    // A context this runtime did not hand out -- a forged pointer, or one
+    // already released -- is not memory the runtime owns. The contexts this
+    // runtime does own live in the slot map above and are released by the
+    // erase; freeing the caller's pointer here would let the guest choose an
+    // address for the host to release.
     return kTrue;
 }
 

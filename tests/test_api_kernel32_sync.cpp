@@ -112,6 +112,12 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32s_SleepConditionVariableSRW(
     std::uint32_t flags) noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t k32s_SetEventWhenCallbackReturns(
     std::int32_t* set, std::uint64_t event) noexcept;
+// `SetEvent` is defined in the socket/event slice rather than this one, and
+// this file reaches it across that boundary for the sixty-four-object case
+// below. The declaration is spelled here because the header that owns the
+// symbol is not one this test includes.
+extern "C" __attribute__((ms_abi)) std::int32_t k32_SetEvent(
+    std::uint64_t handle) noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t k32s_WaitForDebugEvent(
     std::uint32_t* process, std::uint32_t* thread,
     std::uint32_t milliseconds) noexcept;
@@ -296,15 +302,29 @@ void test_invalid_handles_fail_the_wait() {
     check(k32s_WaitForMultipleObjects(2, nullptr, 0, 0) == kWaitFailed,
           "bad argument: a null handle array fails");
     // `MAXIMUM_WAIT_OBJECTS` is 64 and the boundary is inclusive: 64 objects
-    // is a legal wait and 65 is not.
+    // is a legal wait and 65 is not. The legal one is asked with `WAIT_ALL`
+    // over an event nobody signalled, so the answer is a timeout rather than
+    // a signal -- which is also what exercises the full-width mask: a wait
+    // over all sixty-four slots is the one case where `1 << count` has no
+    // meaning, and a mask that came out zero there would answer as soon as
+    // any single object released.
     std::vector<std::uint64_t> many(65, good);
     set_last_error(0);
     check(k32s_WaitForMultipleObjects(65, many.data(), 1, 0) == kWaitFailed,
           "bad argument: more than sixty-four objects fails");
     check(k32_GetLastError() == kErrorInvalidParameter,
           "bad argument: and says why");
-    check(k32s_WaitForMultipleObjects(64, many.data(), 1, 0) == kWaitObject0,
+    check(k32s_WaitForMultipleObjects(64, many.data(), 1, 0) == kWaitTimeout,
           "bad argument: sixty-four is inside the limit");
+    // And the same sixty-four objects answer as satisfied the moment the event
+    // is signalled -- which is the behaviour a zero mask would have broken.
+    // `WAIT_ALL` answers `WAIT_OBJECT_0` rather than naming an index: it says
+    // the whole set was taken, and the lowest set bit of the returned value
+    // is the first object, which is zero.
+    check(k32_SetEvent(good) == 1,
+          "bad argument: the event signals");
+    check(k32s_WaitForMultipleObjects(64, many.data(), 1, 0) == kWaitObject0,
+          "bad argument: and a signalled member satisfies the whole set");
 }
 
 void test_multi_object_names_the_object() {

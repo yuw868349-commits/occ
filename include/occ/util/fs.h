@@ -6,6 +6,7 @@
 // machinery and error-code paths that this project does not want, and it
 // reports failures in a form that is harder to act on than an errno.
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>

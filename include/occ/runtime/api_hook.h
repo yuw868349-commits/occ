@@ -32,7 +32,6 @@
 #pragma once
 
 #include <cstdint>
-#include <span>
 #include <string_view>
 
 namespace occ::runtime::api_hook {

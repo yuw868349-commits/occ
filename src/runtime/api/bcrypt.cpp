@@ -442,10 +442,48 @@ struct HashObject {
     Sha256State sha256;
     Sha1State sha1;
     Md5State md5;
-    std::vector<std::uint8_t> secret;
+    // The HMAC key, normalised to one block: a key longer than the block is
+    // hashed down to the digest, a shorter one is padded with zeros. Empty
+    // means the object is a plain hash and not an HMAC.
+    std::vector<std::uint8_t> key_block;
+    bool hmac = false;
     bool finished = false;
     bool magic = false;
 };
+
+// SHA-1, SHA-256 and MD5 all consume sixty-four-byte blocks, which is the
+// width HMAC's key padding is written to.
+constexpr std::size_t kHashBlockSize = 64;
+
+// The three operations, dispatched by algorithm so that the MAC code above
+// can prime and run a state without repeating the switch at every call.
+void hash_init(HashObject& state) noexcept {
+    switch (state.algorithm) {
+        case Algorithm::Sha256: sha256_init(state.sha256); break;
+        case Algorithm::Sha1: sha1_init(state.sha1); break;
+        case Algorithm::Md5: md5_init(state.md5); break;
+        default: break;
+    }
+}
+
+void hash_update(HashObject& state, const std::uint8_t* data,
+                 std::size_t length) noexcept {
+    switch (state.algorithm) {
+        case Algorithm::Sha256: sha256_update(state.sha256, data, length); break;
+        case Algorithm::Sha1: sha1_update(state.sha1, data, length); break;
+        case Algorithm::Md5: md5_update(state.md5, data, length); break;
+        default: break;
+    }
+}
+
+void hash_finish(HashObject& state, std::uint8_t* out) noexcept {
+    switch (state.algorithm) {
+        case Algorithm::Sha256: sha256_finish(state.sha256, out); break;
+        case Algorithm::Sha1: sha1_finish(state.sha1, out); break;
+        case Algorithm::Md5: md5_finish(state.md5, out); break;
+        default: break;
+    }
+}
 
 std::vector<HashObject*>& hash_objects() noexcept {
     static std::vector<HashObject*> objects;
@@ -623,20 +661,41 @@ extern "C" __attribute__((ms_abi)) Ntstatus k32bc_CreateHash(
     auto* state = new HashObject();
     state->algorithm = provider->algorithm;
     state->magic = true;
-    if (secret != nullptr && secret_size != 0) {
-        // The secret is the key of an HMAC construction. It is kept as it
-        // was given and not folded in here: the keyed hash prepends the key,
-        // and folding it in at creation would produce a digest of the key
-        // rather than of the key and the message.
-        state->secret.assign(secret, secret + secret_size);
+    if (state->algorithm != Algorithm::Sha256 &&
+        state->algorithm != Algorithm::Sha1 &&
+        state->algorithm != Algorithm::Md5) {
+        delete state;
+        return kStatusNotSupported;
     }
-    switch (state->algorithm) {
-        case Algorithm::Sha256: sha256_init(state->sha256); break;
-        case Algorithm::Sha1: sha1_init(state->sha1); break;
-        case Algorithm::Md5: md5_init(state->md5); break;
-        default:
-            delete state;
-            return kStatusNotSupported;
+    if (secret != nullptr && secret_size != 0) {
+        // The secret turns the hash into an HMAC. The key is normalised to
+        // one block -- a key longer than the block is hashed down to the
+        // digest, a shorter one is padded with zeros -- and the inner state
+        // is primed with the key exclusive-ored against the inner pad. The
+        // padded key is kept so that the finish can run the outer hash over
+        // it; folding it in at creation would produce a digest of the key
+        // rather than of the key and the message.
+        state->hmac = true;
+        std::vector<std::uint8_t> key(secret, secret + secret_size);
+        if (key.size() > kHashBlockSize) {
+            std::uint8_t digest[32] = {};
+            HashObject shortened;
+            shortened.algorithm = state->algorithm;
+            hash_init(shortened);
+            hash_update(shortened, key.data(), key.size());
+            hash_finish(shortened, digest);
+            key.assign(digest, digest + digest_length(state->algorithm));
+        }
+        key.resize(kHashBlockSize, 0);
+        state->key_block = key;
+    }
+    hash_init(*state);
+    if (state->hmac) {
+        std::vector<std::uint8_t> inner_pad = state->key_block;
+        for (std::uint8_t& byte : inner_pad) {
+            byte ^= 0x36;
+        }
+        hash_update(*state, inner_pad.data(), inner_pad.size());
     }
     hash_objects().push_back(state);
     *hash = state;
@@ -679,6 +738,24 @@ extern "C" __attribute__((ms_abi)) Ntstatus k32bc_FinishHash(
         // truncated digest that compares unequal against every recorded
         // value, with nothing to say why.
         return kStatusBufferTooSmall;
+    }
+    if (state->hmac) {
+        // The outer half of HMAC: finish the inner digest, then hash the key
+        // exclusive-ored against the outer pad followed by that digest. The
+        // inner state is re-primed for the outer pass, so the result is the
+        // keyed hash and not a bare digest of the message.
+        std::uint8_t inner[32] = {};
+        hash_finish(*state, inner);
+        hash_init(*state);
+        std::vector<std::uint8_t> outer_pad = state->key_block;
+        for (std::uint8_t& byte : outer_pad) {
+            byte ^= 0x5c;
+        }
+        hash_update(*state, outer_pad.data(), outer_pad.size());
+        hash_update(*state, inner, needed);
+        hash_finish(*state, output);
+        state->finished = true;
+        return kStatusSuccess;
     }
     switch (state->algorithm) {
         case Algorithm::Sha256: sha256_finish(state->sha256, output); break;

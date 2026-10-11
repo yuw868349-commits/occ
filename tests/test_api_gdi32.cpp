@@ -151,7 +151,7 @@ constexpr std::int32_t kHorzres = 8;
 constexpr std::int32_t kVertres = 10;
 constexpr std::int32_t kBitsPixel = 12;
 constexpr std::int32_t kPlanes = 14;
-constexpr std::int32_t kColorres = 106;
+constexpr std::int32_t kColorres = 108;
 
 constexpr std::uint32_t kSrcCopy = 0x00CC0020u;
 constexpr std::uint32_t kPatCopy = 0x00F00021u;
@@ -407,9 +407,20 @@ void test_dib_section_bits_are_the_guests() {
     check(p[1 * stride + 1 * 4 + 0] == 0x00,
           "gdi32: the blue channel is clear where only green was drawn");
 
+    // A bitmap a context has selected cannot be deleted, and this is the one
+    // object kind Windows refuses outright: the context is drawing into the
+    // bitmap's pixels, so freeing them under it is a use-after-free. The
+    // refusal has to be observed while the selection still stands, which is
+    // why it is asserted here rather than after the context goes away.
+    check(u32g_DeleteObject(dib) == 0,
+          "gdi32: a bitmap the context still holds cannot be deleted");
+
+    // Destroying the context releases its selection without destroying the
+    // object, so the section becomes the caller's to destroy -- and its bits,
+    // which were handed out at CreateDIBSection, go with it.
+    check(u32g_DeleteDC(dc) == 1, "gdi32: the context is freed");
     check(u32g_DeleteObject(dib) == 1,
           "gdi32: the section is the caller's to destroy");
-    check(u32g_DeleteDC(dc) == 1, "gdi32: the context is freed");
 }
 
 // -- a blit between two contexts ---------------------------------------------

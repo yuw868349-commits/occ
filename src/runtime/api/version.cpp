@@ -376,6 +376,41 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32v_GetFileVersionInfoA(
     return u32v_GetFileVersionInfoW(wide.c_str(), handle, len, buffer);
 }
 
+// The `Ex` spellings take the same arguments as the plain ones with a
+// leading `dwFlags`. They are separate entry points rather than aliases of
+// the plain names: an `Ex` name bound to a function that reads its first
+// argument as the file name reads the caller's flags word as a string
+// pointer, and the read then lands in whatever the flags happen to name.
+// This runtime does not vary its answer by the flags, so each Ex entry
+// point drops them and forwards.
+extern "C" __attribute__((ms_abi)) std::uint32_t
+u32v_GetFileVersionInfoSizeExW(std::uint32_t flags, const char16_t* path,
+                               std::uint32_t* handle) noexcept {
+    static_cast<void>(flags);
+    return u32v_GetFileVersionInfoSizeW(path, handle);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint32_t
+u32v_GetFileVersionInfoSizeExA(std::uint32_t flags, const char* path,
+                               std::uint32_t* handle) noexcept {
+    static_cast<void>(flags);
+    return u32v_GetFileVersionInfoSizeA(path, handle);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t u32v_GetFileVersionInfoExW(
+    std::uint32_t flags, const char16_t* path, std::uint32_t handle,
+    std::uint32_t len, void* buffer) noexcept {
+    static_cast<void>(flags);
+    return u32v_GetFileVersionInfoW(path, handle, len, buffer);
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t u32v_GetFileVersionInfoExA(
+    std::uint32_t flags, const char* path, std::uint32_t handle,
+    std::uint32_t len, void* buffer) noexcept {
+    static_cast<void>(flags);
+    return u32v_GetFileVersionInfoA(path, handle, len, buffer);
+}
+
 // The query. The sub-block names are the tree's paths:
 //
 //   `\`                      -- the fixed info
@@ -684,15 +719,15 @@ void add_version(ExportList& out) {
     e("VerLanguageNameW", reinterpret_cast<void*>(&u32v_VerLanguageNameW));
     e("VerLanguageNameA", reinterpret_cast<void*>(&u32v_VerLanguageNameA));
     // The `Ex` spellings, which the family documents as the same calls
-    // with a reserved parameter.
+    // with a leading `dwFlags` parameter.
     e("GetFileVersionInfoSizeExW",
-      reinterpret_cast<void*>(&u32v_GetFileVersionInfoSizeW));
+      reinterpret_cast<void*>(&u32v_GetFileVersionInfoSizeExW));
     e("GetFileVersionInfoSizeExA",
-      reinterpret_cast<void*>(&u32v_GetFileVersionInfoSizeA));
+      reinterpret_cast<void*>(&u32v_GetFileVersionInfoSizeExA));
     e("GetFileVersionInfoExW",
-      reinterpret_cast<void*>(&u32v_GetFileVersionInfoW));
+      reinterpret_cast<void*>(&u32v_GetFileVersionInfoExW));
     e("GetFileVersionInfoExA",
-      reinterpret_cast<void*>(&u32v_GetFileVersionInfoA));
+      reinterpret_cast<void*>(&u32v_GetFileVersionInfoExA));
 }
 
 }  // namespace occ::runtime::winabi

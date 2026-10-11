@@ -65,8 +65,9 @@ void append_json_escaped(std::string& out, std::string_view s) noexcept;
 }
 
 [[nodiscard]] constexpr std::uint16_t u16le_at(ByteSpan s, std::size_t off) noexcept {
-    return static_cast<std::uint16_t>(s[off]) |
-           static_cast<std::uint16_t>(static_cast<std::uint16_t>(s[off + 1]) << 8);
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(s[off]) |
+        static_cast<std::uint16_t>(static_cast<std::uint16_t>(s[off + 1]) << 8));
 }
 
 } // namespace occ

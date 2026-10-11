@@ -19,6 +19,7 @@
 // reason this layer reports how many are in use rather than pretending the
 // number is unbounded.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

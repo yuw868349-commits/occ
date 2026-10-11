@@ -38,7 +38,6 @@
 #include <linux/seccomp.h>
 
 #include "occ/syscall/errno.h"
-#include "occ/util/span.h"
 
 namespace occ::sys {
 
@@ -153,14 +152,14 @@ private:
 // It is a refusal list rather than an allow list, and that choice is worth
 // stating: the runtime's own thunks reach the kernel on the target's behalf
 // for everything the target asks through the Windows API, and a target that
-// needs a syscall the list forgot is a target that stops with ENOSYS for
-// reasons nobody can see from inside the container. The always-allowed
-// fallback keeps a usable target usable while the list below takes away the
-// calls a Windows target has no business making: the mount family, the
-// module family, kernel debugging and tracing, namespace changes, and the
-// io_uring, keyring and cross-process memory interfaces. A caller that wants
-// the stricter allow list can set `fallback = Errno` on its own policy and
-// install that instead; the container takes the policy it is given.
+// needs a syscall the list forgot is a target that keeps running -- the
+// fallback here allows whatever no rule names -- rather than one that stops
+// for reasons nobody can see from inside the container. The list below takes
+// away the calls a Windows target has no business making: the mount family,
+// the module family, kernel debugging and tracing, namespace changes, and
+// the io_uring, keyring and cross-process memory interfaces. A caller that
+// wants the stricter allow list can set `fallback = Errno` on its own policy
+// and install that instead; the container takes the policy it is given.
 [[nodiscard]] SeccompPolicy guest_default_policy() noexcept;
 
 // Compiles the policy into bytecode. Building never throws and never installs
@@ -180,8 +179,17 @@ private:
 [[nodiscard]] int seccomp_install(const SeccompProgram& program) noexcept;
 
 // Installs a compiled program on another thread, which must be stopped in a
-// ptrace stop. The tracer uses this to filter a child that it is about to
-// release. Returns 0 on success or a negative errno.
+// ptrace stop.
+//
+// This build cannot do it, and the function says so rather than pretending
+// otherwise. `seccomp(2)` installs on the *calling* thread only, and the one
+// supported way for a tracer to filter a traced thread is for that thread to
+// call `seccomp` itself -- which the isolation layer arranges by compiling
+// the program in the parent and having the child install it before it drops
+// privileges. A caller that reaches this function has a design that has to
+// change, and a false success would let it believe a filter is active.
+//
+// Returns 0 on success or a negative errno.
 [[nodiscard]] int seccomp_install_on_thread(const SeccompProgram& program,
                                             int tid) noexcept;
 

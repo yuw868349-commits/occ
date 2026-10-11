@@ -14,6 +14,7 @@
 // image_loaded event is written before any mapping event, so a consumer that
 // reads the stream top to bottom has a complete picture at every point.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

@@ -17,10 +17,12 @@
 // `api-ms-win-crt-string-l1-1-0.dll` actually asks for.
 
 #include "occ/runtime/api.h"
+#include "occ/runtime/dos_path.h"
 #include "occ/runtime/winabi.h"
 
 #include <cstdarg>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,9 +31,14 @@
 #include <cwchar>
 #include <clocale>
 #include <malloc.h>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 extern "C" char** environ;
 
@@ -153,6 +160,21 @@ std::int32_t set_errno_value(std::int32_t v) noexcept {
 struct CrtLocale {
     std::string name;
 };
+
+// The handles this runtime created, so that `_free_locale` can tell one of
+// its own from the arbitrary value a guest may hand it. Without the ledger
+// the free would `delete` whatever pointer arrived, and a guest that passes
+// a value it did not get from `_create_locale` would be choosing an address
+// for the host to free.
+std::mutex& locale_ledger_mutex() noexcept {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<CrtLocale*>& locale_ledger() noexcept {
+    static std::vector<CrtLocale*> ledger;
+    return ledger;
+}
 
 }  // namespace
 
@@ -1560,12 +1582,34 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32u__create_locale(
     }
     auto* loc = new CrtLocale();
     loc->name = name;
+    // The handle is recorded before it is answered with, so that the free
+    // can recognize it; a guest that never frees it leaks one object, which
+    // is the same leak a program that never calls `_free_locale` has.
+    {
+        const std::lock_guard<std::mutex> guard(locale_ledger_mutex());
+        locale_ledger().push_back(loc);
+    }
     return reinterpret_cast<std::uint64_t>(loc);
 }
 
 extern "C" __attribute__((ms_abi)) void u32u__free_locale(
     std::uint64_t locale) noexcept {
-    delete reinterpret_cast<CrtLocale*>(locale);
+    if (locale == 0) {
+        return;
+    }
+    auto* target = reinterpret_cast<CrtLocale*>(locale);
+    // Only a handle this runtime minted is freed. A value the guest made up
+    // is ignored, because freeing an address the caller chose would hand the
+    // choice of what the host frees to the guest.
+    const std::lock_guard<std::mutex> guard(locale_ledger_mutex());
+    std::vector<CrtLocale*>& ledger = locale_ledger();
+    for (auto it = ledger.begin(); it != ledger.end(); ++it) {
+        if (*it == target) {
+            ledger.erase(it);
+            delete target;
+            return;
+        }
+    }
 }
 
 extern "C" __attribute__((ms_abi)) char* u32u_setlocale(
@@ -1640,13 +1684,325 @@ extern "C" __attribute__((ms_abi)) Lconv* u32u_localeconv() noexcept {
 // The process, console and thread entry points
 // ===========================================================================
 
+namespace {
+
+// One redirection a command line asked for, at the spelling the guest wrote:
+// `<` reads standard input, `>` writes standard output, `>>` appends to it,
+// and a leading `1` or `2` on the operator selects the stream.
+struct CommandRedirection {
+    int stream = 1;
+    bool append = false;
+    std::string path;
+};
+
+// One item of the line, in the order it was written: a word, or a
+// redirection operator waiting for the word that names its file.
+struct CommandToken {
+    bool redirect = false;
+    int stream = 1;
+    bool append = false;
+    std::string text;
+};
+
+// A character a command language would act on rather than pass through. The
+// interpreter refuses a line that carries one, because reading it as an
+// ordinary argument would run a different command from the one the guest
+// wrote, and handing it to a shell to interpret is exactly the host command
+// processor this runtime does not put in the guest's hands.
+[[nodiscard]] bool is_shell_metacharacter(char c) noexcept {
+    switch (c) {
+        case '|':
+        case '&':
+        case ';':
+        case '(':
+        case ')':
+        case '`':
+        case '$':
+        case '*':
+        case '?':
+        case '%':
+        case '!':
+        case '^':
+        case '\n':
+        case '\r':
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Splits a command line into words and redirection operators. Returns false
+// for a line this interpreter does not implement: an unterminated quote, a
+// shell metacharacter, or a stream number in front of an operator.
+[[nodiscard]] bool lex_command_line(const std::string& line,
+                                    std::vector<CommandToken>& out) noexcept {
+    std::string word;
+    bool has_word = false;
+    bool in_quotes = false;
+    std::size_t i = 0;
+    while (i < line.size()) {
+        const char c = line[i];
+        if (in_quotes) {
+            if (c == '"') {
+                in_quotes = false;
+            } else {
+                word.push_back(c);
+                has_word = true;
+            }
+            ++i;
+            continue;
+        }
+        if (c == '"') {
+            in_quotes = true;
+            has_word = true;  // an empty pair still names an empty word
+            ++i;
+            continue;
+        }
+        if (c == ' ' || c == '\t') {
+            if (has_word) {
+                out.push_back(CommandToken{false, 1, false, std::move(word)});
+                word = std::string();
+                has_word = false;
+            }
+            ++i;
+            continue;
+        }
+        if (c == '>' || c == '<') {
+            CommandToken token;
+            token.redirect = true;
+            token.stream = c == '<' ? 0 : 1;
+            // A stream number written against the operator -- `1>`, `2>` --
+            // selects which stream it is. The number has to be adjacent, so
+            // a word that merely happens to be a digit followed by a space
+            // is still an argument.
+            if (has_word && (word == "1" || word == "2")) {
+                token.stream = word[0] - '0';
+                word = std::string();
+                has_word = false;
+            }
+            if (c == '>' && i + 1 < line.size() && line[i + 1] == '>') {
+                token.append = true;
+                ++i;
+            }
+            out.push_back(std::move(token));
+            ++i;
+            continue;
+        }
+        if (is_shell_metacharacter(c)) {
+            return false;
+        }
+        word.push_back(c);
+        has_word = true;
+        ++i;
+    }
+    if (in_quotes) {
+        return false;
+    }
+    if (has_word) {
+        out.push_back(CommandToken{false, 1, false, std::move(word)});
+    }
+    return true;
+}
+
+// The words the line names and the streams its redirections fill.
+struct ParsedCommand {
+    std::vector<std::string> words;
+    std::vector<CommandRedirection> redirections;
+};
+
+[[nodiscard]] bool split_command(const std::vector<CommandToken>& tokens,
+                                 ParsedCommand& out) noexcept {
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        const CommandToken& token = tokens[i];
+        if (!token.redirect) {
+            out.words.push_back(token.text);
+            continue;
+        }
+        // A redirection operator's operand is the word after it; an operator
+        // at the end of the line, or in front of another operator, names no
+        // file and is refused.
+        if (i + 1 >= tokens.size() || tokens[i + 1].redirect) {
+            return false;
+        }
+        CommandRedirection redirection;
+        redirection.stream = token.stream;
+        redirection.append = token.append;
+        redirection.path = tokens[i + 1].text;
+        out.redirections.push_back(std::move(redirection));
+        ++i;
+    }
+    return true;
+}
+
+[[nodiscard]] bool is_builtin(const std::string& name) noexcept {
+    // cmd matches a command name without regard to case.
+    std::string lower = name;
+    for (char& c : lower) {
+        c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    }
+    return lower == "echo" || lower == "rem" || lower == "::";
+}
+
+[[nodiscard]] bool write_all(int fd, std::string_view text) noexcept {
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const ssize_t put = ::write(fd, text.data() + at, text.size() - at);
+        if (put < 0) {
+            return false;
+        }
+        at += static_cast<std::size_t>(put);
+    }
+    return true;
+}
+
+// Runs a command this interpreter answers itself, so that a container root
+// holding no `/bin/echo` still runs a batch line that only echoes or
+// comments. `out_fd` is the descriptor redirection opened, or -1 for the
+// process's own standard output.
+[[nodiscard]] std::int32_t run_builtin(const std::vector<std::string>& words,
+                                       int out_fd) noexcept {
+    std::string lower = words[0];
+    for (char& c : lower) {
+        c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    }
+    if (lower == "rem" || lower == "::") {
+        return 0;  // a comment: the rest of the line is text, not a command
+    }
+    std::string text;
+    for (std::size_t i = 1; i < words.size(); ++i) {
+        if (i > 1) {
+            text.push_back(' ');
+        }
+        text += words[i];
+    }
+    text.push_back('\n');
+    const int fd = out_fd >= 0 ? out_fd : STDOUT_FILENO;
+    return write_all(fd, text) ? 0 : 1;
+}
+
+// Runs one command line the way Windows' own command processor would, but
+// without a host shell in the path. The line is split by this runtime's own
+// lexer, redirection is applied by opening the named file, and the program
+// is started directly, so no command language ever sees the guest's text.
+[[nodiscard]] std::int32_t run_command_line(const char* command) noexcept {
+    std::vector<CommandToken> tokens;
+    if (!lex_command_line(std::string(command), tokens)) {
+        set_errno_value(kEInval);
+        return -1;
+    }
+    ParsedCommand parsed;
+    if (!split_command(tokens, parsed)) {
+        set_errno_value(kEInval);
+        return -1;
+    }
+    if (parsed.words.empty()) {
+        // An empty line, or one that only redirects, is an empty command:
+        // cmd answers success for it.
+        return 0;
+    }
+
+    // The redirection files are opened before the child exists, so a name
+    // that cannot be opened is reported with the command unrun rather than
+    // as the child's death, and no half-built child is left behind.
+    int in_fd = -1;
+    int out_fd = -1;
+    int err_fd = -1;
+    for (const CommandRedirection& redirection : parsed.redirections) {
+        const std::string host = from_dos_path(redirection.path);
+        int fd = -1;
+        if (redirection.stream == 0) {
+            fd = ::open(host.c_str(), O_RDONLY);
+        } else {
+            const int flags =
+                O_WRONLY | O_CREAT | (redirection.append ? O_APPEND : O_TRUNC);
+            fd = ::open(host.c_str(), flags, 0666);
+        }
+        if (fd < 0) {
+            if (in_fd >= 0) {
+                ::close(in_fd);
+            }
+            if (out_fd >= 0) {
+                ::close(out_fd);
+            }
+            if (err_fd >= 0) {
+                ::close(err_fd);
+            }
+            set_errno_value(kENoEnt);
+            return -1;
+        }
+        if (redirection.stream == 0) {
+            in_fd = fd;
+        } else if (redirection.stream == 1) {
+            out_fd = fd;
+        } else {
+            err_fd = fd;
+        }
+    }
+    const auto close_redirects = [&]() {
+        if (in_fd >= 0) {
+            ::close(in_fd);
+        }
+        if (out_fd >= 0) {
+            ::close(out_fd);
+        }
+        if (err_fd >= 0) {
+            ::close(err_fd);
+        }
+    };
+
+    if (is_builtin(parsed.words[0])) {
+        const std::int32_t code = run_builtin(parsed.words, out_fd);
+        close_redirects();
+        return code;
+    }
+
+    std::vector<char*> argv;
+    argv.reserve(parsed.words.size() + 1);
+    for (std::string& word : parsed.words) {
+        argv.push_back(word.data());
+    }
+    argv.push_back(nullptr);
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        close_redirects();
+        return -1;
+    }
+    if (pid == 0) {
+        if (in_fd >= 0) {
+            (void)::dup2(in_fd, STDIN_FILENO);
+            ::close(in_fd);
+        }
+        if (out_fd >= 0) {
+            (void)::dup2(out_fd, STDOUT_FILENO);
+            ::close(out_fd);
+        }
+        if (err_fd >= 0) {
+            (void)::dup2(err_fd, STDERR_FILENO);
+            ::close(err_fd);
+        }
+        ::execvp(argv[0], argv.data());
+        ::_exit(127);  // the program could not be started
+    }
+    close_redirects();
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            set_errno_value(kEInval);
+            return -1;
+        }
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+}  // namespace
+
 extern "C" __attribute__((ms_abi)) std::int32_t u32u_system(
     const char* command) noexcept {
     if (command == nullptr) {
         return 1;  // the documented "a command processor is present"
     }
-    const int rc = ::system(command);
-    return rc;
+    return run_command_line(command);
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t u32u__wsystem(
@@ -1672,20 +2028,32 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32u__putch(
 }
 
 using BeginThreadFn = std::uint32_t(__attribute__((ms_abi))*)(void*);
+
+// The record the new thread's trampoline owns and frees: the entry and its
+// argument, which only that thread reads. It is kept apart from the handle
+// the call answers with, because the two have different owners -- the
+// trampoline frees this record when the entry returns, while the handle
+// stays with the caller.
 struct ThreadStart {
     BeginThreadFn fn;
     void* arg;
 };
 
+// The identity `_beginthreadex` answers with. It outlives the thread's
+// start record deliberately: freeing it here, in the trampoline, would hand
+// the caller a handle to memory that was already gone by the time the call
+// returned it.
+struct CrtThreadHandle {
+    std::uint32_t id;
+};
+
 std::uint32_t thread_trampoline(ThreadStart* start) noexcept {
     const BeginThreadFn fn = start->fn;
     void* arg = start->arg;
+    // Only the start record is this thread's to free; the handle belongs to
+    // the caller that the call answered.
     delete start;
-    // The thread object the CRT keeps: one heap allocation holding the
-    // result, which `_endthreadex` reads. The trampoline is what a real
-    // CRT runs, and the result is what the call returns.
-    const std::uint32_t rc = fn(arg);
-    return rc;
+    return fn(arg);
 }
 
 extern "C" __attribute__((ms_abi)) std::uintptr_t u32u__beginthreadex(
@@ -1700,14 +2068,15 @@ extern "C" __attribute__((ms_abi)) std::uintptr_t u32u__beginthreadex(
     // The thread the CRT starts is a host thread running the guest's
     // entry; the id is handed back the way the call promises.
     static std::uint32_t next_id = 100;
+    auto* handle = new CrtThreadHandle{++next_id};
     if (thread_id != nullptr) {
-        *thread_id = ++next_id;
+        *thread_id = handle->id;
     }
     auto* start = new ThreadStart{fn, arg};
     std::thread(thread_trampoline, start).detach();
-    // The handle the call answers with is the thread object, which is the
-    // identity the CRT's own calls take.
-    return reinterpret_cast<std::uintptr_t>(start);
+    // The handle the call answers with is the caller's to close, which is
+    // why it is not the record the trampoline frees.
+    return reinterpret_cast<std::uintptr_t>(handle);
 }
 
 extern "C" __attribute__((ms_abi)) void u32u__endthreadex(

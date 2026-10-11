@@ -41,6 +41,7 @@
 // that bridge, and its correctness is tested per conversion rather than
 // trusted.
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>

@@ -646,7 +646,24 @@ int dbg_pe_runner(int argc, char** argv) noexcept {
                 std::fprintf(stdout, "mdmp: the guest is not stopped\n");
                 continue;
             }
-            if (fields < 2) {
+            // The path is taken as the rest of the line rather than through
+            // the hex scanners the numeric commands use. A filesystem path
+            // is not a number, so sscanf's %llx fails on it and every real
+            // invocation is reported as a missing path. The newline that
+            // fgets leaves on the line is trimmed with the rest of the
+            // trailing whitespace, because a path ending in "\n" names a
+            // file that does not exist.
+            const char* arg = text + std::strlen(cmd);
+            while (*arg == ' ' || *arg == '\t') {
+                ++arg;
+            }
+            std::string p(arg);
+            while (!p.empty() &&
+                   (p.back() == '\n' || p.back() == '\r' || p.back() == ' ' ||
+                    p.back() == '\t')) {
+                p.pop_back();
+            }
+            if (p.empty()) {
                 std::fprintf(stdout, "mdmp: needs a path\n");
                 continue;
             }
@@ -657,7 +674,6 @@ int dbg_pe_runner(int argc, char** argv) noexcept {
             }
             ctx.regs[REG_RIP] = stop.rip;
             ctx.valid = true;
-            const std::string p(text + std::strlen(cmd) + 1);
             static_cast<void>(runtime::minidump::write(
                 p, base, session.process->image().module.size, ctx,
                 0x80000003, stop.rip, image_path.c_str()));
@@ -739,13 +755,29 @@ std::uint32_t g_iob_base = 0;
 [[nodiscard]] std::uint32_t arena_alloc(runtime::i386::Memory& mem,
                                         std::uint32_t bytes) noexcept {
     const std::uint32_t at = g_i386_arena;
-    const std::uint32_t rounded = (bytes + 15u) & ~15u;
-    // Touch the pages so the region exists; the block is zero-filled,
-    // which is the promise HeapAlloc makes.
-    for (std::uint32_t p = at & ~0xFFFu; p < at + rounded; p += 0x1000) {
-        static_cast<void>(mem.page(p));
+    // Round up to a paragraph, checked rather than wrapped. A size within
+    // fifteen bytes of the top of the range would otherwise round to a small
+    // number, and the block handed back would overlap the one before it.
+    if (bytes > 0xFFFFFFFFu - 15u) {
+        return 0;
     }
-    g_i386_arena = at + rounded;
+    const std::uint32_t rounded = (bytes + 15u) & ~15u;
+    // The bump is checked too. An arena that cannot reach past the block is
+    // out of memory; returning the old top unchanged would hand out a block
+    // that overlaps whatever the next request gets.
+    if (at > 0xFFFFFFFFu - rounded) {
+        return 0;
+    }
+    const std::uint32_t end = at + rounded;
+    // Touch the pages so the region exists; the block is zero-filled, which
+    // is the promise HeapAlloc makes. The page cursor is a 64-bit value so
+    // that the loop cannot wrap back to zero and touch pages forever when
+    // the block ends near the top of the 32-bit range.
+    for (std::uint64_t p = at & ~0xFFFu;
+         p < static_cast<std::uint64_t>(end); p += 0x1000u) {
+        static_cast<void>(mem.page(static_cast<std::uint32_t>(p)));
+    }
+    g_i386_arena = end;
     return at;
 }
 
@@ -895,6 +927,15 @@ bool i386_host_call(void* state, const char* dll, const char* name,
         const std::string path = "C:\\crt32.exe";
         const std::uint32_t n = static_cast<std::uint32_t>(path.size());
         const std::uint32_t cap = arg2;
+        // A zero-sized buffer holds nothing, not even the terminator. The
+        // "cap - 1" below would underflow to a near-4GiB length and send the
+        // write off the end of whatever buffer the guest named, so the empty
+        // case is answered before the subtraction.
+        if (cap == 0) {
+            m.regs[eax] = 0;
+            m.esp_adjust = 12;
+            return true;
+        }
         const std::uint32_t put = n < cap ? n : cap - 1;
         mem.write(arg1, path.c_str(), put);
         mem.write8(arg1 + put, 0);

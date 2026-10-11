@@ -47,6 +47,7 @@ using Ntstatus = std::uint32_t;
 // `ntstatus_to_dos` below implements.
 constexpr Ntstatus kStSuccess = 0;
 constexpr Ntstatus kStInvalidParameter = 0xC000000D;
+constexpr Ntstatus kStInvalidInfoClass = 0xC0000003;
 constexpr Ntstatus kStBufferTooSmall = 0xC0000023;
 constexpr Ntstatus kStBufferOverflow = 0xC0000100;
 constexpr Ntstatus kStNotImplemented = 0xC0000002;
@@ -82,6 +83,10 @@ constexpr std::size_t kVersionCsd = 20;
 // run past it.
 constexpr std::size_t kVersionCsdChars = 128;
 constexpr std::size_t kVersionBytes = kVersionCsd + kVersionCsdChars * 2;
+// RTL_OSVERSIONINFOEXW appends the service-pack words, the suite mask, the
+// product type and a reserved byte after the 128-WCHAR name: eight bytes
+// past the base record.
+constexpr std::size_t kVersionExBytes = kVersionBytes + 8;
 
 // The SLIST_HEADER a lock-free stack lives in. On x64 it is 16 bytes: a
 // packed depth-and-sequence word, then the entry pointer.
@@ -134,6 +139,13 @@ constexpr std::size_t kSdAbsOwner = 8;
 constexpr std::size_t kSdAbsGroup = 16;
 constexpr std::size_t kSdAbsSacl = 24;
 constexpr std::size_t kSdAbsDacl = 32;
+// An absolute SECURITY_DESCRIPTOR is the revision and control word padded
+// to pointer alignment, then the four pointers: 40 bytes, not the 20-byte
+// self-relative header. `RtlLengthSecurityDescriptor` answers this for the
+// absolute form and the header-plus-fields size for the relative one, and
+// reporting the relative header size for the absolute form answers a
+// question about a different structure.
+constexpr std::size_t kSdAbsoluteBytes = kSdAbsDacl + 8;
 
 // An ACL header, and the ACE header inside it.
 constexpr std::size_t kAclSize = 2;
@@ -313,20 +325,39 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetVersion(
     if (info == nullptr) {
         return kStInvalidParameter;
     }
+    // The caller's own `dwOSVersionInfoSize` says which of the two records
+    // it offered. Reading it before anything is written is what makes the
+    // answer fit the buffer: writing the base record unconditionally runs
+    // eight bytes past a caller that offered only the extended form's
+    // prefix, and overwrites the size field the caller set with a number it
+    // did not declare.
+    const std::uint32_t declared = read_u32(info, kVersionSize);
+    // A declared size larger than zero but smaller than the base record is
+    // one the base record does not fit into; refusing it is the honest
+    // answer. A zeroed buffer declares zero, which is the common shape of a
+    // caller that never set the field, and gets the base record.
+    if (declared != 0 && declared < kVersionBytes) {
+        return kStInvalidParameter;
+    }
+    const std::size_t bytes =
+        declared >= kVersionExBytes ? kVersionExBytes : kVersionBytes;
+    // The whole write is bounded to memory the guest owns before it lands.
+    if (!guest_range_is_ours(info, bytes)) {
+        return kStInvalidParameter;
+    }
     // The version this runtime presents is the one its surface is modelled
-    // on. The fields are the five 32-bit ones the structure carries, and
-    // the CSD string is empty because no service pack applies.
-    write_u32(info, kVersionSize, kVersionBytes);
+    // on. The fields are the five 32-bit ones the structure carries, and the
+    // CSD string is empty because no service pack applies.
+    write_u32(info, kVersionSize, static_cast<std::uint32_t>(bytes));
     write_u32(info, kVersionMajor, 10);
     write_u32(info, kVersionMinor, 0);
     write_u32(info, kVersionBuild, 19045);
     write_u32(info, kVersionPlatform, 2);  // VER_PLATFORM_WIN32_NT
-    // No service pack applies, and the empty string is written the way the
-    // structure stores it: the full 128-WCHAR field cleared, so a caller
-    // that reads the field reads an empty string rather than stale bytes.
-    for (std::size_t k = 0; k < kVersionCsdChars; ++k) {
-        write_u16(info, kVersionCsd + k * 2, 0);
-    }
+    // No service pack applies. The name field and everything the extended
+    // form adds are cleared through the end of the declared record, so a
+    // caller that reads them reads empty values rather than stale bytes.
+    std::memset(static_cast<std::uint8_t*>(info) + kVersionCsd, 0,
+                bytes - kVersionCsd);
     return kStSuccess;
 }
 
@@ -402,14 +433,24 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetNtGlobalFlags() noexc
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetNativeSystemInformation(
-    void* info, std::uint32_t bytes, std::uint32_t* needed) noexcept {
+    std::uint32_t system_information_class, void* info, std::uint32_t bytes,
+    std::uint32_t* needed) noexcept {
     if (info == nullptr || needed == nullptr) {
         return kStInvalidParameter;
     }
-    // The native system information is the SYSTEM_INFORMATION_CLASS answer
-    // for class 0, and what a guest actually reads from it is the page
-    // size, the processor count and the granularity. Those are the host's
-    // own values, because the guest runs on the host's processors.
+    // The first argument is the SYSTEM_INFORMATION_CLASS, as it is on the
+    // real export; a wrapper that omitted it and read the caller's class
+    // word as the buffer pointer would fault on the first non-zero class.
+    //
+    // Class 0 is `SystemBasicInformation`, the one class this runtime
+    // answers: the page size, the processor count and the allocation
+    // granularity, all of which are the host's own values because the guest
+    // runs on the host's processors. Any other class names a structure this
+    // runtime does not build, and answering it with the basic one would
+    // hand back a block laid out for a different question.
+    if (system_information_class != 0) {
+        return kStInvalidInfoClass;
+    }
     constexpr std::size_t kPageSizeAt = 4;
     constexpr std::size_t kProcessorsAt = 24;
     constexpr std::size_t kGranularityAt = 32;
@@ -443,13 +484,38 @@ nr2_RtlIsProcessorFeaturePresent(std::uint32_t feature) noexcept {
         case 10:  // PF_PAE_ENABLED
         case 13:  // PF_XMMI64_INSTRUCTIONS_AVAILABLE (SSE2)
         case 14:  // PF_SSE_DAZ_MODE_AVAILABLE
-        case 16:  // PF_XSAVE_ENABLED
         case 17:  // PF_ARM_VFP_32_REGISTERS_AVAILABLE
-        case 20:  // PF_SSSE3_INSTRUCTIONS_AVAILABLE
-        case 21:  // PF_SSE4_1_INSTRUCTIONS_AVAILABLE
-        case 22:  // PF_SSE4_2_INSTRUCTIONS_AVAILABLE
         case 23:  // PF_ARM_MOVE_64_BIT
             return 1;
+        // The vector extensions below are answered the way AVX and AVX2 are:
+        // truthfully for the machine this was compiled for. Reporting one of
+        // them present because the host supports it would let a guest branch
+        // into an instruction the compiler did not enable, which faults
+        // rather than answering.
+        case 16:  // PF_XSAVE_ENABLED
+#if defined(__XSAVE__)
+            return 1;
+#else
+            return 0;
+#endif
+        case 20:  // PF_SSSE3_INSTRUCTIONS_AVAILABLE
+#if defined(__SSSE3__)
+            return 1;
+#else
+            return 0;
+#endif
+        case 21:  // PF_SSE4_1_INSTRUCTIONS_AVAILABLE
+#if defined(__SSE4_1__)
+            return 1;
+#else
+            return 0;
+#endif
+        case 22:  // PF_SSE4_2_INSTRUCTIONS_AVAILABLE
+#if defined(__SSE4_2__)
+            return 1;
+#else
+            return 0;
+#endif
         case 18:  // PF_AVX_INSTRUCTIONS_AVAILABLE
 #if defined(__AVX__)
             return 1;
@@ -471,8 +537,12 @@ nr2_RtlIsProcessorFeaturePresent(std::uint32_t feature) noexcept {
 
 extern "C" __attribute__((ms_abi)) std::uint32_t
 nr2_RtlGetCurrentProcessorNumberEx(void* proc) noexcept {
-    const std::uint32_t number =
-        static_cast<std::uint32_t>(::sched_getcpu());
+    // `sched_getcpu` answers -1 when the host cannot name the processor; a
+    // conversion straight to `uint32_t` would report that as processor
+    // 0xFFFFFFFF, a number no machine has. The zero is the honest answer
+    // for an unknown processor.
+    const int cpu = ::sched_getcpu();
+    const std::uint32_t number = cpu < 0 ? 0u : static_cast<std::uint32_t>(cpu);
     if (proc != nullptr) {
         // PROCESSOR_NUMBER: two 8-bit fields and a 16-bit one.
         auto* bytes = static_cast<std::uint8_t*>(proc);
@@ -494,11 +564,20 @@ nr2_RtlGetCurrentProcessorNumberEx(void* proc) noexcept {
 
 extern "C" __attribute__((ms_abi)) void nr2_RtlInitializeSListHead(
     void* head) noexcept {
+    // A null head names no header to clear; every other function of the
+    // family refuses one the same way, and a clear through it would be a
+    // write to the null page.
+    if (head == nullptr) {
+        return;
+    }
     std::memset(head, 0, kSListBytes);
 }
 
 extern "C" __attribute__((ms_abi)) void* nr2_RtlFirstEntrySList(
     const void* head) noexcept {
+    if (head == nullptr) {
+        return nullptr;
+    }
     return read_ptr(head, kSListNext) == 0
                ? nullptr
                : reinterpret_cast<void*>(read_ptr(head, kSListNext));
@@ -506,7 +585,7 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlFirstEntrySList(
 
 extern "C" __attribute__((ms_abi)) void* nr2_RtlInterlockedPushEntrySList(
     void* head, void* entry) noexcept {
-    if (entry == nullptr) {
+    if (head == nullptr || entry == nullptr) {
         return nullptr;
     }
     // The push the list does when two threads cannot race: the old head is
@@ -540,6 +619,9 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlInterlockedPushEntrySList(
 
 extern "C" __attribute__((ms_abi)) void* nr2_RtlInterlockedPopEntrySList(
     void* head) noexcept {
+    if (head == nullptr) {
+        return nullptr;
+    }
     const std::uint64_t next = read_ptr(head, kSListNext);
     if (next == 0) {
         return nullptr;
@@ -582,6 +664,9 @@ extern "C" __attribute__((ms_abi)) void nr2_RtlInterlockedPushListSList(
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlInterlockedFlushSList(
     void* head) noexcept {
+    if (head == nullptr) {
+        return 0;
+    }
     const std::uint64_t packed = read_ptr(head, kSListDepthSeq);
     const std::uint64_t sequence = packed >> kSListSequenceShift;
     write_ptr(head, kSListNext, 0);
@@ -592,6 +677,9 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlInterlockedFlushSList(
 
 extern "C" __attribute__((ms_abi)) std::uint16_t nr2_RtlQueryDepthSList(
     const void* head) noexcept {
+    if (head == nullptr) {
+        return 0;
+    }
     return static_cast<std::uint16_t>(read_ptr(head, kSListDepthSeq) &
                                       kSListDepthMask);
 }
@@ -726,14 +814,17 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetSaclSecurityDescriptor(
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetOwnerSecurityDescriptor(
-    const void* sd, void** owner, std::uint32_t* defaulted) noexcept {
+    const void* sd, void** owner, std::int32_t* defaulted) noexcept {
     if (sd == nullptr || owner == nullptr || defaulted == nullptr) {
         return kStInvalidParameter;
     }
     *owner = sd_field_mutable(const_cast<void*>(sd), SdField::Owner,
                               kSeOwnerDefaulted, false);
+    // The `defaulted` answer is a BOOLEAN, as it is in the group accessor
+    // beside this one; spelling it `uint32_t` here and `int32_t` there put
+    // two widths on one API surface.
     *defaulted =
-        (read_u16(sd, kSdControl) & kSeOwnerDefaulted) != 0 ? 1u : 0u;
+        (read_u16(sd, kSdControl) & kSeOwnerDefaulted) != 0 ? 1 : 0;
     return kStSuccess;
 }
 
@@ -781,7 +872,7 @@ nr2_RtlLengthSecurityDescriptor(const void* sd) noexcept {
     // the structures live elsewhere and the header is all the descriptor
     // itself occupies, which is what the real function answers.
     if (!sd_self_relative(sd)) {
-        return static_cast<std::uint32_t>(kSdBytes);
+        return static_cast<std::uint32_t>(kSdAbsoluteBytes);
     }
     std::size_t end = kSdBytes;
     const auto extend = [&end, sd](SdField field_id,
@@ -875,7 +966,7 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlMakeSelfRelativeSD(
     return kStSuccess;
 }
 
-extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlFirstFreeAce(
+extern "C" __attribute__((ms_abi)) std::uint8_t nr2_RtlFirstFreeAce(
     const void* acl, void** ace) noexcept {
     if (acl == nullptr || ace == nullptr) {
         return 0;
@@ -890,7 +981,14 @@ extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlFirstFreeAce(
     }
     std::size_t at = kAclBytes;
     for (std::uint16_t k = 0; k < count; ++k) {
-        // An ACE header's size field is its second byte on x64.
+        // The ACE's header must be inside the ACL before its size field is
+        // read. Reading the size first and checking only `at + ace_size`
+        // afterwards is a read of up to two bytes past the ACL for an ACE
+        // whose header straddles the end -- the same order the sibling
+        // `RtlGetAce` keeps.
+        if (at + 4 > size) {
+            return 0;
+        }
         const std::uint16_t ace_size = read_u16(acl, at + 2);
         if (ace_size == 0 || at + ace_size > size) {
             return 0;
@@ -920,6 +1018,13 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetAce(
     }
     std::size_t at = kAclBytes;
     for (std::uint32_t k = 0; k < index; ++k) {
+        // The size field is read only once the whole four-byte ACE header is
+        // known to lie inside the ACL. Reading it first and checking only
+        // the walk's end bound afterwards lets an ACE whose header straddles
+        // the ACL's last byte be read past it.
+        if (at + 4 > size) {
+            return kStInvalidParameter;
+        }
         const std::uint16_t ace_size = read_u16(acl, at + 2);
         if (ace_size == 0 || at + ace_size > size) {
             return kStInvalidParameter;
@@ -1022,6 +1127,9 @@ void li_write(void* li, std::int64_t value) noexcept {
 
 extern "C" __attribute__((ms_abi)) std::int64_t nr2_RtlLargeIntegerAdd(
     const void* a, const void* b, void* out) noexcept {
+    if (a == nullptr || b == nullptr) {
+        return 0;
+    }
     const std::int64_t value = li_read(a) + li_read(b);
     if (out != nullptr) {
         li_write(out, value);
@@ -1031,6 +1139,9 @@ extern "C" __attribute__((ms_abi)) std::int64_t nr2_RtlLargeIntegerAdd(
 
 extern "C" __attribute__((ms_abi)) std::int64_t nr2_RtlLargeIntegerSubtract(
     const void* a, const void* b, void* out) noexcept {
+    if (a == nullptr || b == nullptr) {
+        return 0;
+    }
     const std::int64_t value = li_read(a) - li_read(b);
     if (out != nullptr) {
         li_write(out, value);
@@ -1043,6 +1154,9 @@ extern "C" __attribute__((ms_abi)) std::int64_t nr2_RtlLargeIntegerNegate(
     // Negation is done on the unsigned bit pattern: negating the most
     // negative value overflows a signed type, and the two's complement result
     // is still the answer the kernel gives.
+    if (a == nullptr) {
+        return 0;
+    }
     const std::int64_t value = li_read(a);
     const std::int64_t negated = static_cast<std::int64_t>(
         0ull - static_cast<std::uint64_t>(value));
@@ -1057,6 +1171,9 @@ extern "C" __attribute__((ms_abi)) std::int64_t nr2_RtlLargeIntegerShiftLeft(
     // A shift of 64 or more answers zero, and the shift is done unsigned so
     // that a negative dividend -- whose high bits are what must move -- is
     // not a signed operation the language leaves undefined.
+    if (a == nullptr) {
+        return 0;
+    }
     const std::uint64_t bits =
         shift >= 64 ? 0ull : (static_cast<std::uint64_t>(li_read(a)) << shift);
     if (out != nullptr) {
@@ -1071,6 +1188,9 @@ extern "C" __attribute__((ms_abi)) std::int64_t nr2_RtlLargeIntegerShiftRight(
     // and nothing is pulled in from the left, which is why the answer for a
     // negative dividend comes back positive. `RtlLargeIntegerArithmeticShift`
     // below is the spelling that pulls in the sign instead.
+    if (a == nullptr) {
+        return 0;
+    }
     const std::uint64_t raw = static_cast<std::uint64_t>(li_read(a));
     const std::uint64_t bits =
         shift >= 64 ? 0ull : (raw >> shift);
@@ -1085,6 +1205,9 @@ nr2_RtlLargeIntegerArithmeticShift(const void* a, std::uint8_t shift,
                                    void* out) noexcept {
     // The sign bit is what the arithmetic shift preserves, and a shift of 64
     // or more therefore answers the sign alone: -1 or 0.
+    if (a == nullptr) {
+        return 0;
+    }
     const std::int64_t value = li_read(a);
     const std::int64_t shifted =
         shift >= 64 ? (value < 0 ? -1 : 0) : (value >> shift);
@@ -1100,6 +1223,9 @@ extern "C" __attribute__((ms_abi)) std::int64_t nr2_RtlLargeIntegerDivide(
     // the remainder is the only out-parameter. A divide by zero answers zero
     // with the dividend as the remainder, which is what keeps a caller that
     // ignored the check from walking off the end of a table.
+    if (a == nullptr || b == nullptr) {
+        return 0;
+    }
     const std::int64_t dividend = li_read(a);
     const std::int64_t divisor = li_read(b);
     std::int64_t quotient = 0;
@@ -1140,18 +1266,9 @@ namespace {
 constexpr std::size_t kBitsPerUlong = 32;
 constexpr std::size_t kBitmapSize = 0;
 constexpr std::size_t kBitmapBase = 8;
-
-// The largest index the count can name, and the number of words backing it.
-// A count is not required to be a multiple of the word width, so the walk
-// below stops at the count rather than at a whole number of words: reading
-// past it would read whatever allocation follows the caller's array.
-[[nodiscard]] std::uint32_t* bitmap_base(const void* header) noexcept {
-    return reinterpret_cast<std::uint32_t*>(read_ptr(header, kBitmapBase));
-}
-
-[[nodiscard]] std::uint32_t bitmap_size(const void* header) noexcept {
-    return read_u32(header, kBitmapSize);
-}
+// RTL_BITMAP on x64: the count, a reserved word, and the base pointer,
+// padded to sixteen bytes.
+constexpr std::size_t kBitmapHeaderBytes = 16;
 
 [[nodiscard]] bool bit_is_set(const std::uint32_t* map,
                               std::size_t index) noexcept {
@@ -1174,6 +1291,48 @@ void set_bit(std::uint32_t* map, std::size_t index, bool on) noexcept {
 // unsigned index, and 0xFFFFFFFF is the one value no real index can take.
 constexpr std::uint32_t kNoSuchBit = 0xFFFFFFFFu;
 
+// A bitmap the walk may touch: its base, its count, and whether both are
+// memory this guest owns.
+//
+// RTL_BITMAP carries a count and a pointer but no length, so the count is
+// what sizes the array and nothing in the structure bounds it. A walk that
+// trusted the count would read one ULONG per thirty-two bits of it -- a
+// count of 0xFFFFFFFF names half a gigabyte -- so the count is bound to a
+// real mapping before a single bit is read. With no guest installed the
+// caller is the host's own test and answers yes, which is the same
+// discipline `guest_range_is_ours` keeps everywhere else.
+struct BitMapView {
+    std::uint32_t* base = nullptr;
+    std::uint32_t bits = 0;
+    bool ok = false;
+};
+
+[[nodiscard]] BitMapView open_bitmap(const void* header) noexcept {
+    BitMapView view;
+    if (header == nullptr ||
+        !guest_range_is_ours(header, kBitmapHeaderBytes)) {
+        return view;
+    }
+    const std::uint32_t bits = read_u32(header, kBitmapSize);
+    auto* const map =
+        reinterpret_cast<std::uint32_t*>(read_ptr(header, kBitmapBase));
+    if (map == nullptr) {
+        return view;
+    }
+    // The array the count names: one ULONG per thirty-two bits, rounded up,
+    // computed in 64-bit arithmetic so the largest count cannot wrap.
+    const std::uint64_t words =
+        (static_cast<std::uint64_t>(bits) + kBitsPerUlong - 1) / kBitsPerUlong;
+    const std::uint64_t bytes = words * sizeof(std::uint32_t);
+    if (bits != 0 && !guest_range_is_ours(map, bytes)) {
+        return view;
+    }
+    view.base = map;
+    view.bits = bits;
+    view.ok = true;
+    return view;
+}
+
 }  // namespace
 
 extern "C" __attribute__((ms_abi)) void nr2_RtlInitializeBitMap(
@@ -1194,14 +1353,13 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlFindSetBits(
     if (header == nullptr || count == 0) {
         return kNoSuchBit;
     }
-    const std::uint32_t* map = bitmap_base(header);
-    const std::uint32_t bits = bitmap_size(header);
-    if (map == nullptr || count > bits) {
+    const BitMapView view = open_bitmap(header);
+    if (!view.ok || count > view.bits) {
         return kNoSuchBit;
     }
     std::size_t run = 0;
-    for (std::uint32_t k = 0; k < bits; ++k) {
-        if (!bit_is_set(map, k)) {
+    for (std::uint32_t k = 0; k < view.bits; ++k) {
+        if (!bit_is_set(view.base, k)) {
             run = 0;
             continue;
         }
@@ -1220,26 +1378,28 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlFindSetBitsAndClear(
     if (at == kNoSuchBit) {
         return at;
     }
-    std::uint32_t* map = bitmap_base(header);
+    // The find above already bound the count to the caller's array, so the
+    // same open answers here; the view is re-opened rather than carried so
+    // the bounds check is in one place.
+    const BitMapView view = open_bitmap(header);
+    if (!view.ok) {
+        return kNoSuchBit;
+    }
     for (std::uint32_t k = 0; k < count; ++k) {
-        set_bit(map, at + k, false);
+        set_bit(view.base, at + k, false);
     }
     return at;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlNumberOfSetBits(
     const void* header) noexcept {
-    if (header == nullptr) {
-        return 0;
-    }
-    const std::uint32_t* map = bitmap_base(header);
-    const std::uint32_t bits = bitmap_size(header);
-    if (map == nullptr) {
+    const BitMapView view = open_bitmap(header);
+    if (!view.ok) {
         return 0;
     }
     std::uint32_t total = 0;
-    for (std::uint32_t k = 0; k < bits; ++k) {
-        if (bit_is_set(map, k)) {
+    for (std::uint32_t k = 0; k < view.bits; ++k) {
+        if (bit_is_set(view.base, k)) {
             ++total;
         }
     }
@@ -1248,13 +1408,20 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlNumberOfSetBits(
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlNumberOfClearBits(
     const void* header) noexcept {
-    if (header == nullptr) {
+    const BitMapView view = open_bitmap(header);
+    if (!view.ok) {
         return 0;
     }
     // Subtracted rather than counted: the clear bits are whatever the size
     // says the map has and the set bits did not take, which is the same
     // answer and cannot disagree with the set count it is derived from.
-    return bitmap_size(header) - nr2_RtlNumberOfSetBits(header);
+    std::uint32_t total = 0;
+    for (std::uint32_t k = 0; k < view.bits; ++k) {
+        if (!bit_is_set(view.base, k)) {
+            ++total;
+        }
+    }
+    return total;
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlFindSetRuns(
@@ -1264,11 +1431,12 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlFindSetRuns(
     if (header == nullptr || runs == nullptr || max_runs == 0) {
         return 0;
     }
-    const std::uint32_t* map = bitmap_base(header);
-    const std::uint32_t bits = bitmap_size(header);
-    if (map == nullptr) {
+    const BitMapView view = open_bitmap(header);
+    if (!view.ok) {
         return 0;
     }
+    const std::uint32_t* map = view.base;
+    const std::uint32_t bits = view.bits;
 
     if (longest_only != 0) {
         // The longest-run spelling answers exactly one run: the longest one,
@@ -1360,28 +1528,13 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlInitializeCriticalSectionEx(
     return nr2_RtlInitializeCriticalSectionAndSpinCount(crit, spin);
 }
 
-// `RtlEnterCriticalSection` is not registered here: `ntdll_rtl_mem1.cpp`
-// owns it, and two registrations of one name would leave a guest with two
-// different answers depending on which slice answered last.
-extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlEnterCriticalSection(
-    void* crit) noexcept {
-    if (crit == nullptr) {
-        return kStInvalidParameter;
-    }
-    const std::uint32_t self = k32_GetCurrentThreadId();
-    const std::int32_t lock = static_cast<std::int32_t>(read_u32(crit, kCritLockCount));
-    if (lock >= 0 && read_ptr(crit, kCritOwningThread) == self) {
-        // Recursion by the same owner is the one case a critical section
-        // counts: the recursion count goes up and the lock stays held.
-        write_u32(crit, kCritRecursionCount,
-                  read_u32(crit, kCritRecursionCount) + 1);
-        return kStSuccess;
-    }
-    write_u32(crit, kCritLockCount, static_cast<std::uint32_t>(lock + 1));
-    write_u32(crit, kCritRecursionCount, 1);
-    write_ptr(crit, kCritOwningThread, self);
-    return kStSuccess;
-}
+// `RtlEnterCriticalSection` has no implementation here: `ntdll_rtl_mem1.cpp`
+// owns the name and registers it, and a second definition in this slice
+// would be a duplicate export whose two spellings disagree -- one returns
+// `int32_t`, this one returned `Ntstatus` -- so a guest would get one
+// answer or the other depending on which registration won. The leave, the
+// two locked queries and the initialisers below are this slice's, and they
+// are registered here.
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlLeaveCriticalSection(
     void* crit) noexcept {
@@ -1484,11 +1637,10 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlLockHeap(
     return 1;
 }
 
-extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlUnlockHeap(
-    std::uint64_t heap) noexcept {
-    static_cast<void>(heap);
-    return 1;
-}
+// `RtlUnlockHeap` is not defined here: `ntdll_rtl_mem3.cpp` registers the
+// name, and a second definition with a different return type -- that one
+// answers `uint32_t`, this slice had an `int32_t` -- would be a duplicate
+// export whose two spellings disagree.
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetProcessHeaps(
     std::uint32_t count, void** heaps) noexcept {
@@ -1808,8 +1960,17 @@ namespace {
                                           std::u16string& directory) noexcept {
     const std::size_t cut = full.find_last_of(u"/\\");
     if (cut == std::u16string::npos) {
-        // No separator at all: the whole thing is a file name in the
-        // current directory, so the directory is empty.
+        // No separator at all. A path that begins with a drive letter and a
+        // colon -- "C:name" -- is drive-relative: the name lives in the
+        // current directory of that drive, and the "C:" is part of the
+        // directory text. Dropping it would spell a name that resolves on
+        // some other drive, so it is kept and the file part starts after it.
+        if (full.size() > 1 && full[1] == u':') {
+            directory = full.substr(0, 2);
+            return 2;
+        }
+        // Otherwise the whole thing is a file name in the current
+        // directory, so the directory is empty.
         directory.clear();
         return 0;
     }
@@ -1840,8 +2001,18 @@ namespace {
             start = 3;
         }
     } else if (rooted) {
+        // A rooted path's leading separator is kept. A UNC or device path
+        // begins with *two* separators, and both are part of the root:
+        // collapsing "\\server\share" to "\server\share" names a different
+        // namespace, so the doubled separator is preserved and the walk
+        // starts after it.
         prefix.push_back(u'\\');
-        start = 1;
+        if (path.size() > 1 && is_separator(path[1])) {
+            prefix.push_back(u'\\');
+            start = 2;
+        } else {
+            start = 1;
+        }
     }
 
     std::vector<std::u16string> parts;
@@ -1965,7 +2136,12 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetFullPathName_U(
     std::memcpy(buffer, full.data(), full.size() * sizeof(char16_t));
     buffer[full.size()] = u'\0';
     set_last_error(kErrorSuccess);
-    return static_cast<std::uint32_t>(full.size());
+    // The answer is the length in bytes, which is the unit the capacity
+    // parameter is in and the unit the sibling `RtlGetCurrentDirectory_U`
+    // and the Ex path queries answer in. A character count here would be
+    // half the true size and would disagree with every other path query in
+    // this file.
+    return static_cast<std::uint32_t>(full.size() * sizeof(char16_t));
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetFullPathName_UEx(
@@ -2215,10 +2391,15 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlImageRvaToSection(
         // A section whose raw size is larger than its virtual size occupies
         // more of the image than the virtual size says, and the loader maps
         // the larger. The bound is therefore the larger of the two, which is
-        // what makes an RVA inside a padded section still resolve.
+        // what makes an RVA inside a padded section still resolve. The sum
+        // is computed in 64 bits: `virtual_address + span` wraps in 32 and a
+        // wrapped sum makes the test admit an RVA below the section.
         const std::uint32_t span = virtual_size > raw_size ? virtual_size
                                                            : raw_size;
-        if (rva >= virtual_address && rva < virtual_address + span) {
+        const std::uint64_t end =
+            static_cast<std::uint64_t>(virtual_address) + span;
+        if (rva >= virtual_address &&
+            static_cast<std::uint64_t>(rva) < end) {
             return image_at(base, at);
         }
     }
@@ -2458,36 +2639,21 @@ extern "C" __attribute__((ms_abi)) void nr2_RtlMapGenericMask(
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlNewSecurityGrantedAccess(
     std::uint32_t old_mask, const void* old_ace, void** new_ace,
     std::uint32_t* new_mask) noexcept {
-    // Collapsing an access mask down to the smallest set of rights that
-    // grants exactly the same thing is what this does, and the answer is
-    // computed from the object's own generic bits rather than guessed: a
-    // mask with no generic bit left in it is already minimal.
+    // Collapsing an access mask needs the object's own generic mapping, the
+    // caller's token and the privilege set the desired access implies --
+    // none of which this runtime has. An earlier spelling computed an
+    // "answer" from a built-in mapping and reported success, which is a
+    // granted-access set the caller would act on; the honest answer is that
+    // the call is not implemented here.
+    static_cast<void>(old_mask);
     static_cast<void>(old_ace);
-    if (new_mask == nullptr) {
-        return 0;
-    }
-    std::uint32_t specific = old_mask & ~kGenericAll;
-    const std::uint32_t generic = old_mask & kGenericAll;
-    if (generic == kGenericAll) {
-        *new_mask = specific | kGenericAll;
-        if (new_ace != nullptr) {
-            *new_ace = nullptr;
-        }
-        return 1;
-    }
-    for (std::uint32_t bit = 0; bit < 4; ++bit) {
-        const std::uint32_t right = 1u << (31 - bit);
-        if ((generic & right) != 0 &&
-            (specific & map_generic_right(right, kGenericAllMap)) ==
-                map_generic_right(right, kGenericAllMap)) {
-            specific &= ~map_generic_right(right, kGenericAllMap);
-        }
-    }
-    *new_mask = specific | generic;
     if (new_ace != nullptr) {
         *new_ace = nullptr;
     }
-    return 1;
+    if (new_mask != nullptr) {
+        *new_mask = 0;
+    }
+    return kStNotImplemented;
 }
 
 // ------------------------------------------------------------------ 8.3 names
@@ -3126,21 +3292,25 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlLocateExtendedFeature(
     if (features == nullptr || slot == nullptr) {
         return kStInvalidParameter;
     }
-    // With no features enabled there is no slot for any of them, and the
-    // real query answers the index of the first available slot -- which is
-    // the whole of the array -- so a caller that adds a feature to a context
-    // this one built has somewhere to put it.
-    for (std::uint32_t k = 0; k < 16; ++k) {
-        const std::size_t at = k * 8;
-        const bool present =
-            at < 64 ? ((features[0] >> (at / 8)) & 1u) != 0
-                    : false;
-        if (present && features[k / 8] == feature_id) {
-            *slot = k;
-            return kStSuccess;
-        }
+    // `features` is the two-word mask of which extended records the context
+    // carries, and `feature_id` is the record being asked about: the answer
+    // is that record's slot when the bit is set, and an explicit refusal
+    // when it is not. An earlier spelling compared the mask words against
+    // the id and then reported success with slot 0 for everything it did
+    // not find -- a verification that always passes, and one whose caller
+    // would read or write feature 0's storage for a feature it never
+    // enabled.
+    if (feature_id >= 128) {
+        *slot = 0;
+        return kStNotImplemented;
     }
-    *slot = 0;
+    const std::uint64_t word = features[feature_id / 64];
+    const std::uint64_t bit = 1ull << (feature_id % 64);
+    if ((word & bit) == 0) {
+        *slot = 0;
+        return kStNotImplemented;
+    }
+    *slot = feature_id;
     return kStSuccess;
 }
 
@@ -3529,32 +3699,39 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlInitializeHandleTable(
     return nullptr;
 }
 
-namespace {
+// `RtlIsValidHandle` answers whether a handle names one of the two
+// pseudo-handles every module agrees on, and the answer is a `BOOLEAN` --
+// the byte Windows defines -- rather than a pointer. An earlier spelling
+// returned the address of a static token for the true case, which handed
+// the guest a host address in answer to a question about validity and left
+// the caller comparing a pointer where the format says a byte.
+[[nodiscard]] bool pseudo_handle(std::uint64_t handle) noexcept {
+    return handle == 0xFFFFFFFFFFFFFFFFull ||
+           handle == 0xFFFFFFFFFFFFFFFEull;
+}
 
-// What `RtlIsValidHandle` hands back for a handle it recognises. The two
-// pseudo-handles are the only values every module in this runtime agrees on,
-// and a caller that already knows a handle came from a module's own table
-// should ask that module rather than this one.
-std::uint8_t g_pseudo_handle_token = 0;
-
-}  // namespace
-
-extern "C" __attribute__((ms_abi)) void* nr2_RtlIsValidHandle(
+extern "C" __attribute__((ms_abi)) std::uint8_t nr2_RtlIsValidHandle(
     std::uint64_t handle) noexcept {
-    return (handle == 0xFFFFFFFFFFFFFFFFull || handle == 0xFFFFFFFFFFFFFFFEull)
-               ? static_cast<void*>(&g_pseudo_handle_token)
-               : nullptr;
+    return pseudo_handle(handle) ? 1 : 0;
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlIsValidIndexHandle(
     std::uint64_t handle, void* table) noexcept {
     static_cast<void>(table);
-    return nr2_RtlIsValidHandle(handle) != nullptr ? 1 : 0;
+    return pseudo_handle(handle) ? 1 : 0;
 }
 
-extern "C" __attribute__((ms_abi)) void nr2_RtlFreeHandle(
+// `RtlFreeHandle` releases an entry of an `RTL_HANDLE_TABLE` -- a structure
+// a module builds for itself. This runtime keeps no such table: every
+// domain that hands out handles (the registry, the object table, the
+// process table) owns and closes its own. A handle that arrives here is
+// therefore one no table of ours owns, and the honest answer is the
+// refusal rather than the silent return an empty body gives: a caller told
+// nothing goes on believing the slot is reusable.
+extern "C" __attribute__((ms_abi)) std::uint8_t nr2_RtlFreeHandle(
     std::uint64_t handle) noexcept {
     static_cast<void>(handle);
+    return 0;
 }
 
 // ------------------------------------------------------------- the rest
@@ -3695,14 +3872,16 @@ extern "C" __attribute__((ms_abi)) void nr2_RtlFreeUserStack(
     static_cast<void>(base);
 }
 
-extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlProtectHeap(
+extern "C" __attribute__((ms_abi)) std::uint8_t nr2_RtlProtectHeap(
     std::uint64_t heap, std::uint32_t protect) noexcept {
     // Heap protection is a per-block flag this runtime's allocator does not
-    // keep, so there is nothing to set and claiming success would report a
-    // protection that is not in force.
+    // keep, so there is nothing to set. The answer is the `BOOLEAN` the
+    // format defines -- false -- rather than a Win32 error code, which is
+    // the wrong domain for a function whose siblings all answer with
+    // `NTSTATUS` or a bare truth value.
     static_cast<void>(heap);
     static_cast<void>(protect);
-    return kErrorCallNotImplemented;
+    return 0;
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlNormalizeProcessParams(

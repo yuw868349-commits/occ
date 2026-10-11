@@ -132,8 +132,9 @@ regions is a real limit, and the stream reports how many bytes were actually
 covered rather than implying the region was watched.
 
 **Isolation.** User, PID, network, mount, UTS, IPC and cgroup namespaces; an
-overlay root over `pivot_root`; a cgroup v2 subtree; a default-deny seccomp
-filter from a bytecode emitter in the tree.
+overlay root over `pivot_root`; a cgroup v2 subtree; a seccomp filter that
+refuses a fixed list of host-mutating calls with `EPERM`, from a bytecode
+emitter in the tree.
 
 **Isolation without the target knowing.** Syscalls come from `PTRACE_SYSCALL`
 stops, with the register block read at the stop. Memory is read with

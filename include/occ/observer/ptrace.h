@@ -18,6 +18,7 @@
 // shared memory layout, and the whole of it is a handful of constants and
 // one union.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,7 +31,12 @@ namespace occ::obs {
 //
 // Restated rather than taken from <sys/ptrace.h>, because glibc's header
 // renames several of these and the renames differ between architectures.
-// The values are the kernel's and are stable.
+// The values are the kernel's own UAPI values -- the low numbers are in
+// <asm/ptrace-abi.h> and the 0x4200 block is in <linux/ptrace.h> -- and
+// they are part of the ptrace ABI, so they do not vary between builds or
+// machines. They are not guesses: 0x4200 is the base of the
+// architecture-independent additions, and the requests in that block are
+// numbered consecutively from it.
 
 inline constexpr unsigned long kPtraceTraceme = 0;
 inline constexpr unsigned long kPtracePeekText = 1;
@@ -44,19 +50,20 @@ inline constexpr unsigned long kPtraceKill = 8;
 inline constexpr unsigned long kPtraceSinglestep = 9;
 inline constexpr unsigned long kPtraceGetregs = 12;
 inline constexpr unsigned long kPtraceSetregs = 13;
+inline constexpr unsigned long kPtraceGetfpregs = 14;
+inline constexpr unsigned long kPtraceSetfpregs = 15;
 inline constexpr unsigned long kPtraceAttach = 16;
 inline constexpr unsigned long kPtraceDetach = 17;
 inline constexpr unsigned long kPtraceSyscall = 24;
 inline constexpr unsigned long kPtraceSetoptions = 0x4200;
+inline constexpr unsigned long kPtraceGeteventmsg = 0x4201;
 inline constexpr unsigned long kPtraceGetsiginfo = 0x4202;
 inline constexpr unsigned long kPtraceSetsiginfo = 0x4203;
-inline constexpr unsigned long kPtraceGettid = 0x4204;
+inline constexpr unsigned long kPtraceGetregset = 0x4204;
+inline constexpr unsigned long kPtraceSetregset = 0x4205;
 inline constexpr unsigned long kPtraceSeize = 0x4206;
 inline constexpr unsigned long kPtraceInterrupt = 0x4207;
 inline constexpr unsigned long kPtraceListen = 0x4208;
-inline constexpr unsigned long kPtraceGeteventmsg = 0x4205;
-inline constexpr unsigned long kPtracePeekuserAsText = 0x420b;
-inline constexpr unsigned long kPtracePokeuserAsText = 0x420c;
 
 // ------------------------------------------------------------------- options
 
@@ -266,6 +273,44 @@ public:
     // Re-installs every breakpoint after a disarm. Addresses that no longer
     // hold a breakpoint are skipped.
     [[nodiscard]] int rearm_all(Tracer& tracer, int pid) noexcept;
+
+    // Puts every byte back and forgets the breakpoints. Called before the
+    // tracer lets go of the tracee: the 0xcc bytes are this tracer's whole
+    // footprint in the target, and a detach that left them behind would hand
+    // back a process that traps on a byte it never wrote -- the target is
+    // supposed to be unmodified once the tracer is gone.
+    //
+    // The first failure is returned and the list is kept, so a caller that
+    // still owns a live tracee can retry; a tracer that is detaching anyway
+    // ignores the result, because a tracee that cannot be reached has no
+    // bytes left to restore.
+    [[nodiscard]] int restore_all(Tracer& tracer, int pid) noexcept {
+        for (auto& b : points_) {
+            if (!b.armed) {
+                continue;
+            }
+            auto cur = tracer.peek(pid, b.address);
+            if (cur.failed()) {
+                return cur.error;
+            }
+            const std::uint64_t word =
+                (static_cast<std::uint64_t>(cur.value) & ~0xffULL) |
+                static_cast<std::uint64_t>(b.saved);
+            auto w = tracer.poke(pid, b.address, word);
+            if (w.failed()) {
+                return w.error;
+            }
+            b.armed = false;
+        }
+        points_.clear();
+        return 0;
+    }
+
+    // Forgets every breakpoint without touching the tracee. Used when an
+    // exec has replaced the address space: the recorded addresses no longer
+    // name the bytes they did, and writing the saved byte back would corrupt
+    // whatever the new image put there instead.
+    void clear() noexcept { points_.clear(); }
 
     // The breakpoint at `address`, or nullptr. Used to find the original
     // byte when a single step has run over one.

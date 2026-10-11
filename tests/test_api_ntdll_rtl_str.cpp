@@ -459,7 +459,7 @@ void test_create() {
     // are inverses.
     {
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
                   "RtlCreateUnicodeString")(&s, u"hello") == kTrue,
               "create: a five-character string succeeds");
         check(s.length() == 10, "create: Length is 5 characters as 10 bytes");
@@ -477,7 +477,7 @@ void test_create() {
     // back has to branch, and the reference does not make it.
     {
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
                   "RtlCreateUnicodeString")(&s, u"") == kTrue,
               "create: the empty string succeeds");
         check(s.length() == 0, "create: the empty string has Length 0");
@@ -487,13 +487,13 @@ void test_create() {
     }
     {
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
                   "RtlCreateUnicodeString")(&s, nullptr) == kFalse,
               "create: a null source is refused");
     }
     {
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
                   "RtlCreateUnicodeString")(&s, u"abc") == kTrue,
               "create: the structure argument may be null? no -- it may not");
         // With a null destination the reference has nowhere to put the
@@ -504,7 +504,7 @@ void test_create() {
     // bytes become wide characters, so the length is twice the narrow length.
     {
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char*)>(
                   "RtlCreateUnicodeStringFromAsciiz")(&s, "abc") == kTrue,
               "create asciiz: a three-byte source succeeds");
         check(s.length() == 6, "create asciiz: three bytes become six");
@@ -515,7 +515,7 @@ void test_create() {
     }
     {
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char*)>(
                   "RtlCreateUnicodeStringFromAsciiz")(&s, nullptr) == kFalse,
               "create asciiz: a null source is refused");
     }
@@ -529,7 +529,7 @@ void test_free() {
     // otherwise be reading a freed pointer.
     {
         Str s;
-        fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char*)>(
             "RtlCreateUnicodeStringFromAsciiz")(&s, "free me");
         check(!s.buffer_is_null(), "free: there is something to free");
         fn<void (__attribute__((ms_abi)) *)(void*)>("RtlFreeUnicodeString")(&s);
@@ -538,7 +538,7 @@ void test_free() {
     }
     {
         Str s;
-        fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
             "RtlCreateUnicodeString")(&s, u"free me too");
         fn<void (__attribute__((ms_abi)) *)(void*)>("RtlFreeOemString")(&s);
         check(s.buffer_is_null(), "free oem: the structure is cleared");
@@ -568,7 +568,7 @@ void test_free() {
         // property that makes an unconditional `RtlFreeUnicodeString` at the end
         // of a cleanup path safe.
         Str s;
-        fn<std::uint32_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(void*, const char16_t*)>(
             "RtlCreateUnicodeString")(&s, u"twice");
         fn<void (__attribute__((ms_abi)) *)(void*)>("RtlFreeAnsiString")(&s);
         check(s.length() == 0 && s.maximum() == 0 && s.buffer_is_null(),
@@ -905,7 +905,7 @@ void test_copy() {
         sb.set_length(3);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlEqualString")(&sa, &sb, 0) == 0,
               "equal string: 12 and 123 differ because Length decides");
     }
@@ -1085,10 +1085,10 @@ void test_comparison() {
         sb.set_length(3);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlEqualString")(&sa, &sb, 1) == 0,
               "equal string: different lengths are not equal");
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlEqualString")(&sa, &sa, 1) == 1,
               "equal string: a string equals itself");
     }
@@ -1107,7 +1107,7 @@ void test_comparison() {
         sb.set_length(4);
         sb.set_maximum(6);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlEqualUnicodeString")(&sa, &sb, 1) == 0,
               "equal unicode: same length, different text, not equal");
     }
@@ -1125,7 +1125,7 @@ void test_comparison() {
         sb.set_length(1);
         sb.set_maximum(3);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlEqualString")(&sa, &sb, 1) == 1,
               "equal string: only Length bytes are compared");
     }
@@ -1145,7 +1145,7 @@ void test_comparison() {
         sb.set_length(2);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlEqualUnicodeString")(&sa, &sb, 1) == 1,
               "equal unicode: the case flag folds the Latin-1 range too");
     }
@@ -1162,7 +1162,7 @@ void test_comparison() {
         sb.set_length(2);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlEqualUnicodeString")(&sa, &sb, 0) == 0,
               "equal unicode: without the flag the case matters");
     }
@@ -1182,7 +1182,7 @@ void test_comparison() {
         sb.set_length(2);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareUnicodeString")(&sa, &sb, 0) == -2,
               "compare unicode: the answer is the character difference, not -1");
     }
@@ -1199,7 +1199,7 @@ void test_comparison() {
         sb.set_length(2);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareUnicodeString")(&sa, &sb, 0) == 2,
               "compare unicode: and the positive difference is the difference");
     }
@@ -1228,7 +1228,7 @@ void test_comparison() {
         sb.set_length(2);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareUnicodeString")(&sa, &sb, 0) == 2,
               "compare unicode: a prefix compares by the length difference");
     }
@@ -1244,7 +1244,7 @@ void test_comparison() {
         sb.set_maximum(4);
         sa.set_buffer(a.data);
         sb.set_buffer(a.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareUnicodeString")(&sa, &sb, 0) == 0,
               "compare unicode: identical strings compare equal");
     }
@@ -1261,7 +1261,7 @@ void test_comparison() {
         sb.set_length(2);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareUnicodeString")(&sa, &sb, 1) == 0,
               "compare unicode: the case flag makes A and a equal");
     }
@@ -1286,9 +1286,15 @@ void test_comparison() {
         sb.set_length(4);
         sb.set_maximum(6);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *)(const char16_t*, std::uint32_t,
-                                  const char16_t*, std::uint32_t)>(
-                  "RtlCompareUnicodeStrings")(a.data, 3, b.data, 2) == 1,
+        // The lengths are 64-bit and there is a fifth argument. Both matter for the
+        // ABI rather than for the value: the two lengths occupy the second and
+        // fourth register slots as eight bytes each, so a 32-bit spelling put
+        // `b.data` in the wrong slot entirely, and a four-argument call left
+        // the case-sensitivity flag reading whatever the call before it left
+        // in that register.
+        check(fn<std::int32_t (__attribute__((ms_abi)) *)(const char16_t*, std::uint64_t,
+                                  const char16_t*, std::uint64_t, std::uint8_t)>(
+                  "RtlCompareUnicodeStrings")(a.data, 3, b.data, 2, 0) == 1,
               "compare unicode strings: the counts are units, so abc > ab");
     }
     // `RtlCompareString` is the narrow form of the same thing. Its arguments are
@@ -1307,13 +1313,13 @@ void test_comparison() {
         sb.set_length(2);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareString")(&sa, &sb, 0) == 1,
               "compare string: abc > ab");
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareString")(&sa, &sa, 0) == 0,
               "compare string: equal is zero");
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareString")(&sa, &sb, 1) == 1,
               "compare string: the case flag does not change a length difference");
     }
@@ -1330,7 +1336,7 @@ void test_comparison() {
         sb.set_length(0);
         sb.set_maximum(4);
         sb.set_buffer(b.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlCompareUnicodeString")(&sa, &sb, 0) == 0,
               "compare unicode: two empty strings are equal");
     }
@@ -1353,7 +1359,7 @@ void test_prefix() {
         sp.set_length(2);
         sp.set_maximum(3);
         sp.set_buffer(p.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlPrefixString")(&sp, &sa, 0) == 1,
               "prefix string: ab is a prefix of abc");
     }
@@ -1368,7 +1374,7 @@ void test_prefix() {
         sp.set_length(2);
         sp.set_maximum(3);
         sp.set_buffer(p.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlPrefixString")(&sp, &sa, 0) == 1,
               "prefix string: a string is a prefix of itself");
     }
@@ -1383,7 +1389,7 @@ void test_prefix() {
         sp.set_length(2);
         sp.set_maximum(3);
         sp.set_buffer(p.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlPrefixString")(&sp, &sa, 0) == 0,
               "prefix string: aX is not a prefix of ab");
     }
@@ -1401,7 +1407,7 @@ void test_prefix() {
         sp.set_length(2);
         sp.set_maximum(4);
         sp.set_buffer(p.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlPrefixUnicodeString")(&sp, &sa, 0) == 1,
               "prefix unicode: a is a prefix of ab");
     }
@@ -1416,7 +1422,7 @@ void test_prefix() {
         sp.set_length(4);
         sp.set_maximum(6);
         sp.set_buffer(a.data);
-        check(fn<std::int32_t (__attribute__((ms_abi)) *) (const void*, const void*, std::int32_t)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *) (const void*, const void*, std::uint8_t)>(
                   "RtlPrefixUnicodeString")(&sp, &sa, 0) == 0,
               "prefix unicode: a longer prefix is not a prefix");
     }
@@ -1629,7 +1635,7 @@ void test_hash() {
         s.set_buffer(text.data);
         std::uint32_t hash = 0;
         check(fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-std::int32_t,
+std::uint8_t,
 std::uint32_t,
 std::uint32_t*)>(
                   "RtlHashUnicodeString")(&s, 0, 0, &hash) == kSuccess,
@@ -1649,7 +1655,7 @@ std::uint32_t*)>(
         s.set_buffer(text.data);
         std::uint32_t hash = 0;
         check(fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-std::int32_t,
+std::uint8_t,
 std::uint32_t,
 std::uint32_t*)>(
                   "RtlHashUnicodeString")(&s, 0, 0, &hash) == kSuccess,
@@ -1672,12 +1678,12 @@ std::uint32_t*)>(
         std::uint32_t by_default = 0;
         std::uint32_t by_x65599 = 0;
         fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-std::int32_t,
+std::uint8_t,
 std::uint32_t,
 std::uint32_t*)>("RtlHashUnicodeString")(
             &s, kHashDefault, 0, &by_default);
         fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-std::int32_t,
+std::uint8_t,
 std::uint32_t,
 std::uint32_t*)>("RtlHashUnicodeString")(
             &s, kHashX65599, 0, &by_x65599);
@@ -1697,7 +1703,7 @@ std::uint32_t*)>("RtlHashUnicodeString")(
         s.set_buffer(text.data);
         std::uint32_t hash = 0xDEADBEEFu;
         check(fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-std::int32_t,
+std::uint8_t,
 std::uint32_t,
 std::uint32_t*)>(
                   "RtlHashUnicodeString")(&s, 0, 2, &hash) == kInvalidParameter,
@@ -1712,7 +1718,7 @@ std::uint32_t*)>(
         s.set_maximum(4);
         s.set_buffer(text.data);
         check(fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-std::int32_t,
+std::uint8_t,
 std::uint32_t,
 std::uint32_t*)>(
                   "RtlHashUnicodeString")(nullptr, 0, 0, nullptr) ==
@@ -1728,7 +1734,7 @@ std::uint32_t*)>(
         s.set_buffer(text.data);
         std::uint32_t hash = 0xDEADBEEFu;
         check(fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-std::int32_t,
+std::uint8_t,
 std::uint32_t,
 std::uint32_t*)>(
                   "RtlHashUnicodeString")(&s, 0, 0, &hash) == kSuccess,
@@ -1751,7 +1757,7 @@ std::uint32_t*)>(
         std::uint32_t one = 0;
         const auto hash_of =
             fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-                                      std::int32_t, std::uint32_t,
+                                      std::uint8_t, std::uint32_t,
                                       std::uint32_t*)>("RtlHashUnicodeString");
         s.set_length(4);
         hash_of(&s, 0, 0, &full);
@@ -1774,7 +1780,7 @@ std::uint32_t*)>(
         std::uint32_t folded = 0;
         const auto hash_of =
             fn<std::uint32_t (__attribute__((ms_abi)) *)(const void*,
-                                      std::int32_t, std::uint32_t,
+                                      std::uint8_t, std::uint32_t,
                                       std::uint32_t*)>("RtlHashUnicodeString");
         hash_of(&s, 0, 0, &as_is);
         hash_of(&s, 1, 0, &folded);
@@ -1858,7 +1864,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(8);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUpcaseUnicodeString")(&dst, &src, 0) == kSuccess,
               "upcase string: a source that fits succeeds");
         check(dst.length() == 4, "upcase string: Length is in bytes");
@@ -1878,7 +1884,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(2);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUpcaseUnicodeString")(&dst, &src, 0) == kBufferOverflow,
               "upcase string: a source that does not fit overflows, not truncates");
         check(dst.length() == 0,
@@ -1896,7 +1902,7 @@ void test_case() {
         src.set_length(4);
         src.set_maximum(6);
         src.set_buffer(source.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUpcaseUnicodeString")(&dst, &src, 1) == kSuccess,
               "upcase string: the allocating form succeeds");
         check(dst.maximum() == 4,
@@ -1920,7 +1926,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(8);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlDowncaseUnicodeString")(&dst, &src, 0) == kSuccess,
               "downcase string: a source that fits succeeds");
         check(target.data[0] == u'a' && target.data[1] == u'b',
@@ -1939,7 +1945,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(2);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlDowncaseUnicodeString")(&dst, &src, 0) == kBufferOverflow,
               "downcase string: the overflow refusal matches the upcase one");
     }
@@ -1949,7 +1955,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(8);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUpcaseUnicodeString")(&dst, nullptr, 0) ==
                   kInvalidParameter,
               "upcase string: a null source is refused");
@@ -2005,7 +2011,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(16);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUpcaseUnicodeStringToAnsiString")(&dst, &src, 0) ==
                   kSuccess,
               "upcase to ansi: a source that fits succeeds");
@@ -2037,7 +2043,7 @@ void test_case() {
             dst.set_length(0);
             dst.set_maximum(3);
             dst.set_buffer(target.data);
-            check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+            check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                       "RtlUpcaseUnicodeStringToCountedOemString")(&dst, &src, 0) ==
                       kSuccess,
                   "upcase to counted oem: three bytes for three characters fits");
@@ -2062,7 +2068,7 @@ void test_case() {
             dst.set_length(0);
             dst.set_maximum(2);
             dst.set_buffer(target.data);
-            check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+            check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                       "RtlUpcaseUnicodeStringToCountedOemString")(&dst, &src, 0) ==
                       kBufferOverflow,
                   "upcase to counted oem: too small is an overflow");
@@ -2091,7 +2097,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(3);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUpcaseUnicodeStringToOemString")(&dst, &src, 0) ==
                   kBufferOverflow,
               "upcase to oem: three bytes is one short for three characters plus a terminator");
@@ -2118,7 +2124,7 @@ void test_case() {
         dst.set_length(0);
         dst.set_maximum(2);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUpcaseUnicodeStringToOemString")(&dst, &src, 0) ==
                   kBufferOverflow,
               "upcase to oem: two bytes is too small for three characters");
@@ -2181,7 +2187,7 @@ void test_conversions() {
         src.set_maximum(3);
         src.set_buffer(source.data);
         Str out;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlAnsiStringToUnicodeString")(&out, &src, 1) == kSuccess,
               "ansi to unicode: the allocating form succeeds");
         check(out.length() == 4, "ansi to unicode: two narrow bytes are four wide");
@@ -2207,7 +2213,7 @@ void test_conversions() {
         dst.set_length(0);
         dst.set_maximum(6);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlAnsiStringToUnicodeString")(&dst, &src, 0) == kSuccess,
               "ansi to unicode: a buffer that fits succeeds");
         check(dst.length() == 4, "ansi to unicode: and the length is in bytes");
@@ -2225,7 +2231,7 @@ void test_conversions() {
         dst.set_length(0);
         dst.set_maximum(4);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlAnsiStringToUnicodeString")(&dst, &src, 0) ==
                   kBufferOverflow,
               "ansi to unicode: too small is an overflow");
@@ -2242,7 +2248,7 @@ void test_conversions() {
         dst.set_maximum(0);
         dst.set_buffer(target.data);
         dst.set_length(7);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlAnsiStringToUnicodeString")(&dst, &src, 0) ==
                   kBufferOverflow,
               "ansi to unicode: a zero maximum is an overflow");
@@ -2258,7 +2264,7 @@ void test_conversions() {
         src.set_length(0);
         src.set_maximum(1);
         src.set_buffer(source.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlAnsiStringToUnicodeString")(&out, &src, 1) == kSuccess,
               "ansi to unicode: the empty string succeeds");
         check(out.length() == 0, "ansi to unicode: and has Length 0");
@@ -2272,11 +2278,11 @@ void test_conversions() {
         // conversion of nothing rather than an error -- which is the case the
         // next-but-one check covers.
         Str out;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlAnsiStringToUnicodeString")(&out, nullptr, 1) ==
                   kInvalidParameter,
               "ansi to unicode: a null source is refused");
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlAnsiStringToUnicodeString")(nullptr, &out, 1) ==
                   kInvalidParameter,
               "ansi to unicode: and so is a null destination");
@@ -2291,7 +2297,7 @@ void test_conversions() {
         src.set_length(2);
         src.set_maximum(3);
         src.set_buffer(source.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlOemStringToUnicodeString")(&out, &src, 1) == kSuccess,
               "oem to unicode: the allocating form succeeds");
         check(out.length() == 4, "oem to unicode: and the length is in bytes");
@@ -2314,7 +2320,7 @@ void test_conversions() {
         dst.set_length(0);
         dst.set_maximum(3);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUnicodeStringToAnsiString")(&dst, &src, 0) == kSuccess,
               "unicode to ansi: a buffer that fits succeeds");
         check(dst.length() == 2, "unicode to ansi: the narrow Length is bytes");
@@ -2334,7 +2340,7 @@ void test_conversions() {
         dst.set_length(0);
         dst.set_maximum(2);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUnicodeStringToAnsiString")(&dst, &src, 0) ==
                   kBufferOverflow,
               "unicode to ansi: two bytes is too small for two plus a terminator");
@@ -2354,7 +2360,7 @@ void test_conversions() {
         dst.set_maximum(0);
         dst.set_buffer(target.data);
         dst.set_length(9);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUnicodeStringToAnsiString")(&dst, &src, 0) ==
                   kBufferOverflow,
               "unicode to ansi: a zero maximum overflows without touching Length");
@@ -2369,7 +2375,7 @@ void test_conversions() {
         src.set_length(4);
         src.set_maximum(6);
         src.set_buffer(source.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUnicodeStringToOemString")(&out, &src, 1) == kSuccess,
               "unicode to oem: the allocating form succeeds");
         check(out.length() == 2, "unicode to oem: the narrow Length is bytes");
@@ -2392,7 +2398,7 @@ void test_conversions() {
         dst.set_length(0);
         dst.set_maximum(2);
         dst.set_buffer(target.data);
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlUnicodeStringToCountedOemString")(&dst, &src, 0) ==
                   kBufferOverflow,
               "unicode to counted oem: too small is an overflow");
@@ -3444,7 +3450,7 @@ void test_sid() {
         big[12] = static_cast<std::uint8_t>(544 & 0xFF);   // 544, little-endian
         big[13] = static_cast<std::uint8_t>((544 >> 8) & 0xFF);
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlConvertSidToUnicodeString")(&s, big, 1) == kSuccess,
               "sid to string: the allocating form succeeds");
         const auto* text = static_cast<const char16_t*>(s.buffer());
@@ -3477,7 +3483,7 @@ void test_sid() {
         big[10] = 0x00;
         big[11] = 0x00;
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlConvertSidToUnicodeString")(&s, big, 1) == kSuccess,
               "sid to string: a six-byte authority succeeds");
         const auto* text = static_cast<const char16_t*>(s.buffer());
@@ -3495,7 +3501,7 @@ void test_sid() {
     }
     {
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlConvertSidToUnicodeString")(&s, nullptr, 1) ==
                   kInvalidParameter,
               "sid to string: a null SID is refused");
@@ -3505,7 +3511,7 @@ void test_sid() {
         // reference refuses it rather than reading past the structure.
         std::uint8_t bad[2] = {1, 200};
         Str s;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::int32_t)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *) (void*, const void*, std::uint8_t)>(
                   "RtlConvertSidToUnicodeString")(&s, bad, 1) ==
                   kInvalidParameter,
               "sid to string: an impossible sub-authority count is refused");
@@ -3550,10 +3556,13 @@ void test_sid() {
         std::uint8_t dst[32] = {};
         src[0] = 0xAA;
         src[16] = 0xBB;
-        // Source first, destination second -- the same order as the plain
-        // copy functions, and the reverse of what "put these two arrays
-        // together" suggests.
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, void*, const void*)>(
+        // Source first, destination second -- the *reverse* of `RtlCopySid`,
+        // whose `(Length, Destination, Source)` reads like copy-with-size, and
+        // the reverse of what "put these two arrays together" suggests. The
+        // declaration below spells the second parameter as the `const void*`
+        // it is: a `void*` source would type-check just as well and hide the
+        // swap, because the two pointers land in the same register either way.
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, const void*, void*)>(
                   "RtlCopySidAndAttributesArray")(2, src, dst) == kSuccess,
               "copy sid attributes: two elements succeed");
         check(dst[0] == 0xAA && dst[16] == 0xBB,
@@ -3567,21 +3576,24 @@ void test_sid() {
         // A zero count is answered before the pointers are looked at: the
         // reference's sibling copies with a plain counted loop, which never
         // dereferences either pointer when the count is zero.
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, void*, const void*)>(
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, const void*, void*)>(
                   "RtlCopySidAndAttributesArray")(0, nullptr, nullptr) ==
                   kSuccess,
               "copy sid attributes: a zero count is a no-op, not an error");
     }
     {
-        // A non-zero count with nothing to copy from is refused rather than
-        // dereferenced.
+        // A non-zero count with nothing to copy from, or nowhere to copy to,
+        // is refused rather than dereferenced. The two are told apart by which
+        // slot the null lands in, so each gets its own call: with the source
+        // first, `(1, nullptr, dst)` is the missing source and
+        // `(1, dst, nullptr)` is the missing destination.
         std::uint8_t dst[16] = {};
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, void*, const void*)>(
-                  "RtlCopySidAndAttributesArray")(1, dst, nullptr) ==
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, const void*, void*)>(
+                  "RtlCopySidAndAttributesArray")(1, nullptr, dst) ==
                   kInvalidParameter,
               "copy sid attributes: a null source is refused");
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, void*, const void*)>(
-                  "RtlCopySidAndAttributesArray")(1, nullptr, dst) ==
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(std::uint32_t, const void*, void*)>(
+                  "RtlCopySidAndAttributesArray")(1, dst, nullptr) ==
                   kInvalidParameter,
               "copy sid attributes: a null destination is refused");
     }
@@ -3815,7 +3827,7 @@ void test_is_text_unicode() {
         // count of 15 is odd, so it cannot be whole UTF-16.
         const char text[] = "plain ascii text";
         std::int32_t flags = kAllFlags;
-        check(fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
                   "RtlIsTextUnicode")(text, 15, &flags) == 0 &&
               flags == kOddLength,
               "is text unicode: pairs of Latin-1 characters trip only the odd-length fact");
@@ -3825,7 +3837,7 @@ void test_is_text_unicode() {
         // case, and more than half of them is what the statistics test counts.
         const char16_t latin[] = {0x00E9, 0x00E8, 0x00EA, 0x0041};
         std::int32_t flags = kAllFlags;
-        fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
             "RtlIsTextUnicode")(latin, 8, &flags);
         check((flags & kStatistics) != 0,
               "is text unicode: units that are single Latin-1 characters look narrow");
@@ -3834,7 +3846,7 @@ void test_is_text_unicode() {
         // A zero byte in the middle is a strong signal for narrow.
         const char16_t text[] = u"a\0b";
         std::int32_t flags = kAllFlags;
-        fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
             "RtlIsTextUnicode")(text, 6, &flags);
         check((flags & kNullBytes) != 0,
               "is text unicode: an embedded NUL is reported");
@@ -3846,14 +3858,14 @@ void test_is_text_unicode() {
         // gate it.
         const char16_t text[] = u"abc";
         std::int32_t flags = kAllFlags;
-        fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
             "RtlIsTextUnicode")(text, 5, &flags);
         check((flags & kOddLength) != 0,
               "is text unicode: an odd byte count sets the odd-length flag");
     }
     {
         std::int32_t flags = kSignature;
-        check(fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
                   "RtlIsTextUnicode")(nullptr, 4, &flags) == 0 && flags == 0,
               "is text unicode: a null buffer is not text and reports nothing");
     }
@@ -3863,7 +3875,7 @@ void test_is_text_unicode() {
         // unit to look at.
         const char16_t text[] = {u'a'};
         std::int32_t flags = kAllFlags;
-        check(fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
                   "RtlIsTextUnicode")(text, 1, &flags) == 0 && flags == 0,
               "is text unicode: a buffer below one unit is too small to judge");
     }
@@ -3874,7 +3886,7 @@ void test_is_text_unicode() {
         // around, which is why the two units here are CJK.
         const char16_t bom[] = {0xFEFF, 0x4E2D, 0x6587};
         std::int32_t flags = kAllFlags;
-        check(fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        check(fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
                   "RtlIsTextUnicode")(bom, 6, &flags) == 1 &&
               (flags & kSignature) != 0,
               "is text unicode: a BOM with wide text makes it Unicode");
@@ -3884,7 +3896,7 @@ void test_is_text_unicode() {
         // the tests the caller did not ask for.
         const char16_t bom[] = {0xFEFF, 0x4E2D};
         std::int32_t flags = kSignature;
-        fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
             "RtlIsTextUnicode")(bom, 4, &flags);
         check(flags == kSignature, "is text unicode: the caller's mask is respected");
     }
@@ -3893,7 +3905,7 @@ void test_is_text_unicode() {
         // being an input rather than an output location only.
         const char16_t bom[] = {0xFEFF, 0x4E2D};
         std::int32_t flags = 0;
-        fn<std::int32_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
+        fn<std::uint8_t (__attribute__((ms_abi)) *)(const void*, std::int32_t, std::int32_t*)>(
             "RtlIsTextUnicode")(bom, 4, &flags);
         check(flags == 0, "is text unicode: an empty mask reports nothing");
     }
@@ -4020,7 +4032,7 @@ void test_environment() {
         dst.set_maximum(64);
         dst.set_buffer(target.data);
         std::uint32_t bytes = 0;
-        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(const char16_t*, const void*, const void*,
+        check(fn<std::uint32_t (__attribute__((ms_abi)) *)(const char16_t*, const void*, void*,
                                    std::uint32_t*)>(
                   "RtlExpandEnvironmentStrings_U")(block, &src, &dst, &bytes) ==
                   kSuccess,
@@ -4049,7 +4061,7 @@ void test_environment() {
         dst.set_buffer(target.data);
         std::uint32_t bytes = 0;
         const std::uint32_t status = fn<std::uint32_t (__attribute__((ms_abi)) *)(
-            const char16_t*, const void*, const void*, std::uint32_t*)>(
+            const char16_t*, const void*, void*, std::uint32_t*)>(
             "RtlExpandEnvironmentStrings_U")(block, &src, &dst, &bytes);
         check(status == kBufferTooSmall,
               "environment U: too small is BUFFER_TOO_SMALL, not an overflow");

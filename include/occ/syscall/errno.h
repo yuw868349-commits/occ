@@ -12,7 +12,6 @@
 // libc are used because the mapping has to be exact: a wrong number here
 // prints a confident and incorrect error message.
 
-#include <cstddef>
 #include <cstdint>
 
 namespace occ::sys {

@@ -60,6 +60,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -154,6 +155,18 @@ constexpr std::int32_t kGuestMsgOob = 0x1;
 constexpr std::int32_t kGuestMsgPeek = 0x2;
 constexpr std::int32_t kGuestMsgDontRoute = 0x4;
 constexpr std::int32_t kGuestMsgWaitAll = 0x8;
+
+// The `getnameinfo` flags. The two surfaces chose their bit positions
+// independently and, worse, disagree about three of the four that overlap:
+// the guest's `NI_NUMERICHOST` is 0x02 where the host's is 0x01, the guest's
+// `NI_NOFQDN` is 0x01 where the host's is 0x04, and the guest's
+// `NI_NUMERICSERV` is 0x08 where the host's is 0x02. Handing the guest's
+// word over unchanged asks the host for the opposite of what was meant.
+constexpr std::int32_t kGuestNiNoFqdn = 0x01;
+constexpr std::int32_t kGuestNiNumericHost = 0x02;
+constexpr std::int32_t kGuestNiNameReqd = 0x04;
+constexpr std::int32_t kGuestNiNumericServ = 0x08;
+constexpr std::int32_t kGuestNiDgram = 0x10;
 
 // The network event bits `WSAEventSelect` reports. They are also the bits
 // `WSAEnumNetworkEvents` hands back and the ones `FD_ISSET` is a part of.
@@ -442,22 +455,57 @@ std::atomic<std::int32_t> g_winsock_users {0};
 
 // ------------------------------------------------------------ the addresses
 
+// The descriptors this runtime has handed out, so that a socket call can
+// tell one of its own from the value a guest may pass by hand. The range
+// test alone is not enough: a handle of `0x400000 + 1` names descriptor one,
+// which on this host is standard output, and a call aimed at it would write
+// to a stream the runtime owns rather than to a socket.
+std::mutex& socket_table_mutex() noexcept {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_set<int>& socket_table() noexcept {
+    static std::unordered_set<int> table;
+    return table;
+}
+
+void remember_socket(int fd) noexcept {
+    const std::lock_guard<std::mutex> guard(socket_table_mutex());
+    socket_table().insert(fd);
+}
+
+void forget_socket(int fd) noexcept {
+    const std::lock_guard<std::mutex> guard(socket_table_mutex());
+    socket_table().erase(fd);
+}
+
 // Whether the handle names a socket this runtime opened.
 //
-// The check is the range and nothing else: a descriptor minted here is the
-// range test's whole answer, because the other ranges cannot produce a
-// value inside this one.
+// The check is the range and the table together: the range says the handle
+// was minted here rather than for a file or an object, and the table says
+// the descriptor it names is one still open. A handle outside the table is
+// refused, which is what keeps a made-up number from resolving to a host
+// descriptor that was never a socket.
 [[nodiscard]] bool socket_descriptor_of(std::uint64_t handle,
                                         int& fd) noexcept {
     if (handle < kSocketBase || handle >= kSocketBase + kSocketSpan) {
         return false;
     }
-    fd = static_cast<int>(handle - kSocketBase);
+    const int candidate = static_cast<int>(handle - kSocketBase);
+    const std::lock_guard<std::mutex> guard(socket_table_mutex());
+    if (socket_table().find(candidate) == socket_table().end()) {
+        return false;
+    }
+    fd = candidate;
     return true;
 }
 
-// The handle a freshly opened descriptor is presented as.
+// The handle a freshly opened descriptor is presented as. The descriptor is
+// recorded here so that only a socket the runtime opened can be resolved
+// back to it.
 [[nodiscard]] std::uint64_t socket_handle_of(int fd) noexcept {
+    remember_socket(fd);
     return kSocketBase + static_cast<std::uint64_t>(fd);
 }
 
@@ -738,6 +786,28 @@ void timeval_to_milliseconds(const ::timeval& value, void* out) noexcept {
                                           : static_cast<std::uint32_t>(total));
 }
 
+// The guest's `SO_LINGER` value and the host's disagree about their shape as
+// well as their number: Windows writes two 16-bit fields in four bytes, the
+// host takes two `int` fields in eight. Passing the guest's four bytes
+// through would have the host read four bytes past the caller's structure,
+// so the value is rebuilt field by field in both directions.
+constexpr std::size_t kGuestLingerBytes = 4;
+
+[[nodiscard]] bool guest_linger_to_host(const void* value, std::size_t bytes,
+                                        ::linger& out) noexcept {
+    if (value == nullptr || bytes < kGuestLingerBytes) {
+        return false;
+    }
+    out.l_onoff = static_cast<int>(read_u16(value, 0));
+    out.l_linger = static_cast<int>(read_u16(value, 2));
+    return true;
+}
+
+void host_linger_to_guest(const ::linger& value, void* out) noexcept {
+    write_u16(out, 0, static_cast<std::uint16_t>(value.l_onoff));
+    write_u16(out, 2, static_cast<std::uint16_t>(value.l_linger));
+}
+
 }  // namespace
 
 // ----------------------------------------------------- the Berkeley layer
@@ -899,7 +969,10 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32ws_closesocket(
 
     // Closing is the one call that cannot be retried. A descriptor the host
     // has already given away is not closed a second time, because the
-    // number may by now belong to something else.
+    // number may by now belong to something else. The descriptor leaves the
+    // table first, so a handle to it is refused from here on even if the
+    // host's close fails.
+    forget_socket(fd);
     if (::close(fd) != 0) {
         // The host refuses a descriptor it does not own. That is not a
         // failure the guest can act on, and the contract calls it a
@@ -1402,6 +1475,13 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32ws_InetPtonW(
            (option == kGuestSoSndTimeo || option == kGuestSoRcvTimeo);
 }
 
+// Whether a guest option carries the two-field `linger` structure, whose
+// shape differs between the two surfaces.
+[[nodiscard]] bool option_is_linger(std::int32_t level,
+                                    std::int32_t option) noexcept {
+    return level == kGuestSolSocket && option == kGuestSoLinger;
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t k32ws_setsockopt(
     std::uint64_t socket, std::int32_t level, std::int32_t option,
     const void* value, std::int32_t value_bytes) noexcept {
@@ -1427,6 +1507,21 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32ws_setsockopt(
         static_cast<void>(milliseconds_to_timeval(value, timeout));
         if (::setsockopt(fd, host_level, host_option, &timeout,
                          sizeof(timeout)) != 0) {
+            return socket_failure();
+        }
+        set_last_error(0);
+        return 0;
+    }
+
+    if (option_is_linger(level, option)) {
+        ::linger host_linger {};
+        if (!guest_linger_to_host(value,
+                                  static_cast<std::size_t>(value_bytes),
+                                  host_linger)) {
+            return socket_failure_code(kWsaInvalidArgument);
+        }
+        if (::setsockopt(fd, host_level, host_option, &host_linger,
+                         sizeof(host_linger)) != 0) {
             return socket_failure();
         }
         set_last_error(0);
@@ -1477,6 +1572,23 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32ws_getsockopt(
         }
         timeval_to_milliseconds(timeout, value);
         *value_bytes = 4;
+        set_last_error(0);
+        return 0;
+    }
+
+    if (option_is_linger(level, option)) {
+        if (given < static_cast<std::int32_t>(kGuestLingerBytes)) {
+            *value_bytes = static_cast<std::int32_t>(kGuestLingerBytes);
+            return socket_failure_code(kWsaFault);
+        }
+        ::linger host_linger {};
+        socklen_t linger_bytes = sizeof(host_linger);
+        if (::getsockopt(fd, host_level, host_option, &host_linger,
+                         &linger_bytes) != 0) {
+            return socket_failure();
+        }
+        host_linger_to_guest(host_linger, value);
+        *value_bytes = static_cast<std::int32_t>(kGuestLingerBytes);
         set_last_error(0);
         return 0;
     }
@@ -3007,6 +3119,35 @@ void read_search_hints(const void* hints, ::addrinfo& out, bool& present) noexce
     present = true;
 }
 
+// The host resolver's status as the guest's. The two surfaces name the same
+// failures with different numbers, and a caller acts on the difference: a
+// name that does not exist is not a temporary failure to retry, and a
+// non-recoverable failure is not a name that resolved to no address of the
+// kind asked for. Folding them into one code would tell a program to stop
+// looking when it should try again, or the reverse.
+[[nodiscard]] std::int32_t wsa_from_eai(int status) noexcept {
+    switch (status) {
+        case EAI_AGAIN:
+            return kWsaTryAgain;  // a temporary failure, try again
+        case EAI_FAIL:
+            return kWsaNoRecovery;  // a non-recoverable failure
+        case EAI_NONAME:
+            return kWsaHostNotFound;  // no such name
+        case EAI_NODATA:
+            return kWsaNoData;  // the name has no address of this kind
+        case EAI_SYSTEM:
+            return kWsaFault;  // a system error, carried by errno
+        case EAI_MEMORY:
+            return kWsaFault;
+        case EAI_FAMILY:
+        case EAI_SOCKTYPE:
+        case EAI_SERVICE:
+            return kWsaInvalidArgument;
+        default:
+            return kWsaHostNotFound;
+    }
+}
+
 // The one search both the wide and the narrow call make. The two differ in
 // how the strings arrive and in how the answer is spelled; the question put
 // to the host is the same one.
@@ -3029,11 +3170,7 @@ void read_search_hints(const void* hints, ::addrinfo& out, bool& present) noexce
         service.empty() ? nullptr : service.c_str(),
         use_hints ? &host_hints : nullptr, &first);
     if (status != 0) {
-        // The two failures a caller distinguishes: a name that does not
-        // exist, and a name that exists with no address of the kind asked
-        // for. The host's codes carry the distinction and it is kept.
-        const bool missing = status == EAI_NONAME || status == EAI_NODATA;
-        return socket_failure_code(missing ? kWsaHostNotFound : kWsaNoData);
+        return socket_failure_code(wsa_from_eai(status));
     }
 
     void* chain = build_addrinfo_chain(first, wide);
@@ -3159,6 +3296,31 @@ extern "C" __attribute__((ms_abi)) void k32ws_freeaddrinfo(void* list) noexcept 
     free_addrinfo_chain(list);
 }
 
+// The guest's `getnameinfo` flags as the host's, bit by bit, because the two
+// headers put the same names at different positions. Passing the guest's
+// word through would have the host answer the opposite question: a caller
+// that asked for a numeric host would get a name, and one that asked for a
+// name would get a number.
+[[nodiscard]] int host_name_info_flags(std::int32_t flags) noexcept {
+    int host = 0;
+    if ((flags & kGuestNiNoFqdn) != 0) {
+        host |= NI_NOFQDN;
+    }
+    if ((flags & kGuestNiNumericHost) != 0) {
+        host |= NI_NUMERICHOST;
+    }
+    if ((flags & kGuestNiNameReqd) != 0) {
+        host |= NI_NAMEREQD;
+    }
+    if ((flags & kGuestNiNumericServ) != 0) {
+        host |= NI_NUMERICSERV;
+    }
+    if ((flags & kGuestNiDgram) != 0) {
+        host |= NI_DGRAM;
+    }
+    return host;
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t k32ws_getnameinfo(
     const void* address, std::int32_t address_length, char* host,
     std::uint32_t host_bytes, char* service, std::uint32_t service_bytes,
@@ -3183,10 +3345,9 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32ws_getnameinfo(
         reinterpret_cast<const sockaddr*>(&storage), storage_length,
         host != nullptr ? host : scratch, host != nullptr ? host_bytes : 0,
         service != nullptr ? service : scratch,
-        service != nullptr ? service_bytes : 0, flags);
+        service != nullptr ? service_bytes : 0, host_name_info_flags(flags));
     if (status != 0) {
-        const bool missing = status == EAI_NONAME || status == EAI_NODATA;
-        return socket_failure_code(missing ? kWsaHostNotFound : kWsaNoData);
+        return socket_failure_code(wsa_from_eai(status));
     }
 
     set_last_error(0);

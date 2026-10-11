@@ -39,15 +39,17 @@ Occ does not write to the target's memory. Concretely:
 - `ptrace` is used for stop, continue, single-step, signal delivery, and
   register access.
 
-Two things sit outside this claim. Both are stated here rather than left
-for the reader to discover:
+One thing sits outside this claim. It is stated here rather than left for the
+reader to discover:
 
-1. **uprobes.** The PE engine hooks Wine's `ntdll` with a uprobe. A uprobe
-   works by the kernel inserting a trap instruction into the probed
-   function. Occ asks for it; the kernel performs the write. Occ itself
-   does not write the byte. This is a real modification of target memory,
-   the mechanism is the kernel's, and it is on by default for the PE
-   engine because function-level observability is the point of the engine.
+1. **uprobes.** When a function-level probe is placed, it works by the kernel
+   inserting a trap instruction into the probed function. Occ asks for it; the
+   kernel performs the write. Occ itself does not write the byte. This is a
+   real modification of target memory, and the mechanism is the kernel's. No
+   run places one today: the table of probes that named symbols in Wine's
+   Unix-side `ntdll` is not wired into any engine, because the loader it hooked
+   is no longer in the path, and pointing it at this runtime's own `Nt*`
+   functions is open work.
 
 The claim is "Occ does not write to the target unless you ask it to", not
 "nothing is ever written". The first is true. The second is not, and any

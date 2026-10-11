@@ -30,12 +30,12 @@
 
 #pragma once
 
-#include "occ/runtime/winabi.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+
+#include "occ/runtime/winabi.h"
 
 namespace occ::runtime::winabi {
 

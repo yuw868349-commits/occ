@@ -128,6 +128,15 @@ constexpr std::uint64_t kEventSourceHandleBase = 0x00010000ULL;
 // `VALENTW` on the 64-bit ABI: a pointer, a 32-bit length, padding, a
 // pointer-sized value pointer, a 32-bit type and padding.
 constexpr std::size_t kValentSize = 32;
+
+// An upper bound on the entries one `RegQueryMultipleValues` call may name.
+// The API has no parameter that describes the `valents` array's length --
+// `count` *is* the description -- so the array's extent is checked against
+// the ledger and this constant is the second half of the bound: a guest
+// that points `valents` at a large mapping could otherwise ask the runtime
+// to build a `count`-long vector at the guest's chosen size. No real call
+// names more than a few dozen, so the constant is generous.
+constexpr std::uint32_t kMaxMultiValues = 1u << 16;
 constexpr std::size_t kValentName = 0;
 constexpr std::size_t kValentLength = 8;
 constexpr std::size_t kValentValuePtr = 16;
@@ -1597,9 +1606,22 @@ extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryMultipleValuesW(
     if (at == nullptr) {
         return finish(kStatusInvalidHandle);
     }
+    // `valents` is the guest's array of VALENT structures and `count` is
+    // how many the guest says it holds. Both are the guest's to write, and
+    // the pair is the buffer every loop below walks: the ledger check ties
+    // `count` to memory the runtime actually handed out, and the constant
+    // keeps a guest that points `valents` at one large mapping from asking
+    // for a vector to match it. Neither check alone is enough -- the
+    // ledger has no opinion about how much of a mapping is in use, and the
+    // constant has no opinion about whether the addresses exist at all.
+    if (count > kMaxMultiValues ||
+        !guest_range_is_ours(
+            valents, static_cast<std::uint64_t>(count) * kValentSize)) {
+        return finish(kStatusInvalidParameter);
+    }
     std::vector<const RegValue*> found;
     found.reserve(count);
-    std::uint32_t needed = 0;
+    std::uint64_t needed = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto* entry =
             static_cast<const std::uint8_t*>(valents) + i * kValentSize;
@@ -1610,13 +1632,30 @@ extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryMultipleValuesW(
             return finish(kStatusFileNotFound);
         }
         found.push_back(slot);
-        needed += static_cast<std::uint32_t>(slot->data.size());
+        needed += slot->data.size();
+    }
+    // The total is accumulated in sixty-four bits and reported through a
+    // thirty-two-bit field. The ledger check above already bounds the
+    // values this can name, but the sum is checked rather than truncated
+    // anyway, because the number a caller sizes its retry from is the one
+    // thing in this call that must not wrap.
+    if (needed > 0xFFFFFFFFULL) {
+        return finish(kStatusInvalidParameter);
     }
     if (needed > *total) {
         // Nothing is written on the short path: the caller retries with the
         // size it was told.
-        *total = needed;
+        *total = static_cast<std::uint32_t>(needed);
         return finish(kStatusMoreData);
+    }
+    // The buffer is about to receive `needed` bytes and the ledger is what
+    // says those bytes are the caller's to write. The API has no length
+    // parameter here -- Windows requires the caller to have sized the
+    // buffer from `*total` -- so this is the strongest check the shape
+    // allows, and it is the one that keeps a caller who ignored the size
+    // contract from having the runtime write past its own buffer.
+    if (!guest_range_is_ours(buffer, needed)) {
+        return finish(kStatusInvalidParameter);
     }
     std::size_t offset = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -1634,7 +1673,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryMultipleValuesW(
         write_u32(entry, kValentType, slot->type);
         offset += slot->data.size();
     }
-    *total = needed;
+    *total = static_cast<std::uint32_t>(needed);
     return finish(kStatusOk);
 }
 
@@ -1651,9 +1690,17 @@ extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryMultipleValuesA(
     }
     std::vector<const RegValue*> found;
     std::vector<std::string> narrow_data;
+    // The same two checks the wide spelling makes, for the same reason: the
+    // narrow form walks the same `valents` array and reports through the
+    // same thirty-two-bit total.
+    if (count > kMaxMultiValues ||
+        !guest_range_is_ours(
+            valents, static_cast<std::uint64_t>(count) * kValentSize)) {
+        return finish(kStatusInvalidParameter);
+    }
     found.reserve(count);
     narrow_data.reserve(count);
-    std::uint32_t needed = 0;
+    std::uint64_t needed = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto* entry =
             static_cast<const std::uint8_t*>(valents) + i * kValentSize;
@@ -1669,13 +1716,19 @@ extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryMultipleValuesA(
         if (status != kStatusOk) {
             return finish(status);
         }
-        needed += static_cast<std::uint32_t>(narrow.size());
+        needed += narrow.size();
         found.push_back(slot);
         narrow_data.push_back(std::move(narrow));
     }
+    if (needed > 0xFFFFFFFFULL) {
+        return finish(kStatusInvalidParameter);
+    }
     if (needed > *total) {
-        *total = needed;
+        *total = static_cast<std::uint32_t>(needed);
         return finish(kStatusMoreData);
+    }
+    if (!guest_range_is_ours(buffer, needed)) {
+        return finish(kStatusInvalidParameter);
     }
     std::size_t offset = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -1693,7 +1746,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryMultipleValuesA(
         write_u32(entry, kValentType, found[i]->type);
         offset += narrow.size();
     }
-    *total = needed;
+    *total = static_cast<std::uint32_t>(needed);
     return finish(kStatusOk);
 }
 

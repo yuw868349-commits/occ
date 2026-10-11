@@ -24,6 +24,7 @@
 // what a legitimate program does, and self-modifying code is a legitimate
 // technique as well as a hostile one.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

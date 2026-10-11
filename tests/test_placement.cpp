@@ -1086,15 +1086,19 @@ void test_every_relocation_type_is_written_in_its_own_form() {
     // loader noisy so the compiler cannot see through the test -- buys a green
     // run with a print left in production code, and that is a worse defect than
     // a folded assertion, because it looks like a fix.
+    // The fold is done in unsigned arithmetic, which is what the relocation
+    // the loader performs does. Written as signed additions it is undefined
+    // behaviour rather than a wrong answer: the field, the adjustment, the
+    // delta and the rounding term routinely sum past `0x7fffffff`, and only
+    // the top sixteen bits of the result are ever used.
     auto expected_field = [](std::uint16_t initial, std::int16_t adj,
                              std::int32_t addend, std::int32_t rounding) {
-        volatile std::int32_t t =
-            static_cast<std::int32_t>(static_cast<std::uint32_t>(initial)
-                                      << 16);
-        t += adj;
-        t += addend;
-        t += rounding;
-        return static_cast<std::uint16_t>(t >> 16);
+        const std::uint32_t sum =
+            (static_cast<std::uint32_t>(initial) << 16) +
+            static_cast<std::uint32_t>(adj) +
+            static_cast<std::uint32_t>(addend) +
+            static_cast<std::uint32_t>(rounding);
+        return static_cast<std::uint16_t>(sum >> 16);
     };
 
     {

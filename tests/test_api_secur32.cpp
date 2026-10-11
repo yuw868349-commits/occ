@@ -108,6 +108,13 @@ void test_package_queries() {
           "secur32: the packages enumerate");
     check(count >= 2, "secur32: the interface carries its packages");
     check(packages != nullptr, "secur32: the array is handed back");
+    // The array belongs to the caller, which releases it with
+    // `FreeContextBuffer` -- the half of the contract the information block
+    // below is already exercising. Leaving it allocated is a leak in the
+    // test, not in the runtime: the block is in the runtime's ledger either
+    // way, and the ledger is what makes the release refuse a pointer the
+    // guest made up.
+    cr32_FreeContextBuffer(packages);
 
     void* info = nullptr;
     check(cr32_QuerySecurityPackageInfoA("NTLM", &info) == 0,

@@ -165,20 +165,44 @@ void append_padded(std::u16string& out, const std::u16string& text, bool left,
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
+// What formatting one insert produced.
+enum class InsertOutcome {
+    // The argument was read and its text appended.
+    Supplied,
+    // The insert named an argument the caller did not supply; the caller
+    // writes the insert's own text through instead of reading a slot that is
+    // not there.
+    Unsupplied,
+    // The insert was malformed or held a value that could not be converted.
+    Failed,
+};
+
 // Formats insert number `index` (1-based). `spec` is the text between the
 // two `!` marks of the insert's format, with `!!` already folded to `!`,
-// empty when the insert had no format. Returns false after setting the last
-// error.
-[[nodiscard]] bool append_insert(std::u16string& out, std::uint32_t index,
-                                 const std::string& spec, bool wide_call,
-                                 const std::uint8_t* slots) noexcept {
+// empty when the insert had no format. Returns `Failed` after setting the
+// last error.
+[[nodiscard]] InsertOutcome append_insert(std::u16string& out,
+                                          std::uint32_t index,
+                                          const std::string& spec,
+                                          bool wide_call,
+                                          const std::uint8_t* slots) noexcept {
     if (slots == nullptr) {
         // An insert needs an argument and the caller supplied none; Windows
         // answers "parameter incorrect" rather than printing a guess.
         set_last_error(kErrorInvalidParameter);
-        return false;
+        return InsertOutcome::Failed;
     }
-    const std::uint8_t* slot = slots + static_cast<std::size_t>(index - 1) * kSlotBytes;
+    const std::uint8_t* slot =
+        slots + static_cast<std::size_t>(index - 1) * kSlotBytes;
+    // The API passes `Arguments` as a `va_list` with no length, so an insert
+    // can name a slot past the last argument the caller actually supplied:
+    // `%99!s!` names a slot 784 bytes past the first. A slot outside the
+    // memory this runtime mapped for the guest was not supplied, and the
+    // insert's own text is written through rather than reading whatever
+    // follows the argument array.
+    if (!guest_range_is_ours(slot, kSlotBytes)) {
+        return InsertOutcome::Unsupplied;
+    }
 
     // The conversion is the last letter of the spec; a spec without one
     // means the insert is a string, which is the documented default.
@@ -197,16 +221,16 @@ void append_padded(std::u16string& out, const std::u16string& text, bool left,
         const bool native_wide = (conv == 'c') == wide_call;
         if (native_wide) {
             out.push_back(static_cast<char16_t>(raw & 0xFFFFu));
-            return true;
+            return InsertOutcome::Supplied;
         }
         const char narrow = static_cast<char>(raw & 0xFFu);
         std::u16string piece;
         if (!narrow_in(std::string_view(&narrow, 1), piece).converted) {
             set_last_error(kErrorInvalidParameter);
-            return false;
+            return InsertOutcome::Failed;
         }
         out += piece;
-        return true;
+        return InsertOutcome::Supplied;
     }
 
     // Integer inserts go through the printf bridge, which consumes the slot
@@ -227,15 +251,15 @@ void append_padded(std::u16string& out, const std::u16string& text, bool left,
         std::string piece;
         if (host_vformat(piece, pf.c_str(), slot) < 0) {
             set_last_error(kErrorInvalidParameter);
-            return false;
+            return InsertOutcome::Failed;
         }
         std::u16string wide;
         if (!narrow_in(piece, wide).converted) {
             set_last_error(kErrorInvalidParameter);
-            return false;
+            return InsertOutcome::Failed;
         }
         out += wide;
-        return true;
+        return InsertOutcome::Supplied;
     }
 
     // Everything else is the documented default: a string. `s` names a
@@ -244,7 +268,7 @@ void append_padded(std::u16string& out, const std::u16string& text, bool left,
     std::memcpy(&raw, slot, sizeof(raw));
     if (raw == 0) {
         out += u"(null)";
-        return true;
+        return InsertOutcome::Supplied;
     }
     const bool native_wide = (conv != 'S') == wide_call;
     std::u16string piece;
@@ -257,7 +281,7 @@ void append_padded(std::u16string& out, const std::u16string& text, bool left,
             static_cast<std::uintptr_t>(raw));
         if (!narrow_in(std::string_view(text), piece).converted) {
             set_last_error(kErrorInvalidParameter);
-            return false;
+            return InsertOutcome::Failed;
         }
     }
 
@@ -274,7 +298,7 @@ void append_padded(std::u16string& out, const std::u16string& text, bool left,
         ++at;
     }
     append_padded(out, piece, left, width);
-    return true;
+    return InsertOutcome::Supplied;
 }
 
 // Expands the message text. `wide_call` says which width `s`/`S` name.
@@ -383,8 +407,16 @@ void append_padded(std::u16string& out, const std::u16string& text, bool left,
         }
         // An insert with no format at all is still an insert; its spec is
         // then empty and the documented default, a string, applies.
-        if (!append_insert(out, number, spec, wide_call, slot_base())) {
+        const InsertOutcome outcome =
+            append_insert(out, number, spec, wide_call, slot_base());
+        if (outcome == InsertOutcome::Failed) {
             return false;
+        }
+        if (outcome == InsertOutcome::Unsupplied) {
+            // The insert named an argument the caller did not supply, so the
+            // sequence goes through as text rather than reading past the
+            // argument array.
+            out.append(fmt.substr(i, after - i));
         }
         i = after;
     }

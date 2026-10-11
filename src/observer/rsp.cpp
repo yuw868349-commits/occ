@@ -29,6 +29,18 @@ char hex_char(int nibble) noexcept {
     return static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + (nibble - 10));
 }
 
+// The most a single packet's payload may grow before the decoder gives up on
+// it and re-synchronises.
+//
+// The largest packet the stub legitimately exchanges is a memory read, and
+// those are capped well below this, so the bound is never reached by a
+// well-behaved peer. It exists for the one that is not: a peer that sends a
+// '$' and then streams bytes without ever sending a '#', or with a '#' that
+// never has its checksum follow, would otherwise make payload_ grow for as
+// long as the connection is held open. The cap turns that into a bounded
+// amount of memory and a packet the decoder drops.
+constexpr std::size_t kMaxPacketBytes = 1u << 20;
+
 } // namespace
 
 std::string unescape(std::string_view in) noexcept {
@@ -145,6 +157,18 @@ std::size_t PacketDecoder::feed(const char* data, std::size_t length) noexcept {
                 payload_.clear();
                 raw_.clear();
                 raw_.push_back(c);
+            } else if (raw_.size() >= kMaxPacketBytes) {
+                // The payload has run past the bound without a closing '#'.
+                // It is not a packet that can ever be framed, so it is
+                // dropped and the state returns to Idle, which is the same
+                // recovery the checksum states use for a packet they cannot
+                // read: the bytes already buffered are released and the next
+                // '$' starts a fresh packet. The alternative -- holding the
+                // bytes and waiting for an end that may never come -- is the
+                // unbounded growth this bound exists to prevent.
+                payload_.clear();
+                raw_.clear();
+                state_ = State::Idle;
             } else {
                 payload_.push_back(c);
                 raw_.push_back(c);

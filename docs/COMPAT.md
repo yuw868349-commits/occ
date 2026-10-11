@@ -63,7 +63,7 @@ The checks, and what failing means:
 | `mount` | private tmpfs | Cannot build a root without it |
 | `overlayfs` | the root layer | **The root filesystem layer cannot be built** |
 | `cgroup v2` | resource limits | No limits; the run proceeds without them |
-| `seccomp` | syscall filtering | No default-deny filter; the target is not restricted |
+| `seccomp` | syscall filtering | No filter can be installed; the target runs unfiltered |
 | `bpf` | the seccomp filter path | The filter cannot be loaded; the target is not restricted |
 | `perf_event` | W^X tracking and uprobes | Hardware breakpoints unavailable; `--track-wx` reports it and stops |
 | `tracefs` | uprobe registration | Function-level probes cannot be placed |
@@ -93,12 +93,23 @@ also goes through `perf_event_open`.
 
 ## Failing soft, and what it looks like
 
-The `bpf` and `seccomp` checks are the ones that degrade rather than block: a
-host that refuses the `bpf` syscall loses the filter, and a host without
-seccomp support cannot have one at all. Either way the target still runs and
-the stream carries a `note` saying which capability was not acquired — the
-`note` kind exists so that a missing capability is visible in the record
-rather than inferred from an absence.
+The `bpf` and `seccomp` checks are the two that concern the syscall filter.
+`bpf` is informational: occ runs as root with `CAP_BPF`, so
+`kernel.unprivileged_bpf_disabled` does not apply to it, and the check is
+reported for completeness.
+
+`seccomp` is the capability that matters, and it is worth saying exactly what
+the filter is now that one is installed on every run. The policy the container
+installs when the caller names none is a refusal list, not an allow list: it
+permits everything and takes away a fixed set of host-mutating calls -- the
+mount and module families, `ptrace`, namespace changes, `bpf`,
+`perf_event_open`, `io_uring`, the keyring and the cross-process memory calls
+-- with `EPERM`. A caller that wants the stricter allow list supplies its own
+policy with `fallback = Errno`, and `install_seccomp = false` turns the filter
+off entirely, which is the escape hatch for a host that cannot load one. A
+capability that is genuinely missing shows up in the stream as a `note` naming
+the stage that was not reached -- the `note` kind exists so that a missing
+capability is visible in the record rather than inferred from an absence.
 
 The `binderfs` check is the one whose subject occ does not currently need. The
 APK engine is in the tree, and it reads a package and refuses to run it

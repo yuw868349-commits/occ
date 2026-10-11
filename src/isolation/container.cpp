@@ -74,6 +74,44 @@ std::string cgroup_name(int pid) {
            to_decimal(static_cast<std::uint64_t>(pid));
 }
 
+// ------------------------------------------------------------ ownership mark
+//
+// A directory this runtime created for a run is marked as its own, so that
+// container_cleanup can remove it without ever touching a directory the
+// caller handed in. Without a mark there is no way to tell "the caller's
+// --upper, which happens to be empty" from "the --upper this run made", and
+// cleanup would delete the caller's data.
+//
+// The mark is a dotfile *beside* the directory, not inside it. An overlay's
+// work directory has to be empty for the mount to be accepted, and its upper
+// directory's contents are merged into the target's own root, so a file
+// written inside either would either break the mount or show up in the
+// target's filesystem. A sibling dotfile is invisible to both.
+
+std::string ownership_marker(const std::string& dir) {
+    // A trailing slash is trimmed so that "upper/" is marked as the sibling
+    // of "upper" rather than as a file inside it.
+    std::size_t end = dir.size();
+    while (end > 1 && dir[end - 1] == '/') {
+        --end;
+    }
+    const std::string trimmed = dir.substr(0, end);
+    const std::size_t slash = trimmed.find_last_of('/');
+    if (slash == std::string::npos) {
+        return "." + trimmed + ".occ-owned";
+    }
+    return trimmed.substr(0, slash + 1) + "." + trimmed.substr(slash + 1) +
+           ".occ-owned";
+}
+
+bool mark_owned(const std::string& dir) {
+    return fs::write_file(ownership_marker(dir), "occ\n");
+}
+
+bool is_owned(const std::string& dir) {
+    return fs::read_file(ownership_marker(dir)).has_value();
+}
+
 // ---------------------------------------------------------------- cgroup v2
 
 struct MountEntry {
@@ -663,11 +701,23 @@ int assemble_root(const ContainerConfig& config, const std::string& target,
                      "directory";
             return sys::kEinval;
         }
+        // Whether each directory predates this run decides whether it is
+        // this run's to remove later. A directory that did not exist and
+        // that this run creates is marked; one that was already there is the
+        // caller's and is left alone.
+        const bool upper_new = !fs::exists(config.upper_dir);
+        const bool work_new = !fs::exists(config.work_dir);
         for (const auto& d : {target, config.upper_dir, config.work_dir}) {
             if (!fs::mkdir_p(d, 0755)) {
                 detail = "cannot create " + d;
                 return sys::kEacces;
             }
+        }
+        if (upper_new) {
+            (void)mark_owned(config.upper_dir);
+        }
+        if (work_new) {
+            (void)mark_owned(config.work_dir);
         }
 
         std::string options = "lowerdir=" + config.root_dir;
@@ -1067,6 +1117,17 @@ int drop_capabilities(const std::vector<sys::Cap>& keep,
         }
         auto q = sys::prctl(kCapBsetRead, bit, 0, 0, 0);
         if (q.failed()) {
+            // A capability bit that this kernel predates is not in its
+            // bounding set, and PR_CAPBSET_READ answers EINVAL for it. The
+            // newest bits in the table -- CAP_CHECKPOINT_RESTORE arrived in
+            // 5.9 -- are exactly the ones an older kernel rejects, so
+            // treating that as a failure would abort the whole drop, and
+            // with it the run, on every kernel that predates the newest
+            // capability. The bit is skipped, which is what "not in the
+            // bounding set" would have meant anyway.
+            if (q.error == sys::kEinval) {
+                continue;
+            }
             detail = "reading capability " + to_decimal(bit) +
                      " from the bounding set";
             return q.error;
@@ -1079,6 +1140,12 @@ int drop_capabilities(const std::vector<sys::Cap>& keep,
         }
         auto d = sys::prctl(kCapBsetDrop, bit, 0, 0, 0);
         if (d.failed()) {
+            // The same kernel-versus-table mismatch, one step later: there
+            // is nothing to drop for a bit the kernel does not have, so
+            // EINVAL is a no-op rather than a failure.
+            if (d.error == sys::kEinval) {
+                continue;
+            }
             detail = "dropping capability " + to_decimal(bit) +
                      " from the bounding set";
             return d.error;
@@ -1404,7 +1471,18 @@ void child_report(int fd, char verdict, Stage stage, int error,
     message.push_back(verdict);
     if (verdict == kVerdictFailed) {
         message.push_back(static_cast<char>(stage));
-        message.push_back(static_cast<char>(error & 0xff));
+        // The errno travels as four bytes rather than one. A single byte
+        // happens to hold today's errno values, but the field is an int and
+        // a stage is free to report a code that does not fit; truncating it
+        // silently would turn a real failure into a different one. The
+        // little-endian order is stated here rather than left to the host,
+        // because the two ends of this pipe are the only writers and readers
+        // and the width is part of the message.
+        const std::uint32_t code = static_cast<std::uint32_t>(error);
+        message.push_back(static_cast<char>(code & 0xffu));
+        message.push_back(static_cast<char>((code >> 8) & 0xffu));
+        message.push_back(static_cast<char>((code >> 16) & 0xffu));
+        message.push_back(static_cast<char>((code >> 24) & 0xffu));
         message += detail;
     }
 
@@ -1727,15 +1805,31 @@ SpawnResult container_spawn(const ContainerConfig& config,
                 if (verdict == kVerdictFailed) {
                     char body[512];
                     auto br = sys::read(report[0], body, sizeof(body));
-                    if (br.ok() && br.value >= 2) {
+                    // The body is the stage byte, four bytes of errno and
+                    // the detail. Five is the shortest body that carries the
+                    // stage and the whole errno; a shorter one is a message
+                    // this build cannot read.
+                    if (br.ok() && br.value >= 5) {
                         const auto stage_code =
                             static_cast<std::uint8_t>(body[0]);
-                        const auto err = static_cast<std::uint8_t>(body[1]);
+                        const std::uint32_t code =
+                            static_cast<std::uint32_t>(
+                                static_cast<std::uint8_t>(body[1])) |
+                            (static_cast<std::uint32_t>(
+                                 static_cast<std::uint8_t>(body[2]))
+                             << 8) |
+                            (static_cast<std::uint32_t>(
+                                 static_cast<std::uint8_t>(body[3]))
+                             << 16) |
+                            (static_cast<std::uint32_t>(
+                                 static_cast<std::uint8_t>(body[4]))
+                             << 24);
                         out.error = ContainerError{
-                            static_cast<Stage>(stage_code), err,
-                            std::string(body + 2,
+                            static_cast<Stage>(stage_code),
+                            static_cast<int>(code),
+                            std::string(body + 5,
                                         static_cast<std::size_t>(br.value) -
-                                            2)};
+                                            5)};
                     } else if (br.failed() && br.error != sys::kEintr) {
                         out.error = ContainerError{Stage::Clone, br.error,
                                                    "reading the failure report"};
@@ -1903,16 +1997,25 @@ long container_cleanup(const ContainerConfig& config) noexcept {
     }
 
     if (config.root_kind == RootKind::Overlay) {
-        if (!config.upper_dir.empty() && fs::exists(config.upper_dir)) {
+        // Only a directory this runtime marked as its own is removed. A
+        // caller who passed --upper or --work named a directory they own,
+        // and deleting it would take whatever was already in it; the marker
+        // beside the directory is what tells the two apart. The marker itself
+        // goes with the directory.
+        if (!config.upper_dir.empty() && fs::exists(config.upper_dir) &&
+            is_owned(config.upper_dir)) {
             const long n = fs::remove_tree(config.upper_dir);
+            (void)fs::remove_file(ownership_marker(config.upper_dir));
             if (n < 0) {
                 removed = -1;
             } else {
                 removed += n;
             }
         }
-        if (!config.work_dir.empty() && fs::exists(config.work_dir)) {
+        if (!config.work_dir.empty() && fs::exists(config.work_dir) &&
+            is_owned(config.work_dir)) {
             const long n = fs::remove_tree(config.work_dir);
+            (void)fs::remove_file(ownership_marker(config.work_dir));
             if (n < 0) {
                 removed = -1;
             } else {

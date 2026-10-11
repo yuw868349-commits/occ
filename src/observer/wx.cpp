@@ -486,9 +486,12 @@ ArmReport WriteExecuteTracker::arm(Watchpoints& watchpoints,
             order.push_back(i);
         }
     }
-    for (std::size_t i = 0; i < order.size(); ++i) {
-        order[i] = i;
-    }
+    // The list already holds the indices of this process's regions, so it is
+    // sorted in place. It must not be renumbered to 0..order.size()-1 first:
+    // the entries are looked up as regions_[idx] below, and renumbering them
+    // would arm the first N regions of the whole table -- including another
+    // process's, whose pid check was the reason the list was filtered -- and
+    // leave the regions this process actually staged into unwatched.
     std::stable_sort(order.begin(), order.end(),
                      [this](std::size_t a, std::size_t b) {
                          return regions_[a].target.length <

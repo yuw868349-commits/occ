@@ -10,6 +10,7 @@
 #include "occ/util/log.h"
 #include "occ/util/string.h"
 
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -86,6 +87,44 @@ std::vector<std::string> merge_environment(
         }
     }
     return out;
+}
+
+// Names the host directory an output path has to be exported from, or says
+// why it cannot be.
+//
+// A dump written inside the container does not land on the host unless the
+// directory it lands in is bound in, and only a directory the caller named
+// can be bound. A bare filename names no directory. The tempting default is
+// the current directory, but binding that writable hands the target the
+// host's working directory, which is exactly the escape the isolation is
+// there to prevent, so it is declined rather than assumed. A path whose
+// directory is the filesystem root ("/dump.bin") would bind the host root,
+// which is worse, and is declined for the same reason. An explicitly named
+// directory -- including an explicit "." -- is honoured, because the caller
+// named it and knows what it is exporting.
+//
+// Returns true and fills `dir` and `base` when the path can be exported;
+// false with `why` set when it cannot.
+bool export_directory(const std::string& full, std::string& dir,
+                      std::string& base, std::string& why) {
+    const std::size_t slash = full.find_last_of('/');
+    if (slash == std::string::npos) {
+        why = "names no directory, so nothing can be bound for it; name one "
+              "explicitly, as in \"./" + full + "\"";
+        return false;
+    }
+    dir = full.substr(0, slash);
+    base = full.substr(slash + 1);
+    if (dir.empty() || dir == "/") {
+        why = "resolves to the filesystem root, which cannot be bound "
+              "writable into the container";
+        return false;
+    }
+    if (base.empty()) {
+        why = "names no file after the directory";
+        return false;
+    }
+    return true;
 }
 
 // Reports the end of a session that never started, and the reason. Every
@@ -398,10 +437,14 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         config.root_kind == isolation::RootKind::ReadOnlyBind) {
         config.root_dir = "/";
     }
-    // The engine's root is the last word: an engine that needs a writable
-    // root has said so, and a caller who did not name one has not asked to
-    // override it.
-    if (!plan.root_dir.empty()) {
+    // The engine's root is a fallback, not the last word. An engine that
+    // needs a writable root has said so because a target it knows about
+    // needs one; a caller who passed --root has said where the target's
+    // filesystem lives, and an engine default that replaced it would run the
+    // target against a root the caller did not choose -- the flag would be
+    // accepted and then ignored. Only a caller who named no root gets the
+    // engine's.
+    if (config.root_dir.empty() && !plan.root_dir.empty()) {
         config.root_dir = plan.root_dir;
     }
 
@@ -416,17 +459,24 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // is the process that actually runs the guest -- so a switch the outer
     // process could see and the runner could not would be invisible exactly
     // where it is needed, and the trace it turns on would look broken rather
-    // than absent. Appending after the merge is deliberate: an --env of the
-    // same name is a caller trying to set a variable for the target, and it
-    // must not displace the switch that describes how this run is observed.
+    // than absent.
+    //
+    // The switches are merged over the caller's environment rather than
+    // appended. Appending leaves two entries for the same name, and which
+    // one the target's libc returns is not specified, so an --env of the
+    // same name could displace the switch that describes how the run is
+    // observed. Merging replaces the entry in place, so the switch is the
+    // one in effect and there is only ever one entry per name.
+    std::vector<std::string> observer_switches;
     for (const char* name :
          {"OCC_GUEST_TRACE", "OCC_API_TRACE", "OCC_MEMWATCH",
           "OCC_TRACE_STEPS", "OCC_DUMP_AT_OEP"}) {
         const char* value = ::getenv(name);
         if (value != nullptr && value[0] != '\0') {
-            env.emplace_back(std::string(name) + "=" + value);
+            observer_switches.emplace_back(std::string(name) + "=" + value);
         }
     }
+    env = merge_environment(env, observer_switches);
 
     // A dump has to come back out of the container, and the container's
     // root is its own: a path the caller named on the host does not exist
@@ -435,29 +485,39 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // fixed point and the runner is told to write there instead, so the
     // switch it reads names a path this file chose and the two name the
     // same bytes on either side of the boundary.
+    //
+    // When the path names no directory that can be bound this way, the run
+    // is not silently left without a dump: the reason is recorded as a
+    // degradation, and the switch keeps the host path the caller gave it.
     if (const char* dump = ::getenv("OCC_DUMP_IMAGE");
         dump != nullptr && dump[0] != '\0') {
-        const std::string full(dump);
-        const std::size_t slash = full.find_last_of('/');
-        const std::string dir = slash == std::string::npos
-                                    ? std::string(".")
-                                    : full.substr(0, slash);
-        const std::string base =
-            slash == std::string::npos ? full : full.substr(slash + 1);
-        config.extra_mounts.push_back({dir, "/occ-dump-out", true});
-        env.emplace_back("OCC_DUMP_IMAGE=/occ-dump-out/" + base);
+        std::string dir;
+        std::string base;
+        std::string why;
+        if (export_directory(std::string(dump), dir, base, why)) {
+            config.extra_mounts.push_back({dir, "/occ-dump-out", true});
+            env = merge_environment(
+                env, {"OCC_DUMP_IMAGE=/occ-dump-out/" + base});
+        } else {
+            out.degradations.push_back(
+                std::string("OCC_DUMP_IMAGE \"") + dump + "\" " + why +
+                "; the image dump will not be exported from the container");
+        }
     }
     if (const char* mdmp = ::getenv("OCC_MINIDUMP");
         mdmp != nullptr && mdmp[0] != '\0') {
-        const std::string full(mdmp);
-        const std::size_t slash = full.find_last_of('/');
-        const std::string dir = slash == std::string::npos
-                                    ? std::string(".")
-                                    : full.substr(0, slash);
-        const std::string base =
-            slash == std::string::npos ? full : full.substr(slash + 1);
-        config.extra_mounts.push_back({dir, "/occ-mdmp-out", true});
-        env.emplace_back("OCC_MINIDUMP=/occ-mdmp-out/" + base);
+        std::string dir;
+        std::string base;
+        std::string why;
+        if (export_directory(std::string(mdmp), dir, base, why)) {
+            config.extra_mounts.push_back({dir, "/occ-mdmp-out", true});
+            env = merge_environment(
+                env, {"OCC_MINIDUMP=/occ-mdmp-out/" + base});
+        } else {
+            out.degradations.push_back(
+                std::string("OCC_MINIDUMP \"") + mdmp + "\" " + why +
+                "; the minidump will not be exported from the container");
+        }
     }
 
     // An observed run has to have its target stop at the exec boundary, or
@@ -572,10 +632,29 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         if (sr.failed) {
             out.failed = true;
             out.failure_detail = sr.detail;
+
+            // The session gave up before the target ended. It owns the wait
+            // while it runs, but it has returned and on the paths where it
+            // detaches it has let the target go: the child is running again
+            // with nothing left to collect it, so it is a leaked process, or
+            // a zombie if it happened to exit on its own. It is killed first
+            // so that the reap below cannot block on a target the observer
+            // stopped driving, and then reaped so the exit status is
+            // collected here rather than left to the process that reaps
+            // orphans. On the paths where the session already reaped it, the
+            // kill finds no process and the reap reports ECHILD, which is not
+            // a new failure.
+            (void)sys::kill(spawned.pid, SIGKILL);
+            const isolation::ContainerResult collected =
+                isolation::container_reap(spawned.pid);
+            out.exit_code = collected.exit_code;
+            out.term_signal = collected.term_signal;
+            out.signaled = collected.signaled;
+        } else {
+            out.exit_code = sr.exit_code;
+            out.term_signal = sr.term_signal;
+            out.signaled = sr.signaled;
         }
-        out.exit_code = sr.exit_code;
-        out.term_signal = sr.term_signal;
-        out.signaled = sr.signaled;
 
         (void)isolation::container_cleanup(config);
         (void)fs::remove_tree(scratch);

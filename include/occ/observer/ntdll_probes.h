@@ -38,6 +38,7 @@
 // first: files, processes, memory, registry, synchronisation, dynamic loading,
 // and the query calls a program makes about itself.
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 #include <vector>

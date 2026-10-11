@@ -609,9 +609,10 @@ int main() {
         }
         const auto program = build_seccomp(policy);
         check_true("a multi-rule policy builds", program.valid());
-        // Six instructions of preamble, then two per rule (entry and pad)
-        // plus one action, then the trailing fallback.
-        const std::size_t want = 6 + 8 * 3 + 1;
+        // Six instructions of preamble, then two per rule (the entry and
+        // the action -- there is no landing pad, since a match sets `jt = 0`
+        // and continues at the next instruction), then the trailing fallback.
+        const std::size_t want = 6 + 8 * 2 + 1;
         check("the instruction count is what the policy implies",
               static_cast<long>(program.insn_count()),
               static_cast<long>(want));
@@ -758,9 +759,13 @@ int main() {
         check_true("a rule using all six arguments builds", program.valid());
         const auto* code = program.code();
 
-        // Six instructions of preamble, then the entry, the pad, six tests
-        // and the action, then the trailing fallback.
-        const std::size_t want = 6 + 2 + 6 * 5 + 1 + 1;
+        // Six instructions of preamble, then the entry, six tests and the
+        // action, then the trailing fallback. There is no landing pad after
+        // the entry: a match sets `jt = 0` and so continues at the very next
+        // instruction, which is the block's first. The pad an earlier layout
+        // carried here was unreachable and only made both jump offsets differ
+        // by one, so the counts below have no room for it.
+        const std::size_t want = 6 + 1 + 6 * 5 + 1 + 1;
         check("the widest rule is the size the layout implies",
               static_cast<long>(program.insn_count()),
               static_cast<long>(want));
@@ -775,7 +780,7 @@ int main() {
                       "the jump field is one byte wide");
         const std::size_t block = 6 * 5 + 1;
         check("the widest rule's skip offset is what the layout implies",
-              static_cast<long>(code[6].jf), static_cast<long>(block + 1));
+              static_cast<long>(code[6].jf), static_cast<long>(block));
     }
 
     // The x32 defence. A number with bit 30 set is an x32 caller, and the
@@ -898,11 +903,15 @@ int main() {
         policy.rules.back().error = 4095;
         const auto program = build_seccomp(policy);
         check_true("a rule errno of 4095 is accepted", program.valid());
-        // The layout is a six-instruction preamble, then per rule an entry,
-        // a pad and the block. This is the first and only rule, so its
-        // action is instruction 8: 6 preamble, 6 entry, 7 pad, 8 action.
+        // The layout is a six-instruction preamble, then per rule an entry
+        // and the block. This is the first and only rule and it has no
+        // argument tests, so its block is the action alone and that action is
+        // instruction 7. Instruction 8 is the trailing fallback, which is
+        // why the two answers have to be read from different places: a check
+        // on 8 would read the fallback's errno (38 here) and pass for the
+        // wrong reason.
         check("the rule errno is emitted without masking",
-              static_cast<long>(program.code()[8].k & 0xffffu), 4095);
+              static_cast<long>(program.code()[7].k & 0xffffu), 4095);
     }
 
     // Installing a program that was never built has to fail rather than

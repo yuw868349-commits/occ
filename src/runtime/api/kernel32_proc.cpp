@@ -45,11 +45,13 @@
 
 #include "occ/runtime/api.h"
 #include "occ/runtime/api_common.h"
+#include "occ/runtime/winabi.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -428,27 +430,85 @@ struct Snapshot {
     std::vector<ModuleItem> modules;
     std::vector<std::uint64_t> heaps;
     std::size_t cursor = 0;
+
+    // One lock per snapshot, and `cursor` is the field it guards: a guest
+    // with two threads walking one snapshot is a guest whose
+    // `Process32Next` calls race on this counter, and each thread's
+    // iterator *is* this counter rather than a position in a list. The
+    // three lists are immutable once the snapshot is built, so the lock
+    // has exactly one thing to protect.
+    //
+    // Per-snapshot rather than global because two threads walking two
+    // different snapshots have nothing to do with each other, and a global
+    // lock would serialise them for no reason.
+    std::mutex lock;
 };
 
 // Snapshots live for the run. Native ones are closed with CloseHandle; a
 // runtime without per-handle cleanup grows the table instead of reusing a
 // closed slot, which trades a bounded leak for never answering a stale
 // snapshot.
-std::vector<Snapshot> g_snapshots;
+//
+// The elements are held by pointer rather than by value, and that is what
+// makes the table safe to grow: the handle a caller holds is an *index*
+// into this vector, and a second thread creating a snapshot while a first
+// thread walks one would move the vector's storage out from under the
+// walker if the elements were `Snapshot` objects themselves. An element's
+// address is its `unique_ptr`'s, and `push_back` never changes an existing
+// pointer, so a `Snapshot*` stays valid for the life of the run.
+//
+// The two locks below are never held at the same time:
+// `g_snapshot_table_lock` covers the vector's size and growth and nothing
+// else, and each element's own lock covers that element. There is therefore
+// no lock order to get wrong.
+std::vector<std::unique_ptr<Snapshot>> g_snapshots;
+std::mutex g_snapshot_table_lock;
 
 // Process handles this runtime has issued for other existing processes.
+// Guarded by `g_process_lock`: the table is written by `OpenProcess` and
+// read by half a dozen calls, all of them on the guest's threads, and a
+// `std::map` being inserted into under a concurrent reader is the same
+// class of bug the snapshot table above had.
 std::map<std::uint64_t, std::uint32_t> g_process_handles;
 std::uint64_t g_next_process_handle = kProcessHandleBase;
+std::mutex g_process_lock;
 
 [[nodiscard]] Snapshot* find_snapshot(std::uint64_t handle) noexcept {
     if (handle < kSnapshotHandleBase) {
         return nullptr;
     }
+    const std::lock_guard<std::mutex> held(g_snapshot_table_lock);
     const auto index = static_cast<std::size_t>(handle - kSnapshotHandleBase);
     if (index >= g_snapshots.size()) {
         return nullptr;
     }
-    return &g_snapshots[index];
+    return g_snapshots[index].get();
+}
+
+// The process-handle table under its lock, answering by value rather than
+// by iterator: an iterator would outlive the lock, and the next reader
+// would be walking the map with nothing holding it still.
+[[nodiscard]] bool process_handle_pid(std::uint64_t handle,
+                                      std::uint32_t& pid) noexcept {
+    const std::lock_guard<std::mutex> held(g_process_lock);
+    const auto it = g_process_handles.find(handle);
+    if (it == g_process_handles.end()) {
+        return false;
+    }
+    pid = it->second;
+    return true;
+}
+
+[[nodiscard]] bool process_handle_known(std::uint64_t handle) noexcept {
+    const std::lock_guard<std::mutex> held(g_process_lock);
+    return g_process_handles.find(handle) != g_process_handles.end();
+}
+
+[[nodiscard]] std::uint64_t process_handle_record(std::uint32_t pid) noexcept {
+    const std::lock_guard<std::mutex> held(g_process_lock);
+    const std::uint64_t handle = g_next_process_handle++;
+    g_process_handles.emplace(handle, pid);
+    return handle;
 }
 
 // The priority and working-set calls check handles inline rather than
@@ -1176,9 +1236,7 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32p_OpenProcess(
     if (pid == current_pid()) {
         return kCurrentProcessPseudo;
     }
-    const std::uint64_t handle = g_next_process_handle++;
-    g_process_handles.emplace(handle, pid);
-    return handle;
+    return process_handle_record(pid);
 }
 
 extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetProcessId(
@@ -1186,12 +1244,12 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetProcessId(
     if (handle == kCurrentProcessPseudo) {
         return current_pid();
     }
-    const auto it = g_process_handles.find(handle);
-    if (it == g_process_handles.end()) {
+    std::uint32_t pid = 0;
+    if (!process_handle_pid(handle, pid)) {
         set_last_error(kErrorInvalidHandle);
         return 0;
     }
-    return it->second;
+    return pid;
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32p_GetExitCodeProcess(
@@ -1200,8 +1258,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_GetExitCodeProcess(
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    if (handle != kCurrentProcessPseudo &&
-        g_process_handles.find(handle) == g_process_handles.end()) {
+    if (handle != kCurrentProcessPseudo && !process_handle_known(handle)) {
         set_last_error(kErrorInvalidHandle);
         return 0;
     }
@@ -1247,8 +1304,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetPriorityClass(
         set_last_error(0);
         return g_priority_class;
     }
-    const auto it = g_process_handles.find(handle);
-    if (it == g_process_handles.end()) {
+    if (!process_handle_known(handle)) {
         set_last_error(kErrorInvalidHandle);
         return 0;
     }
@@ -1259,8 +1315,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetPriorityClass(
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32p_SetPriorityClass(
     std::uint64_t handle, std::uint32_t priority) noexcept {
-    if (handle != kCurrentProcessPseudo &&
-        g_process_handles.find(handle) == g_process_handles.end()) {
+    if (handle != kCurrentProcessPseudo && !process_handle_known(handle)) {
         set_last_error(kErrorInvalidHandle);
         return 0;
     }
@@ -1315,7 +1370,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_GetProcessWorkingSetSize(
         return 0;
     }
     if (handle != kCurrentProcessPseudo) {
-        if (g_process_handles.find(handle) == g_process_handles.end()) {
+        if (!process_handle_known(handle)) {
             set_last_error(kErrorInvalidHandle);
         } else {
             set_last_error(kErrorAccessDenied);
@@ -1331,7 +1386,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_GetProcessWorkingSetSize(
 extern "C" __attribute__((ms_abi)) std::int32_t k32p_SetProcessWorkingSetSize(
     std::uint64_t handle, std::uint64_t minimum, std::uint64_t maximum) noexcept {
     if (handle != kCurrentProcessPseudo) {
-        if (g_process_handles.find(handle) == g_process_handles.end()) {
+        if (!process_handle_known(handle)) {
             set_last_error(kErrorInvalidHandle);
         } else {
             set_last_error(kErrorAccessDenied);
@@ -1380,7 +1435,12 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32p_CreateToolhelp32Snapshot(
         set_last_error(kErrorInvalidParameter);
         return kInvalidHandleValue;
     }
-    Snapshot snapshot;
+    // The snapshot is built in a local `unique_ptr` and moved into the
+    // table as a pointer. `Snapshot` holds a lock and is therefore neither
+    // copyable nor movable, so the "local then push" shape has to go
+    // through the pointer the table actually stores.
+    auto held_snapshot = std::make_unique<Snapshot>();
+    Snapshot& snapshot = *held_snapshot;
     if ((flags & kSnapHeapList) != 0) {
         if (pid != 0 && pid != current_pid()) {
             set_last_error(kErrorAccessDenied);
@@ -1401,7 +1461,8 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32p_CreateToolhelp32Snapshot(
         }
         enumerate_modules(snapshot.modules);
     }
-    g_snapshots.push_back(std::move(snapshot));
+    const std::lock_guard<std::mutex> held(g_snapshot_table_lock);
+    g_snapshots.push_back(std::move(held_snapshot));
     return kSnapshotHandleBase +
            static_cast<std::uint64_t>(g_snapshots.size() - 1);
 }
@@ -1500,6 +1561,12 @@ template <typename ItemT>
         set_last_error(kErrorInsufficientBuffer);
         return false;
     }
+    // The walk holds this snapshot's lock from the first read of the
+    // cursor to the last write of it. What the lock is *not* held across is
+    // the guest's own code: `fill` writes the caller's buffer and returns,
+    // and no guest callback happens inside this function, so the lock
+    // cannot be re-entered by a thread that is waiting on it.
+    const std::lock_guard<std::mutex> held(snapshot->lock);
     const std::vector<ItemT>& list = snapshot->*items;
     if (snapshot->cursor >= list.size()) {
         set_last_error(kErrorNoMoreFiles);
@@ -1518,6 +1585,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Process32FirstW(
     std::uint64_t handle, void* entry) noexcept {
     Snapshot* snapshot = find_snapshot(handle);
     if (snapshot != nullptr) {
+        const std::lock_guard<std::mutex> held(snapshot->lock);
         snapshot->cursor = 0;
     }
     return toolhelp_next<ProcEntry>(
@@ -1544,6 +1612,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Process32FirstA(
     std::uint64_t handle, void* entry) noexcept {
     Snapshot* snapshot = find_snapshot(handle);
     if (snapshot != nullptr) {
+        const std::lock_guard<std::mutex> held(snapshot->lock);
         snapshot->cursor = 0;
     }
     return toolhelp_next<ProcEntry>(
@@ -1570,6 +1639,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Thread32First(
     std::uint64_t handle, void* entry) noexcept {
     Snapshot* snapshot = find_snapshot(handle);
     if (snapshot != nullptr) {
+        const std::lock_guard<std::mutex> held(snapshot->lock);
         snapshot->cursor = 0;
     }
     return toolhelp_next<ThreadItem>(handle, entry, ThreadEntryLayout::kBytes,
@@ -1590,6 +1660,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Module32FirstW(
     std::uint64_t handle, void* entry) noexcept {
     Snapshot* snapshot = find_snapshot(handle);
     if (snapshot != nullptr) {
+        const std::lock_guard<std::mutex> held(snapshot->lock);
         snapshot->cursor = 0;
     }
     return toolhelp_next<ModuleItem>(
@@ -1616,6 +1687,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Module32FirstA(
     std::uint64_t handle, void* entry) noexcept {
     Snapshot* snapshot = find_snapshot(handle);
     if (snapshot != nullptr) {
+        const std::lock_guard<std::mutex> held(snapshot->lock);
         snapshot->cursor = 0;
     }
     return toolhelp_next<ModuleItem>(
@@ -1675,6 +1747,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Heap32ListFirst(
     std::uint64_t handle, void* entry) noexcept {
     Snapshot* snapshot = find_snapshot(handle);
     if (snapshot != nullptr) {
+        const std::lock_guard<std::mutex> held(snapshot->lock);
         snapshot->cursor = 0;
     }
     return heap_list_next(handle, entry) ? 1 : 0;
@@ -1730,6 +1803,15 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32p_Toolhelp32ReadProcessMemory
         return 0;
     }
     if (size != 0) {
+        // Both ends are addresses the guest named, and the ledger is what
+        // decides whether they are this runtime's memory: a source past the
+        // ledger is the runtime's own image or its stack, and a copy from
+        // there is a read a guest does not get.
+        if (!guest_range_is_ours(base, size) ||
+            !guest_range_is_ours(buffer, size)) {
+            set_last_error(kErrorAccessDenied);
+            return 0;
+        }
         std::memcpy(buffer, base, static_cast<std::size_t>(size));
     }
     if (read != nullptr) {

@@ -43,8 +43,9 @@ Every run gets:
 - A new root built with `pivot_root` over an overlayfs whose upper layer is
   disposable and whose lower layer is never written.
 - A cgroup v2 subtree with explicit limits.
-- A seccomp-BPF filter, default-deny, built from an in-tree bytecode
-  emitter.
+- A seccomp-BPF filter, assembled by an in-tree bytecode emitter, that
+  refuses a fixed list of host-mutating syscalls with `EPERM` while leaving
+  the rest allowed.
 
 The isolation layer is the security boundary of this project. Its seccomp
 emitter is tested against filters the kernel actually installs — 91

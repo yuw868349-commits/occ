@@ -56,6 +56,7 @@
 //     is a program that faults on a value it can be shown, and this loader
 //     already goes out of its way to preserve that value for `occ check`.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>

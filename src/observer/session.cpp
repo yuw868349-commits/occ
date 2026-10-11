@@ -289,7 +289,16 @@ void append_gdb_register(std::string& out, std::uint64_t value,
         value &= (std::uint64_t{1} << bits) - 1u;
     }
     for (unsigned i = 0; i < bytes; ++i) {
-        const auto byte = static_cast<unsigned>((value >> (8u * i)) & 0xFFu);
+        // An 80-bit x87 register is ten bytes wide, but the value handed in
+        // is a std::uint64_t and only eight of those bytes can be non-zero.
+        // Shifting by 8*i for i at nine would be a shift by 72 on a 64-bit
+        // operand, which is undefined; the two high bytes are emitted as
+        // zero instead, which is what the caller's zeroed x87 state holds
+        // anyway.
+        unsigned byte = 0;
+        if (8u * i < 64u) {
+            byte = static_cast<unsigned>((value >> (8u * i)) & 0xFFu);
+        }
         out += kHexDigits[byte >> 4];
         out += kHexDigits[byte & 0xFu];
     }
@@ -1150,7 +1159,14 @@ std::string DebugServer::handle_write_memory(std::string_view args) noexcept {
 std::string DebugServer::handle_breakpoint(std::string_view args) noexcept {
     // The packet is Z<type>,<addr>,<kind> or z<type>,<addr>,<kind>. The
     // kind is the instruction length on some targets and is ignored here.
-    if (args.size() < 2) {
+    //
+    // Three characters are the minimum that can carry a type and its
+    // separator: the leading Z or z, one type digit, and the comma before
+    // the address. Guarding on two instead would let "Z0" through to
+    // substr(3), which is past the end of a two-character view, and the
+    // project is built with exceptions disabled -- the throw is a terminate,
+    // not an error reply.
+    if (args.size() < 3) {
         return "E01";
     }
     const bool insert = args[0] == 'Z';
@@ -1810,6 +1826,12 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
                             (void)connection.send_packet(reply.payload);
                         }
                         if (server.detached()) {
+                            // The debugger asked the stub to let go. The
+                            // breakpoint bytes go back before the detach:
+                            // they are the tracer's footprint in the target,
+                            // and leaving them would hand back a process
+                            // that traps on a byte it never wrote.
+                            (void)breakpoints.restore_all(tracer, config.pid);
                             (void)tracer.detach(config.pid, 0);
                             connection.close();
                             break;
@@ -1826,6 +1848,9 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
         }
 
         if (server.detached()) {
+            // Same reason as the detach inside the packet loop: the target
+            // is handed back without the 0xcc bytes this tracer wrote.
+            (void)breakpoints.restore_all(tracer, config.pid);
             (void)tracer.detach(config.pid, 0);
             break;
         }
@@ -2038,10 +2063,16 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
             // are dropped rather than carried over, because a breakpoint at
             // an address that meant something in the old image means
             // something else in the new one.
-            for (const auto& b : breakpoints.all()) {
-                (void)tracer.poke(stop.pid, b.address,
-                                  static_cast<std::uint64_t>(b.saved));
-            }
+            //
+            // The bytes are not written back. An exec replaces the whole
+            // address space, so the 0xcc the tracer wrote into the old image
+            // is already gone, and poking the saved old byte at the old
+            // address would write it into whatever the new image has there
+            // instead. That would modify the target on its behalf, which is
+            // the one thing the tracer promises not to do. The tracker
+            // forgets the addresses so nothing tries to restore or re-arm
+            // them later.
+            breakpoints.clear();
             // The same is true of the watches, with one extra problem: a
             // watch placed on the old image's address now points at
             // whatever the new image put there, so it would fire on an
@@ -2377,6 +2408,15 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
     // The session is over. Any process still in the traced set is one whose
     // exit the loop did not see, which happens when the debugger detached
     // first; they are continued so that they are not left stopped.
+    //
+    // The breakpoints on the main process are removed before the mask
+    // detach, because a session that ends while a breakpoint is still
+    // installed would leave the target running with a 0xcc byte in it. The
+    // list is per main pid -- a debugger sets breakpoints by address and
+    // only for the process it attached to -- so it is restored once rather
+    // than for every traced pid, which would poke those addresses into
+    // children that never had them.
+    (void)breakpoints.restore_all(tracer, config.pid);
     for (int pid : traced) {
         (void)tracer.detach(pid, 0);
     }

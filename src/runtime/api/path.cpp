@@ -536,6 +536,12 @@ template <typename C>
 //
 // The output buffer is optional: Windows documents it as such and a caller
 // that only wants the count passes null.
+// The character count every path function in this file is bounded by.
+// Windows spells it `MAX_PATH` and every caller sizes its buffer at it; none
+// of the entry points below carries a capacity parameter, so this is the
+// bound the format itself carries and the one the walks enforce.
+constexpr std::size_t kMaxPath = 260;
+
 template <typename C>
 [[nodiscard]] std::int32_t common_prefix(const C* a, const C* b,
                                          C* out) noexcept {
@@ -559,6 +565,14 @@ template <typename C>
         }
     }
     if (out != nullptr) {
+        // The output is a `MAX_PATH` array in every caller Windows
+        // documents, and this function has no parameter that describes it
+        // any better. A prefix longer than the array is a refusal -- the
+        // zero a caller reads as "nothing in common" -- rather than a copy
+        // that runs past the buffer.
+        if (i + 1 > kMaxPath) {
+            return 0;
+        }
         for (std::size_t k = 0; k < i; ++k) {
             out[k] = a[k];
         }
@@ -597,14 +611,28 @@ template <typename C>
         return true;
     }
     C* out = const_cast<C*>(base);
+    // The result is built in place and no entry point here carries a
+    // capacity: the bound is the format's own `MAX_PATH`, and a result that
+    // would run past it is a refusal rather than a write past the caller's
+    // array. The check is per character rather than a length computed up
+    // front, because `..` shortens the result and a bound derived from the
+    // inputs would refuse joins that do fit.
+    bool over = false;
+    const auto put = [out, &over](std::size_t at, C ch) {
+        if (at + 1 >= kMaxPath) {
+            over = true;
+            return;
+        }
+        out[at] = ch;
+    };
     if (has_drive(more) && is_sep(more[2])) {
         std::size_t k = 0;
         while (more[k] != static_cast<C>(0)) {
-            out[k] = more[k];
+            put(k, more[k]);
             ++k;
         }
-        out[k] = static_cast<C>(0);
-        return true;
+        put(k, static_cast<C>(0));
+        return !over;
     }
     std::size_t n = length_of(base);
     const C* p = more;
@@ -633,23 +661,29 @@ template <typename C>
                 // Nothing was stepped over; the walk starts again from the
                 // root's separator so the result is still a path.
                 if (is_sep(base[0])) {
-                    out[n++] = backslash<C>();
+                    put(n, backslash<C>());
+                    ++n;
                 }
             }
         } else {
             if (n != 0 && !is_sep(out[n - 1])) {
-                out[n++] = backslash<C>();
+                put(n, backslash<C>());
+                ++n;
             }
             for (std::size_t k = 0; k < piece_len; ++k) {
-                out[n++] = piece[k];
+                put(n, piece[k]);
+                ++n;
             }
         }
         while (is_sep(*p)) {
             ++p;
         }
     }
-    out[n] = static_cast<C>(0);
-    return true;
+    if (over) {
+        return false;
+    }
+    put(n, static_cast<C>(0));
+    return !over;
 }
 
 // ---------------------------------------------------------------------------
@@ -681,24 +715,32 @@ template <typename C>
     if (file == nullptr) {
         file = kEmpty;
     }
-    const auto copy_out = [out](const C* from) {
+    bool over = false;
+    const auto put = [out, &over](std::size_t at, C ch) {
+        if (at + 1 >= kMaxPath) {
+            over = true;
+            return;
+        }
+        out[at] = ch;
+    };
+    const auto copy_out = [put](const C* from) {
         std::size_t k = 0;
         while (from[k] != static_cast<C>(0)) {
-            out[k] = from[k];
+            put(k, from[k]);
             ++k;
         }
-        out[k] = static_cast<C>(0);
+        put(k, static_cast<C>(0));
     };
     if (file[0] == static_cast<C>(0) || dir[0] == static_cast<C>(0) ||
         has_drive(file)) {
         copy_out(file[0] == static_cast<C>(0) ? dir : file);
-        return true;
+        return !over;
     }
     if (is_sep(file[0])) {
         if (is_backslash(file[0]) && is_backslash(file[1])) {
             // A UNC file is its own root; nothing of the directory survives.
             copy_out(file);
-            return true;
+            return !over;
         }
         // Keep the directory's root, then the file without its separator.
         std::size_t root = 0;
@@ -712,7 +754,7 @@ template <typename C>
             root = 1;
         }
         for (std::size_t k = 0; k < root; ++k) {
-            out[k] = dir[k];
+            put(k, dir[k]);
         }
         const C* rest = file;
         while (is_sep(*rest)) {
@@ -720,12 +762,17 @@ template <typename C>
         }
         std::size_t n = root;
         while (*rest != static_cast<C>(0)) {
-            out[n++] = *rest++;
+            put(n, *rest);
+            ++rest;
+            ++n;
         }
-        out[n] = static_cast<C>(0);
-        return true;
+        put(n, static_cast<C>(0));
+        return !over;
     }
     copy_out(dir);
+    if (over) {
+        return false;
+    }
     return append(out, file);
 }
 

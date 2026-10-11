@@ -12,7 +12,6 @@
 // either do not carry at all, or carry behind a feature test that this
 // project does not want to depend on.
 
-#include <cstddef>
 #include <cstdint>
 
 #include <linux/bpf.h>
@@ -78,12 +77,13 @@ inline constexpr int kMntDetach = 2;
 
 // -------------------------------------------------------------------- seccomp
 //
-// SECCOMP_RET_* and the filter flag bits come from <linux/seccomp.h>. The
-// access-width bits in the low half of a return value are the exception:
-// they are undocumented in the header and are what makes a 64-bit argument
-// comparison safe against the x32 truncation trick.
+// SECCOMP_RET_* and the filter flag bits come from <linux/seccomp.h>, as does
+// SECCOMP_RET_DATA, the mask over the data field in the low half of a return
+// value. The two access-width codes below are the exception: they are this
+// project's own encoding and are not in the header, and they are what a
+// 64-bit argument comparison records when it has to say which width it
+// looked at.
 
-inline constexpr std::uint32_t kSeccompRetDataSizeMask = 0x0000ffffU;
 inline constexpr std::uint32_t kSeccompRetDataSize16 = 1U << 0;
 inline constexpr std::uint32_t kSeccompRetDataSize32 = 2U << 0;
 
@@ -104,10 +104,14 @@ inline constexpr std::uint32_t kAudArchX8664 = 0xc000003eU;
 // number is not diagnosable from the error.
 
 // -------------------------------------------------------------------- ptrace
+//
+// The request numbers and option bits are the kernel's UAPI values, taken
+// from the same numbering as the observer layer's own table. They are
+// restated here because this header is the one the isolation and runner
+// code can reach without pulling in the observer's types.
 
-inline constexpr unsigned long kPtraceTracerPid = 0x4200;
-inline constexpr unsigned long kPtracePeekData = 1;
-inline constexpr unsigned long kPtracePokeData = 2;
+inline constexpr unsigned long kPtracePeekData = 2;
+inline constexpr unsigned long kPtracePokeData = 5;
 inline constexpr unsigned long kPtraceCont = 7;
 inline constexpr unsigned long kPtraceKill = 8;
 inline constexpr unsigned long kPtraceSinglestep = 9;
@@ -129,14 +133,20 @@ inline constexpr unsigned long kPtraceGetSyscallInfo = 0x420e;
 // TRACEME is 0. Naming it makes the call sites readable.
 inline constexpr unsigned long kPtraceTraceme = 0;
 
+// The option word passed to PTRACE_SETOPTIONS. These are the kernel's
+// PTRACE_O_* bits, which are not the same as the TRACE_* event codes the
+// stops carry: TRACEFORK is 0x2 and TRACEEXIT is 0x40, and reading one as
+// the other enables the wrong events.
 inline constexpr std::uint64_t kPtraceOTraceSysgood = 0x00000001ULL;
-inline constexpr std::uint64_t kPtraceOTraceExit = 0x00000002ULL;
-inline constexpr std::uint64_t kPtraceOTraceFork = 0x00000004ULL;
-inline constexpr std::uint64_t kPtraceOTraceVFork = 0x00000008ULL;
-inline constexpr std::uint64_t kPtraceOTraceClone = 0x00000010ULL;
-inline constexpr std::uint64_t kPtraceOTraceExec = 0x00000020ULL;
-inline constexpr std::uint64_t kPtraceOTraceSeccomp = 0x00000040ULL;
-inline constexpr std::uint64_t kPtraceOTraceExitkill = 0x00000080ULL;
+inline constexpr std::uint64_t kPtraceOTraceFork = 0x00000002ULL;
+inline constexpr std::uint64_t kPtraceOTraceVFork = 0x00000004ULL;
+inline constexpr std::uint64_t kPtraceOTraceClone = 0x00000008ULL;
+inline constexpr std::uint64_t kPtraceOTraceExec = 0x00000010ULL;
+inline constexpr std::uint64_t kPtraceOTraceVForkDone = 0x00000020ULL;
+inline constexpr std::uint64_t kPtraceOTraceExit = 0x00000040ULL;
+inline constexpr std::uint64_t kPtraceOTraceSeccomp = 0x00000080ULL;
+inline constexpr std::uint64_t kPtraceOTraceExitkill = 0x00100000ULL;
+inline constexpr std::uint64_t kPtraceOSuspendSeccomp = 0x00200000ULL;
 
 // perf_event_attr comes from <linux/perf_event.h> in full. Only the size
 // constant and the breakpoint type are named here, because the kernel

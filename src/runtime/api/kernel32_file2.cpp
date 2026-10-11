@@ -122,7 +122,14 @@ std::vector<std::pair<std::uint64_t, FindState>>& find_table() noexcept {
     return table;
 }
 
-std::uint64_t g_next_find_handle = 0x4000;
+// The base of the find-handle range. It sits above the file handles rather
+// than inside their range: a find handle minted at the file base would be
+// read as a file descriptor by every call that takes a file handle, so a
+// walk passed to `ReadFile` would read whatever descriptor carried the same
+// number -- and the two families cannot share a number space that way.
+constexpr std::uint64_t kFindHandleBase = kFileHandleBase + kFileHandleSpan;
+
+std::uint64_t g_next_find_handle = kFindHandleBase;
 
 // The prefix a search pattern carries before its wildcard, which is the part
 // a host `readdir` cannot filter for. Everything after it is matched here.

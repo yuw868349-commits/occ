@@ -342,6 +342,15 @@ void write_section_characteristics(Json& json, std::uint32_t characteristics) {
 
 std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
                             const InspectOptions& options) {
+    // The contract: a parse that failed produces no document, because the
+    // numbers a report would be built from are the ones the parse refused
+    // to produce. The caller reports the failure through the parse's own
+    // error, and answering an empty string here is how it learns there is
+    // nothing to report -- reading a half-filled header would otherwise
+    // turn a refusal into a report of zeroes.
+    if (!image.ok()) {
+        return std::string();
+    }
     std::string out;
     out.reserve(64 * 1024);
     Json json(out);
@@ -395,7 +404,15 @@ std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
     // -- the optional header's security posture ----------------------------
     json.key("dll_characteristics");
     {
-        const std::uint32_t offset = lfanew + 24 + (plus ? 70 : 68);
+        // DllCharacteristics sits at the same offset in both optional-header
+        // layouts. The two layouts differ -- PE32 carries a 4-byte BaseOfData
+        // that PE32+ does not, and PE32+'s ImageBase is 8 bytes where PE32's
+        // is 4 -- but the two differences cancel exactly before this field:
+        // both reach SectionAlignment at offset 32, and every field from
+        // there to DllCharacteristics has the same width, so both reach it
+        // at 70. Reading PE32 at 68 instead lands on Subsystem, which turns
+        // the executable/gui distinction into invented ASLR, NX and CFG bits.
+        const std::uint32_t offset = lfanew + 24 + 70;
         const std::uint32_t characteristics =
             (in_file(file_size, offset, 2)) ? read_u16(file + offset) : 0;
         write_dll_characteristics(json, characteristics);
@@ -852,8 +869,15 @@ std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
                 std::uint32_t entries_total = 0;
                 // Level 1: types.
                 if (in_file(file_size, section->raw_offset, 16)) {
-                    const std::uint16_t named = read_u16(base + 2);
-                    const std::uint16_t ided = read_u16(base + 4);
+                    // IMAGE_RESOURCE_DIRECTORY carries four fields before its
+                    // two counts -- Characteristics, TimeDateStamp and the
+                    // two version words, eight bytes in all -- so
+                    // NumberOfNamedEntries is at +12 and NumberOfIdEntries at
+                    // +14, not at +2 and +4. Reading the version words as the
+                    // counts reports a resource table whose size came out of
+                    // a build stamp.
+                    const std::uint16_t named = read_u16(base + 12);
+                    const std::uint16_t ided = read_u16(base + 14);
                     const std::uint32_t type_count =
                         static_cast<std::uint32_t>(named) + ided;
                     for (std::uint32_t t = 0; t < type_count && t < 64; ++t) {
@@ -890,10 +914,13 @@ std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
                         json.key("entries");
                         json.begin_array();
                         if (is_directory && sub_offset + 16 <= section_span) {
+                            // The same layout as the type directory: the two
+                            // counts follow the eight-byte prefix, so they
+                            // are at +12 and +14.
                             const std::uint16_t named2 =
-                                read_u16(base + sub_offset + 2);
+                                read_u16(base + sub_offset + 12);
                             const std::uint16_t ided2 =
-                                read_u16(base + sub_offset + 4);
+                                read_u16(base + sub_offset + 14);
                             const std::uint32_t name_count =
                                 static_cast<std::uint32_t>(named2) + ided2;
                             for (std::uint32_t n = 0;
@@ -921,8 +948,18 @@ std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
                                         section_span) {
                                     const std::uint32_t lang_dir =
                                         lang_field & 0x7FFFFFFFu;
-                                    const std::uint16_t langs =
-                                        read_u16(base + lang_dir + 4);
+                                    // A language directory has the same
+                                    // prefix as the two above, so its counts
+                                    // are at +12 and +14; reading +4 lands
+                                    // on the build stamp's low half.
+                                    const std::uint16_t langs_named =
+                                        read_u16(base + lang_dir + 12);
+                                    const std::uint16_t langs_ided =
+                                        read_u16(base + lang_dir + 14);
+                                    const std::uint32_t langs =
+                                        static_cast<std::uint32_t>(
+                                            langs_named) +
+                                        langs_ided;
                                     json.key("languages");
                                     json.begin_array();
                                     for (std::uint32_t l = 0;

@@ -57,6 +57,7 @@
 #include "occ/runtime/winabi.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <thread>
@@ -549,8 +550,17 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32s_WaitForMultipleObjects(
     // The deadline is computed once, for the reason `take` gives.
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(milliseconds);
-    const std::uint64_t every =
-        (std::uint64_t(1) << count) - std::uint64_t(1);
+    // The mask of every object in the set. A shift by the width of the type is
+    // undefined, and a set of all sixty-four objects asks for exactly that:
+// `1 << 64` names no bit, and on a host that folds the shift the mask comes
+// out zero -- which makes an all-object wait behave like an any-object one
+    // and answers as soon as a single object releases. Every bit set is the
+    // answer the full-width case wants, and it is spelled rather than
+    // computed because there is no shift that produces it.
+    const std::uint64_t every = count == kMaxWaitObjects
+                                    ? ~std::uint64_t(0)
+                                    : (std::uint64_t(1) << count) -
+                                          std::uint64_t(1);
 
     for (;;) {
         // What this round has taken. It starts empty every time: an
@@ -646,39 +656,48 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32s_SignalObjectAndWait(
         return kWaitFailed;
     }
 
+    bool signal = false;
     {
         const std::lock_guard<std::mutex> guard(g_sync_lock);
         SyncRecord* const record = live_locked(signal_object);
-        if (record != nullptr) {
-            if (record->kind == SyncKind::Mutex) {
-                // Signalling a mutex is releasing it, which only its owner
-                // may do.
-                if (record->owner != current_thread_token() ||
-                    record->recursion == 0) {
-                    set_last_error(kErrorNotOwner);
-                    return kWaitFailed;
-                }
-                record->recursion -= 1;
-                if (record->recursion == 0) {
-                    record->owner = 0;
-                }
-            } else {
-                if (record->count >= record->maximum) {
-                    set_last_error(kErrorInvalidParameter);
-                    return kWaitFailed;
-                }
-                ++record->count;
+        if (record == nullptr) {
+            // A plain event: signalling it is `SetEvent`, performed below
+            // once the lock is released.
+            signal = true;
+        } else if (record->kind == SyncKind::Mutex) {
+            // Signalling a mutex is releasing it, which only its owner may
+            // do. The event underneath stands for "free", so it is set only
+            // when the owner's recursion count reaches zero. Setting it
+            // while the lock is still held would hand the mutex to a waiter
+            // that never took it, because `take` claims a mutex on the
+            // signal alone.
+            if (record->owner != current_thread_token() ||
+                record->recursion == 0) {
+                set_last_error(kErrorNotOwner);
+                return kWaitFailed;
             }
+            record->recursion -= 1;
+            if (record->recursion == 0) {
+                record->owner = 0;
+                signal = true;
+            }
+        } else {
+            if (record->count >= record->maximum) {
+                set_last_error(kErrorInvalidParameter);
+                return kWaitFailed;
+            }
+            ++record->count;
+            // A token is present, so the event standing for "at least one
+            // token" is signalled.
+            signal = true;
         }
     }
     // Signalled with the lock released, for the reason `put_back` gives. An
     // object with no record is an event, and signalling an event is
     // `SetEvent`.
-    if (!objects::set_event(signal_object)) {
-        // Not an event and not one of this file's synchronised objects, so
-        // there was nothing to signal. A semaphore whose count rose above
-        // zero is already signalled by construction; a mutex that went free
-        // likewise, so reaching here means the handle named neither.
+    if (signal && !objects::set_event(signal_object)) {
+        // A synchronised object's event always signals; reaching here means
+        // the handle named neither an event nor one of this file's objects.
         if (!is_synchronised(signal_object)) {
             set_last_error(kErrorInvalidHandle);
             return kWaitFailed;
@@ -1035,6 +1054,13 @@ struct WaitableTimer {
     std::atomic<bool> cancelled{false};
     std::atomic<bool> running{false};
     std::shared_ptr<WaitableTimer> self;
+    // The worker sleeps out the due time, which can be hours, so the sleep
+    // has to be interruptible: a re-set or a cancel wakes the worker through
+    // this condition rather than waiting for the clock, and the thread doing
+    // the arming waits here for `running` to drop before it starts a second
+    // worker onto the same event.
+    std::mutex wait_lock;
+    std::condition_variable wait_cv;
 };
 
 std::mutex& timer_lock() noexcept {
@@ -1048,21 +1074,21 @@ std::map<std::uint64_t, std::shared_ptr<WaitableTimer>>& timer_table() noexcept 
 }
 
 // The worker: wait out the due time, signal, and repeat for as long as a
-// period was set and nobody cancelled. One sleep at a time -- the check
-// between sleeps is what bounds a cancel's latency to one interval, which
-// is the same bound Windows promises and the same one a caller relies on
-// when it closes a timer it no longer wants firing.
+// period was set and nobody cancelled. The wait is on the timer's condition
+// rather than on the clock alone, so a re-set or a cancel ends it at once
+// instead of after a due time that can be hours away -- which is what keeps
+// the arming call from blocking on a sleep it cannot shorten.
 void timer_worker(std::shared_ptr<WaitableTimer> state,
                   std::uint64_t first_ms, std::uint32_t period_ms) noexcept {
     state->running = true;
-    const auto sleep_ms = [](std::uint64_t ms) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    };
     for (;;) {
-        if (state->cancelled) {
-            break;
+        {
+            std::unique_lock<std::mutex> lock(state->wait_lock);
+            // Wakes when the due time elapses or when `cancelled` is set,
+            // whichever comes first.
+            state->wait_cv.wait_for(lock, std::chrono::milliseconds(first_ms),
+                                    [&] { return state->cancelled.load(); });
         }
-        sleep_ms(first_ms);
         if (state->cancelled) {
             break;
         }
@@ -1080,6 +1106,9 @@ void timer_worker(std::shared_ptr<WaitableTimer> state,
         first_ms = period_ms;
     }
     state->running = false;
+    // Wake the thread arming or cancelling the timer, which is waiting for
+    // this to drop.
+    state->wait_cv.notify_all();
 }
 
 // The interval, in milliseconds, between now and the due time. A negative
@@ -1174,10 +1203,16 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32s_SetWaitableTimer(
     }
     // A set on a running timer restarts it: the old worker's cancellation
     // is what stops it, and a new one takes the new due time. This is the
-    // same observable behaviour a Windows set has.
-    state->cancelled = true;
-    while (state->running) {
-        std::this_thread::yield();
+    // same observable behaviour a Windows set has. The old worker may be
+    // sleeping out a due time that is hours away, so it is woken through the
+    // timer's condition rather than by spinning on its `running` flag; the
+    // wait then holds until that worker has actually stopped, which is what
+    // makes it safe to start its replacement onto the same event.
+    {
+        std::unique_lock<std::mutex> lock(state->wait_lock);
+        state->cancelled = true;
+        state->wait_cv.notify_all();
+        state->wait_cv.wait(lock, [&] { return !state->running.load(); });
     }
     state->cancelled = false;
     // The set below arms a timer whose event has to start unsignalled, and
@@ -1218,7 +1253,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32s_CancelWaitableTimer(
         set_last_error(kErrorInvalidHandle);
         return 0;
     }
+    // The cancel reaches a worker sleeping out a due time that can be hours
+    // away, so it is woken through the timer's condition rather than left to
+    // notice the flag when the clock next fires.
     state->cancelled = true;
+    state->wait_cv.notify_all();
     set_last_error(kErrorSuccess);
     return 1;
 }

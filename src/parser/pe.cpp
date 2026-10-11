@@ -1254,15 +1254,29 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                 // only this one would be invisible because the other would
                 // still hold.
 
-                // The ordinal. The base is added in a 64-bit temporary and
-                // then narrowed, which is what makes a file that claims a
-                // base near the top of the 32-bit range produce a report
-                // rather than a wrapped ordinal. A file may legitimately set
-                // the base to zero, and this honors that: ordinals then start
-                // at zero and the image is saying so.
+                // The ordinal. The sum is formed in 64 bits and then checked
+                // against the 32-bit field that holds it. Widening the
+                // addition alone is not enough: the field is 32 bits, so a
+                // base near the top of the range would still be narrowed and
+                // wrap, silently renaming every export past the wrap. Since
+                // the value cannot be represented, the file has stated an
+                // ordinal table this reader cannot report, and it is refused
+                // rather than reported with an ordinal that means something
+                // else. A base of zero is legal and stays honored: ordinals
+                // then start at zero and the image is saying so.
+                const std::uint64_t ordinal64 =
+                    static_cast<std::uint64_t>(i) + out.export_base_;
+                if (ordinal64 > 0xFFFFFFFFull) {
+                    return fail(
+                        PeError::BadExportTable,
+                        "the export directory's base is " +
+                            decimal(out.export_base_) +
+                            ", which pushes the address table's ordinal to " +
+                            decimal(ordinal64) +
+                            ", past the 32 bits an ordinal is held in");
+                }
                 e.rva = rva;
-                e.ordinal = static_cast<std::uint32_t>(
-                    static_cast<std::uint64_t>(i) + out.export_base_);
+                e.ordinal = static_cast<std::uint32_t>(ordinal64);
 
                 // The forwarder test, and it is an address comparison rather
                 // than a bit in the table because the format has no bit for

@@ -184,6 +184,35 @@ std::uint32_t g_wer_flags = 0;
     return true;
 }
 
+// The mask naming one processor, bounded by the same rule the set above
+// applies: an index at or above 64 cannot be named in the 64-bit word a
+// caller reads, and the shift that would try is undefined. A caller that
+// builds one record per processor checks through here first, so the shift it
+// then performs is one the width of the word can carry.
+[[nodiscard]] bool processor_mask(std::uint32_t cpu,
+                                  std::uint64_t& out) noexcept {
+    if (cpu >= 64) {
+        return false;
+    }
+    out = (1ull << cpu);
+    return true;
+}
+
+// Whether every processor the host offers can be named in a 64-bit mask. The
+// affinity call and the logical-processor records all carry that mask, so a
+// host with a processor at or above index 63 is refused by each of them
+// rather than shifting past the width of the word.
+[[nodiscard]] bool processors_are_nameable(
+    const std::vector<std::uint32_t>& cpus) noexcept {
+    std::uint64_t ignored = 0;
+    for (std::uint32_t cpu : cpus) {
+        if (!processor_mask(cpu, ignored)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 // -------------------------------------------------------- the environment
@@ -401,6 +430,14 @@ k32s2_GetLogicalProcessorInformation(void* buffer,
         return 0;
     }
     const std::vector<std::uint32_t> cpus = host_processor_set();
+    // Each record names its processor in a 64-bit mask, so a processor the
+    // mask cannot name is one this call cannot describe. The rule is the one
+    // `mask_from_processors` applies, and a host that reaches past index 63
+    // is refused rather than shifting past the width of the word.
+    if (!processors_are_nameable(cpus)) {
+        set_last_error(kErrorNotSupported);
+        return 0;
+    }
     // One record per processor core, each naming itself in the mask. The
     // relationship is "this mask is a core", which is what a caller that
     // wants to know how many cores it may run on reads.
@@ -444,6 +481,16 @@ k32s2_GetLogicalProcessorInformationEx(std::uint32_t relationship,
         return 0;
     }
     const std::vector<std::uint32_t> cpus = host_processor_set();
+    // A processor record names its processor in a 64-bit mask, so the same
+    // bound the other call applies is applied here before any shift: a host
+    // whose processors reach past index 63 is refused rather than shifting
+    // past the width of the word. A cache-only query builds no processor
+    // record and is not affected.
+    const bool processor_records = relationship != kRelationCache;
+    if (processor_records && !processors_are_nameable(cpus)) {
+        set_last_error(kErrorNotSupported);
+        return 0;
+    }
     // The Ex form groups by relationship, and the only relationship with a
     // record here is the processor one: this runtime reports no cache
     // topology, so a cache query answers the header-only size a caller sees

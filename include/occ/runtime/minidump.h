@@ -19,6 +19,10 @@
 
 #include <cstdint>
 #include <string>
+// For NGREG, which the assert under `Context` pins the register count to.
+// The platform header is pulled in for the count alone; the struct keeps its
+// own literal so its layout does not move with the platform's.
+#include <sys/ucontext.h>
 
 namespace occ::runtime::minidump {
 
@@ -35,6 +39,23 @@ struct Context {
     std::uint64_t regs[23] = {};
     bool valid = false;
 };
+
+// The count is a literal rather than NGREG on purpose. This struct's layout
+// is fixed by the MDMP format and the guest it describes, so a platform
+// header that grew or shrank its gregs set must not silently resize the
+// dump's register block -- the reader on the other end would be the first to
+// notice, with no way to tell which side moved. Pinning the literal to NGREG
+// here fails the build that hit the drift instead.
+//
+// It is an assert rather than a shared constant because the two headers that
+// carry a register block -- this one and guestdbg.h -- have no other reason
+// to depend on each other. Each reaches NGREG through the same platform
+// header and pins its own literal to it, so the two counts stay in step
+// without one including the other.
+static_assert(sizeof(((Context*)nullptr)->regs) /
+                      sizeof(((Context*)nullptr)->regs[0]) == NGREG,
+              "the minidump CONTEXT register count must match the platform's "
+              "gregs count");
 
 // Writes the dump. `image_base` and `image_size` name the guest's module;
 // `stack_base`/`stack_bytes` name the region of the guest's stack to

@@ -20,6 +20,12 @@ public:
     [[nodiscard]] constexpr std::size_t size() const noexcept { return size_; }
     [[nodiscard]] constexpr bool empty() const noexcept { return size_ == 0; }
 
+    // No bounds check, and that is the contract rather than an omission: it
+    // is the operator std::span has, and it leaves the precondition with the
+    // caller for the same reason. A check here would sit in every parser
+    // loop that has already established the index from a bounds test, so the
+    // cost would fall on the callers that are already correct. Calling this
+    // with i >= size() is undefined behavior, not an error return.
     [[nodiscard]] constexpr T& operator[](std::size_t i) const noexcept {
         return data_[i];
     }

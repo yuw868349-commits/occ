@@ -113,11 +113,20 @@ constexpr Ntstatus kStNotFound = 0xC0000225;
 // a null pointer.
 constexpr Ntstatus kStNoUnicodeTranslation = 0xC0000717;
 
-// The `BOOLEAN` a ntdll entry point takes and answers. One byte on Windows,
-// and a guest reads the low byte of the register either way, so the return
-// is widened to `int` and the argument narrowed to `int` -- which is what a
-// `BOOLEAN` in a register looks like from both sides.
-using Boolean = std::int32_t;
+// The `BOOLEAN` a ntdll entry point takes and answers: one byte, unsigned,
+// with 0 and 1 the two values.
+//
+// It has to be one byte on both sides, not merely in the return. A 32-bit
+// stand-in agrees with the truth in the return register -- ms_abi leaves the
+// answer in `AL` and a 32-bit read sees the same 0 or 1 -- but it disagrees
+// about every *argument*: a `BOOLEAN` parameter occupies the low byte of its
+// register slot with the other three undefined, and passing four bytes where
+// the caller passed one shifts nothing on x86-64 yet makes the callee's own
+// read a different width from the caller's write. A guest that reached one of
+// these through a function pointer typed with the real `BOOLEAN` is calling a
+// function whose signature does not match, which is undefined behaviour the
+// caller cannot detect and this type made more likely rather than less.
+using Boolean = std::uint8_t;
 constexpr Boolean kFalse = 0;
 constexpr Boolean kTrue = 1;
 
@@ -268,8 +277,14 @@ void* allocate_for_string(std::uint64_t bytes) noexcept {
     if (u == 0xFF) {
         return static_cast<char16_t>(0x178);
     }
-    // Latin Extended-A. The two runs are even/odd pairs; the capital is the
-    // odd one, so an even code point moves up and an odd one moves down.
+    // Latin Extended-A. The block alternates which parity is the capital,
+    // and it is not one rule for the whole range: U+0100 is `A` with a
+    // macron, so through U+0137 the even code point is the capital; U+0139
+    // begins a stretch where the odd one is, then U+014A turns back, and
+    // U+0179 turns again. The branch below carries the parity its own run
+    // needs, which is what the four cases are. (The block also has gaps --
+    // U+0138 and U+0149 -- which is why the runs are split where they are
+    // rather than one range with a rule.)
     if (u >= 0x0100 && u <= 0x0137) {
         return (u % 2 == 0) ? static_cast<char16_t>(u + 1)
                              : static_cast<char16_t>(c);

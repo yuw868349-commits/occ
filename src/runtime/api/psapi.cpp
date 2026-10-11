@@ -129,18 +129,25 @@ struct PerfInfo {
     // The fault count is the kernel's own cumulative answer.
     f = ::fopen("/proc/self/stat", "rb");
     if (f != nullptr) {
-        // The field layout is: pid (comm) state ppid ... minflt majflt...
-        // The ninth numeric field after the parenthesised name is
-        // `minflt`, the tenth `majflt`; the parse skips the name by
-        // scanning past its closing parenthesis.
+        // `/proc/self/stat` is `pid (comm) state ppid pgrp session tty_nr
+        // tpgid flags minflt cminflt majflt ...`. The `comm` field is
+        // parenthesised and may itself contain spaces and parentheses, so
+        // the parse finds the *last* `)` on the line: everything before it
+        // is the name, and the state and the numeric fields are all
+        // bracket-free. After the state character, six more numeric fields
+        // (ppid, pgrp, session, tty_nr, tpgid, flags) stand before
+        // `minflt`, which is the tenth field; `cminflt` follows it and
+        // `majflt` is the twelfth. A scan that stepped the wrong distance
+        // would report one of the earlier fields as the fault count.
         char line[512];
         if (::fgets(line, sizeof(line), f) != nullptr) {
-            const char* p = ::strchr(line, ')');
+            const char* p = ::strrchr(line, ')');
             if (p != nullptr) {
                 unsigned long minflt = 0;
+                unsigned long cminflt = 0;
                 unsigned long majflt = 0;
-                if (::sscanf(p + 2, "%*c %*d %lu %lu", &minflt, &majflt) >=
-                    2) {
+                if (::sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*d %lu %lu %lu",
+                             &minflt, &cminflt, &majflt) == 3) {
                     c.page_fault_count =
                         static_cast<std::uint32_t>(minflt + majflt);
                 }
@@ -298,6 +305,33 @@ extern "C" __attribute__((ms_abi)) std::uint32_t u32p_GetModuleFileNameExW(
     // implements its modules in place, and the path is the name -- there
     // is no file behind the module to name.
     return u32p_GetModuleBaseNameW(process, handle, out, size);
+}
+
+extern "C" __attribute__((ms_abi)) std::uint32_t u32p_GetModuleBaseNameA(
+    std::uint64_t process, std::uint64_t handle, char* out,
+    std::uint32_t size) noexcept {
+    if (out == nullptr || size == 0) {
+        set_last_error(kErrParam);
+        return 0;
+    }
+    // The wide spelling answers the name; the narrow spelling is that name
+    // in the runtime's narrow encoding, which is the same text a `W` answer
+    // carries. A narrow entry point bound to the wide body would fill the
+    // caller's byte buffer with UTF-16 and leave it looking at every other
+    // byte.
+    char16_t wide[64] = {};
+    const std::uint32_t got =
+        u32p_GetModuleBaseNameW(process, handle, wide, 64);
+    if (got == 0) {
+        return 0;
+    }
+    std::string narrow;
+    static_cast<void>(utf16_to_utf8(std::u16string_view(wide), narrow));
+    const std::size_t take =
+        std::min(narrow.size(), static_cast<std::size_t>(size) - 1);
+    std::memcpy(out, narrow.data(), take);
+    out[take] = '\0';
+    return static_cast<std::uint32_t>(take);
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t u32p_GetModuleInformation(
@@ -661,7 +695,7 @@ void add_psapi(ExportList& out) {
     e("GetProcessImageFileNameA",
       reinterpret_cast<void*>(&u32p_GetProcessImageFileNameA));
     // The `A`-side process and module queries the family also carries.
-    e("GetModuleBaseNameA", reinterpret_cast<void*>(&u32p_GetModuleBaseNameW));
+    e("GetModuleBaseNameA", reinterpret_cast<void*>(&u32p_GetModuleBaseNameA));
 }
 
 }  // namespace occ::runtime::winabi

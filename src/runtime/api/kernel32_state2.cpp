@@ -221,9 +221,14 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32t2_GetFileInformationByHandle
     std::memset(info, 0, 52);
     write_u32(info, 0, S_ISDIR(st.st_mode) ? 0x10u : 0x80u);
     const auto write_time = [&info](std::size_t at, const struct ::timespec& ts) {
+        // A FILETIME counts 100-nanosecond ticks from 1601, and the host's
+        // `timespec` counts seconds from 1970, so the host's count is
+        // *advanced* by the 1601-to-1970 gap before it is scaled. A
+        // conversion that subtracted the gap would name an instant three
+        // and a half centuries after the one the file carries.
         constexpr std::int64_t kEpoch = 11644473600;
         const std::int64_t ticks =
-            (static_cast<std::int64_t>(ts.tv_sec) - kEpoch) * 10000000 +
+            (static_cast<std::int64_t>(ts.tv_sec) + kEpoch) * 10000000 +
             static_cast<std::int64_t>(ts.tv_nsec) / 100;
         auto* bytes = static_cast<std::uint8_t*>(info);
         for (std::size_t k = 0; k < 8; ++k) {
@@ -235,10 +240,15 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32t2_GetFileInformationByHandle
     write_time(4, st.st_ctim);
     write_time(12, st.st_atim);
     write_time(20, st.st_mtim);
+    // BY_HANDLE_FILE_INFORMATION places the volume serial number after the
+    // three times at offset 28, and only then the size's two halves at 32
+    // and 36. A file's volume serial read out of the size-high slot is a
+    // number the caller compares handles with, and getting it wrong makes
+    // every such comparison answer the wrong question.
     const auto size = static_cast<std::uint64_t>(st.st_size);
-    write_u32(info, 28, static_cast<std::uint32_t>(size >> 32));
-    write_u32(info, 32, static_cast<std::uint32_t>(size & 0xFFFFFFFFu));
-    write_u32(info, 36, static_cast<std::uint32_t>(st.st_dev));
+    write_u32(info, 28, static_cast<std::uint32_t>(st.st_dev));
+    write_u32(info, 32, static_cast<std::uint32_t>(size >> 32));
+    write_u32(info, 36, static_cast<std::uint32_t>(size & 0xFFFFFFFFu));
     write_u32(info, 40, static_cast<std::uint32_t>(st.st_nlink));
     write_u32(info, 44, static_cast<std::uint32_t>(st.st_ino >> 32));
     write_u32(info, 48, static_cast<std::uint32_t>(st.st_ino & 0xFFFFFFFFu));
@@ -264,9 +274,11 @@ k32t2_GetFileInformationByHandleEx(void* file, std::uint32_t info_class,
         return 0;
     }
     const auto write_time = [&info](std::size_t at, const struct ::timespec& ts) {
+        // The same 1601-to-1970 advance the plain query performs: the host
+        // counts from 1970 and a FILETIME from 1601, so the gap is added.
         constexpr std::int64_t kEpoch = 11644473600;
         const std::int64_t ticks =
-            (static_cast<std::int64_t>(ts.tv_sec) - kEpoch) * 10000000 +
+            (static_cast<std::int64_t>(ts.tv_sec) + kEpoch) * 10000000 +
             static_cast<std::int64_t>(ts.tv_nsec) / 100;
         auto* bytes = static_cast<std::uint8_t*>(info);
         for (std::size_t k = 0; k < 8; ++k) {
