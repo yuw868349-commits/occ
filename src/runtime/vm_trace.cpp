@@ -43,9 +43,16 @@ struct DispatchRecord {
     std::uint64_t index;  // rax at dispatch
     std::uint64_t base;   // r12 at dispatch
     std::uint64_t target; // handler pointer read from the table
-    std::uint64_t rsi;
+    std::uint64_t rsi;    // bytecode cursor (VM state)
     std::uint64_t rdi;
     std::uint64_t rsp;
+    std::uint64_t rbp;    // virtual stack pointer (VM state)
+    // The virtual stack, as the guest holds it: the top slots at the
+    // dispatch are the operands the next handler consumes. Read from the
+    // guest's own memory, which is the one source that cannot lie.
+    std::uint64_t st0;
+    std::uint64_t st1;
+    std::uint64_t st2;
 };
 
 // The trace's switch and output, read once.
@@ -268,6 +275,21 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
         rec.rsi = static_cast<std::uint64_t>(g[REG_RSI]);
         rec.rdi = static_cast<std::uint64_t>(g[REG_RDI]);
         rec.rsp = static_cast<std::uint64_t>(g[REG_RSP]);
+        rec.rbp = static_cast<std::uint64_t>(g[REG_RBP]);
+
+        // The virtual stack, from the guest's own memory. The top slots
+        // are the operands the next handler consumes; recording them
+        // turns the trace into an operand-level record of the stream.
+        rec.st0 = 0;
+        rec.st1 = 0;
+        rec.st2 = 0;
+        if (rec.rbp >= 0x10000 && rec.rbp < 0x7ffffffff000ull) {
+            const auto* stack = reinterpret_cast<const std::uint64_t*>(
+                rec.rbp & ~7ull);
+            rec.st0 = stack[0];
+            rec.st1 = stack[1];
+            rec.st2 = stack[2];
+        }
 
         // The handler pointer is in the table the guest indexes: this
         // process maps the guest, so the read is a plain load from the
@@ -298,12 +320,14 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
                 g_to_stderr = true;
             }
         }
-        char line[320];
+        char line[400];
         const int n = std::snprintf(
             line, sizeof(line),
             "{\"kind\":\"dispatch\",\"seq\":%llu,\"va\":\"0x%llx\","
             "\"index\":\"0x%llx\",\"base\":\"0x%llx\",\"target\":\"0x%llx\","
-            "\"rsi\":\"0x%llx\",\"rdi\":\"0x%llx\",\"rsp\":\"0x%llx\"}\n",
+            "\"rsi\":\"0x%llx\",\"rdi\":\"0x%llx\",\"rsp\":\"0x%llx\","
+            "\"rbp\":\"0x%llx\",\"st0\":\"0x%llx\",\"st1\":\"0x%llx\","
+            "\"st2\":\"0x%llx\"}\n",
             static_cast<unsigned long long>(g_recorded),
             static_cast<unsigned long long>(rec.rip),
             static_cast<unsigned long long>(rec.index),
@@ -311,7 +335,11 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
             static_cast<unsigned long long>(rec.target),
             static_cast<unsigned long long>(rec.rsi),
             static_cast<unsigned long long>(rec.rdi),
-            static_cast<unsigned long long>(rec.rsp));
+            static_cast<unsigned long long>(rec.rsp),
+            static_cast<unsigned long long>(rec.rbp),
+            static_cast<unsigned long long>(rec.st0),
+            static_cast<unsigned long long>(rec.st1),
+            static_cast<unsigned long long>(rec.st2));
         if (g_to_stderr) {
             std::fprintf(stderr, "%s", line);
         } else if (g_file != nullptr) {
