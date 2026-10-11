@@ -16,6 +16,7 @@ VMP 3 virtual instruction format (this sample):
   visible as the guest's own API address appearing in the stack slots.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -32,6 +33,107 @@ API_TABLE = {
     0x7fdb7da3b360: "RtlCaptureContext",
     0x7fdb7da51700: "RtlLookupFunctionEntry",
 }
+
+def asm_label(handlers: dict, h: int) -> str:
+    """A short instruction name for a handler, inferred from its real
+    instruction text: vImm -> imm, vStack -> push/pop/load/store/op by
+    the actual mnemonic, vCall -> call, vRet -> ret."""
+    sem = handlers.get(h, [])
+    names: list[str] = []
+    for c, op in sem[:3]:
+        opn = op.lower().strip()
+        if c == "vImm":
+            names.append("imm")
+            continue
+        if c == "vStack":
+            if "pop" in opn:
+                names.append("pop")
+            elif "push" in opn:
+                names.append("push")
+            elif "call" in opn:
+                names.append("call")
+            elif "jmp" in opn:
+                names.append("jmp")
+            elif opn.startswith("j") and len(opn) > 1:
+                names.append("jcc")
+            elif "mov" in opn:
+                dst = opn.split("mov", 1)[1].strip().split(",")[0].strip()
+                names.append("store" if "[" in dst else "load")
+            elif "add" in opn:
+                names.append("add")
+            elif "sub" in opn:
+                names.append("sub")
+            elif "and" in opn:
+                names.append("and")
+            elif "or" in opn:
+                names.append("or")
+            elif "xor" in opn:
+                names.append("xor")
+            elif "dec" in opn:
+                names.append("dec")
+            elif "inc" in opn:
+                names.append("inc")
+            elif "cmp" in opn:
+                names.append("cmp")
+            elif "test" in opn:
+                names.append("test")
+            elif "shl" in opn or "shr" in opn or "sar" in opn:
+                names.append("shift")
+            elif "imul" in opn or "mul" in opn:
+                names.append("mul")
+            elif "neg" in opn:
+                names.append("neg")
+            elif "not" in opn:
+                names.append("not")
+            else:
+                names.append("op")
+            continue
+        names.append(c.lower())
+    return " ".join(names) or "?"
+
+
+def asm_mode(handlers: dict, rows: list, out: list, limit: int) -> None:
+    """Emit the trace as an assembly-like listing: per dispatch the
+    bytecode address, the handler's instruction name, and the operand
+    values observed in the virtual stack slots."""
+    out.append("")
+    out.append(f"assembly-like listing (first {limit or len(rows)} of "
+               f"{len(rows)} dispatches):")
+    out.append(f"{'#':<5}{'@rsi':<13}{'handler':<14}{'instr':<22}  operands")
+    out.append("-" * 78)
+    for r in rows[:limit if limit else len(rows)]:
+        h = rol(r["word"], 10)
+        label = asm_label(handlers, h)
+        ops = []
+        for slot in ("st0", "st1", "st2"):
+            v = r[slot]
+            if v:
+                name = api_name(v)
+                ops.append(name or f"0x{v:x}")
+        op_str = ", ".join(ops)
+        out.append(f"{r['seq']:<5}0x{r['rsi']:010x} 0x{h:010x}  {label:<22}  {op_str}")
+
+def load_api_map(path: str) -> dict:
+    """Read the address-to-name map the runtime dumps next to the image
+    (`.api`, JSON lines). The map moves with the host's ASLR, so a
+    baked-in table would not survive from one run to the next."""
+    table: dict[int, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "addr" in rec and "name" in rec:
+                    table[int(rec["addr"])] = str(rec["name"])
+    except OSError:
+        return {}
+    return table
+
 
 def api_name(addr: int) -> str:
     if addr in API_TABLE:
@@ -122,13 +224,19 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(2)
     trace_path, dump_path = sys.argv[1], sys.argv[2]
+    api_path = os.path.splitext(dump_path)[0] + ".api"
+    if os.path.exists(api_path):
+        API_TABLE.update(load_api_map(api_path))
     limit = 0
     report_path = None
+    asm_limit = 0
     args = sys.argv[3:]
     while args:
         a = args.pop(0)
         if a == "-o":
             report_path = args.pop(0)
+        elif a == "--asm":
+            asm_limit = int(args.pop(0)) if args and args[0].isdigit() else 0
         else:
             limit = int(a)
 
@@ -196,6 +304,9 @@ def main() -> None:
     emit(f"\nopcode histogram (all {len(rows)}):")
     for op, c in counts.most_common():
         emit(f"  {op:<14}{c}")
+
+    if asm_limit != 0 or "--asm" in sys.argv:
+        asm_mode(handlers, rows, lines, asm_limit)
 
     # Control flow: the bytecode cursor (rsi) advances by the length of
     # each virtual instruction; a jump larger than any instruction's

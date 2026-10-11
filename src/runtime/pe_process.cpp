@@ -15,6 +15,7 @@
 // Windows.
 
 #include "occ/runtime/pe_process.h"
+#include "occ/runtime/api_hook.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -1937,6 +1938,11 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                      vm_path.c_str());
         static_cast<void>(
             image_dump::dump(vm_trace::image_base(), vm_path, nullptr));
+        // The API map that names the addresses in the trace. The host's
+        // ASLR moves them every run, so the de-virtualizer reads this
+        // instead of a baked table.
+        const std::string api_path = image_dump::path() + ".api";
+        api_hook::dump_map(api_path.c_str());
     }
     if (filter != 0) {
         alignas(16) std::uint8_t context[kContextSize];

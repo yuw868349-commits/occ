@@ -192,6 +192,21 @@ const char* name_for_address(std::uint64_t address) noexcept {
     return g_names[it->second].c_str();
 }
 
+void dump_map(const char* path) noexcept {
+    FILE* out = ::fopen(path, "w");
+    if (out == nullptr) {
+        return;
+    }
+    for (const auto& [address, slot] : g_by_address) {
+        if (slot < g_names.size() && g_names[slot].size() < 4096) {
+            std::fprintf(out, "{\"addr\":%llu,\"name\":\"%s\"}\n",
+                         static_cast<unsigned long long>(address),
+                         g_names[slot].c_str());
+        }
+    }
+    ::fclose(out);
+}
+
 void note_trampoline(std::uint64_t address, std::uint32_t slot) noexcept {
     if (slot >= g_count || address == 0) {
         return;

@@ -67,6 +67,13 @@ extern "C" void occ_api_hook() noexcept;
 extern "C" void occ_api_note(std::uint64_t index, std::uint64_t a0,
                              std::uint64_t a1, std::uint64_t a2) noexcept;
 
+// Writes the address-to-name map as JSON lines ({"addr":N,"name":"..."})
+// to the given path, one line per known export. This is what lets an
+// offline tool (the de-virtualizer) name the API addresses it finds in a
+// VM trace run -- the addresses move with ASLR, so a baked-in table does
+// not survive from one run to the next.
+void dump_map(const char* path) noexcept;
+
 // The table the hook reads: slot to implementation address. Extern "C" and
 // a pointer rather than the array itself, so the assembly names one
 // symbol whose value the C++ side owns.
