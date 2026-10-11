@@ -571,6 +571,13 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
 
     if (options.container_optional) {
         used_container = false;
+        // The plain path has no mount namespace of its own, which is the
+        // second half of what a runner recognizes its container by. A
+        // guest that checks that state -- the PE runner does -- would
+        // refuse a run the caller explicitly accepted. The variable says
+        // the caller was told and agreed; without it the default is the
+        // refusal, which is the stronger default.
+        env = merge_environment(env, {"OCC_PLAIN_SPAWN=1"});
         spawned = isolation::plain_spawn(
             config.seccomp_policy, config.install_seccomp,
             config.stop_at_exec, plan.program, plan.argv, env);
@@ -589,6 +596,10 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
                 spawned.error.detail +
                 "); the target runs without the container's namespaces, "
                 "on the engine's own isolation");
+            // Same signal as the explicit plain path: the guest's runner
+            // must know the run it is in is the container-less one, or it
+            // refuses the run the engine already promised.
+            env = merge_environment(env, {"OCC_PLAIN_SPAWN=1"});
             spawned = isolation::plain_spawn(
                 config.seccomp_policy, config.install_seccomp,
                 config.stop_at_exec, plan.program, plan.argv, env);

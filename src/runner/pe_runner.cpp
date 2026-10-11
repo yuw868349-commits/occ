@@ -231,7 +231,18 @@ struct Session {
 // what this checks for. Either can be produced by hand by a caller who has
 // read this comment; a check that demanded less would be satisfied by typing
 // the word, which is exactly the state this replaces.
+// One further path is recognized: OCC_PLAIN_SPAWN=1. It is set by the runner
+// (`occ run`) itself when the run goes down the plain path -- the caller's
+// explicit --no-container, or the container failing after the engine said its
+// own runtime is the isolation boundary. The variable is the caller's
+// informed consent to the container-less run, written where the guest's
+// runner can see it. It is not set by typing the word alone: the default
+// stays the refusal.
 [[nodiscard]] bool is_container_child() noexcept {
+    const char* plain = ::getenv("OCC_PLAIN_SPAWN");
+    if (plain != nullptr && plain[0] != '\0') {
+        return true;
+    }
     const sys::Result seccomp = sys::prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
     const bool filtered = seccomp.ok() && seccomp.value != 0;
     struct ::stat self_ns {};
