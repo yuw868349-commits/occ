@@ -539,6 +539,15 @@ std::int32_t core_set_value(std::uint64_t base, std::u16string_view path,
     if (data == nullptr && bytes != 0) {
         return kStatusInvalidParameter;
     }
+    // The bytes are about to be read out of the guest's buffer, and the
+    // ledger is what says the buffer is the guest's to offer. A count that
+    // names memory past the runtime's own -- a value larger than the block
+    // the caller was given, or a pointer aimed outside it entirely -- is an
+    // argument error before it is a read, which is the same gate the query
+    // side runs on the buffers it writes into.
+    if (bytes != 0 && !guest_range_is_ours(data, bytes)) {
+        return kStatusInvalidParameter;
+    }
     RegValue* slot = at->find_value(name);
     if (slot == nullptr) {
         at->values.push_back(RegValue{std::u16string(name), type, {}});

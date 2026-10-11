@@ -1116,9 +1116,10 @@ void test_every_relocation_type_is_written_in_its_own_form() {
         // candidates differ, the value must be the rounded one.
         const std::uint16_t unrounded =
             expected_field(0x5678u, kAdjustment, delta32, 0);
-        if (static_cast<std::uint32_t>(
-                static_cast<std::int32_t>(0x5678u << 16) + kAdjustment +
-                delta32) < 0x8000u) {
+        if (static_cast<std::uint32_t>(0x5678u << 16) +
+                static_cast<std::uint32_t>(kAdjustment) +
+                static_cast<std::uint32_t>(delta32) <
+            0x8000u) {
             check(load_u16(text_va + kOff + 0x10) != unrounded,
                   "types: HIGHADJ's rounding term moved the field by one");
         } else {

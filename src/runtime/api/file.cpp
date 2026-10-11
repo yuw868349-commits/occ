@@ -33,6 +33,7 @@
 // over the character type, so the A and W forms cannot drift.
 
 #include "occ/runtime/api.h"
+#include "occ/runtime/containment.h"
 #include "occ/runtime/dos_path.h"
 #include "occ/runtime/winabi.h"
 
@@ -284,7 +285,7 @@ template <typename C>
         return kInvalidFileAttributes;
     }
     struct stat info {};
-    if (::stat(host.c_str(), &info) != 0) {
+    if (contained_stat(host.c_str(), info, /*follow=*/true) != 0) {
         set_last_error(error_from_errno(errno));
         return kInvalidFileAttributes;
     }
@@ -310,7 +311,7 @@ template <typename C>
         return 0;
     }
     struct stat info {};
-    if (::stat(host.c_str(), &info) != 0) {
+    if (contained_stat(host.c_str(), info, /*follow=*/true) != 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }
@@ -341,7 +342,7 @@ template <typename C>
     } else if (!names_only_unstored) {
         mode |= S_IWUSR;
     }
-    if (::chmod(host.c_str(), mode) != 0) {
+    if (contained_chmod(host.c_str(), mode) != 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }
@@ -370,7 +371,7 @@ template <typename C>
         return 0;
     }
     struct stat info {};
-    if (::stat(host.c_str(), &info) != 0) {
+    if (contained_stat(host.c_str(), info, /*follow=*/true) != 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }
@@ -419,7 +420,7 @@ template <typename C>
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    if (::mkdir(host.c_str(), 0777) != 0) {
+    if (contained_mkdir(host.c_str(), 0777) != 0) {
         set_last_error(errno == EEXIST ? kErrorAlreadyExists
                                        : error_from_errno(errno));
         return 0;
@@ -444,7 +445,7 @@ template <typename C>
         return 0;
     }
     struct stat info {};
-    if (::stat(host.c_str(), &info) != 0) {
+    if (contained_stat(host.c_str(), info, /*follow=*/true) != 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }
@@ -452,7 +453,7 @@ template <typename C>
         set_last_error(kErrorDirectoryNotEmpty);
         return 0;
     }
-    if (::rmdir(host.c_str()) != 0) {
+    if (contained_rmdir(host.c_str()) != 0) {
         set_last_error(errno == ENOTEMPTY ? kErrorDirectoryNotEmpty
                                           : error_from_errno(errno));
         return 0;
@@ -496,7 +497,7 @@ template <typename C>
         return 0;
     }
     struct stat info {};
-    if (::stat(host.c_str(), &info) != 0) {
+    if (contained_stat(host.c_str(), info, /*follow=*/true) != 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }
@@ -636,14 +637,14 @@ template <typename C>
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
-    const int in = ::open(source.c_str(), O_RDONLY);
+    const int in = contained_open(source.c_str(), O_RDONLY, 0);
     if (in < 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }
     const int flags =
         O_WRONLY | O_CREAT | (fail_if_exists != 0 ? O_EXCL : O_TRUNC);
-    const int out = ::open(dest.c_str(), flags, 0666);
+    const int out = contained_open(dest.c_str(), flags, 0666);
     if (out < 0) {
         ::close(in);
         set_last_error(errno == EEXIST ? kErrorFileExists
@@ -662,8 +663,8 @@ template <typename C>
     // restoring a file from a backup expects and what the host's `open`
     // would otherwise replace with the process's default.
     struct stat info {};
-    if (::stat(source.c_str(), &info) == 0) {
-        ::chmod(dest.c_str(), info.st_mode & 07777);
+    if (contained_stat(source.c_str(), info, /*follow=*/true) == 0) {
+        (void)contained_chmod(dest.c_str(), info.st_mode & 07777);
     }
     set_last_error(0);
     return 1;
@@ -695,7 +696,7 @@ template <typename C>
     }
     constexpr std::uint32_t kReplaceExisting = 0x00000001;
     struct stat info {};
-    if (::stat(dest.c_str(), &info) == 0) {
+    if (contained_stat(dest.c_str(), info, /*follow=*/true) == 0) {
         if ((flags & kReplaceExisting) == 0) {
             set_last_error(kErrorAlreadyExists);
             return 0;
@@ -707,7 +708,7 @@ template <typename C>
             return 0;
         }
     }
-    if (::rename(source.c_str(), dest.c_str()) == 0) {
+    if (contained_rename(source.c_str(), dest.c_str()) == 0) {
         set_last_error(0);
         return 1;
     }
@@ -720,12 +721,12 @@ template <typename C>
     // failure to read the source leaves no new name behind, and the partial
     // destination is removed on a copy that fails part way, because a name
     // holding half a file is a worse answer than the failure itself.
-    const int in = ::open(source.c_str(), O_RDONLY);
+    const int in = contained_open(source.c_str(), O_RDONLY, 0);
     if (in < 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }
-    const int out = ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    const int out = contained_open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out < 0) {
         ::close(in);
         set_last_error(error_from_errno(errno));
@@ -736,17 +737,17 @@ template <typename C>
     ::close(in);
     ::close(out);
     if (!copied) {
-        ::unlink(dest.c_str());
+        (void)contained_unlink(dest.c_str());
         set_last_error(error_from_errno(saved));
         return 0;
     }
     // The copy carries the source's permissions, as `CopyFile` does, so that
     // the moved name keeps the mode it had before the move.
     struct stat source_info {};
-    if (::stat(source.c_str(), &source_info) == 0) {
-        ::chmod(dest.c_str(), source_info.st_mode & 07777);
+    if (contained_stat(source.c_str(), source_info, /*follow=*/true) == 0) {
+        (void)contained_chmod(dest.c_str(), source_info.st_mode & 07777);
     }
-    if (::unlink(source.c_str()) != 0) {
+    if (contained_unlink(source.c_str()) != 0) {
         set_last_error(error_from_errno(errno));
         return 0;
     }

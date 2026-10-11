@@ -232,6 +232,24 @@ struct Surface {
     }
 };
 
+// The depths a DIB's own header may name. Anything else in `biBitCount` --
+// zero, three, seventeen -- is a value no real DIB carries, and letting it
+// through would put it in the stride and the allocation before anyone had
+// asked whether the copy it shapes is one the caller could have backed.
+[[nodiscard]] bool dib_depth_is_supported(int bpp) noexcept {
+    switch (bpp) {
+    case 1:
+    case 4:
+    case 8:
+    case 16:
+    case 24:
+    case 32:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The stride a DIB of the given shape takes: each scan line padded to a
 // four-byte boundary, which is the rule the format fixes.
 [[nodiscard]] int dib_stride(int width, int bpp) noexcept {
@@ -1727,6 +1745,15 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_CreateDIBSection(
         set_last_error(kErrParam);
         return 0;
     }
+    // The header is read before the shape it names is acted on, and read
+    // only if the ledger backs the forty bytes the `BITMAPINFOHEADER` is --
+    // the same gate `SetDIBits` and `GetDIBits` run, without which a guest
+    // pointer aimed just short of the runtime's memory would be read for a
+    // header it never owned.
+    if (!guest_range_is_ours(info, kBitmapInfoHeaderBytes)) {
+        set_last_error(kErrParam);
+        return 0;
+    }
     const auto* p = static_cast<const std::uint8_t*>(info);
     BitmapInfoHeader hdr;
     hdr.size = read_u32(p, 0);
@@ -1742,7 +1769,16 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_CreateDIBSection(
     }
     const bool top_down = hdr.height < 0;
     const int height = top_down ? -hdr.height : hdr.height;
+    // Zero is a depth the reference accepts -- it is how a 16-bpp DIB says
+    // "default" -- but no other value outside the depths a DIB can carry
+    // is: a bit count of three or of four hundred would reach the stride
+    // and the pixel formats below it as a shape nothing else in this
+    // runtime knows how to read.
     const int bpp = hdr.bit_count == 0 ? 1 : hdr.bit_count;
+    if (!dib_depth_is_supported(bpp)) {
+        set_last_error(kErrParam);
+        return 0;
+    }
 
     GdiState& s = gdi();
     const Lock l(s.lock);
@@ -3468,16 +3504,39 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_StretchDIBits(
         bits == nullptr) {
         return kFalse;
     }
+    // The same ledger the other DIB entries run. `info` is the header the
+    // depth and the shape below are read out of, so it is checked before
+    // either is read; the pixel array is `stride * |hs|` bytes with both
+    // factors shaped by the header, so the product is taken in sixty-four
+    // bits, bounded by the largest DIB this runtime builds, and checked
+    // against the ledger -- which is also what bounds a `bits` pointer the
+    // guest pointed at a buffer smaller than the header claims. The
+    // dimensions are refused at their own gates: a zero or negative source
+    // names no pixels, a zero destination draws none, and a depth no real
+    // DIB carries is a malformed header, all answers the reference gives
+    // as zero rather than as a draw.
+    if (!guest_range_is_ours(info, kBitmapInfoHeaderBytes)) {
+        return kFalse;
+    }
     const auto* p = static_cast<const std::uint8_t*>(info);
     const int bpp = read_u16(p, 14);
+    if (ws <= 0 || hs == 0 || wd == 0 || hd == 0 ||
+        !dib_depth_is_supported(bpp)) {
+        return 0;
+    }
     const int stride = dib_stride(ws, bpp);
+    const std::uint64_t need =
+        static_cast<std::uint64_t>(stride) *
+        static_cast<std::uint64_t>(std::abs(hs));
+    if (need > kMaxDibBytes || !guest_range_is_ours(bits, need)) {
+        return kFalse;
+    }
     Surface temp;
     temp.w = ws;
     temp.h = std::abs(hs);
     temp.bpp = bpp;
     temp.stride = stride;
-    temp.owned.assign(static_cast<std::size_t>(stride) *
-                          static_cast<std::size_t>(temp.h), 0);
+    temp.owned.assign(static_cast<std::size_t>(need), 0);
     std::memcpy(temp.owned.data(), bits, temp.owned.size());
     default_palette_for(temp);
     for (int yy = 0; yy < std::abs(hd); ++yy) {

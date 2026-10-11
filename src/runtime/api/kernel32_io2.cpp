@@ -20,6 +20,7 @@
 
 #include "occ/runtime/api.h"
 #include "occ/runtime/api_common.h"
+#include "occ/runtime/containment.h"
 #include "occ/runtime/dos_path.h"
 #include "occ/runtime/winabi.h"
 
@@ -250,7 +251,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32io2_SetFileInformationByHandl
                 return 0;
             }
             resolved[got] = '\0';
-            if (::unlink(resolved) != 0) {
+            if (contained_unlink(resolved) != 0) {
                 set_last_error(kErrorAccessDenied);
                 return 0;
             }
@@ -289,7 +290,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32io2_SetFileInformationByHandl
             // is in when the caller gave a relative path, and the call
             // replaces an existing file only when the flag says so.
             const std::uint8_t replace = read_u8(info, kRenameReplaceIfExists);
-            if (replace == 0 && ::access(host.c_str(), F_OK) == 0) {
+            if (replace == 0 && contained_access(host.c_str(), F_OK) == 0) {
                 set_last_error(kErrorAlreadyExists);
                 return 0;
             }
@@ -302,7 +303,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32io2_SetFileInformationByHandl
                 return 0;
             }
             resolved[got] = '\0';
-            if (::rename(resolved, host.c_str()) != 0) {
+            if (contained_rename(resolved, host.c_str()) != 0) {
                 set_last_error(kErrorAccessDenied);
                 return 0;
             }

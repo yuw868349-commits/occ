@@ -52,10 +52,12 @@ std::string from_dos_path(std::string_view dos_path) {
     // the bind mount the container built.
     //
     // This is the lexical half of the containment. The other half is the
-    // kernel's: a symlink inside the root that points outside it still
-    // resolves outside unless the open goes through `openat` with
-    // `RESOLVE_BENEATH`, and that belongs at the call sites, which this
-    // hands a name to rather than a descriptor.
+    // kernel's, and it lives in `containment.h`: a symlink inside the root
+    // that points outside it still resolves outside unless the open goes
+    // through `openat2` with `RESOLVE_BENEATH` (or, on a kernel without
+    // that call, through the walker there). Every call site that turns the
+    // name this hands back into a file-system operation must go through
+    // that layer rather than open the name directly.
     std::vector<std::string_view> segments;
     std::size_t at = 0;
     for (;;) {

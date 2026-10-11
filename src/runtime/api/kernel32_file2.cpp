@@ -21,6 +21,7 @@
 
 #include "occ/runtime/api.h"
 #include "occ/runtime/api_common.h"
+#include "occ/runtime/containment.h"
 #include "occ/runtime/dos_path.h"
 #include "occ/runtime/winabi.h"
 
@@ -229,7 +230,7 @@ void write_wide_name(void* entry, std::size_t offset, std::size_t chars,
 [[nodiscard]] bool fill_find_entry(void* entry, const std::string& host_path,
                                    const char* name) noexcept {
     struct ::stat st {};
-    if (::stat(host_path.c_str(), &st) != 0) {
+    if (contained_stat(host_path.c_str(), st, /*follow=*/true) != 0) {
         return false;
     }
     std::memset(entry, 0, kFindBytes);
@@ -395,7 +396,21 @@ extern "C" __attribute__((ms_abi)) void* k32f2_FindFirstFileExW(
             return reinterpret_cast<void*>(kInvalidHandleValue64);
         }
     }
-    DIR* dir = ::opendir(host_dir.c_str());
+    // The directory is opened confined, then handed to `fdopendir`: the
+    // enumeration reads the names under a descriptor that cannot resolve
+    // out of the root, exactly as every other guest-file operation does.
+    DIR* dir = nullptr;
+    {
+        const int dirfd =
+            contained_open(host_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+                           0);
+        if (dirfd >= 0) {
+            dir = ::fdopendir(dirfd);
+            if (dir == nullptr) {
+                ::close(dirfd);
+            }
+        }
+    }
     if (dir == nullptr) {
         set_last_error(kErrorPathNotFound);
         return reinterpret_cast<void*>(kInvalidHandleValue64);
@@ -509,7 +524,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32f2_GetLongPathNameW(
         return 0;
     }
     const std::string host = from_dos_path(narrow);
-    if (host.empty() || ::access(host.c_str(), F_OK) != 0) {
+    if (host.empty() || contained_access(host.c_str(), F_OK) != 0) {
         set_last_error(kErrorFileNotFound);
         return 0;
     }

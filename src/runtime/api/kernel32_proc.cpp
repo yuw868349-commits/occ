@@ -1727,6 +1727,12 @@ namespace {
         set_last_error(kErrorInsufficientBuffer);
         return false;
     }
+    // The same contract `toolhelp_next` states: the cursor is the one field
+    // the snapshot's lock guards, and a read-modify-write of it is exactly
+    // the window two threads racing through one heap-list walk would turn
+    // into a skipped or repeated entry. The lock is held from the first
+    // read of the cursor to the last write of it.
+    const std::lock_guard<std::mutex> held(snapshot->lock);
     if (snapshot->cursor >= snapshot->heaps.size()) {
         set_last_error(kErrorNoMoreFiles);
         return false;

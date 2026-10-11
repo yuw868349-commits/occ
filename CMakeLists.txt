@@ -573,6 +573,7 @@ add_library(occ_core STATIC
     src/runner/pe_runner.cpp
     src/runtime/address_space.cpp
     src/runtime/dos_path.cpp
+    src/runtime/containment.cpp
     src/runtime/mapper.cpp
     src/runtime/loader.cpp
     src/runtime/exports.cpp

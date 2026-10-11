@@ -17,6 +17,7 @@
 // `api-ms-win-crt-string-l1-1-0.dll` actually asks for.
 
 #include "occ/runtime/api.h"
+#include "occ/runtime/containment.h"
 #include "occ/runtime/dos_path.h"
 #include "occ/runtime/winabi.h"
 
@@ -1911,11 +1912,11 @@ struct ParsedCommand {
         const std::string host = from_dos_path(redirection.path);
         int fd = -1;
         if (redirection.stream == 0) {
-            fd = ::open(host.c_str(), O_RDONLY);
+            fd = contained_open(host.c_str(), O_RDONLY, 0);
         } else {
             const int flags =
                 O_WRONLY | O_CREAT | (redirection.append ? O_APPEND : O_TRUNC);
-            fd = ::open(host.c_str(), flags, 0666);
+            fd = contained_open(host.c_str(), flags, 0666);
         }
         if (fd < 0) {
             if (in_fd >= 0) {
