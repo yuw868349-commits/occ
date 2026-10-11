@@ -15,6 +15,7 @@
 // three-part form decodes literal bytes, which is how a hook's prologue is
 // analyzed without a file at all.
 
+#include "occ/inspect/analysis.h"
 #include "occ/inspect/disasm.h"
 #include "occ/inspect/inspect.h"
 #include "occ/parser/pe.h"
@@ -52,6 +53,8 @@ int occ::cmd_inspect(int argc, char** argv) {
     std::uint32_t disasm_count = 64;
     std::vector<std::uint8_t> disasm_bytes;
     std::uint64_t disasm_base = 0;
+    bool want_analyze = false;
+    bool lean = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -59,6 +62,19 @@ int occ::cmd_inspect(int argc, char** argv) {
             options.strings = false;
         } else if (std::strcmp(arg, "--strings") == 0) {
             options.strings = true;
+        } else if (std::strcmp(arg, "--analyze") == 0) {
+            // The analysis document: functions, xrefs, call graph and the
+            // names the image gives itself, in place of the structural
+            // report. One command, two documents -- the report answers
+            // "what is in this file", the analysis answers "what does it
+            // do" -- and a caller who wants the second says so.
+            want_analyze = true;
+        } else if (std::strcmp(arg, "--lean") == 0) {
+            // With --disasm: the instruction list and nothing else. The
+            // report that usually rides beside it is noise to a script
+            // that asked for instructions, and noise is what --lean
+            // leaves out.
+            lean = true;
         } else if (std::strcmp(arg, "--disasm") == 0 && i + 1 < argc) {
             want_disasm = true;
             ++i;
@@ -118,6 +134,21 @@ int occ::cmd_inspect(int argc, char** argv) {
         }
     }
 
+    // The raw byte form is a decode of bytes the caller typed, and it
+    // needs no file: reading `path` before checking for it made the mode
+    // that exists precisely to analyze a prologue without an image refuse
+    // to start without one.
+    if (want_disasm && !disasm_bytes.empty()) {
+        std::fputs(occ::inspect::x64_disassemble_json(
+                       occ::ByteSpan{disasm_bytes.data(),
+                                           disasm_bytes.size()},
+                       disasm_base, disasm_count)
+                       .c_str(),
+                   stdout);
+        std::fputc('\n', stdout);
+        return 0;
+    }
+
     auto bytes = occ::fs::read_file_bytes(path);
     if (!bytes || bytes->empty()) {
         return inspect_failure("the file could not be read", path);
@@ -137,24 +168,24 @@ int occ::cmd_inspect(int argc, char** argv) {
         return 2;
     }
 
-    // The structural report, or -- with --disasm and no byte form -- the
-    // disassembly of a range inside the image. Both are one JSON document
-    // on stdout, because jq is the interface.
-    if (want_disasm && !disasm_bytes.empty()) {
-        std::fputs(occ::inspect::x64_disassemble_json(
-                       occ::ByteSpan{disasm_bytes.data(),
-                                           disasm_bytes.size()},
-                       disasm_base, disasm_count)
-                       .c_str(),
+    // The structural report, the analysis document, or -- with --disasm
+    // and no byte form -- the disassembly of a range inside the image.
+    // Each is one JSON document on stdout, because jq is the interface.
+    // --lean drops the report and leaves only the disassembly; --analyze
+    // swaps the report for functions, xrefs and the call graph.
+    if (want_analyze) {
+        std::fputs(occ::inspect::analyze_pe_json(image, span).c_str(),
                    stdout);
         std::fputc('\n', stdout);
         return 0;
     }
 
-    const std::string report =
-        occ::inspect::inspect_pe_json(image, span, options);
-    std::fputs(report.c_str(), stdout);
-    std::fputc('\n', stdout);
+    if (!lean) {
+        const std::string report =
+            occ::inspect::inspect_pe_json(image, span, options);
+        std::fputs(report.c_str(), stdout);
+        std::fputc('\n', stdout);
+    }
 
     if (want_disasm) {
         // The disassembly rides in its own document, after the report: two

@@ -1329,6 +1329,141 @@ std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
                 json.end_object();
             }
         }
+        // Packer fingerprints. Three signals, kept separate so a reader can
+        // weigh each: the section names the packers leave behind, the
+        // suspicious-import combination a packer needs, and -- already
+        // reported above -- the entropy of the code it leaves. No one
+        // signal is a conclusion; the observation names what fired.
+        {
+            static const char* const packer_sections[] = {
+                ".vmp0", ".vmp1", ".vmp2", ".themida", ".upx0", ".upx1",
+                ".upx2", ".aspack", ".adata", ".enigma1", ".enigma2",
+                ".petite", ".nsp0", ".nsp1", ".nspack", ".y0da",
+            };
+            std::vector<const char*> named;
+            for (const parser::PeSection& s : image.sections()) {
+                for (const char* suspect : packer_sections) {
+                    if (s.name == suspect) {
+                        named.push_back(suspect);
+                    }
+                }
+            }
+            if (!named.empty()) {
+                json.begin_object();
+                json.key("kind");
+                json.value("packer_section_names");
+                json.key("sections");
+                json.begin_array();
+                for (const char* name : named) {
+                    json.value(name);
+                }
+                json.end_array();
+                json.end_object();
+            }
+            // The import combination a packer cannot do without: unpack
+            // into new memory, make it executable, resolve the real API
+            // by name. Few imports with all three present is the shape a
+            // packed image has -- the real imports do not exist until the
+            // unpacker has run.
+            {
+                bool alloc = false;
+                bool protect = false;
+                bool load = false;
+                bool resolve = false;
+                std::size_t total = 0;
+                for (const std::string& name : image.imports()) {
+                    ++total;
+                    if (name == "VirtualAlloc" || name == "VirtualAllocEx") {
+                        alloc = true;
+                    }
+                    if (name == "VirtualProtect" ||
+                        name == "VirtualProtectEx") {
+                        protect = true;
+                    }
+                    if (name == "LoadLibraryA" || name == "LoadLibraryW" ||
+                        name == "LoadLibraryExA" ||
+                        name == "LoadLibraryExW") {
+                        load = true;
+                    }
+                    if (name == "GetProcAddress") {
+                        resolve = true;
+                    }
+                }
+                if (alloc && protect && load && resolve && total < 32) {
+                    json.begin_object();
+                    json.key("kind");
+                    json.value("packer_import_fingerprint");
+                    json.key("imports");
+                    json.value(static_cast<std::uint64_t>(total));
+                    json.key("reason");
+                    json.value(
+                        "VirtualAlloc + VirtualProtect + LoadLibrary + "
+                        "GetProcAddress with few imports: the shape of an "
+                        "unpacker stub");
+                    json.end_object();
+                }
+            }
+        }
+        // TLS callbacks: code the loader runs before the entry point. The
+        // directory names the callback array; the array is read until its
+        // zero terminator, and every address it holds is reported -- it is
+        // where anti-debug code hides from a reader who only looks at the
+        // entry.
+        if (directory_rva[9] != 0 && directory_size[9] != 0) {
+            std::uint64_t tls_offset = 0;
+            if (image.to_file_offset(directory_rva[9], tls_offset) &&
+                in_file(file_size, tls_offset, plus ? 40 : 24)) {
+                // AddressOfCallBacks is a VA; the directory's own fields
+                // are VAs, sized by the optional header format.
+                const std::uint64_t callbacks_va =
+                    plus ? read_u64(file + tls_offset + 24)
+                         : read_u32(file + tls_offset + 12);
+                if (callbacks_va != 0) {
+                    // To read the array the VA has to come back to an RVA,
+                    // which for a linked image is the VA minus the base --
+                    // relocated images carry the pre-relocation value in
+                    // the file, which is the one that names the array.
+                    const std::uint64_t callbacks_rva =
+                        callbacks_va >= image.image_base()
+                            ? callbacks_va - image.image_base()
+                            : callbacks_va;
+                    std::uint64_t array_offset = 0;
+                    if (image.to_file_offset(callbacks_rva, array_offset)) {
+                        std::vector<std::uint64_t> callbacks;
+                        for (std::uint32_t i = 0; i < 1024; ++i) {
+                            const std::uint64_t slot =
+                                array_offset +
+                                static_cast<std::uint64_t>(i) * (plus ? 8 : 4);
+                            if (!in_file(file_size, slot, plus ? 8 : 4)) {
+                                break;
+                            }
+                            const std::uint64_t callback =
+                                plus ? read_u64(file + slot)
+                                     : read_u32(file + slot);
+                            if (callback == 0) {
+                                break;
+                            }
+                            callbacks.push_back(callback);
+                        }
+                        if (!callbacks.empty()) {
+                            json.begin_object();
+                            json.key("kind");
+                            json.value("tls_callbacks");
+                            json.key("count");
+                            json.value(
+                                static_cast<std::uint64_t>(callbacks.size()));
+                            json.key("addresses");
+                            json.begin_array();
+                            for (const std::uint64_t cb : callbacks) {
+                                json.hex(cb);
+                            }
+                            json.end_array();
+                            json.end_object();
+                        }
+                    }
+                }
+            }
+        }
         // An image with a .managed section and a hydrated one is an AOT
         // .NET binary: noted, because the analysis approach differs.
         json.end_array();

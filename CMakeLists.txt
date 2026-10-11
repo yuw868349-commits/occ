@@ -586,6 +586,7 @@ add_library(occ_core STATIC
     src/runtime/guest_tls.cpp
     src/runtime/guest_module.cpp
     src/inspect/inspect.cpp
+    src/inspect/analysis.cpp
     src/inspect/disasm.cpp
     src/runtime/api_common.cpp
     src/runtime/api_hook.cpp

@@ -542,6 +542,958 @@ std::uint32_t x64_instruction_length(const std::uint8_t* bytes,
     }
 }
 
+// The names the group opcodes resolve to, by the /digit their reg field
+// carries. These are the real mnemonics: `grp1` was the decoder's honest
+// admission that it had not read the reg field, and reading it is the
+// difference between a length decoder and a semantic one.
+[[nodiscard]] const char* group1_name(std::uint8_t reg) noexcept {
+    static const char* const names[8] = {"add", "or",  "adc", "sbb",
+                                         "and", "sub", "xor", "cmp"};
+    return names[reg & 7];
+}
+
+[[nodiscard]] const char* group3_name(std::uint8_t reg) noexcept {
+    // The grp3 encoding: /0 and /1 are both test (one reads an immediate),
+    // then not, neg, and the four arithmetic pairs.
+    static const char* const names[8] = {"test", "test", "not", "neg",
+                                         "mul",  "imul", "div", "idiv"};
+    return names[reg & 7];
+}
+
+[[nodiscard]] const char* shift_name(std::uint8_t reg) noexcept {
+    static const char* const names[8] = {"rol", "ror", "rcl", "rcr",
+                                         "shl", "shr", "sal", "sar"};
+    return names[reg & 7];
+}
+
+[[nodiscard]] const char* jcc_name(std::uint8_t cc) noexcept {
+    static const char* const names[16] = {
+        "jo",  "jno", "jb",  "jae", "je",  "jne", "jbe", "ja",
+        "js",  "jns", "jp",  "jnp", "jl",  "jge", "jle", "jg"};
+    return names[cc & 15];
+}
+
+// The cmov and set spellings put the condition after the family, and the
+// two families use the same sixteen conditions.
+[[nodiscard]] const char* condition_suffix(std::uint8_t cc) noexcept {
+    static const char* const names[16] = {
+        "o",  "no", "b",  "ae", "e",  "ne", "be", "a",
+        "s",  "ns", "p",  "np", "l",  "ge", "le", "g"};
+    return names[cc & 15];
+}
+
+// -- the register tables -----------------------------------------------------
+//
+// Sixteen entries each, indexed by the three reg/rm bits plus the REX
+// extension bit. The 8-bit table has the split the manual defines: with a
+// REX prefix present the high-byte names are gone and spl/bpl/sil/dil
+// replace them, which is why the table is chosen by whether a REX walked
+// past, not by the instruction alone.
+
+const char* const kReg64[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp",
+                                "rsi", "rdi", "r8",  "r9",  "r10", "r11",
+                                "r12", "r13", "r14", "r15"};
+const char* const kReg32[16] = {"eax", "ecx", "edx", "ebx", "esp", "ebp",
+                                "esi", "edi", "r8d", "r9d", "r10d", "r11d",
+                                "r12d", "r13d", "r14d", "r15d"};
+const char* const kReg16[16] = {"ax", "cx", "dx", "bx", "sp", "bp",
+                                "si", "di", "r8w", "r9w", "r10w", "r11w",
+                                "r12w", "r13w", "r14w", "r15w"};
+const char* const kReg8Rex[16] = {"al", "cl", "dl", "bl", "spl", "bpl",
+                                  "sil", "dil", "r8b", "r9b", "r10b", "r11b",
+                                  "r12b", "r13b", "r14b", "r15b"};
+const char* const kReg8[8] = {"al", "cl", "dl", "bl", "ah", "ch", "dh", "bh"};
+
+[[nodiscard]] const char* reg_name(std::uint8_t index, int size,
+                                   bool rex_present) noexcept {
+    switch (size) {
+    case 8:
+        return kReg64[index & 15];
+    case 4:
+        return kReg32[index & 15];
+    case 2:
+        return kReg16[index & 15];
+    case 1:
+        return rex_present ? kReg8Rex[index & 15] : kReg8[index & 7];
+    default:
+        return "?";
+    }
+}
+
+// The renderer. It writes into `out` -- the caller's fixed buffer -- and
+// answers false when the form is one it does not cover, in which case the
+// caller leaves the operands empty. An operand line this decoder is unsure
+// of is worse than no line.
+struct OperandWriter {
+    char* out;
+    std::size_t cap;
+    std::size_t used = 0;
+
+    bool put(const char* text) {
+        while (*text != '\0') {
+            if (used + 1 >= cap) {
+                return false;
+            }
+            out[used++] = *text++;
+        }
+        out[used] = '\0';
+        return true;
+    }
+    bool put_hex(std::uint64_t value) {
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "0x%llx",
+                      static_cast<unsigned long long>(value));
+        return put(buf);
+    }
+    bool put_char(char c) {
+        if (used + 1 >= cap) {
+            return false;
+        }
+        out[used++] = c;
+        out[used] = '\0';
+        return true;
+    }
+};
+
+// One memory operand: base + index*scale + displacement, in the order the
+// Intel syntax prints them. `rip_relative` collapses the whole form to
+// [rip+disp] -- the encoding's own meaning, and the shape every image
+// analysis starts from.
+[[nodiscard]] bool render_memory(OperandWriter& w, std::uint8_t base,
+                                 std::uint8_t index, int scale, bool rex,
+                                 bool rip_relative, std::int64_t disp,
+                                 bool has_disp) {
+    if (!w.put_char('[')) {
+        return false;
+    }
+    if (rip_relative) {
+        if (!w.put("rip")) {
+            return false;
+        }
+        if (has_disp) {
+            if (!w.put_char(disp < 0 ? '-' : '+')) {
+                return false;
+            }
+            if (!w.put_hex(static_cast<std::uint64_t>(
+                    disp < 0 ? -disp : disp))) {
+                return false;
+            }
+        }
+        return w.put_char(']');
+    }
+    bool wrote = false;
+    if (base != 0xFF) {  // 0xFF is the "no base" sentinel
+        if (!w.put(reg_name(base, 8, rex))) {
+            return false;
+        }
+        wrote = true;
+    }
+    if (index != 0xFF) {
+        if (wrote && !w.put_char('+')) {
+            return false;
+        }
+        if (!w.put(reg_name(index, 8, rex))) {
+            return false;
+        }
+        if (scale != 1) {
+            char s[8];
+            std::snprintf(s, sizeof(s), "*%d", scale);
+            if (!w.put(s)) {
+                return false;
+            }
+        }
+        wrote = true;
+    }
+    if (has_disp) {
+        if (disp != 0 || !wrote) {
+            if (wrote && !w.put_char(disp < 0 ? '-' : '+')) {
+                return false;
+            }
+            if (!w.put_hex(
+                    static_cast<std::uint64_t>(disp < 0 ? -disp : disp))) {
+                return false;
+            }
+        }
+    }
+    return w.put_char(']');
+}
+
+// The facts the semantic layer needs about one instruction's operands: the
+// two register indexes, the memory form, the immediate. Filled by the
+// renderer's own walk.
+struct OpFacts {
+    std::uint8_t reg = 0;        // the reg field, REX.R extended
+    std::uint8_t rm = 0;         // the rm field, REX.B extended
+    std::uint8_t base = 0xFF;    // memory base register, or 0xFF
+    std::uint8_t index = 0xFF;   // memory index, or 0xFF
+    int scale = 1;
+    std::int64_t disp = 0;
+    bool has_disp = false;
+    bool rip_relative = false;
+    bool is_register = false;    // mod == 3
+};
+
+[[nodiscard]] bool read_facts(const std::uint8_t* bytes, std::size_t at,
+                              std::uint8_t modrm, std::uint8_t rex,
+                              bool address16, OpFacts& facts) {
+    facts.reg = static_cast<std::uint8_t>(((modrm >> 3) & 7) |
+                                          ((rex & 0x4) != 0 ? 8 : 0));
+    const std::uint8_t mod = static_cast<std::uint8_t>(modrm >> 6);
+    facts.rm = static_cast<std::uint8_t>((modrm & 7) | ((rex & 0x1) != 0 ? 8 : 0));
+    if (mod == 3) {
+        facts.is_register = true;
+        return true;
+    }
+    if (!address16 && (modrm & 7) == 5 && mod == 0) {
+        // rip-relative, or -- with a SIB in front of it -- absolute disp32.
+        // The SIB case is decided by the caller, which knows whether a SIB
+        // byte is present; the facts below are the no-SIB reading.
+        facts.rip_relative = true;
+        facts.has_disp = true;
+        std::int32_t d = 0;
+        std::memcpy(&d, bytes + at, 4);
+        facts.disp = d;
+        return true;
+    }
+    if (!address16 && (modrm & 7) == 4) {
+        // SIB addressing. The SIB byte sits at `at`.
+        const std::uint8_t sib = bytes[at];
+        const std::uint8_t sib_base = sib & 7;
+        const std::uint8_t sib_index = (sib >> 3) & 7;
+        const std::uint8_t sib_scale = (sib >> 6) & 3;
+        facts.scale = 1 << sib_scale;
+        const std::size_t disp_at = at + 1;
+        if (sib_base == 5 && mod == 0) {
+            facts.base = 0xFF;
+            facts.has_disp = true;
+            std::int32_t d = 0;
+            std::memcpy(&d, bytes + disp_at, 4);
+            facts.disp = d;
+        } else {
+            facts.base = static_cast<std::uint8_t>(
+                sib_base | ((rex & 0x1) != 0 ? 8 : 0));
+            if (sib_index != 4) {
+                facts.index = static_cast<std::uint8_t>(
+                    sib_index | ((rex & 0x2) != 0 ? 8 : 0));
+            }
+            if (mod == 1) {
+                facts.has_disp = true;
+                facts.disp = static_cast<std::int8_t>(bytes[disp_at]);
+            } else if (mod == 2) {
+                facts.has_disp = true;
+                std::int32_t d = 0;
+                std::memcpy(&d, bytes + disp_at, 4);
+                facts.disp = d;
+            }
+        }
+        return true;
+    }
+    // The plain forms: base is rm, displacement sized by mod.
+    facts.base = facts.rm;
+    facts.has_disp = mod != 3;
+    if (mod == 1) {
+        facts.disp = static_cast<std::int8_t>(bytes[at]);
+    } else if (mod == 2) {
+        std::int32_t d = 0;
+        std::memcpy(&d, bytes + at, 4);
+        facts.disp = d;
+    }
+    return true;
+}
+
+// The immediate's signed value, widened. Rendered unsigned in hex, which
+// is the convention for immediates; the caller that wants the signed
+// reading has the bytes.
+[[nodiscard]] std::uint64_t read_immediate(const std::uint8_t* bytes,
+                                           std::size_t at,
+                                           std::size_t size) noexcept {
+    std::uint64_t v = 0;
+    for (std::size_t i = 0; i < size && i < 8; ++i) {
+        v |= static_cast<std::uint64_t>(bytes[at + i]) << (i * 8);
+    }
+    return v;
+}
+
+std::uint32_t x64_decode(const std::uint8_t* bytes, std::size_t available,
+                         std::uint64_t va, Decoded& out) noexcept {
+    out = Decoded{};
+
+    // The length decoder is the authority on where the instruction ends.
+    // The semantic walk below re-derives the positions it needs -- the
+    // ModRM byte, the SIB, the displacement, the immediate -- from the same
+    // prefix and opcode rules; a disagreement between the two walks would
+    // be a decoder bug, and the decode tests compare them on every case.
+    const std::uint32_t length = x64_instruction_length(bytes, available);
+    if (length == 0) {
+        return 0;
+    }
+    out.length = length;
+
+    // The prefix walk again, this time keeping what the semantics need.
+    std::size_t i = 0;
+    bool operand16 = false;
+    bool address16 = false;
+    bool f2 = false;
+    bool f3 = false;
+    std::uint8_t rex = 0;
+    bool rex_present = false;
+    std::uint8_t opcode_map = 0;
+    while (i < available) {
+        const std::uint8_t b = bytes[i];
+        if (b == 0x66) {
+            operand16 = true;
+            ++i;
+        } else if (b == 0x67) {
+            address16 = true;
+            ++i;
+        } else if (b == 0xF2) {
+            f2 = true;
+            ++i;
+        } else if (b == 0xF3) {
+            f3 = true;
+            ++i;
+        } else if (b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
+                   b == 0x64 || b == 0x65) {
+            ++i;
+        } else if (b >= 0x40 && b <= 0x4F) {
+            rex = b;
+            rex_present = true;
+            ++i;
+            break;
+        } else if (b == 0xC4 || b == 0xC5 || b == 0x62) {
+            // VEX and EVEX instructions are named by their tables and not
+            // rendered operand-by-operand here; the mnemonic layer below
+            // answers "vex"/"evex" for them and the operands stay empty.
+            out.mnemonic = (b == 0x62) ? "evex" : "vex";
+            return length;
+        } else {
+            break;
+        }
+    }
+
+    const std::uint8_t op1 = bytes[i++];
+    std::uint8_t op = op1;
+    if (op1 == 0x0F && i < available) {
+        opcode_map = 0x0F;
+        op = bytes[i++];
+        if ((op == 0x38 || op == 0x3A) && i < available) {
+            opcode_map = op;
+            op = bytes[i++];
+        }
+    }
+
+    std::uint8_t modrm = 0;
+    bool has_modrm = false;
+    // Which forms carry a ModRM: the default for the one- and two-byte
+    // maps, minus the no-ModRM forms the length decoder's own table names.
+    if (opcode_map == 0) {
+        const std::uint8_t rules = kOp1[op1];
+        has_modrm = (rules & (kHasModrm | kNoModrm)) == kHasModrm;
+    } else if (opcode_map == 0x0F) {
+        const std::uint8_t rules = kOp2[op];
+        has_modrm = (rules & (kHasModrm | kNoModrm)) == kHasModrm;
+    } else {
+        has_modrm = true;
+    }
+    if (op1 >= 0xD8 && op1 <= 0xDF) {
+        has_modrm = true;
+    }
+
+    OpFacts facts;
+    std::size_t after_modrm = i;
+    std::size_t imm_at = 0;
+    std::size_t imm_size = 0;
+    if (has_modrm) {
+        modrm = bytes[i++];
+        after_modrm = i;
+        out.has_modrm = true;
+        out.modrm = modrm;
+        out.reg_field = (modrm >> 3) & 7;
+        // Walk the addressing, to find where the immediate would start.
+        // The SIB/displacement arithmetic repeats the length decoder's
+        // rules -- that is the point: the same walk, one more consumer.
+        const std::uint8_t mod = static_cast<std::uint8_t>(modrm >> 6);
+        std::size_t disp_size = 0;
+        if (!address16 && (modrm & 7) == 4 && mod != 3) {
+            const std::uint8_t sib =
+                (i < available) ? bytes[i] : 0;
+            ++i;  // the SIB byte
+            if (mod == 1) {
+                disp_size = 1;
+            } else if (mod == 2) {
+                disp_size = 4;
+            } else if ((sib & 7) == 5) {
+                disp_size = 4;
+            }
+        } else if (mod != 3) {
+            if (!address16 && (modrm & 7) == 5 && mod == 0) {
+                disp_size = 4;
+            } else if (mod == 1) {
+                disp_size = 1;
+            } else if (mod == 2) {
+                disp_size = 4;
+            } else if (address16 && mod == 0 && (modrm & 7) == 6) {
+                disp_size = 2;
+            }
+        }
+        i += disp_size;
+        imm_at = i;
+
+        // The immediates, by the same rule set the length decoder uses.
+        if (opcode_map == 0) {
+            switch (op1) {
+            case 0x69:
+                imm_size = operand16 ? 2 : 4;
+                break;
+            case 0x6B:
+                imm_size = 1;
+                break;
+            case 0x80:
+            case 0xC0:
+            case 0xC1:
+            case 0xC6:
+                imm_size = 1;
+                break;
+            case 0x81:
+            case 0xC7:
+                imm_size = operand16 ? 2 : 4;
+                break;
+            case 0x83:
+                imm_size = 1;
+                break;
+            case 0xF6:
+                if (out.reg_field <= 1) {
+                    imm_size = 1;
+                }
+                break;
+            case 0xF7:
+                if (out.reg_field <= 1) {
+                    imm_size = operand16 ? 2 : 4;
+                }
+                break;
+            default:
+                break;
+            }
+        } else if (opcode_map == 0x0F) {
+            if (op2_has_imm8(op) || op == 0x71 || op == 0x72 ||
+                op == 0x73) {
+                imm_size = 1;
+            }
+        }
+        (void)read_facts(bytes, after_modrm, modrm, rex, address16, facts);
+    } else {
+        // The no-ModRM forms' immediates.
+        const std::uint8_t rules =
+            opcode_map == 0 ? kOp1[op1] : kOp2[op];
+        if ((rules & kImm8) != 0) {
+            imm_size = 1;
+        } else if ((rules & kImm16F) != 0) {
+            imm_size = 2;
+        } else if ((rules & kImmZ) != 0) {
+            imm_size = (rex_present && (rex & 0x8) != 0 && op1 >= 0xB8 &&
+                        op1 <= 0xBF)
+                           ? 8
+                           : (operand16 ? 2 : 4);
+        } else if ((rules & kImmV) != 0) {
+            imm_size = (rex_present && (rex & 0x8) != 0) ? 8
+                                                         : (operand16 ? 2 : 4);
+        } else if ((rules & kImmP) != 0) {
+            imm_size = 8;
+        }
+        if (op1 == 0xC8) {
+            imm_size = 3;
+        }
+        imm_at = i;
+    }
+    if (imm_size != 0 && imm_at + imm_size <= available) {
+        out.has_immediate = true;
+        out.immediate = read_immediate(bytes, imm_at, imm_size);
+    }
+
+    // The rip-relative target: mod 0 with rm 5 and no SIB is the form, and
+    // its displacement is signed 32 relative to the *next* instruction.
+    if (has_modrm && !address16) {
+        const std::uint8_t mod = static_cast<std::uint8_t>(modrm >> 6);
+        const bool has_sib = (modrm & 7) == 4 && mod != 3;
+        if (mod == 0 && (modrm & 7) == 5 && !has_sib) {
+            std::int32_t d = 0;
+            std::memcpy(&d, bytes + after_modrm, 4);
+            out.has_rip_target = true;
+            out.rip_target =
+                va + static_cast<std::uint64_t>(length) +
+                static_cast<std::uint64_t>(d);
+        }
+    }
+
+    // -- the mnemonic, and the shapes that make it resolve ---------------
+    OperandWriter w{out.operands, Decoded::kOperandsSize};
+
+    // Operand size, for the forms that render. Byte ops are their own
+    // family; everything else sizes by REX.W and 66.
+    const bool rex_w = rex_present && (rex & 0x8) != 0;
+    const int size = rex_w ? 8 : (operand16 ? 2 : 4);
+
+    // Renders "reg, r/m" or "r/m, reg" with the memory operand from the
+    // facts. Answers false when the renderer could not finish.
+    const auto render_rm_reg = [&](bool rm_first, const char* name) {
+        if (!w.put(name) || !w.put_char(' ')) {
+            return false;
+        }
+        const char* first =
+            reg_name(rm_first ? facts.rm : facts.reg, size, rex_present);
+        const char* second =
+            reg_name(rm_first ? facts.reg : facts.rm, size, rex_present);
+        if (facts.is_register) {
+            return w.put(first) && w.put(", ") && w.put(second);
+        }
+        if (!w.put(second) || !w.put(", ")) {
+            return false;
+        }
+        return render_memory(w, facts.base, facts.index, facts.scale,
+                             rex_present, facts.rip_relative, facts.disp,
+                             facts.has_disp);
+    };
+
+    // The signed displacement of a rel8/rel32 branch, resolved to a target.
+    const auto branch = [&](InsnKind kind, std::int64_t rel) {
+        out.kind = kind;
+        out.has_branch_target = true;
+        out.branch_target =
+            va + static_cast<std::uint64_t>(length) + static_cast<std::uint64_t>(rel);
+    };
+
+    if (opcode_map == 0x0F) {
+        switch (op) {
+        case 0x05:
+            out.mnemonic = "syscall";
+            out.kind = InsnKind::Syscall;
+            return length;
+        case 0x0B:
+            out.mnemonic = "ud2";
+            return length;
+        case 0x1E:
+            if (f3 && out.has_modrm && out.modrm == 0xFA) {
+                out.mnemonic = "endbr64";
+                return length;
+            }
+            out.mnemonic = "nop";
+            return length;
+        case 0x10: case 0x11:
+            out.mnemonic = f2 ? "movsd" : (f3 ? "movss"
+                                              : (operand16 ? "movupd"
+                                                           : "movups"));
+            return length;
+        case 0x28: case 0x29:
+            out.mnemonic = operand16 ? "movapd" : "movaps";
+            return length;
+        case 0x1F:
+            out.mnemonic = "nop";
+            return length;
+        case 0x31:
+            out.mnemonic = "rdtsc";
+            return length;
+        case 0xA2:
+            out.mnemonic = "cpuid";
+            return length;
+        case 0x80: case 0x81: case 0x82: case 0x83:
+        case 0x84: case 0x85: case 0x86: case 0x87:
+        case 0x88: case 0x89: case 0x8A: case 0x8B:
+        case 0x8C: case 0x8D: case 0x8E: case 0x8F: {
+            out.mnemonic = jcc_name(op & 15);
+            if (imm_at >= 4) {
+                std::int32_t rel = 0;
+                std::memcpy(&rel, bytes + imm_at, 4);
+                branch(InsnKind::Jcc, rel);
+            }
+            return length;
+        }
+        case 0x90: case 0x91: case 0x92: case 0x93:
+        case 0x94: case 0x95: case 0x96: case 0x97:
+        case 0x98: case 0x99: case 0x9A: case 0x9B:
+        case 0x9C: case 0x9D: case 0x9E: case 0x9F: {
+            static char set_names[16][8];
+            static bool built = false;
+            if (!built) {
+                for (int c = 0; c < 16; ++c) {
+                    std::snprintf(set_names[c], sizeof(set_names[c]),
+                                  "set%s",
+                                  condition_suffix(static_cast<std::uint8_t>(c)));
+                }
+                built = true;
+            }
+            out.mnemonic = set_names[op & 15];
+            return length;
+        }
+        case 0x40: case 0x41: case 0x42: case 0x43:
+        case 0x44: case 0x45: case 0x46: case 0x47:
+        case 0x48: case 0x49: case 0x4A: case 0x4B:
+        case 0x4C: case 0x4D: case 0x4E: case 0x4F: {
+            static char cmov_names[16][10];
+            static bool built = false;
+            if (!built) {
+                for (int c = 0; c < 16; ++c) {
+                    std::snprintf(cmov_names[c], sizeof(cmov_names[c]),
+                                  "cmov%s",
+                                  condition_suffix(static_cast<std::uint8_t>(c)));
+                }
+                built = true;
+            }
+            out.mnemonic = cmov_names[op & 15];
+            return length;
+        }
+        case 0xAF:
+            out.mnemonic = "imul";
+            if (out.has_modrm) {
+                (void)render_rm_reg(false, "imul");
+            }
+            return length;
+        case 0xB6: case 0xB7:
+            out.mnemonic = "movzx";
+            return length;
+        case 0xBE: case 0xBF:
+            out.mnemonic = "movsx";
+            return length;
+        case 0xBC: case 0xBD:
+            out.mnemonic = (op == 0xBC) ? "bsf" : "bsr";
+            return length;
+        case 0xB0: case 0xB1:
+            out.mnemonic = "cmpxchg";
+            return length;
+        case 0xC0: case 0xC1:
+            out.mnemonic = "xadd";
+            return length;
+        case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+        case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+            out.mnemonic = "bswap";
+            return length;
+        case 0xA3: case 0xAB: case 0xB3: case 0xBB:
+            out.mnemonic = "bt";
+            return length;
+        default:
+            // The opcodes this switch does not name fall through to the
+            // older table, which names the common SSE families. The two
+            // layers compose: the switch owns the shapes whose mnemonic
+            // needs operand facts, the table owns the ones that do not.
+            out.mnemonic = mnemonic_for(bytes, available);
+            return length;
+        }
+    }
+
+    // The one-byte map.
+    if (op1 < 0x40 && (op1 & 7) <= 3) {
+        static const char* const names[8] = {"add", "or",  "adc", "sbb",
+                                             "and", "sub", "xor", "cmp"};
+        out.mnemonic = names[op1 >> 3];
+        if (has_modrm) {
+            // The byte forms are the ones whose low bits name an 8-bit
+            // operand: op&7 == 0 writes r/m8, op&7 == 2 reads r8,r/m8. The
+            // other two -- 01 and 03 -- are the word/dword/qword forms the
+            // operand-size prefix and REX.W size, which is why `mov rbp,
+            // rsp` (89) and `mov spl, bpl` (88) share one reg field.
+            const bool byte_op = (op1 & 7) == 0 || (op1 & 7) == 2;
+            const int op_size = byte_op ? 1 : size;
+            const auto render = [&](bool rm_first) {
+                if (!w.put(out.mnemonic) || !w.put_char(' ')) {
+                    return false;
+                }
+                const char* r = reg_name(facts.reg, op_size, rex_present);
+                const char* m =
+                    facts.is_register
+                        ? reg_name(facts.rm, op_size, rex_present)
+                        : nullptr;
+                if (facts.is_register) {
+                    return rm_first ? (w.put(m) && w.put(", ") && w.put(r))
+                                    : (w.put(r) && w.put(", ") && w.put(m));
+                }
+                if (rm_first) {
+                    if (!w.put(r) || !w.put(", ")) {
+                        return false;
+                    }
+                    return render_memory(w, facts.base, facts.index,
+                                         facts.scale, rex_present,
+                                         facts.rip_relative, facts.disp,
+                                         facts.has_disp);
+                }
+                if (!w.put(m) || !w.put(", ")) {
+                    return false;
+                }
+                return render_memory(w, facts.base, facts.index, facts.scale,
+                                     rex_present, facts.rip_relative,
+                                     facts.disp, facts.has_disp);
+            };
+            // The direction bit decides which way the operands read.
+            (void)render((op1 & 2) != 0);
+        }
+        return length;
+    }
+
+    switch (op1) {
+    case 0x50: case 0x51: case 0x52: case 0x53:
+    case 0x54: case 0x55: case 0x56: case 0x57:
+        out.mnemonic = "push";
+        w.put("push ") && w.put(reg_name(op1 - 0x50, 8, false));
+        return length;
+    case 0x58: case 0x59: case 0x5A: case 0x5B:
+    case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+        out.mnemonic = "pop";
+        w.put("pop ") && w.put(reg_name(op1 - 0x58, 8, false));
+        return length;
+    case 0x63:
+        out.mnemonic = "movsxd";
+        return length;
+    case 0x68:
+        out.mnemonic = "push";
+        w.put("push ") && w.put_hex(out.immediate);
+        return length;
+    case 0x6A:
+        out.mnemonic = "push";
+        w.put("push ") && w.put_hex(out.immediate);
+        return length;
+    case 0x69: case 0x6B:
+        out.mnemonic = "imul";
+        return length;
+    case 0x70: case 0x71: case 0x72: case 0x73:
+    case 0x74: case 0x75: case 0x76: case 0x77:
+    case 0x78: case 0x79: case 0x7A: case 0x7B:
+    case 0x7C: case 0x7D: case 0x7E: case 0x7F:
+        out.mnemonic = jcc_name(op1 & 15);
+        if (imm_at < available) {
+            branch(InsnKind::Jcc,
+                   static_cast<std::int8_t>(bytes[imm_at]));
+        }
+        return length;
+    case 0x80: case 0x81: case 0x83:
+        out.mnemonic = group1_name(out.reg_field);
+        if (has_modrm && out.has_immediate) {
+            // 0x80 is the byte group; 0x81 and 0x83 size by the prefixes,
+            // which is what puts rsp into `sub rsp, 0x20` and not spl.
+            const int op_size = (op1 == 0x80) ? 1 : size;
+            if (w.put(out.mnemonic) && w.put_char(' ')) {
+                if (facts.is_register) {
+                    w.put(reg_name(facts.rm, op_size, rex_present));
+                } else {
+                    (void)render_memory(w, facts.base, facts.index,
+                                        facts.scale, rex_present,
+                                        facts.rip_relative, facts.disp,
+                                        facts.has_disp);
+                }
+                w.put(", ") && w.put_hex(out.immediate);
+            }
+        }
+        return length;
+    case 0x84: case 0x85:
+        out.mnemonic = "test";
+        return length;
+    case 0x86: case 0x87:
+        out.mnemonic = "xchg";
+        return length;
+    case 0x88: case 0x89: case 0x8A: case 0x8B:
+        out.mnemonic = "mov";
+        if (has_modrm) {
+            // 88 and 8A are the byte forms; 89 and 8B size by the
+            // prefixes. The distinction is the low bit, not the pair.
+            const bool byte_op = (op1 == 0x88) || (op1 == 0x8A);
+            const int op_size = byte_op ? 1 : size;
+            const auto render = [&](bool rm_first) {
+                if (!w.put("mov ")) {
+                    return false;
+                }
+                const char* r = reg_name(facts.reg, op_size, rex_present);
+                const char* m =
+                    facts.is_register
+                        ? reg_name(facts.rm, op_size, rex_present)
+                        : nullptr;
+                if (facts.is_register) {
+                    return rm_first ? (w.put(m) && w.put(", ") && w.put(r))
+                                    : (w.put(r) && w.put(", ") && w.put(m));
+                }
+                if (rm_first) {
+                    if (!w.put(r) || !w.put(", ")) {
+                        return false;
+                    }
+                    return render_memory(w, facts.base, facts.index,
+                                         facts.scale, rex_present,
+                                         facts.rip_relative, facts.disp,
+                                         facts.has_disp);
+                }
+                if (!w.put(m) || !w.put(", ")) {
+                    return false;
+                }
+                return render_memory(w, facts.base, facts.index, facts.scale,
+                                     rex_present, facts.rip_relative,
+                                     facts.disp, facts.has_disp);
+            };
+            (void)render((op1 & 2) != 0);
+        }
+        return length;
+    case 0x8D:
+        out.mnemonic = "lea";
+        if (has_modrm) {
+            if (w.put("lea ") &&
+                w.put(reg_name(facts.reg, 8, rex_present)) &&
+                w.put(", ")) {
+                (void)render_memory(w, facts.base, facts.index, facts.scale,
+                                    rex_present, facts.rip_relative,
+                                    facts.disp, facts.has_disp);
+            }
+        }
+        return length;
+    case 0x90:
+        out.mnemonic = "nop";
+        return length;
+    case 0x98:
+        out.mnemonic = "cwde";
+        return length;
+    case 0x99:
+        out.mnemonic = "cdq";
+        return length;
+    case 0xA8: case 0xA9:
+        out.mnemonic = "test";
+        return length;
+    case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+    case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+        out.mnemonic = "mov";
+        w.put("mov ") && w.put(reg_name(op1 - 0xB0, 1, rex_present)) &&
+            w.put(", ") && w.put_hex(out.immediate);
+        return length;
+    case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+    case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+        out.mnemonic = "mov";
+        w.put("mov ") &&
+            w.put(reg_name(op1 - 0xB8, rex_w ? 8 : size, rex_present)) &&
+            w.put(", ") && w.put_hex(out.immediate);
+        return length;
+    case 0xC0: case 0xC1: case 0xD0: case 0xD1:
+    case 0xD2: case 0xD3:
+        out.mnemonic = shift_name(out.reg_field);
+        return length;
+    case 0xC2:
+        out.mnemonic = "ret";
+        out.kind = InsnKind::Ret;
+        return length;
+    case 0xC3:
+        out.mnemonic = "ret";
+        out.kind = InsnKind::Ret;
+        return length;
+    case 0xC6: case 0xC7:
+        out.mnemonic = "mov";
+        if (has_modrm && out.has_immediate) {
+            const int op_size = (op1 == 0xC6) ? 1 : size;
+            // The "mov r/m, imm" form: render from a clean writer so the
+            // operand text starts at the mnemonic, whatever earlier cases
+            // left in the buffer.
+            out.operands[0] = '\0';
+            OperandWriter w2{out.operands, Decoded::kOperandsSize};
+            if (w2.put("mov ")) {
+                if (facts.is_register) {
+                    w2.put(reg_name(facts.rm, op_size, rex_present));
+                } else {
+                    (void)render_memory(w2, facts.base, facts.index,
+                                        facts.scale, rex_present,
+                                        facts.rip_relative, facts.disp,
+                                        facts.has_disp);
+                }
+                w2.put(", ") && w2.put_hex(out.immediate);
+            }
+        }
+        return length;
+    case 0xC9:
+        out.mnemonic = "leave";
+        return length;
+    case 0xCC:
+        out.mnemonic = "int3";
+        return length;
+    case 0xE8:
+        out.mnemonic = "call";
+        if (imm_at + 4 <= available) {
+            std::int32_t rel = 0;
+            std::memcpy(&rel, bytes + imm_at, 4);
+            branch(InsnKind::Call, rel);
+            w.put("call ") && w.put_hex(out.branch_target);
+        }
+        return length;
+    case 0xE9:
+        out.mnemonic = "jmp";
+        out.kind = InsnKind::Jmp;
+        if (imm_at + 4 <= available) {
+            std::int32_t rel = 0;
+            std::memcpy(&rel, bytes + imm_at, 4);
+            out.has_branch_target = true;
+            out.branch_target = va + length +
+                                static_cast<std::uint64_t>(rel);
+            w.put("jmp ") && w.put_hex(out.branch_target);
+        }
+        return length;
+    case 0xEB:
+        out.mnemonic = "jmp";
+        out.kind = InsnKind::Jmp;
+        if (imm_at < available) {
+            out.has_branch_target = true;
+            out.branch_target =
+                va + static_cast<std::uint64_t>(length) +
+                static_cast<std::uint64_t>(
+                    static_cast<std::int8_t>(bytes[imm_at]));
+            w.put("jmp ") && w.put_hex(out.branch_target);
+        }
+        return length;
+    case 0xF6: case 0xF7:
+        out.mnemonic = group3_name(out.reg_field);
+        if (out.mnemonic == nullptr) {
+            // /7 of the grp3 encoding is not named by this decoder; the
+            // group's own name is the honest answer.
+            out.mnemonic = "grp3";
+        }
+        return length;
+    case 0xFE: case 0xFF: {
+        switch (out.reg_field) {
+        case 0:
+            out.mnemonic = "inc";
+            break;
+        case 1:
+            out.mnemonic = "dec";
+            break;
+        case 2:
+            out.mnemonic = "call";
+            out.kind = InsnKind::Call;
+            break;
+        case 3:
+            out.mnemonic = "lcall";
+            break;
+        case 4:
+            out.mnemonic = "jmp";
+            out.kind = InsnKind::Jmp;
+            break;
+        case 5:
+            out.mnemonic = "ljmp";
+            break;
+        case 6:
+            out.mnemonic = "push";
+            break;
+        default:
+            out.mnemonic = (op1 == 0xFE) ? "grp5" : "grp5";
+            break;
+        }
+        if (has_modrm) {
+            const int op_size = (op1 == 0xFE) ? 1 : 8;
+            if (w.put(out.mnemonic) && w.put_char(' ')) {
+                if (facts.is_register) {
+                    w.put(reg_name(facts.rm, op_size, rex_present));
+                } else {
+                    (void)render_memory(w, facts.base, facts.index,
+                                        facts.scale, rex_present,
+                                        facts.rip_relative, facts.disp,
+                                        facts.has_disp);
+                }
+            }
+        }
+        return length;
+    }
+    default:
+        out.mnemonic = mnemonic_for(bytes, available);
+        return length;
+    }
+}
+
 // The bytes as hex, lowercase, space separated -- the same spelling every
 // disassembler prints, so the output can be diffed against one.
 [[nodiscard]] std::string hex_bytes(const std::uint8_t* bytes,
@@ -604,10 +1556,40 @@ std::string x64_disassemble_json(ByteSpan bytes, std::uint64_t base_va,
         } else {
             out += hex_bytes(data + offset, length);
             out += "\"";
-            const char* mnemonic = mnemonic_for(data + offset, length);
-            if (mnemonic != nullptr) {
+            Decoded insn;
+            (void)x64_decode(data + offset, bytes.size() - offset,
+                             base_va + offset, insn);
+            if (insn.mnemonic != nullptr) {
                 out += ",\"mnemonic\":\"";
-                out += mnemonic;
+                out += insn.mnemonic;
+                out += "\"";
+            }
+            if (insn.operands[0] != '\0') {
+                out += ",\"operands\":\"";
+                out += insn.operands;
+                out += "\"";
+            }
+            if (insn.kind != InsnKind::Other) {
+                static const char* const kinds[] = {
+                    "other", "call", "jmp", "jcc", "ret", "syscall"};
+                out += ",\"kind\":\"";
+                out += kinds[static_cast<int>(insn.kind)];
+                out += "\"";
+            }
+            if (insn.has_branch_target) {
+                out += ",\"target\":\"0x";
+                std::snprintf(buf, sizeof(buf), "%llx",
+                              static_cast<unsigned long long>(
+                                  insn.branch_target));
+                out += buf;
+                out += "\"";
+            }
+            if (insn.has_rip_target) {
+                out += ",\"rip_target\":\"0x";
+                std::snprintf(buf, sizeof(buf), "%llx",
+                              static_cast<unsigned long long>(
+                                  insn.rip_target));
+                out += buf;
                 out += "\"";
             }
             out += ",\"length\":";
