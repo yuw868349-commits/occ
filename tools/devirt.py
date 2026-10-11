@@ -197,6 +197,37 @@ def main() -> None:
     for op, c in counts.most_common():
         emit(f"  {op:<14}{c}")
 
+    # Control flow: the bytecode cursor (rsi) advances by the length of
+    # each virtual instruction; a jump larger than any instruction's
+    # footprint -- or backwards at all -- is a control-flow edge. The
+    # edge's handler is the branch (vCall forward, vRet back), and its
+    # virtual stack top names the target the branch took.
+    emit(f"\ncontrol flow (basic blocks from rsi continuity):")
+    blocks = []      # (start_seq, end_seq, start_rsi, end_rsi)
+    block_start = 0
+    for i in range(1, len(rows)):
+        d = rows[i]["rsi"] - rows[i - 1]["rsi"]
+        if d > 0x40 or d < 0:
+            blocks.append((block_start + 1, i, rows[block_start]["rsi"],
+                           rows[i - 1]["rsi"]))
+            block_start = i
+    blocks.append((block_start + 1, len(rows), rows[block_start]["rsi"],
+                   rows[-1]["rsi"]))
+    emit(f"  {len(blocks)} basic blocks")
+    for bi, (lo, hi, rs, re) in enumerate(blocks):
+        h = rol(rows[lo - 1]["word"], 10)
+        sem = handlers.get(h, [])
+        label = " ; ".join(f"{c}" for c, _ in sem[:2]) or "?"
+        edge = ""
+        if lo > 1:
+            d = rows[lo - 1]["rsi"] - rows[lo - 2]["rsi"]
+            if d > 0x40 or d < 0:
+                tgt = rows[lo - 1]["st0"]
+                kind = "vCall" if d > 0 else "vRet"
+                edge = f"  <- {kind} from #{lo-1} (target st0=0x{tgt:x})"
+        emit(f"  B{bi} #{lo:>4}-#{hi:<4} rsi 0x{rs:x}..0x{re:x} "
+             f"{len(range(lo, hi+1))} instr{edge}")
+
     if report_path:
         with open(report_path, "w") as f:
             f.write("\n".join(lines) + "\n")
