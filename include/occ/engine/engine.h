@@ -178,6 +178,22 @@ struct LaunchPlan {
     // what each of them runs against.
     std::string root_dir;
 
+    // Whether this plan can run without the container around it.
+    //
+    // False is the default and the honest value for an engine that needs
+    // the mount table or the namespaces to give the target a coherent
+    // world. True is a statement an engine earns: the plan's own runtime
+    // is the isolation boundary, and the container is a second fence that
+    // is welcome where the host grants it and not required where it does
+    // not. The PE runtime says true -- the guest runs in a ledger-tracked
+    // address space of the runner's own, its file access goes through the
+    // kernel-level path containment, and the syscall filter still installs
+    // on the plain path -- and the runner uses the statement exactly as it
+    // is written: the container is tried first, the plain spawn is the
+    // fallback when the container cannot be set up, and the run reports
+    // which one it got.
+    bool container_optional = false;
+
     // A directory the engine created that the runner must remove when the
     // run ends. Named rather than left for the engine to clean up, because
     // the engine's plan is made before the run and has no callback into its

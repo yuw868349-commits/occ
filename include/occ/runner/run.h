@@ -143,14 +143,39 @@ struct RunOptions {
 
     // A directory this run owns, created if it does not exist and removed
     // when the run ends. An engine that keeps state on disk needs one, and
-    // the runner is what knows when the run is over. Empty means the runner
-    // picks one under /run, named after the process so two concurrent runs
-    // cannot collide.
+    // the runner is what knows when the run is over.
+    //
+    // Empty resolves in order: OCC_SCRATCH_DIR, then a directory under
+    // $TMPDIR (or /tmp when unset), named after the process so two
+    // concurrent runs cannot collide. The temp tree is where the default
+    // lives and not /run, because /run is root-owned on a stock system and
+    // a run that cannot create its scratch is a run that never starts.
+    // `occ run --scratch <dir>` is the spelling a caller writes when the
+    // choice matters on this command line.
     //
     // A caller that names a directory here is responsible for it being
     // somewhere the target's writes cannot outlive the run, which in
     // practice means not a directory the target can reach twice.
     std::string scratch_dir;
+
+    // Whether the target's container installs its syscall filter. True by
+    // default; false is the escape hatch for a host whose kernel has no
+    // seccomp, and it is reachable two ways: `occ run --no-seccomp` on the
+    // command line, or OCC_NO_SECCOMP=1 in the environment for a caller
+    // whose every run is on such a host.
+    bool install_seccomp = true;
+
+    // Whether the run is allowed to start the target without the container
+    // when the container cannot be set up. False keeps the container
+    // mandatory, which is the reading a caller who asked for namespaces
+    // meant; true lets an engine whose own runtime is the isolation
+    // boundary -- the PE runtime, which runs the guest in a ledger-tracked
+    // address space of its own -- proceed without them. Reached two ways:
+    // `occ run --no-container`, or OCC_NO_CONTAINER=1 in the environment.
+    // It is honoured only for a plan whose engine said the container is
+    // optional; an engine that needs the mount table still refuses, and
+    // says so.
+    bool container_optional = false;
 
     // The engine the caller asked for, by the name an engine reports, or
     // "occ" for whichever engine this build routes the format to. Empty

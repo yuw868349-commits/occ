@@ -515,10 +515,25 @@ int seccomp_install(const SeccompProgram& program) noexcept {
     prog.len = static_cast<unsigned short>(program.insn_count());
     prog.filter = const_cast<struct sock_filter*>(program.code());
 
-    // PR_SET_NO_NEW_PRIVS is the caller's decision, not this function's: it
-    // stops a setuid binary from gaining privilege across an exec, which
-    // matters for a target run under isolation and does not matter for a
-    // filter installed on a process that is already unprivileged.
+    // PR_SET_NO_NEW_PRIVS is set here, by the installer, and not by the
+    // callers. The kernel refuses an unprivileged filter install unless the
+    // bit is set -- the check is in prctl(SECCOMP) itself, so a caller that
+    // "decided" not to set it decided that the install fails with EACCES.
+    // Leaving the bit to the caller meant every caller had to know the rule
+    // and none did, which is how a run ends with a filter that was built
+    // correctly and never became active.
+    //
+    // The bit is one-way and only ever narrows: it stops a setuid exec from
+    // gaining privilege, which is what the isolation around a target run
+    // wants anyway, and it changes nothing for a process that is already
+    // unprivileged. Setting it unconditionally is the reading that keeps
+    // this function's promise -- the filter the caller built is the filter
+    // the kernel is running when this returns.
+    auto nnp = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (nnp.failed()) {
+        return -nnp.error;
+    }
+
     auto r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER,
                    reinterpret_cast<unsigned long>(&prog), 0, 0);
     if (r.failed()) {

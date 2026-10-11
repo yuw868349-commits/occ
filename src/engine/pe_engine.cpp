@@ -233,6 +233,18 @@ LaunchPlan PeEngine::plan(const EngineRequest& request,
     // host's; and the scratch directory this run owns stays empty, because
     // the runtime is from this binary and the process keeps no state on
     // disk.
+    // The container is a second fence here, not the first one. The
+    // runtime this plan names runs the guest inside its own process, in an
+    // address space its own ledger tracks, with the guest's file access
+    // confined at the kernel by the path containment and the syscall
+    // filter installed on the process either way. The namespaces and the
+    // mount table are welcome where the host grants them -- the runner
+    // still tries the container first -- but a host that refuses them no
+    // longer refuses the target: the plan says the container is optional,
+    // and the run degrades to the plain spawn and says so, instead of
+    // making the whole PE pipeline a privilege-only feature.
+    out.container_optional = true;
+
     out.program = runner::kPeRunnerProgram;
     out.argv.push_back(runner::kPeRunnerProgram);
     out.argv.push_back(runner::kPeRunnerCommand);

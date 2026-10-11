@@ -34,6 +34,13 @@ void print_run_usage() {
         "  --pids <n>         process count limit for the target\n"
         "  --cpu <percent>    cpu bandwidth, 1..100\n"
         "  --cgroup <dir>     create the run's cgroup under <dir>\n"
+        "  --scratch <dir>    directory the run owns for scratch state;\n"
+        "                     default is OCC_SCRATCH_DIR, then $TMPDIR\n"
+        "  --no-seccomp       install no syscall filter (escape hatch for\n"
+        "                     a host whose kernel has no seccomp)\n"
+        "  --no-container     let an engine whose own runtime isolates the\n"
+        "                     guest run without namespaces; refused for an\n"
+        "                     engine that needs the mount table\n"
         "  --env <K=V>        set an environment variable for the target\n"
         "  --engine <name>    run under the named engine; 'occ' is this\n"
         "                     build's own runtime, and the detection's\n"
@@ -284,6 +291,26 @@ int cmd_run(int argc, char** argv) {
                 return 2;
             }
             options.cgroup_parent = v;
+        } else if (arg == "--scratch") {
+            const char* v = value("--scratch");
+            if (v == nullptr) {
+                return 2;
+            }
+            options.scratch_dir = v;
+        } else if (arg == "--no-seccomp") {
+            // The escape hatch for a host whose kernel has no seccomp, or
+            // whose policy blocks the filter install. The run proceeds
+            // without a filter and the target's syscalls are unfiltered --
+            // which is the caller's explicit instruction, and the reason it
+            // is a flag rather than a silent fallback.
+            options.install_seccomp = false;
+        } else if (arg == "--no-container") {
+            // Let an engine whose own runtime is the isolation boundary run
+            // without the container's namespaces. Honoured only when the
+            // engine's plan says the container is optional; an engine that
+            // needs the mount table refuses, and the run says so rather
+            // than starting the target half-isolated.
+            options.container_optional = true;
         } else if (arg == "--env") {
             const char* v = value("--env");
             if (v == nullptr) {
@@ -450,6 +477,20 @@ int cmd_run(int argc, char** argv) {
                 options.observe = true;
             }
         }
+    }
+
+    // The environment's answer on the isolation switches, consulted after
+    // the flags and never over an explicit one. OCC_NO_SECCOMP and
+    // OCC_NO_CONTAINER are about the host -- a kernel without seccomp, a
+    // box where the namespace calls are denied -- and a caller who exports
+    // them has said something about every run they are about to make.
+    if (const char* seccomp_env = ::getenv("OCC_NO_SECCOMP");
+        seccomp_env != nullptr && seccomp_env[0] == '1') {
+        options.install_seccomp = false;
+    }
+    if (const char* container_env = ::getenv("OCC_NO_CONTAINER");
+        container_env != nullptr && container_env[0] == '1') {
+        options.container_optional = true;
     }
 
     // Bound before the target starts. The port has to be printed before

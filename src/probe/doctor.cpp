@@ -149,7 +149,59 @@ Check probe_seccomp() {
         return fail("seccomp", "actions_avail missing; the kernel predates "
                                "the seccomp filter interface occ requires");
     }
-    return ok("seccomp", "actions: " + std::string(trim(*v)));
+
+    // The file existing is the kernel's answer, not this process's. The
+    // check that matters is whether *this* process can install a filter,
+    // and the only way to know is to install one -- so the probe does
+    // exactly what the run does: NO_NEW_PRIVS, then a filter. The filter
+    // is the smallest one that is still a filter -- allow everything --
+    // so a successful install changes nothing about how this process
+    // behaves and the doctor's own answer costs it nothing. A failed
+    // install is the finding: it names the errno, and the errno is the
+    // difference between a kernel without the feature (EINVAL), a policy
+    // that blocks the call (EPERM), and the NO_NEW_PRIVS path being
+    // refused, which no stock kernel does.
+    auto nnp = sys::prctl(38 /* PR_SET_NO_NEW_PRIVS */, 1, 0, 0, 0);
+    if (nnp.failed()) {
+        return fail("seccomp",
+                    "the kernel lists actions " + std::string(trim(*v)) +
+                        " but PR_SET_NO_NEW_PRIVS failed: " +
+                        errno_text(nnp.error));
+    }
+
+    // One instruction: return ALLOW. That is a valid filter, the same
+    // shape build_seccomp emits, and installing it proves the whole path
+    // -- the prctl, the program length check, the copy from user -- is
+    // open to this process.
+    struct SockFilter {
+        unsigned short code;
+        unsigned char jt;
+        unsigned char jf;
+        unsigned int k;
+    };
+    SockFilter allow_all{0x0006 /* BPF_RET | BPF_K */,
+                         0,
+                         0,
+                         0x7fff0000 /* SECCOMP_RET_ALLOW */};
+    struct SockFprog {
+        unsigned short len;
+        SockFilter* filter;
+    };
+    SockFprog prog{1, &allow_all};
+
+    auto install = sys::prctl(22 /* PR_SET_SECCOMP */,
+                              2 /* SECCOMP_MODE_FILTER */,
+                              reinterpret_cast<unsigned long>(&prog), 0, 0);
+    if (install.failed()) {
+        return fail("seccomp",
+                    "the kernel lists actions " + std::string(trim(*v)) +
+                        " but installing a filter failed: " +
+                        errno_text(install.error) +
+                        "; a run would build its filter and then fail at "
+                        "the same call");
+    }
+    return ok("seccomp", "actions: " + std::string(trim(*v)) +
+                             "; a filter install was performed and works");
 }
 
 Check probe_bpf() {

@@ -211,6 +211,31 @@ struct SpawnResult {
                                           const std::vector<std::string>& argv,
                                           const std::vector<std::string>& envp);
 
+// Spawns the target with no container around it: a fork, the tracer
+// arrangement the caller asked for, the syscall filter the caller asked
+// for, and the exec.
+//
+// This is not a weaker container_spawn and it is not a fallback that
+// quietly drops the isolation on the floor. It is the path for a target
+// whose engine has said the container is optional -- whose own runtime is
+// the isolation boundary, the way the PE runtime is: the guest runs in an
+// address space that runtime's own ledger tracks, its file path goes
+// through the kernel-level containment, and the namespaces would only be
+// a second fence around a process that already has one. The syscall
+// filter still installs here, because a filter needs no privilege and
+// protects the host from the target on every path.
+//
+// A failure of the tracer arrangement or of the filter install is
+// reported with its stage, the same protocol the container spawn uses.
+// The caller decides what a failure means; for a plan that said the
+// container is optional, the runner degrades to this path only after the
+// container path has actually failed, and says so in the run's output.
+[[nodiscard]] SpawnResult plain_spawn(
+    const sys::SeccompPolicy& seccomp_policy, bool install_seccomp,
+    bool stop_at_exec, const std::string& path,
+    const std::vector<std::string>& argv,
+    const std::vector<std::string>& envp);
+
 // Releases a spawned child. Returns the error if the resume failed.
 [[nodiscard]] ContainerError container_resume(int pid) noexcept;
 

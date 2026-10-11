@@ -127,6 +127,30 @@ bool export_directory(const std::string& full, std::string& dir,
     return true;
 }
 
+// Names the scratch directory a run uses when the caller did not pick one.
+//
+// The order is: the caller's value, then OCC_SCRATCH_DIR, then a directory
+// under the temp tree. /run was the old answer and it was a wrong one for
+// anyone who was not root: the directory is root-owned on a stock system,
+// a plain user cannot create a child in it, and a run that died there
+// failed before the target was even parsed. $TMPDIR -- /tmp when unset --
+// is the directory the system promises is writable, and it is where the
+// container's own setup scratch already goes.
+std::string default_scratch_dir() {
+    const char* named = ::getenv("OCC_SCRATCH_DIR");
+    if (named != nullptr && named[0] != '\0') {
+        return named;
+    }
+    const char* tmp = ::getenv("TMPDIR");
+    std::string base = (tmp != nullptr && tmp[0] != '\0')
+                           ? std::string(tmp)
+                           : std::string("/tmp");
+    if (!base.empty() && base.back() == '/') {
+        base.pop_back();
+    }
+    return base + "/occ-scratch-" + std::to_string(::getpid());
+}
+
 // Reports the end of a session that never started, and the reason. Every
 // path that stops before a process exists comes through here, so a stream
 // that shows a refusal still ends with a session_end and a reader does not
@@ -298,7 +322,7 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // anything has been built.
     std::string scratch;
     if (options.scratch_dir.empty()) {
-        scratch = "/run/occ-scratch-" + std::to_string(::getpid());
+        scratch = default_scratch_dir();
     } else {
         scratch = options.scratch_dir;
     }
@@ -414,6 +438,7 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     config.limits.pids = options.pids;
     config.limits.cpu_percent = options.cpu_percent;
     config.extra_mounts = options.extra_mounts;
+    config.install_seccomp = options.install_seccomp;
 
     // The engine's binds go after the caller's. Order matters: a later bind
     // of the same target is the one that is in effect, so an engine that
@@ -524,8 +549,53 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // the target can complete before the observer reaches it.
     config.stop_at_exec = options.observe;
 
-    isolation::SpawnResult spawned =
-        isolation::container_spawn(config, plan.program, plan.argv, env);
+    // Which spawn path the run takes, and why. The container is the
+    // default because it is the stronger fence; the plain path exists for
+    // the target whose engine said its own runtime is the isolation
+    // boundary, and it is reached either by the caller's explicit
+    // instruction or by the container actually failing. An engine that
+    // never said the container is optional has no plain path, and a caller
+    // who asked for one is told that rather than getting a target running
+    // against a half-built world.
+    isolation::SpawnResult spawned;
+    bool used_container = true;
+
+    if (options.container_optional && !plan.container_optional) {
+        (void)fs::remove_tree(scratch);
+        return refuse(
+            std::move(out), events,
+            "--no-container was asked for, but the engine that owns this "
+            "format needs the container's mount table to give the target a "
+            "coherent filesystem; there is no plain path for it");
+    }
+
+    if (options.container_optional) {
+        used_container = false;
+        spawned = isolation::plain_spawn(
+            config.seccomp_policy, config.install_seccomp,
+            config.stop_at_exec, plan.program, plan.argv, env);
+    } else {
+        spawned =
+            isolation::container_spawn(config, plan.program, plan.argv, env);
+        if (!spawned.error.ok() && plan.container_optional) {
+            // The container was tried and the host said no. The engine's
+            // statement covers exactly this: the target still runs, the
+            // namespaces are what it goes without, and the run is the
+            // place that has to say so -- a degradation, because the
+            // caller got less isolation than a privileged host would have
+            // given and a consumer of the output is entitled to know it.
+            out.degradations.push_back(
+                "the container could not be set up (" +
+                spawned.error.detail +
+                "); the target runs without the container's namespaces, "
+                "on the engine's own isolation");
+            spawned = isolation::plain_spawn(
+                config.seccomp_policy, config.install_seccomp,
+                config.stop_at_exec, plan.program, plan.argv, env);
+            used_container = false;
+        }
+    }
+
     if (!spawned.error.ok()) {
         (void)fs::remove_tree(scratch);
         out.failed = true;
@@ -533,7 +603,9 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         auto& e = events.begin(obs::EventKind::Note);
         // The literal is named as a string_view: without it the overload set
         // would prefer the bool one and the text would become a truth value.
-        e.add("text", std::string_view{"the container could not be started"});
+        e.add("text", std::string_view{used_container
+                                           ? "the container could not be started"
+                                           : "the target could not be started"});
         e.add("stage", isolation::stage_name(spawned.error.stage));
         e.add("errno", static_cast<std::int64_t>(spawned.error.error));
         e.add("detail", spawned.error.detail);
@@ -656,7 +728,13 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
             out.signaled = sr.signaled;
         }
 
-        (void)isolation::container_cleanup(config);
+        // The cleanup is the container's, and only the container's: the
+        // plain path created no cgroup and no overlay to take down, and
+        // asking the cleanup to look would be work answering a question
+        // this run never asked.
+        if (used_container) {
+            (void)isolation::container_cleanup(config);
+        }
         (void)fs::remove_tree(scratch);
 
         auto& end = events.begin(obs::EventKind::SessionEnd);
@@ -696,7 +774,9 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     exit.add("term_signal", static_cast<std::uint64_t>(reaped.term_signal));
     events.commit();
 
-    (void)isolation::container_cleanup(config);
+    if (used_container) {
+        (void)isolation::container_cleanup(config);
+    }
     (void)fs::remove_tree(scratch);
 
     auto& end = events.begin(obs::EventKind::SessionEnd);

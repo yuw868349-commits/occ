@@ -170,6 +170,12 @@ private:
 
 // Installs a compiled program on the calling thread.
 //
+// The installer sets PR_SET_NO_NEW_PRIVS itself, before the filter: the
+// kernel refuses an unprivileged install without it, and a bit the caller
+// had to remember was a bit that was forgotten. The bit is one-way and only
+// narrows what an exec can gain, which is the direction every isolation
+// caller wants anyway.
+//
 // SECCOMP_FILTER_FLAG_TSYNC is not used. It can only succeed while the
 // process is single-threaded, so a caller that needs it is a caller that has
 // already lost, and the kernel's failure mode for the unsupported cases is

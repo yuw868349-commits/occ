@@ -268,6 +268,14 @@ constexpr char kVerdictFailed = 1;
 constexpr int kExitSetupFailed = 125;
 constexpr int kExitExecFailed = 126;
 
+// The filter stage has its own sentinel, and the reason is the protocol
+// above it. A verdict byte travels by write, and a filter that denies
+// write would kill the child the moment it tried to report -- so both
+// spawn paths report their verdict *before* the filter becomes active,
+// and a filter that fails to install is reported the only way left that
+// cannot be filtered: the exit code. The reap names the stage from it.
+constexpr int kExitFilterFailed = 124;
+
 // ---------------------------------------------------------------- cloning
 //
 // Two ways to create the process, and the reason there are two is not
@@ -1189,10 +1197,31 @@ int drop_capabilities(const std::vector<sys::Cap>& keep,
 // Everything the child does between its first instruction and exec. Runs in
 // the container's namespaces, on the container's root. Returns 0 on success,
 // or a positive errno, with `stage` naming the step that failed.
+// Builds and installs the syscall filter, as the last stage of either
+// spawn path. Returns 0, or a positive errno with `detail` naming what
+// failed.
+int install_seccomp_stage(const sys::SeccompPolicy& policy,
+                          std::string& detail) noexcept {
+    const sys::SeccompProgram program = sys::build_seccomp(policy);
+    if (!program.valid()) {
+        detail = program.error() != nullptr ? program.error()
+                                            : "the syscall filter did not "
+                                              "compile";
+        return sys::kEinval;
+    }
+    const int rc = sys::seccomp_install(program);
+    if (rc != 0) {
+        // `seccomp_install` reports a negative errno; the stage contract is
+        // a positive one.
+        detail = "install the syscall filter";
+        return rc < 0 ? -rc : rc;
+    }
+    return 0;
+}
+
 int child_setup(const ContainerConfig& config, const std::string& scratch,
                 const std::string& root_holder, Stage& stage,
-                std::string& detail) {
-    // Make the mount table private before anything is mounted, so no mount
+                std::string& detail, bool install_filter = true) {    // Make the mount table private before anything is mounted, so no mount
     // performed below can propagate to the host. Without this the container
     // would modify the host's mount table, which is both a correctness
     // problem and a security one.
@@ -1338,25 +1367,17 @@ int child_setup(const ContainerConfig& config, const std::string& scratch,
     // which "the target runs under the filter" is true of every instruction
     // the target executes.
     //
-    // The filter cannot be uninstalled -- that is what a seccomp filter is --
-    // so a failure here is reported rather than retried, and a caller that
-    // asked for no filter gets the branch below and no less.
-    if (config.install_seccomp) {
+    // A caller that wants the verdict reported before the filter goes on --
+    // both spawn paths now do, because a filter that denies write would
+    // kill the child mid-report -- passes `install_filter` false here and
+    // runs `install_seccomp_stage` itself at the point the report has gone
+    // out. The function keeps the build step and the install step together,
+    // so the two paths cannot drift into installing different shapes.
+    if (config.install_seccomp && install_filter) {
         stage = Stage::Seccomp;
-        const sys::SeccompProgram program =
-            sys::build_seccomp(config.seccomp_policy);
-        if (!program.valid()) {
-            detail = program.error() != nullptr ? program.error()
-                                                : "the syscall filter did "
-                                                  "not compile";
-            return kExitSetupFailed;
-        }
-        const int rc = sys::seccomp_install(program);
+        const int rc = install_seccomp_stage(config.seccomp_policy, detail);
         if (rc != 0) {
-            // `seccomp_install` reports a negative errno; the stage contract
-            // is a positive one.
-            detail = "install the syscall filter";
-            return rc < 0 ? -rc : rc;
+            return rc;
         }
     }
 
@@ -1503,6 +1524,240 @@ void child_report(int fd, char verdict, Stage stage, int error,
     }
 }
 
+// Reads the child's verdict -- the protocol `child_report` writes -- off a
+// report pipe, and returns it as the spawn's error. Shared by both spawn
+// paths, because the protocol and its parse are the same on either side of
+// the namespaces: a verdict byte, and behind a failed verdict the stage,
+// the errno and the detail.
+//
+// The wait ends on whichever of two definite events comes first: the child
+// writes its verdict, or the write end of the pipe closes. The write end
+// closes when the child execs -- the pipe is O_CLOEXEC, so the exec closes
+// it -- and when the child exits for any other reason. So the bounded poll
+// is not a grace period that can expire while a report is still coming; it
+// is a bound on how long the child's own setup may take before the parent
+// stops waiting for it.
+//
+// The timeout exists only because a child's setup involves mount calls,
+// and a mount on a busy or uninterruptible host can take longer than any
+// fixed number chosen here. When it expires, the verdict is unknown, and
+// that is reported as a failure rather than as a success: the exit status
+// in the reap is where a child that failed is caught, and a spawn that said
+// "ok" for a target that then failed is exactly the defect this protocol
+// exists to remove.
+[[nodiscard]] ContainerError read_child_verdict(int report_fd) {
+    ContainerError error{Stage::Clone, 0, ""};
+
+    sys::PollFd pfd{};
+    pfd.fd = report_fd;
+    pfd.events = POLLIN;
+
+    // A generous bound. Waiting too little here turns a slow host into a
+    // reported failure; waiting too long costs nothing on a run that
+    // succeeded, because the child writes its verdict as soon as its setup
+    // is done and the poll returns at that point rather than at the
+    // timeout.
+    constexpr int kReportWaitMs = 2000;
+    auto pr = sys::poll(&pfd, 1, kReportWaitMs);
+
+    if (pr.failed()) {
+        error = ContainerError{Stage::Clone, pr.error,
+                               "waiting for the child's verdict"};
+        return error;
+    }
+    if (pr.value == 0) {
+        error = ContainerError{
+            Stage::Clone, sys::kEio,
+            "the target did not report within the setup window"};
+        return error;
+    }
+
+    // Read the verdict on its own before anything else. The rest of the
+    // message is only meaningful once the verdict says there is one, so it
+    // is not read on the strength of a byte count.
+    char verdict = 0;
+    auto vr = sys::read(report_fd, &verdict, 1);
+    if (vr.failed() && vr.error == sys::kEintr) {
+        error = ContainerError{Stage::Clone, vr.error,
+                               "reading the child's verdict"};
+        return error;
+    }
+    if (vr.ok() && vr.value == 1) {
+        if (verdict == kVerdictFailed) {
+            char body[512];
+            auto br = sys::read(report_fd, body, sizeof(body));
+            // The body is the stage byte, four bytes of errno and the
+            // detail. Five is the shortest body that carries the stage and
+            // the whole errno; a shorter one is a message this build cannot
+            // read.
+            if (br.ok() && br.value >= 5) {
+                const auto stage_code = static_cast<std::uint8_t>(body[0]);
+                const std::uint32_t code =
+                    static_cast<std::uint32_t>(
+                        static_cast<std::uint8_t>(body[1])) |
+                    (static_cast<std::uint32_t>(
+                         static_cast<std::uint8_t>(body[2]))
+                     << 8) |
+                    (static_cast<std::uint32_t>(
+                         static_cast<std::uint8_t>(body[3]))
+                     << 16) |
+                    (static_cast<std::uint32_t>(
+                         static_cast<std::uint8_t>(body[4]))
+                     << 24);
+                error = ContainerError{
+                    static_cast<Stage>(stage_code), static_cast<int>(code),
+                    std::string(body + 5,
+                                static_cast<std::size_t>(br.value) - 5)};
+            } else if (br.failed() && br.error != sys::kEintr) {
+                error = ContainerError{Stage::Clone, br.error,
+                                       "reading the failure report"};
+            } else {
+                // The verdict said failed and the body did not arrive. The
+                // stage and the errno are lost, so the failure is reported
+                // without them rather than as a success.
+                error = ContainerError{
+                    Stage::Clone, sys::kEio,
+                    "the child reported a failure with no detail"};
+            }
+        } else if (verdict != kVerdictOk) {
+            // A verdict this build does not know. Refusing to read a body
+            // behind it is the only safe answer: the two bytes after an
+            // unknown verdict are not known to be a stage and an errno.
+            error = ContainerError{
+                Stage::Clone, sys::kEio,
+                "the child reported a verdict this build does not know"};
+        }
+        // kVerdictOk: the target is up. Nothing after it is occ's to read
+        // -- the target owns the process from here.
+        return error;
+    }
+
+    // End of file before a verdict. The child execed without writing one,
+    // which the protocol does not allow, or it died before it could. Either
+    // way the outcome is not a success.
+    error = ContainerError{Stage::Clone, sys::kEchild,
+                           "the child ended without reporting a verdict"};
+    return error;
+}
+
+// The plain spawn: the whole of the target's startup, without namespaces.
+// Shared by the exported wrapper below and placed here because it speaks
+// the same child protocol the container spawn does -- `child_report`,
+// `child_exec`, and the exit sentinels both sides know.
+SpawnResult plain_spawn_impl(const sys::SeccompPolicy& seccomp_policy,
+                             bool install_seccomp, bool stop_at_exec,
+                             const std::string& path,
+                             const std::vector<std::string>& argv,
+                             const std::vector<std::string>& envp) {
+    SpawnResult out;
+
+    // One pipe, one direction. The container spawn needs a second one
+    // because its parent has setup steps that must happen between "the
+    // child exists" and "the child proceeds"; this path has none, so the
+    // child never waits for a go-ahead and only its verdict travels.
+    int report[2] = {-1, -1};
+    auto pre = sys::pipe2(report, 02000000 /* O_CLOEXEC */);
+    if (pre.failed()) {
+        out.error =
+            ContainerError{Stage::Clone, pre.error, "pipe2 for the report"};
+        return out;
+    }
+
+    auto f = sys::fork();
+    if (f.failed()) {
+        out.error =
+            ContainerError{Stage::Clone, f.error, "fork for the plain spawn"};
+        (void)sys::close(report[0]);
+        (void)sys::close(report[1]);
+        return out;
+    }
+
+    if (f.value == 0) {
+        // Child. fork() from a process that may have threads running is
+        // safe here on the same terms the container path's clone is: the
+        // child touches no allocator state, executes only raw syscalls on
+        // the way to its exec, and never returns.
+        (void)sys::close(report[0]);
+
+        // The tracer arrangement happens before the filter install, and
+        // both happen before the exec, for the same ordering reason the
+        // container path gives: TRACEME needs the credential comparison to
+        // be made across no boundary, and the filter has to be active for
+        // the first instruction the target image runs.
+        if (stop_at_exec) {
+            auto tr = sys::ptrace(0 /* PTRACE_TRACEME */, 0, nullptr, nullptr);
+            if (tr.failed()) {
+                child_report(report[1], kVerdictFailed, Stage::Clone, tr.error,
+                             "PTRACE_TRACEME before the exec");
+                sys::exit_group(kExitSetupFailed);
+            }
+        }
+
+        // The filter is built before the verdict goes out -- a build
+        // failure is reportable, because the filter is not active yet --
+        // and installed after it, for the reason the order exists: the
+        // report travels by write, and a filter that denies write would
+        // kill the child as it reported. An install that fails after the
+        // verdict exits with the filter sentinel, and the reap names the
+        // stage from that.
+        sys::SeccompProgram program;
+        if (install_seccomp) {
+            program = sys::build_seccomp(seccomp_policy);
+            if (!program.valid()) {
+                child_report(report[1], kVerdictFailed, Stage::Seccomp,
+                             sys::kEinval,
+                             program.error() != nullptr
+                                 ? program.error()
+                                 : "the syscall filter did not compile");
+                sys::exit_group(kExitSetupFailed);
+            }
+        }
+
+        child_report(report[1], kVerdictOk, Stage::Clone, 0, "");
+        (void)sys::close(report[1]);
+
+        if (install_seccomp) {
+            const int rc = sys::seccomp_install(program);
+            if (rc != 0) {
+                std::string message;
+                message += "occ: the syscall filter could not be installed: ";
+                message += strerror(rc < 0 ? -rc : rc);
+                message += "\n";
+                (void)sys::write(2, message.data(), message.size());
+                sys::exit_group(kExitFilterFailed);
+            }
+        }
+
+        const int erc = child_exec(path, argv, envp);
+        if (erc != 0) {
+            // The message names the errno, because ENOENT and EACCES and
+            // ENOEXEC are three different problems with three different
+            // fixes, and the run's own exit status says only that the child
+            // gave up.
+            std::string message;
+            message += "exec " + path + ": " + strerror(erc) + "\n";
+            (void)sys::write(2, message.data(), message.size());
+        }
+        sys::exit_group(kExitExecFailed);
+    }
+
+    // Parent.
+    (void)sys::close(report[1]);
+    out.pid = static_cast<int>(f.value);
+    out.error = read_child_verdict(report[0]);
+    (void)sys::close(report[0]);
+
+    if (!out.error.ok()) {
+        // The child reported a failure of its own setup. It is on its way
+        // out with the setup-failed sentinel, and it is reaped here so the
+        // caller is not handed a pid whose process has already gone.
+        int status = 0;
+        (void)sys::wait4(out.pid, &status, 0, nullptr);
+        out.pid = 0;
+    }
+    return out;
+}
+
 } // namespace
 
 // -------------------------------------------------------------------- spawn
@@ -1638,7 +1893,12 @@ SpawnResult container_spawn(const ContainerConfig& config,
 
         Stage stage = Stage::Clone;
         std::string detail;
-        const int rc = child_setup(config, scratch, scratch, stage, detail);
+        // The container setup, with the filter deliberately left out: the
+        // verdict byte that follows travels by write, and a filter that
+        // denies write would kill the child as it reported. The filter is
+        // the last thing that happens before the exec instead.
+        const int rc =
+            child_setup(config, scratch, scratch, stage, detail, false);
         if (rc != 0) {
             child_report(report[1], kVerdictFailed, stage, rc, detail);
             sys::exit_group(kExitSetupFailed);
@@ -1650,12 +1910,26 @@ SpawnResult container_spawn(const ContainerConfig& config,
         // whether it managed to read this before the exec replaced the
         // process image -- and, more to the point, so the parent learns the
         // answer from a byte rather than from the absence of a byte.
-        //
-        // An exec that fails after this point is a different failure: the
-        // container came up and the target did not, so it is reported on
-        // stderr and through the exit code, and container_reap names it.
         child_report(report[1], kVerdictOk, Stage::Clone, 0, "");
         (void)sys::close(report[1]);
+
+        // The filter goes on now, after the report and before the exec.
+        // Its failure cannot travel on the pipe -- the reason the verdict
+        // moved ahead of it -- so it exits with the filter sentinel, and
+        // the reap names the stage from that. The run still fails; it
+        // fails with the truth instead of with silence.
+        if (config.install_seccomp) {
+            std::string filter_detail;
+            const int frc =
+                install_seccomp_stage(config.seccomp_policy, filter_detail);
+            if (frc != 0) {
+                std::string message;
+                message += "occ: the syscall filter could not be installed: ";
+                message += filter_detail + "\n";
+                (void)sys::write(2, message.data(), message.size());
+                sys::exit_group(kExitFilterFailed);
+            }
+        }
 
         const int erc = child_exec(path, argv, envp);
         // exec failed. The errno and a newline are included because a
@@ -1755,118 +2029,21 @@ SpawnResult container_spawn(const ContainerConfig& config,
 
     out.pid = static_cast<int>(cloned.pid);
 
-    // Read the child's verdict.
-    //
-    // The wait ends on whichever of two definite events comes first: the
-    // child writes its verdict, or the write end of the pipe closes. The
-    // write end closes when the child execs -- the pipe is O_CLOEXEC, so the
-    // exec closes it -- and when the child exits for any other reason. So a
-    // bounded poll is not a grace period that can expire while a report is
-    // still coming; it is a bound on how long the child's own setup may take
-    // before the parent stops waiting for it.
-    //
-    // The timeout exists only because a child's setup involves mount calls,
-    // and a mount on a busy or uninterruptible host can take longer than any
-    // fixed number chosen here. When it expires, the verdict is unknown, and
-    // that is reported as a failure of this function rather than as a
-    // success: the exit status in container_reap is where a child that failed
-    // is caught, and a spawn that said "ok" for a container that then failed
-    // is exactly the defect this protocol exists to remove.
-    {
-        sys::PollFd pfd{};
-        pfd.fd = report[0];
-        pfd.events = POLLIN;
-
-        // A generous bound. Waiting too little here turns a slow host into a
-        // reported failure; waiting too long costs nothing on a run that
-        // succeeded, because the child writes its verdict as soon as its
-        // setup is done and the poll returns at that point rather than at the
-        // timeout.
-        constexpr int kReportWaitMs = 2000;
-        auto pr = sys::poll(&pfd, 1, kReportWaitMs);
-
-        if (pr.failed()) {
-            out.error = ContainerError{Stage::Clone, pr.error,
-                                       "waiting for the child's verdict"};
-        } else if (pr.value == 0) {
-            out.error = ContainerError{
-                Stage::Clone, sys::kEio,
-                "the container did not report within the setup window"};
-        } else {
-            // Read the verdict on its own before anything else. The rest of
-            // the message is only meaningful once the verdict says there is
-            // one, so it is not read on the strength of a byte count.
-            char verdict = 0;
-            auto vr = sys::read(report[0], &verdict, 1);
-            if (vr.failed() && vr.error == sys::kEintr) {
-                out.error = ContainerError{Stage::Clone, vr.error,
-                                           "reading the child's verdict"};
-            } else if (vr.ok() && vr.value == 1) {
-                if (verdict == kVerdictFailed) {
-                    char body[512];
-                    auto br = sys::read(report[0], body, sizeof(body));
-                    // The body is the stage byte, four bytes of errno and
-                    // the detail. Five is the shortest body that carries the
-                    // stage and the whole errno; a shorter one is a message
-                    // this build cannot read.
-                    if (br.ok() && br.value >= 5) {
-                        const auto stage_code =
-                            static_cast<std::uint8_t>(body[0]);
-                        const std::uint32_t code =
-                            static_cast<std::uint32_t>(
-                                static_cast<std::uint8_t>(body[1])) |
-                            (static_cast<std::uint32_t>(
-                                 static_cast<std::uint8_t>(body[2]))
-                             << 8) |
-                            (static_cast<std::uint32_t>(
-                                 static_cast<std::uint8_t>(body[3]))
-                             << 16) |
-                            (static_cast<std::uint32_t>(
-                                 static_cast<std::uint8_t>(body[4]))
-                             << 24);
-                        out.error = ContainerError{
-                            static_cast<Stage>(stage_code),
-                            static_cast<int>(code),
-                            std::string(body + 5,
-                                        static_cast<std::size_t>(br.value) -
-                                            5)};
-                    } else if (br.failed() && br.error != sys::kEintr) {
-                        out.error = ContainerError{Stage::Clone, br.error,
-                                                   "reading the failure report"};
-                    } else {
-                        // The verdict said failed and the body did not
-                        // arrive. The stage and the errno are lost, so the
-                        // failure is reported without them rather than as a
-                        // success.
-                        out.error = ContainerError{
-                            Stage::Clone, sys::kEio,
-                            "the child reported a failure with no detail"};
-                    }
-                } else if (verdict != kVerdictOk) {
-                    // A verdict this build does not know. Refusing to read a
-                    // body behind it is the only safe answer: the two bytes
-                    // after an unknown verdict are not known to be a stage
-                    // and an errno.
-                    out.error = ContainerError{
-                        Stage::Clone, sys::kEio,
-                        "the child reported a verdict this build does not "
-                        "know"};
-                }
-                // kVerdictOk: the container is up. Nothing after it is occ's
-                // to read -- the target owns the process from here.
-            } else {
-                // End of file before a verdict. The child execed without
-                // writing one, which the protocol does not allow, or it died
-                // before it could. Either way the outcome is not a success.
-                out.error = ContainerError{
-                    Stage::Clone, sys::kEchild,
-                    "the child ended without reporting a verdict"};
-            }
-        }
-    }
+    // Read the child's verdict. The bound and the parse are the shared
+    // verdict protocol, documented with `read_child_verdict`.
+    out.error = read_child_verdict(report[0]);
     (void)sys::close(report[0]);
 
     return out;
+}
+
+SpawnResult plain_spawn(const sys::SeccompPolicy& seccomp_policy,
+                        bool install_seccomp, bool stop_at_exec,
+                        const std::string& path,
+                        const std::vector<std::string>& argv,
+                        const std::vector<std::string>& envp) {
+    return plain_spawn_impl(seccomp_policy, install_seccomp, stop_at_exec,
+                            path, argv, envp);
 }
 
 ContainerError container_resume(int pid) noexcept {
@@ -1923,6 +2100,18 @@ ContainerResult container_reap(int pid) noexcept {
         if (code == kExitSetupFailed) {
             out.error = ContainerError{Stage::RootAssembly, sys::kEchild,
                                        "the container setup failed"};
+            return out;
+        }
+        if (code == kExitFilterFailed) {
+            // The filter stage reports through this sentinel because it is
+            // installed after the verdict byte, which is after the point
+            // where a report that travels by write can no longer be
+            // trusted to a filter that may deny write. The errno is
+            // EPERM-shaped -- the install was refused -- and the stderr
+            // note the child wrote names the errno it actually got.
+            out.error = ContainerError{Stage::Seccomp, sys::kEperm,
+                                       "the syscall filter could not be "
+                                       "installed"};
             return out;
         }
         if (code == kExitExecFailed) {
