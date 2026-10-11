@@ -1263,6 +1263,36 @@ int child_setup(const ContainerConfig& config, const std::string& scratch,
         }
     }
 
+    // The syscall filter, installed last because it is the one stage that
+    // takes capability away from the stages above it: a filter installed
+    // first would refuse the mount, the capability changes and the uid
+    // mapping this setup performs on the target's behalf. It is installed
+    // after the last of those and before the exec, which is the window in
+    // which "the target runs under the filter" is true of every instruction
+    // the target executes.
+    //
+    // The filter cannot be uninstalled -- that is what a seccomp filter is --
+    // so a failure here is reported rather than retried, and a caller that
+    // asked for no filter gets the branch below and no less.
+    if (config.install_seccomp) {
+        stage = Stage::Seccomp;
+        const sys::SeccompProgram program =
+            sys::build_seccomp(config.seccomp_policy);
+        if (!program.valid()) {
+            detail = program.error() != nullptr ? program.error()
+                                                : "the syscall filter did "
+                                                  "not compile";
+            return kExitSetupFailed;
+        }
+        const int rc = sys::seccomp_install(program);
+        if (rc != 0) {
+            // `seccomp_install` reports a negative errno; the stage contract
+            // is a positive one.
+            detail = "install the syscall filter";
+            return rc < 0 ? -rc : rc;
+        }
+    }
+
     return 0;
 }
 

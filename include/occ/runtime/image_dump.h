@@ -30,8 +30,7 @@
 // mean nothing in a file. Rebuilding that is the other half of unpacking
 // and it is not this file's job.
 
-#ifndef OCC_RUNTIME_IMAGE_DUMP_H_
-#define OCC_RUNTIME_IMAGE_DUMP_H_
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -97,4 +96,3 @@ static_assert(sizeof(EntryRegs) == 14 * sizeof(std::uint64_t),
 
 }  // namespace occ::runtime::image_dump
 
-#endif  // OCC_RUNTIME_IMAGE_DUMP_H_

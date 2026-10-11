@@ -263,9 +263,17 @@ struct ModuleEntryLayout {
     [[maybe_unused]] static constexpr std::size_t kBaseSize = 32;      // uint32
     [[maybe_unused]] static constexpr std::size_t kModuleHandle = 40;  // pointer
     [[maybe_unused]] static constexpr std::size_t kModuleName = 48;
-    [[maybe_unused]] static constexpr std::size_t kNameChars = 256;
-    [[maybe_unused]] static constexpr std::size_t kExePath = 560;
-    [[maybe_unused]] static constexpr std::size_t kPathChars = 260;
+    // The two spellings diverge here: the wide name is 512 bytes wide and
+    // the narrow one 256, so the wide path starts at 560 and the narrow at
+    // 304. A narrow entry filled at the wide offset writes its path 252
+    // bytes past the structure the caller sized as `kBytesA`.
+    [[maybe_unused]] static constexpr std::size_t kNameCharsW = 512;
+    [[maybe_unused]] static constexpr std::size_t kModuleNameW = 48;
+    [[maybe_unused]] static constexpr std::size_t kExePathW = 560;
+    [[maybe_unused]] static constexpr std::size_t kPathCharsW = 260;
+    [[maybe_unused]] static constexpr std::size_t kNameCharsA = 256;
+    [[maybe_unused]] static constexpr std::size_t kExePathA = 304;
+    [[maybe_unused]] static constexpr std::size_t kPathCharsA = 260;
     [[maybe_unused]] static constexpr std::size_t kBytesW = 1080;
     [[maybe_unused]] static constexpr std::size_t kBytesA = 568;
 };
@@ -1453,20 +1461,20 @@ void fill_module(void* entry, const ModuleItem& item, bool wide) noexcept {
         put_field(item.name,
                   reinterpret_cast<char16_t*>(
                       static_cast<std::uint8_t*>(entry) +
-                      ModuleEntryLayout::kModuleName),
-                  ModuleEntryLayout::kNameChars);
+                      ModuleEntryLayout::kModuleNameW),
+                  ModuleEntryLayout::kNameCharsW);
         put_field(item.path,
                   reinterpret_cast<char16_t*>(
                       static_cast<std::uint8_t*>(entry) +
-                      ModuleEntryLayout::kExePath),
-                  ModuleEntryLayout::kPathChars);
+                      ModuleEntryLayout::kExePathW),
+                  ModuleEntryLayout::kPathCharsW);
     } else {
         put_field(item.name,
-                  static_cast<char*>(entry) + ModuleEntryLayout::kModuleName,
-                  ModuleEntryLayout::kNameChars);
+                  static_cast<char*>(entry) + ModuleEntryLayout::kModuleNameW,
+                  ModuleEntryLayout::kNameCharsA);
         put_field(item.path,
-                  static_cast<char*>(entry) + ModuleEntryLayout::kExePath,
-                  ModuleEntryLayout::kPathChars);
+                  static_cast<char*>(entry) + ModuleEntryLayout::kExePathA,
+                  ModuleEntryLayout::kPathCharsA);
     }
 }
 

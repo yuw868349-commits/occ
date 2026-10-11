@@ -4,6 +4,7 @@
 #include "occ/runtime/i386.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -367,16 +368,36 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
     // with the first guest that asks for them; the first guest this file
     // runs reads its imports and calls, which is the spine.
     Memory mem;
+    // The offsets below are read straight out of the file, and the file is
+    // the guest's: every offset has to be proven against `bytes` before the
+    // read that uses it, because a header that names an offset past the end
+    // is a read past the end of the mapping the bytes live in. The proofs
+    // are 64-bit arithmetic throughout -- a `pe_at` near the top of 32 bits
+    // added to a header size would wrap and pass a 32-bit check.
     const std::uint32_t image_base = [&] {
+        if (bytes < 0x40) {
+            return std::uint32_t{0};
+        }
         std::uint32_t pe_at = 0;
         std::memcpy(&pe_at, image_bytes + 0x3C, 4);
+        if (static_cast<std::uint64_t>(pe_at) + 24 + 32 >
+            static_cast<std::uint64_t>(bytes)) {
+            return std::uint32_t{0};
+        }
         std::uint32_t base = 0;
         std::memcpy(&base, image_bytes + pe_at + 24 + 28, 4);
         return base;
     }();
     const std::uint32_t size_of_headers = [&] {
+        if (bytes < 0x40) {
+            return std::uint32_t{0};
+        }
         std::uint32_t pe_at = 0;
         std::memcpy(&pe_at, image_bytes + 0x3C, 4);
+        if (static_cast<std::uint64_t>(pe_at) + 24 + 64 >
+            static_cast<std::uint64_t>(bytes)) {
+            return std::uint32_t{0};
+        }
         std::uint32_t v = 0;
         std::memcpy(&v, image_bytes + pe_at + 24 + 60, 4);
         return v;
@@ -401,6 +422,14 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         }();
         const std::size_t table =
             static_cast<std::size_t>(pe_at) + 24 + optional_size;
+        // The whole section table has to be inside the file before the
+        // first entry is read: a `section_count` larger than the file
+        // carries is a table of reads past the end, one entry at a time.
+        if (static_cast<std::uint64_t>(table) +
+                static_cast<std::uint64_t>(section_count) * 40 >
+            static_cast<std::uint64_t>(bytes)) {
+            return false;
+        }
         for (std::uint16_t s = 0; s < section_count; ++s) {
             const std::size_t e = table + static_cast<std::size_t>(s) * 40;
             std::uint32_t va = 0, raw = 0, raw_size = 0, vsize = 0;
@@ -409,6 +438,14 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             std::memcpy(&raw_size, image_bytes + e + 16, 4);
             std::memcpy(&raw, image_bytes + e + 20, 4);
             if (raw == 0 || raw_size == 0 || va == 0) {
+                continue;
+            }
+            // `raw` is the file's to choose and `bytes` is what is actually
+            // mapped: a `raw` past the end would make `bytes - raw` wrap
+            // into a `take` of nearly four gigabytes, so the containment is
+            // checked before the subtraction rather than trusted after it.
+            if (static_cast<std::uint64_t>(raw) >=
+                static_cast<std::uint64_t>(bytes)) {
                 continue;
             }
             const std::size_t take = raw_size < bytes - raw ? raw_size
@@ -606,8 +643,11 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         std::uint32_t segment_base = 0;  // fs lands here, per instruction
         (void)rep;
         (void)segment_base;
-        // Prefixes, before any opcode.
-        for (;;) {
+        // Prefixes, before any opcode. The fetch buffer is the bound: a
+        // stream of prefixes that fills it is an instruction this
+        // interpreter cannot decode, and the alternative is reading past
+        // the buffer one byte at a time.
+        while (i < code.size()) {
             if (c[i] == 0x66) {
                 op16 = false;
                 ++i;
@@ -623,6 +663,15 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             } else {
                 break;
             }
+        }
+        if (i >= code.size()) {
+            // The prefixes ran to the end of the fetch buffer, so there is
+            // no opcode to read and no instruction to run. Report it the
+            // way every other decode failure here is reported.
+            if (loop_fault != nullptr) {
+                *loop_fault = "the instruction ran past the fetch buffer";
+            }
+            return false;
         }
         const unsigned opsz = op16 ? 4u : 2u;  // the 66 prefix's answer
         const std::uint8_t op = c[i++];

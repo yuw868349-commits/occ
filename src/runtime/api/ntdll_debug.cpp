@@ -42,7 +42,7 @@ namespace {
 // The status codes the families answer with, at the values the kernel
 // assigns them.
 constexpr std::uint32_t kStatusSuccess = 0x00000000;
-constexpr std::uint32_t kStatusTimeout = 0x00000102;
+[[maybe_unused]] constexpr std::uint32_t kStatusTimeout = 0x00000102;
 constexpr std::uint32_t kStatusInvalidParameter = 0xC000000D;
 constexpr std::uint32_t kStatusInvalidHandle = 0xC0000008;
 constexpr std::uint32_t kStatusNotImplemented = 0xC0000002;
@@ -50,7 +50,7 @@ constexpr std::uint32_t kStatusInfoLengthMismatch = 0xC0000004;
 constexpr std::uint32_t kStatusAccessViolation = 0xC0000005;
 constexpr std::uint32_t kStatusPortDisconnected = 0xC0000037;
 constexpr std::uint32_t kStatusDebuggerInactive = 0x40000008;
-constexpr std::uint32_t kStatusProcessIsTerminating = 0x4000000B;
+[[maybe_unused]] constexpr std::uint32_t kStatusProcessIsTerminating = 0x4000000B;
 constexpr std::uint32_t kStatusBadLength = 0xC0000206;
 
 // -- the debug object, per thread ------------------------------------------
@@ -467,6 +467,16 @@ extern "C" __attribute__((ms_abi)) std::uint32_t u32n_CsrCaptureMessageString(
     std::uint64_t buffer, const char* message_string, std::uint32_t length,
     std::uint32_t maximum_length, char** captured) noexcept {
     (void)length;
+    // A zero-length capture has nowhere to put even the terminator: the
+    // allocation below hands back a slot sized exactly by `maximum_length`,
+    // and the terminator write at the end assumes one byte of it. Refusing
+    // with a null capture is the answer that stays inside the allocation.
+    if (maximum_length == 0) {
+        if (captured != nullptr) {
+            *captured = nullptr;
+        }
+        return kStatusSuccess;
+    }
     void* at = nullptr;
     const std::uint32_t status =
         u32n_CsrAllocateMessagePointer(buffer, maximum_length, &at);
@@ -477,7 +487,7 @@ extern "C" __attribute__((ms_abi)) std::uint32_t u32n_CsrCaptureMessageString(
         auto* dst = static_cast<char*>(at);
         const std::size_t take = std::min<std::size_t>(
             message_string != nullptr ? std::strlen(message_string) : 0,
-            maximum_length > 0 ? maximum_length - 1 : 0);
+            maximum_length - 1);
         if (take != 0) {
             std::memcpy(dst, message_string, take);
         }

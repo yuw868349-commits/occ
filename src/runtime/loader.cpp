@@ -571,7 +571,7 @@ void rollback(AddressSpace& space, Mapper* placement,
 }
 
 TlsResult commit_tls_index(const TlsModule& m, AddressSpace& space,
-                           TlsTable& table) noexcept {
+                           Mapper* placement, TlsTable& table) noexcept {
     TlsResult out;
     if (m.index_va == 0) {
         // A directory with no `AddressOfIndex` is legal -- a module can
@@ -618,12 +618,45 @@ TlsResult commit_tls_index(const TlsModule& m, AddressSpace& space,
         return out;
     }
     if ((protection_to_prot(r->protection) & PROT_WRITE) == 0) {
-        // The loader writes the module's TLS slot during process setup.
+        // The loader writes the module's TLS slot during process setup, and
         // Windows grants that write even into a section the file declared
-        // read-only -- the slot is the loader's own, not the image's -- so
-        // mirror it here: raise the containing page, store the index, put
-        // the protection back. A packed image is the case this exists for:
-        // its sections are merged and a stub often marks them all read-only.
+        // read-only -- the slot is the loader's own, not the image's. Mirror
+        // it here: raise the containing page, store the index, put the
+        // protection back. A packed image is the case this exists for: its
+        // sections are merged and a stub often marks them all read-only.
+        //
+        // The raise goes through the mapper's kernel half, and for a reason
+        // worth spelling out. `AddressSpace::set_protection` records a
+        // protection and calls nothing, so a raise spelled that way would
+        // succeed as a ledger entry and the store would fault on a page that
+        // was never made writable. `Mapper::protect_in_range` asks the kernel
+        // but refuses to cut an image region, and the cut is wrong here
+        // anyway: the raise lasts for one store and is taken back below, so
+        // the ledger ends where it started -- the section the file declared
+        // read-only is the section the guest finds read-only -- and a cut
+        // would make the ledger describe three regions where the guest was
+        // promised one. `protect_range` is the one operation that does
+        // exactly this: the kernel is asked, the ledger is not touched, and
+        // the pair of calls brackets the store.
+        //
+        // The range is the pages the DWORD actually covers rather than the
+        // one page it starts in: an index whose four bytes straddle a page
+        // boundary is a file this runtime accepts -- `region_for_write`
+        // checked the field, not the page -- and raising only the first page
+        // would fault on the second.
+        if (placement == nullptr) {
+            // No mapper means no way to raise a page, and a store into a
+            // read-only page is a fault rather than a refusal. A caller that
+            // has no mapper is a caller that laid the image out without one.
+            release();
+            out.error = TlsError::MalformedDirectory;
+            out.detail = "the TLS index at " + hex_of(m.index_va) + " is in " +
+                         (r->section.empty() ? "an unnamed section"
+                                             : r->section) +
+                         ", which the file declared read-only, and there is "
+                         "no mapper here to raise the page for the write";
+            return out;
+        }
         const PageProtection saved = r->protection;
         const std::uint32_t base = protection_base(saved);
         const PageProtection raised =
@@ -636,21 +669,34 @@ TlsResult commit_tls_index(const TlsModule& m, AddressSpace& space,
                                     PageProtection::Execute)
                             ? PageProtection::ExecuteReadWrite
                             : saved;
-        const std::uint64_t page = m.index_va & ~0xFFFull;
-        const auto res = space.set_protection(page, raised);
-        if (!res.ok()) {
+        const std::uint64_t page_mask = AddressSpace::kPageSize - 1;
+        const std::uint64_t page = m.index_va & ~page_mask;
+        const std::uint64_t span =
+            (((m.index_va + sizeof(std::uint32_t)) - page + page_mask) &
+             ~page_mask);
+        const Result<std::uint64_t> up =
+            placement->protect_range(page, span, raised);
+        if (!up.ok()) {
             release();
             out.error = TlsError::MalformedDirectory;
-            out.detail = "the TLS index at " + hex_of(m.index_va) +
-                         " is in " +
+            out.detail = "the TLS index at " + hex_of(m.index_va) + " is in " +
                          (r->section.empty() ? "an unnamed section"
                                              : r->section) +
-                         ", which the file declared read-only, and the "
-                         "loader could not raise the page to write it";
+                         ", which the file declared read-only, and the page "
+                         "could not be raised to write it";
             return out;
         }
         store_u32(m.index_va, m.index);
-        static_cast<void>(space.set_protection(page, saved));
+        // The protection goes back whether or not the restore is what the
+        // mapper would have chosen: the file declared this section read-only,
+        // and a loader that left it writable would hand the guest a section
+        // it never asked to be able to write. A restore that failed would
+        // leave the kernel and the ledger disagreeing about one page, which
+        // is not a condition this can report -- the slot is written and the
+        // module works -- and it is also the one mprotect in this pair that
+        // cannot legitimately fail, having just succeeded in the other
+        // direction over the same bytes.
+        static_cast<void>(placement->protect_range(page, span, saved));
         out.ok = true;
         return out;
     }
@@ -1908,7 +1954,8 @@ LoadResult load_image(const parser::PeImage& image, ByteSpan bytes,
         // is the first moment the index field's writability is a fact rather
         // than a temporary. See `commit_tls_index`.
         if (module.has_tls) {
-            const TlsResult tls = commit_tls_index(module.tls, space, table);
+            const TlsResult tls =
+                commit_tls_index(module.tls, space, placement, table);
             if (!tls.ok) {
                 out.error = LoadError::TlsRefused;
                 out.detail = std::move(tls.detail);
@@ -2460,13 +2507,13 @@ struct TlsDirectoryLayout {
 // relocation can name a read-only section and the IAT often is in one -- so a
 // check made there is a check of a temporary state.
 //
-// A file whose `AddressOfIndex` names a read-only section cannot have a
-// working TLS, because the program reads the slot number from there and
-// nothing will ever write it. Windows refuses such a module at load time
-// (`LdrpTlsSlotsUsed` walks the directory and the write in
-// `alloc_tls_slot` faults or is guarded), and so does this: the refusal
-// names the address, and the slot is given back so a later module can take
-// it.
+// A file whose `AddressOfIndex` names a read-only section is not refused:
+// the slot number is the loader's own write, and Windows grants a loader
+// write into a section the file declared read-only -- `LdrpTlsSlotsUsed`
+// walks the directory and `alloc_tls_slot` writes through a raised page.
+// This does the same: `commit_tls_index` raises the containing page, stores
+// the number, and puts the protection back, so the guest never sees a
+// section it was not promised it could write.
 TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
                    std::uint64_t base, AddressSpace& space,
                    const LoadContext& context, TlsTable& table,
@@ -2694,8 +2741,13 @@ TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
     //
     // The one check that happens later is the index field's writability, in
     // `commit_tls_index`, which runs after the final protections because
-    // that is the first moment the question has an answer. That one does
-    // have to release, and does; see the `release` lambda there.
+    // that is the first moment the question has an answer. An index in a
+    // read-only section is not refused there: the loader raises the page,
+    // writes the slot number, and puts the protection back, which is what
+    // Windows does for a write that belongs to the loader rather than to the
+    // guest. What does have to release is the failure path -- a raise the
+    // kernel refused -- and that path releases; see the `release` lambda
+    // there.
     //
     // Writing this down matters because the next person to add a check will
     // add it here, below the allocation, and it will have to release -- and
@@ -2711,7 +2763,8 @@ TlsResult load_tls(const parser::PeImage& image, ByteSpan bytes,
     // check here would be a check of a temporary state and would always
     // pass. It is `commit_tls_index`, called after the final protections,
     // that finds out whether the index field is in a section the file
-    // declared writable, and a file whose is not is refused there.
+    // declared writable, and one that is not is written through a raised
+    // page, the way the loader's own write is allowed to be.
     //
     // Wine writes it from `alloc_tls_slot`, which also runs after the
     // sections are protected, and for the same reason.

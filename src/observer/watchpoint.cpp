@@ -455,6 +455,28 @@ std::vector<int> Watchpoints::fds() const noexcept {
     return out;
 }
 
+// Copies `n` bytes out of the ring's data area at monotonic offset `at`.
+//
+// perf's head and tail are offsets in a ring's bookkeeping, and the place
+// they name in the mapping is the offset taken modulo the data length. A
+// record that straddles the end of the data area arrives as two pieces --
+// the tail of it at the start of the ring -- and the two memcpys below put
+// it back together; a record inside the ring is one memcpy because `first`
+// covers it all.
+static void ring_read_at(const std::uint8_t* base, std::uint64_t data_bytes,
+                  std::uint64_t at, void* out, std::size_t n) noexcept {
+    at %= data_bytes;
+    const std::size_t at_index = static_cast<std::size_t>(at);
+    const std::size_t room =
+        static_cast<std::size_t>(data_bytes) - at_index;
+    const std::size_t first = n < room ? n : room;
+    std::memcpy(out, base + at_index, first);
+    if (n > first) {
+        std::memcpy(static_cast<std::uint8_t*>(out) + first, base,
+                    n - first);
+    }
+}
+
 std::size_t Watchpoints::read_events(std::vector<WatchEvent>& out) noexcept {
     const std::size_t before = out.size();
 
@@ -495,11 +517,11 @@ std::size_t Watchpoints::read_events(std::vector<WatchEvent>& out) noexcept {
 
         while (w.ring_tail + sizeof(RingHeader) <= head) {
             RingHeader hdr{};
-            std::memcpy(&hdr, base + w.ring_tail, sizeof(hdr));
+            ring_read_at(base, data_bytes, w.ring_tail, &hdr, sizeof(hdr));
 
             if (hdr.size < sizeof(RingHeader) ||
                 w.ring_tail + hdr.size > head ||
-                w.ring_tail + hdr.size > w.ring_data_offset + data_bytes) {
+                hdr.size > data_bytes) {
                 // A record that does not fit where it claims is truncated or
                 // foreign. The tail is snapped to the head to recover,
                 // because a reader that trusted the size would walk off the
@@ -516,9 +538,10 @@ std::size_t Watchpoints::read_events(std::vector<WatchEvent>& out) noexcept {
                 // their bits are numbered: ip first, then addr.
                 std::uint64_t ip = 0;
                 std::uint64_t addr = 0;
-                std::memcpy(&ip, base + w.ring_tail + sizeof(RingHeader), 8);
-                std::memcpy(&addr,
-                            base + w.ring_tail + sizeof(RingHeader) + 8, 8);
+                ring_read_at(base, data_bytes,
+                             w.ring_tail + sizeof(RingHeader), &ip, 8);
+                ring_read_at(base, data_bytes,
+                             w.ring_tail + sizeof(RingHeader) + 8, &addr, 8);
 
                 WatchEvent ev;
                 ev.pid = w.pid;
@@ -541,8 +564,8 @@ std::size_t Watchpoints::read_events(std::vector<WatchEvent>& out) noexcept {
                 // reports a clean target when the truth is that it was not
                 // watching closely enough to know.
                 std::uint64_t lost = 0;
-                std::memcpy(&lost,
-                            base + w.ring_tail + sizeof(RingHeader) + 8, 8);
+                ring_read_at(base, data_bytes,
+                             w.ring_tail + sizeof(RingHeader) + 8, &lost, 8);
                 lost_samples_ += lost;
             }
             // Any other record type advances the tail without producing an

@@ -22,9 +22,9 @@
 // the byte goes back, the flag comes down, and the guest runs on without
 // ever seeing the seam.
 
-#ifndef OCC_RUNTIME_GUESTDBG_H_
-#define OCC_RUNTIME_GUESTDBG_H_
+#pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <sys/ucontext.h>
 
@@ -131,4 +131,3 @@ void complete_rearm(::ucontext_t* uc) noexcept;
 
 }  // namespace occ::runtime::guestdbg
 
-#endif  // OCC_RUNTIME_GUESTDBG_H_

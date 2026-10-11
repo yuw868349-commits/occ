@@ -10,7 +10,11 @@
 #include "occ/runtime/image_dump.h"
 #include "occ/runtime/pe_process.h"
 #include "occ/runtime/winabi.h"
+#include "occ/syscall/syscall.h"
 #include "occ/util/fs.h"
+
+#include <linux/prctl.h>
+#include <sys/stat.h>
 
 #include <pthread.h>
 
@@ -215,9 +219,43 @@ struct Session {
     return session;
 }
 
+// Whether this process is one the container setup produced.
+//
+// `occ __pe-runner` is an internal command word, and a word is a name rather
+// than a credential: any caller can type it, and the process that results
+// would run the image with the host's own privileges, its own mount
+// namespace and no syscall filter -- the isolation the rest of this program
+// exists to provide, skipped by typing seven characters. What the setup
+// leaves behind, and a plain host process does not have, is a seccomp filter
+// in force on this thread and a mount namespace of its own. Those two are
+// what this checks for. Either can be produced by hand by a caller who has
+// read this comment; a check that demanded less would be satisfied by typing
+// the word, which is exactly the state this replaces.
+[[nodiscard]] bool is_container_child() noexcept {
+    const sys::Result seccomp = sys::prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    const bool filtered = seccomp.ok() && seccomp.value != 0;
+    struct ::stat self_ns {};
+    struct ::stat init_ns {};
+    const bool have_ns = ::stat("/proc/self/ns/mnt", &self_ns) == 0 &&
+                         ::stat("/proc/1/ns/mnt", &init_ns) == 0;
+    const bool own_mount_namespace =
+        have_ns && self_ns.st_ino != init_ns.st_ino;
+    return filtered && own_mount_namespace;
+}
+
 } // namespace
 
 int run_pe_runner(int argc, char** argv) noexcept {
+    if (!is_container_child()) {
+        std::fprintf(stderr,
+                     "occ: %s runs the image inside the container the setup "
+                     "builds, and this process is not one: no syscall filter "
+                     "is in force and the mount namespace is the host's. "
+                     "Use `occ run` so that the isolation the run depends on "
+                     "is in place.\n",
+                     kPeRunnerCommand);
+        return 3;
+    }
     if (argc < 2 || argv[1] == nullptr || argv[1][0] == '\0') {
         std::fprintf(stderr, "usage: occ %s <image> [arguments...]\n",
                      kPeRunnerCommand);

@@ -196,7 +196,7 @@ public:
     // A region that has been written to is never evicted. The count returned
     // is watches released, not regions visited, because a region may have
     // held several.
-    std::size_t evict_cold(Watchpoints& watchpoints, std::size_t need) noexcept;
+    [[nodiscard]] std::size_t evict_cold(Watchpoints& watchpoints, std::size_t need) noexcept;
 
     // The regions the tracker knows about, for a caller that has to report
     // them.

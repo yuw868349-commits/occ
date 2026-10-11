@@ -38,6 +38,7 @@
 #include "occ/runtime/api.h"
 #include "occ/runtime/winabi.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -75,7 +76,7 @@ constexpr std::int32_t kFalse = 0;
 
 // -- the messages a window receives -------------------------------------------
 
-constexpr std::uint32_t kMsgNull = 0x0000;
+[[maybe_unused]] constexpr std::uint32_t kMsgNull = 0x0000;
 constexpr std::uint32_t kMsgCreate = 0x0001;
 constexpr std::uint32_t kMsgDestroy = 0x0002;
 constexpr std::uint32_t kMsgMove = 0x0003;
@@ -784,7 +785,11 @@ extern "C" __attribute__((ms_abi)) std::uint16_t u32w_RegisterClassA(
     std::uint64_t instance = 0;
     std::memcpy(&instance, p + 0x18, 8);
     const char* name = nullptr;
-    std::memcpy(&name, p + 0x28, 8);
+    // WNDCLASSA runs style, wndproc, the two extra words, hInstance, hIcon,
+    // hCursor, hbrBackground, lpszMenuName and then lpszClassName -- offset
+    // 0x40. Offset 0x28 is hCursor, and a class name read from there is a
+    // pointer the guest never chose.
+    std::memcpy(&name, p + 0x40, 8);
     return class_register(style, proc, cls_extra, win_extra, instance, 0, 0,
                           0, 0, utf8_to_wide(name));
 }
@@ -2393,7 +2398,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32w_GetCursorPos(
     }
     Station& s = station();
     const Lock held(s.lock);
-    write_rect(point, s.cursor_x, s.cursor_y, 0, 0);
+    // The caller named a POINT -- two words -- and the rect writer puts
+    // four; the last two words would land in whatever the caller's POINT
+    // borders.
+    const std::int32_t xy[2] = {s.cursor_x, s.cursor_y};
+    std::memcpy(point, xy, sizeof(xy));
     return kTrue;
 }
 

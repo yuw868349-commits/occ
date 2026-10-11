@@ -1635,12 +1635,24 @@ constexpr char16_t kEnvTerminator = u'\0';
         return kStInvalidParameter1;
     }
     const std::uint16_t capacity = read_u16(out, kUsMaximumLength);
-    const auto needed =
-        static_cast<std::uint16_t>(value.size() * sizeof(char16_t));
-    write_u16(out, kUsLength, needed);
-    if (needed > capacity) {
+    // The comparison happens before the truncation, not after it: the byte
+    // count is sixty-four bits wide and the field it would be written to is
+    // sixteen, and a string whose count wraps a uint16 would pass a check
+    // made on the wrapped number and then copy the unwrapped one -- three
+    // times the buffer the caller named. A count past the field is a short
+    // buffer by definition, and the length reported back is the saturated
+    // value a caller can size a retry from.
+    const std::uint64_t needed64 =
+        static_cast<std::uint64_t>(value.size()) * sizeof(char16_t);
+    if (needed64 > capacity) {
+        write_u16(out, kUsLength,
+                  needed64 > 0xFFFFu
+                      ? 0xFFFFu
+                      : static_cast<std::uint16_t>(needed64));
         return kStBufferTooSmall;
     }
+    const auto needed = static_cast<std::uint16_t>(needed64);
+    write_u16(out, kUsLength, needed);
     auto* buffer = reinterpret_cast<char16_t*>(read_ptr(out, kUsBuffer));
     if (buffer == nullptr) {
         // A structure with no buffer cannot receive a string even when its

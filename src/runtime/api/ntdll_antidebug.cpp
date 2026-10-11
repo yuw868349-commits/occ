@@ -74,9 +74,9 @@ constexpr std::uint32_t kStatusInvalidHandle = 0xC0000008u;
 constexpr std::uint32_t kStatusInvalidParameter = 0xC000000Du;
 constexpr std::uint32_t kStatusNoMemory = 0xC0000017u;
 constexpr std::uint32_t kStatusBufferTooSmall = 0xC0000023u;
-constexpr std::uint32_t kStatusAccessDenied = 0xC0000022u;
-constexpr std::uint32_t kStatusNotImplemented = 0xC0000002u;
-constexpr std::uint32_t kStatusNotSupported = 0xC00000BBu;
+[[maybe_unused]] constexpr std::uint32_t kStatusAccessDenied = 0xC0000022u;
+[[maybe_unused]] constexpr std::uint32_t kStatusNotImplemented = 0xC0000002u;
+[[maybe_unused]] constexpr std::uint32_t kStatusNotSupported = 0xC00000BBu;
 // The answer `ProcessDebugObjectHandle` gives a process with no debugger. It
 // is the whole point of the class: a caller that gets this knows there is no
 // debug object, and a caller that gets a success knows there is one.
@@ -121,12 +121,12 @@ constexpr std::uint32_t kSystemBasicInformation = 0;
 constexpr std::uint32_t kSystemProcessorInformation = 1;
 constexpr std::uint32_t kSystemPerformanceInformation = 2;
 constexpr std::uint32_t kSystemTimeOfDayInformation = 3;
-constexpr std::uint32_t kSystemProcessInformation = 5;
+[[maybe_unused]] constexpr std::uint32_t kSystemProcessInformation = 5;
 constexpr std::uint32_t kSystemModuleInformation = 0x0B;
 constexpr std::uint32_t kSystemKernelDebuggerInformation = 0x23;
 constexpr std::uint32_t kSystemKernelDebuggerInformationEx = 0x95;
-constexpr std::uint32_t kSystemHypervisorInformation = 0x7D;
-constexpr std::uint32_t kSystemPageSizeInformation = 0x8A;
+[[maybe_unused]] constexpr std::uint32_t kSystemHypervisorInformation = 0x7D;
+[[maybe_unused]] constexpr std::uint32_t kSystemPageSizeInformation = 0x8A;
 
 // ---------------------------------------------------------------------------
 // The structures, at the 64-bit layout
@@ -379,6 +379,12 @@ nt_NtQueryInformationProcess(std::uint64_t process_handle,
         // The image's path, as a `UNICODE_STRING` in the caller's buffer. The
         // string is written after the header, inside the same buffer, so a
         // caller that frees the buffer frees the string with it.
+        if (information == nullptr) {
+            // The null check runs before anything writes: the write below
+            // is into the caller's buffer, and a caller that named no
+            // buffer is refused rather than written at.
+            return kStatusInvalidParameter;
+        }
         const std::string& path = image_path();
         std::u16string wide;
         static_cast<void>(utf8_to_utf16(path, wide));
@@ -386,9 +392,6 @@ nt_NtQueryInformationProcess(std::uint64_t process_handle,
         const bool fits = write_unicode_string_in_buffer(
             information, length, wide, used);
         report(static_cast<std::uint32_t>(used));
-        if (information == nullptr) {
-            return kStatusInvalidParameter;
-        }
         if (!fits) {
             return length < UnicodeStringLayout::kBytes
                        ? kStatusInfoLengthMismatch
@@ -577,25 +580,25 @@ struct ObjectTypeInfoLayout {
     static constexpr std::size_t kTypeName = 0x00;         // UNICODE_STRING
     static constexpr std::size_t kTotalObjects = 0x10;
     static constexpr std::size_t kTotalHandles = 0x14;
-    static constexpr std::size_t kTotalPagedPool = 0x18;
-    static constexpr std::size_t kTotalNonPagedPool = 0x1C;
-    static constexpr std::size_t kTotalNamePool = 0x20;
-    static constexpr std::size_t kTotalHandleTable = 0x24;
-    static constexpr std::size_t kHighWaterObjects = 0x28;
-    static constexpr std::size_t kHighWaterHandles = 0x2C;
-    static constexpr std::size_t kHighWaterPagedPool = 0x30;
-    static constexpr std::size_t kHighWaterNonPagedPool = 0x34;
-    static constexpr std::size_t kHighWaterNamePool = 0x38;
-    static constexpr std::size_t kHighWaterHandleTable = 0x3C;
-    static constexpr std::size_t kInvalidAttributes = 0x40;
-    static constexpr std::size_t kGenericMapping = 0x44;   // 4 x ULONG
+    [[maybe_unused]] static constexpr std::size_t kTotalPagedPool = 0x18;
+    [[maybe_unused]] static constexpr std::size_t kTotalNonPagedPool = 0x1C;
+    [[maybe_unused]] static constexpr std::size_t kTotalNamePool = 0x20;
+    [[maybe_unused]] static constexpr std::size_t kTotalHandleTable = 0x24;
+    [[maybe_unused]] static constexpr std::size_t kHighWaterObjects = 0x28;
+    [[maybe_unused]] static constexpr std::size_t kHighWaterHandles = 0x2C;
+    [[maybe_unused]] static constexpr std::size_t kHighWaterPagedPool = 0x30;
+    [[maybe_unused]] static constexpr std::size_t kHighWaterNonPagedPool = 0x34;
+    [[maybe_unused]] static constexpr std::size_t kHighWaterNamePool = 0x38;
+    [[maybe_unused]] static constexpr std::size_t kHighWaterHandleTable = 0x3C;
+    [[maybe_unused]] static constexpr std::size_t kInvalidAttributes = 0x40;
+    [[maybe_unused]] static constexpr std::size_t kGenericMapping = 0x44;   // 4 x ULONG
     static constexpr std::size_t kValidAccessMask = 0x54;
     static constexpr std::size_t kSecurityRequired = 0x58;  // BOOLEAN
     static constexpr std::size_t kMaintainHandleCount = 0x59;
     static constexpr std::size_t kTypeIndex = 0x5A;
     static constexpr std::size_t kPoolType = 0x5C;
-    static constexpr std::size_t kDefaultPagedPool = 0x60;
-    static constexpr std::size_t kDefaultNonPagedPool = 0x64;
+    [[maybe_unused]] static constexpr std::size_t kDefaultPagedPool = 0x60;
+    [[maybe_unused]] static constexpr std::size_t kDefaultNonPagedPool = 0x64;
     static constexpr std::size_t kBytes = 0x68;
 };
 

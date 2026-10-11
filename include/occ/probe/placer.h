@@ -103,7 +103,7 @@ public:
     //
     // `events` may be null, in which case nothing is written and only the
     // summary is produced.
-    std::size_t place(const std::vector<engine::ProbeRequest>& requests,
+    [[nodiscard]] std::size_t place(const std::vector<engine::ProbeRequest>& requests,
                       std::vector<Placement>& out, Writer* events) noexcept;
 
     // The probes that are attached, for the polling loop.

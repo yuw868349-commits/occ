@@ -21,8 +21,7 @@
 // looking at the number rather than by consulting a table that would have
 // to hold every file as well.
 
-#ifndef OCC_RUNTIME_OBJECTS_H
-#define OCC_RUNTIME_OBJECTS_H
+#pragma once
 
 #include <cstdint>
 
@@ -64,11 +63,11 @@ enum class WaitOutcome : std::uint8_t {
 
 // Sets an event signalled, and one waiter is released. Returns false when
 // the handle names no event.
-bool set_event(std::uint64_t handle) noexcept;
+[[nodiscard]] bool set_event(std::uint64_t handle) noexcept;
 
 // Returns an event to non-signalled. Returns false when the handle names no
 // event.
-bool reset_event(std::uint64_t handle) noexcept;
+[[nodiscard]] bool reset_event(std::uint64_t handle) noexcept;
 
 // Waits for one object. `timeout_ms` of `kInfinite` waits without a
 // deadline; zero asks about the object's state now rather than waiting for
@@ -104,4 +103,3 @@ bool close(std::uint64_t handle) noexcept;
 
 }  // namespace occ::runtime::objects
 
-#endif

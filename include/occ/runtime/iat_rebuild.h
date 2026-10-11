@@ -26,8 +26,7 @@
 // address the code happens to reference -- which is the answer, not a
 // coincidence.
 
-#ifndef OCC_RUNTIME_IAT_REBUILD_H_
-#define OCC_RUNTIME_IAT_REBUILD_H_
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -105,4 +104,3 @@ struct DataExport {
 
 }  // namespace occ::runtime::iat_rebuild
 
-#endif  // OCC_RUNTIME_IAT_REBUILD_H_

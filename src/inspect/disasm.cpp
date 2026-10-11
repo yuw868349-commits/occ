@@ -242,6 +242,13 @@ std::uint32_t x64_instruction_length(const std::uint8_t* bytes,
             // immediates are carried by the same rule below.
             opcode_map = bytes[i];
             i += 1;
+            // The map byte and the opcode are two reads, and the check
+            // above only proves the first one: a 0F 38 that ends the
+            // buffer has a map with no opcode after it, and reading the
+            // opcode unchecked is the read past the end.
+            if (i >= available) {
+                return 0;
+            }
             op = bytes[i++];
         } else {
             opcode_map = 0x0F;

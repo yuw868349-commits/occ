@@ -15,8 +15,7 @@
 // the round trip that makes the write mean something, and `summarize` is
 // the command form of that check.
 
-#ifndef OCC_RUNTIME_MINIDUMP_H_
-#define OCC_RUNTIME_MINIDUMP_H_
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -57,4 +56,3 @@ struct Context {
 
 }  // namespace occ::runtime::minidump
 
-#endif  // OCC_RUNTIME_MINIDUMP_H_

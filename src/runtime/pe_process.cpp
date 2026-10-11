@@ -287,13 +287,27 @@ void store_u16(std::uint64_t base, std::size_t off, std::uint16_t v,
 // UTF-8 and re-encoding would change bytes the caller passed. Widening one
 // byte to one code unit keeps a byte string a byte string, which is what a
 // program that reads it back with `WideCharToMultiByte` expects.
-void store_u16_string(std::uint64_t where, const std::string& s) noexcept {
+//
+// `region_bytes` is what is left of the region the string is going into.
+// The PEB the string lands in is one page, and a command line long enough
+// to fill it is a caller mistake rather than a layout the loader can serve:
+// writing past it would run into whatever the PEB region borders. The
+// caller decides what a refusal means; the write itself never leaves the
+// region.
+bool store_u16_string(std::uint64_t where, const std::string& s,
+                      std::uint64_t region_bytes) noexcept {
+    const std::uint64_t needed =
+        (static_cast<std::uint64_t>(s.size()) + 1) * 2;
+    if (needed > region_bytes) {
+        return false;
+    }
     auto* p = reinterpret_cast<std::uint16_t*>(where);
     for (std::size_t i = 0; i < s.size(); ++i) {
         p[i] = static_cast<std::uint16_t>(
             static_cast<unsigned char>(s[i]));
     }
     p[s.size()] = 0;
+    return true;
 }
 
 void store_unicode_string(std::uint64_t where, std::uint64_t buffer,
@@ -726,17 +740,36 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     // program that reads one gets a pointer into its own PEB rather than
     // into a region that was freed when this function returned.
     std::uint64_t str_cursor = params + 0x400;
+    // Both strings live in the PEB's own page, so the room each one gets is
+    // what is left after the other -- and a pair that does not fit is a
+    // process the caller asked for with an argv the layout cannot carry,
+    // which is refused rather than written past the page.
+    const std::uint64_t strings_room = kPebBytes - 0x400;
+    if (!options.command_line.empty() && !options.image_path.empty()) {
+        const std::uint64_t need =
+            ((static_cast<std::uint64_t>(options.command_line.size()) + 1) * 2 +
+             (static_cast<std::uint64_t>(options.image_path.size()) + 1) * 2);
+        if (need > strings_room) {
+            return nullptr;
+        }
+    }
     if (!options.command_line.empty()) {
         const std::uint32_t chars = static_cast<std::uint32_t>(
             options.command_line.size());
-        store_u16_string(str_cursor, options.command_line);
+        if (!store_u16_string(str_cursor, options.command_line,
+                              kPebBytes - (str_cursor - params))) {
+            return nullptr;
+        }
         store_unicode_string(params + 0x70, str_cursor, chars);
         str_cursor += (static_cast<std::uint64_t>(chars) + 1) * 2;
     }
     if (!options.image_path.empty()) {
         const std::uint32_t chars =
             static_cast<std::uint32_t>(options.image_path.size());
-        store_u16_string(str_cursor, options.image_path);
+        if (!store_u16_string(str_cursor, options.image_path,
+                              kPebBytes - (str_cursor - params))) {
+            return nullptr;
+        }
         store_unicode_string(params + 0x60, str_cursor, chars);
         str_cursor += (static_cast<std::uint64_t>(chars) + 1) * 2;
     }

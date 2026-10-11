@@ -304,7 +304,14 @@ struct BitmapView {
     if (out.bits == 0) {
         return true;  // an empty bitmap is well-formed and has no bits
     }
-    return out.words != nullptr;
+    // The buffer pointer and the bit count are both the guest's to write,
+    // and every reader below indexes the buffer by the count: a buffer that
+    // names the runtime's own memory is a read-modify-write the guest aims
+    // wherever it likes. The bytes the count implies have to be memory the
+    // ledger holds, which is the same rule the allocation calls enforce.
+    const std::uint64_t bytes =
+        static_cast<std::uint64_t>((out.bits + 31) / 32) * 4;
+    return out.words != nullptr && guest_range_is_ours(out.words, bytes);
 }
 
 [[nodiscard]] std::uint32_t bitmap_word_count(
@@ -1059,10 +1066,16 @@ constexpr std::uint8_t kSidMaxSubAuthorities = 15;
 // stops at a malformed size rather than running off the buffer.
 [[nodiscard]] std::size_t acl_aces_end(const void* acl) noexcept {
     const std::uint16_t count = read_u16(acl, kAclAceCount);
+    // The ACL's size field is the buffer's capacity, and the walk is
+    // bounded by it: a `count` larger than the buffer holds would walk the
+    // ACE sizes past the ACL and into whatever borders it, and the caller
+    // hands the answer to a `memmove`. The capacity is the bound the
+    // format itself carries; the count cannot take the walk past it.
+    const std::uint16_t capacity = read_u16(acl, kAclSize);
     std::size_t at = kAclHeaderBytes;
-    for (std::uint16_t i = 0; i < count; ++i) {
+    for (std::uint16_t i = 0; i < count && at < capacity; ++i) {
         const std::uint16_t size = read_u16(acl, at + kAceSize);
-        if (size < 4) {
+        if (size < 4 || at + size > capacity) {
             break;
         }
         at += size;
@@ -1269,13 +1282,27 @@ extern "C" __attribute__((ms_abi)) std::int32_t nr1_RtlAddAce(
     if (static_cast<std::uint32_t>(count) + parsed > 0xFFFFu) {
         return kStatusInvalidAcl;
     }
-    // Walk to the insertion point, then open a gap of exactly the list size.
+    // Walk to the insertion point, then open a gap of exactly the list
+    // size. The walk is bounded by the ACL's own capacity: the ACE sizes
+    // are the guest's to write, and a walk that trusted them could step
+    // past the buffer before the first byte moved. The end the walk below
+    // moves is bounded the same way, and an end behind the insertion point
+    // is a table the guest did not build -- refused, because the `memmove`
+    // it implies has a wrapped length.
+    const std::uint16_t capacity = read_u16(acl, kAclSize);
     std::size_t at = kAclHeaderBytes;
     for (std::uint32_t i = 0; i < index; ++i) {
-        at += read_u16(acl, at + kAceSize);
+        if (at + 4 > capacity) {
+            return kStatusInvalidParameter;
+        }
+        const std::uint16_t size = read_u16(acl, at + kAceSize);
+        if (size < 4 || at + size > capacity) {
+            return kStatusInvalidParameter;
+        }
+        at += size;
     }
     const std::size_t end = acl_aces_end(acl);
-    if (end + list_bytes > read_u16(acl, kAclSize)) {
+    if (end < at || end + list_bytes > capacity) {
         return kStatusBufferTooSmall;
     }
     std::memmove(static_cast<std::uint8_t*>(acl) + at + list_bytes,
@@ -1294,12 +1321,26 @@ extern "C" __attribute__((ms_abi)) std::int32_t nr1_RtlDeleteAce(
     if (index >= count) {
         return kStatusInvalidParameter;
     }
+    const std::uint16_t capacity = read_u16(acl, kAclSize);
     std::size_t at = kAclHeaderBytes;
     for (std::uint32_t i = 0; i < index; ++i) {
-        at += read_u16(acl, at + kAceSize);
+        if (at + 4 > capacity) {
+            return kStatusInvalidParameter;
+        }
+        const std::uint16_t size = read_u16(acl, at + kAceSize);
+        if (size < 4 || at + size > capacity) {
+            return kStatusInvalidParameter;
+        }
+        at += size;
+    }
+    if (at + 4 > capacity) {
+        return kStatusInvalidParameter;
     }
     const std::uint16_t size = read_u16(acl, at + kAceSize);
     const std::size_t end = acl_aces_end(acl);
+    if (size < 4 || at + size > capacity || end < at + size) {
+        return kStatusInvalidParameter;
+    }
     std::memmove(static_cast<std::uint8_t*>(acl) + at,
                  static_cast<const std::uint8_t*>(acl) + at + size,
                  end - at - size);
@@ -1774,6 +1815,15 @@ extern "C" __attribute__((ms_abi)) void* nr1_RtlAddressInSectionTable(
     if (nt_headers == nullptr || base == nullptr) {
         return nullptr;
     }
+    // The headers are the caller's pointer, and the fields below are read
+    // at fixed offsets from it: a pointer that names memory this runtime
+    // did not map turns every one of those reads into a read of whatever
+    // borders it. The header through its section table is the amount the
+    // function walks, and the count it walks is checked against the same
+    // bound once the size of the optional header is known.
+    if (!guest_range_is_ours(nt_headers, kNtOptionalHeader)) {
+        return nullptr;
+    }
     if (read_u32(nt_headers, 0) != kPeSignature) {
         return nullptr;
     }
@@ -1789,6 +1839,16 @@ extern "C" __attribute__((ms_abi)) void* nr1_RtlAddressInSectionTable(
     const std::size_t table =
         kNtOptionalHeader +
         static_cast<std::size_t>(read_u16(nt_headers, kNtSizeOfOptionalHeader));
+    // The table the count implies has to be memory the runtime mapped: a
+    // count larger than the headers that hold it walks the entries past the
+    // mapping, one section at a time, and every field read below is a read
+    // at an offset the entry table chose.
+    if (!guest_range_is_ours(nt_headers, table) ||
+        !guest_range_is_ours(nt_headers, table +
+                             static_cast<std::uint64_t>(sections) *
+                                 kSectionBytes)) {
+        return nullptr;
+    }
     for (std::uint16_t i = 0; i < sections; ++i) {
         const std::size_t at = table + static_cast<std::size_t>(i) * kSectionBytes;
         const std::uint32_t va = read_u32(nt_headers, at + kSectionVirtualAddress);
@@ -1866,18 +1926,43 @@ extern "C" __attribute__((ms_abi)) void* nr1_RtlFindExportedRoutineByName(
         static_cast<const std::uint8_t*>(image_base) + ordinals_rva;
     const auto* functions =
         static_cast<const std::uint8_t*>(image_base) + functions_rva;
+    // The functions table the ordinal indexes is sized by
+    // `NumberOfFunctions`, which the image also supplies: an ordinal past
+    // that count indexes past the table, and the address read there is a
+    // function the guest did not export.
+    const std::uint32_t number_of_functions =
+        read_u32(exports, kExportNumberOfFunctions);
     for (std::uint32_t i = 0; i < number_of_names; ++i) {
         const std::uint32_t name_rva =
             read_u32(names, static_cast<std::size_t>(i) * 4);
         if (!in_image(name_rva, 1, image_size)) {
             continue;
         }
-        const char* candidate = static_cast<const char*>(image_base) + name_rva;
-        if (std::strcmp(candidate, name) != 0) {
+        // The name is NUL-terminated, and the bytes up to the terminator
+        // are the image's to hold: a `strcmp` against a name that runs to
+        // the end of the image and past it reads whatever borders the
+        // mapping. The walk to the terminator is bounded by the image, and
+        // a name with no terminator inside it is not a name.
+        std::size_t name_len = 0;
+        const auto* image_chars =
+            static_cast<const char*>(image_base) + name_rva;
+        const std::size_t image_room =
+            static_cast<std::size_t>(image_size) - name_rva;
+        while (name_len < image_room && image_chars[name_len] != 0) {
+            ++name_len;
+        }
+        if (name_len == image_room) {
+            continue;  // no terminator inside the image
+        }
+        if (std::memcmp(image_chars, name, name_len) != 0 ||
+            name[name_len] != 0) {
             continue;
         }
         const std::uint16_t ordinal =
             read_u16(ordinals, static_cast<std::size_t>(i) * 2);
+        if (static_cast<std::uint32_t>(ordinal) >= number_of_functions) {
+            continue;
+        }
         const std::uint32_t function_rva =
             read_u32(functions, static_cast<std::size_t>(ordinal) * 4);
         if (!in_image(function_rva, 1, image_size)) {

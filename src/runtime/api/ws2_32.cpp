@@ -643,6 +643,15 @@ std::atomic<std::int32_t> g_winsock_users {0};
             // watching a descriptor the host has already given away.
             continue;
         }
+        // The host's `fd_set` is a bitmap with room for `FD_SETSIZE` bits,
+        // and `fd_set` writes into it by shifting: a descriptor past that
+        // size writes into whatever the bitmap borders -- the function's own
+        // frame -- and the descriptor comes from the guest's handle table
+        // rather than from the host. A descriptor the bitmap cannot hold is
+        // skipped, which is the answer for a handle the host never made.
+        if (fd < 0 || fd >= FD_SETSIZE) {
+            continue;
+        }
         FD_SET(fd, &out);
         if (fd > max_fd) {
             max_fd = fd;
@@ -671,6 +680,11 @@ void write_fd_set(void* set, const ::fd_set& result,
         const std::uint64_t handle = read_u64(original, at);
         int fd = 0;
         if (!socket_descriptor_of(handle, fd)) {
+            continue;
+        }
+        // The same bound on the read side: `FD_ISSET` shifts the bitmap by
+        // the descriptor, and one past `FD_SETSIZE` reads out of it.
+        if (fd < 0 || fd >= FD_SETSIZE) {
             continue;
         }
         if (!FD_ISSET(fd, &result)) {

@@ -39,20 +39,20 @@ namespace occ::runtime::winabi {
 
 namespace {
 
-constexpr std::uint32_t kErrOk = 0;
+[[maybe_unused]] constexpr std::uint32_t kErrOk = 0;
 constexpr std::uint32_t kErrParam = 87;
-constexpr std::uint32_t kErrNoMem = 12;
+[[maybe_unused]] constexpr std::uint32_t kErrNoMem = 12;
 constexpr std::uint32_t kErrRange = 34;
-constexpr std::uint32_t kErrBadF = 9;
-constexpr std::uint32_t kErrIlseq = 42;
-constexpr std::uint32_t kErrDomain = 33;
+[[maybe_unused]] constexpr std::uint32_t kErrBadF = 9;
+[[maybe_unused]] constexpr std::uint32_t kErrIlseq = 42;
+[[maybe_unused]] constexpr std::uint32_t kErrDomain = 33;
 
 // The error codes the `errno` family reports, at the values the CRT
 // assigns them.
-constexpr std::int32_t kE2Big = 7;
+[[maybe_unused]] constexpr std::int32_t kE2Big = 7;
 constexpr std::int32_t kEAcces = 13;
 constexpr std::int32_t kEBadf = 9;
-constexpr std::int32_t kEFault = 14;
+[[maybe_unused]] constexpr std::int32_t kEFault = 14;
 constexpr std::int32_t kEInval = 22;
 constexpr std::int32_t kENoMem = 12;
 constexpr std::int32_t kERange = 34;
@@ -62,6 +62,13 @@ constexpr std::int32_t kENoEnt = 2;
 // keeps the guest's, because a guest that sets `errno` and reads it back
 // expects its own value rather than the host's.
 std::int32_t g_errno = 0;
+
+// Whether `%n` writes. Off is the CRT's default and the only safe one for a
+// formatter whose format string is the guest's: the conversion's argument is
+// an address taken from that string, so enabling it is enabling an arbitrary
+// write. `_set_printf_count_output` is the switch the guest turns it on
+// with, and it is honoured the way the reference honours it.
+std::int32_t g_printf_count_output = 0;
 
 // The handshake `_invalid_parameter` makes with the debug CRT: the
 // handler the guest installed, and whether it wants control afterwards.
@@ -466,6 +473,16 @@ void out_finish(Out& o) noexcept {
             continue;
         }
         ++p;
+        if (*p == '\0') {
+            // A format that ends in `%` has no conversion after it, and the
+            // walk above has already stepped past the terminator: reading on
+            // would treat whatever follows the format string in the caller's
+            // memory as a conversion letter. The literal `%` is written and
+            // the walk ends, which is what the reference's formatter does
+            // with the same input.
+            out_char(o, '%');
+            return static_cast<std::int32_t>(o.len);
+        }
         if (*p == '%') {
             out_char(o, '%');
             continue;
@@ -658,13 +675,24 @@ void out_finish(Out& o) noexcept {
             break;
         }
         case 'n': {
-            // The count the format asks to be written back.
+            // The count the format asks to be written back -- and the one
+            // conversion whose argument is an address the *format* chooses.
+            // The CRT this runtime presents has it disabled by default,
+            // exactly as the Microsoft one does: a guest opts in through
+            // `_set_printf_count_output`, and until it does the argument is
+            // consumed from the list and nothing is written. Executing it
+            // unconditionally is an arbitrary write with the format string
+            // as the address.
             if (is_long_long) {
                 auto* at = next_arg<std::int64_t*>(ap);
-                if (at != nullptr) *at = static_cast<std::int64_t>(o.len);
+                if (at != nullptr && g_printf_count_output != 0) {
+                    *at = static_cast<std::int64_t>(o.len);
+                }
             } else {
                 auto* at = next_arg<std::int32_t*>(ap);
-                if (at != nullptr) *at = static_cast<std::int32_t>(o.len);
+                if (at != nullptr && g_printf_count_output != 0) {
+                    *at = static_cast<std::int32_t>(o.len);
+                }
             }
             continue;
         }
@@ -1875,28 +1903,45 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32u__strdate_s(
     return 0;
 }
 
+// The CRT's `tm` is nine thirty-two-bit fields -- thirty-six bytes -- in
+// the order the header declares. The host's `struct tm` carries a UTC offset
+// and a zone pointer after those nine, so a `localtime_r` straight into the
+// guest's structure writes a host pointer into the guest's memory and runs
+// twenty bytes past the thirty-six it allocated. The fields are copied one
+// by one, and the tail stays where it belongs.
+void store_crt_tm(void* out, const struct ::tm& tm) noexcept {
+    const std::int32_t fields[9] = {
+        tm.tm_sec,  tm.tm_min,  tm.tm_hour, tm.tm_mday, tm.tm_mon,
+        tm.tm_year, tm.tm_wday, tm.tm_yday, tm.tm_isdst};
+    std::memcpy(out, fields, sizeof(fields));
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t u32u_localtime_s(
-    std::tm* out, const std::int64_t* timer) noexcept {
+    void* out, const std::int64_t* timer) noexcept {
     if (out == nullptr || timer == nullptr) {
         return kErrParam;
     }
     // The CRT's own time base: seconds from 1970, the same as the host's.
     const std::time_t t = static_cast<std::time_t>(*timer);
-    if (::localtime_r(&t, out) == nullptr) {
+    struct ::tm converted = {};
+    if (::localtime_r(&t, &converted) == nullptr) {
         return kErrParam;
     }
+    store_crt_tm(out, converted);
     return 0;
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t u32u_gmtime_s(
-    std::tm* out, const std::int64_t* timer) noexcept {
+    void* out, const std::int64_t* timer) noexcept {
     if (out == nullptr || timer == nullptr) {
         return kErrParam;
     }
     const std::time_t t = static_cast<std::time_t>(*timer);
-    if (::gmtime_r(&t, out) == nullptr) {
+    struct ::tm converted = {};
+    if (::gmtime_r(&t, &converted) == nullptr) {
         return kErrParam;
     }
+    store_crt_tm(out, converted);
     return 0;
 }
 

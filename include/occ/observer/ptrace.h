@@ -220,6 +220,9 @@ public:
 
     // The siginfo of the stop currently being handled, which is where the
     // faulting address and the trap number live for a hardware breakpoint.
+    // `out` must name at least a whole `siginfo_t` -- the kernel copies
+    // exactly that many bytes and the size is checked here -- and a
+    // smaller buffer comes back as EINVAL rather than as a partial copy.
     [[nodiscard]] sys::Result siginfo(int pid, void* out,
                                       std::size_t size) noexcept;
 };

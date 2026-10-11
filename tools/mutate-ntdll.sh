@@ -39,8 +39,28 @@ TEST_SAN="$BUILD_SAN/tests/occ_test_ntdll"
 # `occ_test_mapper`, and a `Mapper` mutant that ntdll's path never runs through
 # would come back SURVIVED from a binary that was never asked about it. A
 # survivor has to mean the suite is blind, not that the wrong suite was run.
-SUITE="$BUILD/tests/occ_test_mapper $BUILD/tests/occ_test_placement"
-SUITE_SAN="$BUILD_SAN/tests/occ_test_mapper $BUILD_SAN/tests/occ_test_placement"
+# The suites are arrays, and they are run one command at a time. A single
+# string holding two paths does not run two programs: the shell expands it
+# into a command word and an argument, so `occ_test_mapper` received the
+# placement binary's path as its own argument and `occ_test_placement`
+# never ran at all -- every mutant the placement suite would have caught
+# was reported as survived.
+SUITE=("$BUILD/tests/occ_test_mapper" "$BUILD/tests/occ_test_placement")
+SUITE_SAN=("$BUILD_SAN/tests/occ_test_mapper" "$BUILD_SAN/tests/occ_test_placement")
+
+# Runs each binary in turn, appending to one log, and answers whether every
+# one of them exited zero.
+run_suite() {
+    local log="$1"
+    shift
+    local binary
+    for binary in "$@"; do
+        if ! "$binary" >>"$log" 2>&1; then
+            return 1
+        fi
+    done
+    return 0
+}
 SRC=/workspace/Occ/src/runtime/ntdll.cpp
 HDR=/workspace/Occ/include/occ/runtime/ntdll.h
 MAPPER=/workspace/Occ/src/runtime/mapper.cpp
@@ -162,7 +182,8 @@ PYEOF
     fi
     # The plain run first, because a mutant that segfaults or fails an
     # assertion is caught by the fastest signal available.
-    if ! "$TEST" >"$WORK/run.log" 2>&1 || ! $SUITE >"$WORK/run-suite.log" 2>&1; then
+    if ! "$TEST" >"$WORK/run.log" 2>&1 ||
+        ! run_suite "$WORK/run-suite.log" "${SUITE[@]}"; then
         echo "  [$name] caught"
         caught=$((caught + 1))
         restore
@@ -179,7 +200,8 @@ PYEOF
         restore
         return
     fi
-    if "$TEST_SAN" >"$WORK/run-san.log" 2>&1 && $SUITE_SAN >"$WORK/run-san-suite.log" 2>&1; then
+    if "$TEST_SAN" >"$WORK/run-san.log" 2>&1 &&
+        run_suite "$WORK/run-san-suite.log" "${SUITE_SAN[@]}"; then
         echo "  [$name] SURVIVED"
         survived=$((survived + 1))
         failed_names+=("$name")

@@ -35,8 +35,7 @@
 // keep the watch's step and the guest's own step distinguishable, so a
 // guest that steps on purpose keeps working while it is being watched.
 
-#ifndef OCC_RUNTIME_MEMWATCH_H_
-#define OCC_RUNTIME_MEMWATCH_H_
+#pragma once
 
 #include <cstdint>
 
@@ -141,4 +140,3 @@ void note_protect(std::uint64_t address, std::uint64_t size) noexcept;
 
 }  // namespace occ::runtime::memwatch
 
-#endif  // OCC_RUNTIME_MEMWATCH_H_

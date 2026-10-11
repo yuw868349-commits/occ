@@ -79,7 +79,7 @@ struct InstallRequest {
 // placement failed, in which case the PEB's list is left as it was -- an
 // empty list is the smaller lie than a list naming images that are not
 // there.
-bool install(const InstallRequest& request) noexcept;
+[[nodiscard]] bool install(const InstallRequest& request) noexcept;
 
 // The base a module lookup answers with, by the folded (lower-case) module
 // name, zero for a module this process has no image of. The image's own

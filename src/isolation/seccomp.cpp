@@ -192,6 +192,78 @@ std::uint32_t highest_known_syscall() noexcept {
     return 0x1ffu;
 }
 
+namespace {
+
+// The syscall numbers the refusal list names, on the x86-64 table this
+// runtime targets. They are written out here rather than taken from a header
+// because the header that defines them is the kernel's and this file already
+// carries the values it needs from that interface.
+constexpr std::uint32_t kSysChroot = 161;
+constexpr std::uint32_t kSysPivotRoot = 155;
+constexpr std::uint32_t kSysMount = 165;
+constexpr std::uint32_t kSysUmount2 = 166;
+constexpr std::uint32_t kSysSwapon = 167;
+constexpr std::uint32_t kSysSwapoff = 168;
+constexpr std::uint32_t kSysReboot = 169;
+constexpr std::uint32_t kSysSethostname = 170;
+constexpr std::uint32_t kSysSetdomainname = 171;
+constexpr std::uint32_t kSysIopl = 172;
+constexpr std::uint32_t kSysIoperm = 173;
+constexpr std::uint32_t kSysInitModule = 175;
+constexpr std::uint32_t kSysDeleteModule = 176;
+constexpr std::uint32_t kSysPtrace = 101;
+constexpr std::uint32_t kSysKexecLoad = 246;
+constexpr std::uint32_t kSysKexecFileLoad = 320;
+constexpr std::uint32_t kSysSetns = 308;
+constexpr std::uint32_t kSysUnshare = 272;
+constexpr std::uint32_t kSysBpf = 321;
+constexpr std::uint32_t kSysPerfEventOpen = 298;
+constexpr std::uint32_t kSysUserfaultfd = 323;
+constexpr std::uint32_t kSysNameToHandleAt = 303;
+constexpr std::uint32_t kSysOpenByHandleAt = 304;
+constexpr std::uint32_t kSysProcessVmReadv = 310;
+constexpr std::uint32_t kSysProcessVmWritev = 311;
+constexpr std::uint32_t kSysAddKey = 248;
+constexpr std::uint32_t kSysRequestKey = 249;
+constexpr std::uint32_t kSysKeyctl = 250;
+constexpr std::uint32_t kSysFinitModule = 313;
+constexpr std::uint32_t kSysIoUringSetup = 425;
+constexpr std::uint32_t kSysIoUringEnter = 426;
+constexpr std::uint32_t kSysIoUringRegister = 427;
+
+}  // namespace
+
+SeccompPolicy guest_default_policy() noexcept {
+    SeccompPolicy policy;
+    policy.fallback = SeccompDefault::Allow;
+    // EPERM rather than ENOSYS: the call exists and this runtime is refusing
+    // it, which is a distinction a target that inspects the answer can act
+    // on -- and one that keeps a missing call from looking like a kernel
+    // that predates it.
+    const auto refuse = [&policy](std::uint32_t nr) {
+        SeccompRule rule;
+        rule.nr = nr;
+        rule.action = SeccompAction::Errno;
+        rule.error = sys::kEperm;
+        policy.rules.push_back(rule);
+    };
+    for (const std::uint32_t nr : {
+             kSysChroot,         kSysPivotRoot,      kSysMount,
+             kSysUmount2,        kSysSwapon,         kSysSwapoff,
+             kSysReboot,         kSysSethostname,    kSysSetdomainname,
+             kSysIopl,           kSysIoperm,         kSysInitModule,
+             kSysDeleteModule,   kSysFinitModule,    kSysKexecLoad,
+             kSysKexecFileLoad,  kSysPtrace,         kSysSetns,
+             kSysUnshare,        kSysBpf,            kSysPerfEventOpen,
+             kSysUserfaultfd,    kSysNameToHandleAt, kSysOpenByHandleAt,
+             kSysProcessVmReadv, kSysProcessVmWritev, kSysAddKey,
+             kSysRequestKey,     kSysKeyctl,         kSysIoUringSetup,
+             kSysIoUringEnter,   kSysIoUringRegister}) {
+        refuse(nr);
+    }
+    return policy;
+}
+
 SeccompProgram build_seccomp(const SeccompPolicy& policy) noexcept {
     SeccompProgram out;
 

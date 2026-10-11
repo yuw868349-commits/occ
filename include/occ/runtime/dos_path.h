@@ -11,8 +11,7 @@
 // answer, and two copies of a mapping are two chances for one of them to
 // disagree with the other about what a path means.
 
-#ifndef OCC_RUNTIME_DOS_PATH_H
-#define OCC_RUNTIME_DOS_PATH_H
+#pragma once
 
 #include <string>
 #include <string_view>
@@ -35,4 +34,3 @@ namespace occ::runtime {
 
 }  // namespace occ::runtime
 
-#endif  // OCC_RUNTIME_DOS_PATH_H

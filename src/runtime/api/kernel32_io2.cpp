@@ -442,18 +442,20 @@ void iocp_post(CompletionPort& port, const CompletionPacket& packet) noexcept {
     return taken;
 }
 
-// The OVERLAPPED layout, as `file.cpp` spells it and as this file's
-// completion answers write it: two kernel words, the position, the event,
-// and the byte count the caller reads first.
-[[maybe_unused]] constexpr std::size_t kOverlappedInternalHigh = 8;
-[[maybe_unused]] constexpr std::size_t kOverlappedOffset = 16;
-[[maybe_unused]] constexpr std::size_t kOverlappedOffsetHigh = 24;
-constexpr std::size_t kOverlappedBytes = 40;
+// The OVERLAPPED layout, the one Windows spells: two kernel words, the
+// position, the event. The byte count a completed operation reports lives
+// in `InternalHigh`, and that is both where the kernel writes it and where
+// `GetOverlappedResult` reads it back -- which is why the count below is
+// written there and nowhere else. An offset past the 32-byte structure
+// would be a write into whatever the caller's OVERLAPPED borders, and a
+// count nothing reads.
+constexpr std::size_t kOverlappedInternalHigh = 8;
 
 void overlapped_set_bytes(void* overlapped, std::uint32_t bytes) noexcept {
     if (overlapped != nullptr) {
-        std::memcpy(static_cast<std::uint8_t*>(overlapped) + kOverlappedBytes,
-                    &bytes, 4);
+        std::memcpy(
+            static_cast<std::uint8_t*>(overlapped) + kOverlappedInternalHigh,
+            &bytes, 4);
     }
 }
 
@@ -562,9 +564,21 @@ k32io2_GetQueuedCompletionStatusEx(std::uint64_t port, void* entries,
     // Each entry is an OVERLAPPED_ENTRY: the completion key, the byte
     // count, the overlapped pointer, and the internal status the caller
     // does not read -- 32 bytes, of which three are filled here.
+    //
+    // `count` is the guest's to choose, and the stack is not the place a
+    // guest-sized number of packets goes: an `alloca` of `count` times the
+    // packet size is a stack the guest can end with one call. The batch is
+    // taken in bounded slices instead -- the caller that wants more calls
+    // again, which is what a drained port answers -- and the remainder is
+    // reported through `removed_out` exactly as a shorter take is.
+    constexpr std::uint32_t kMaxPacketsPerCall = 256;
+    if (count > kMaxPacketsPerCall) {
+        count = kMaxPacketsPerCall;
+    }
+    alignas(8) std::uint8_t packet_storage[sizeof(CompletionPacket) *
+                                           kMaxPacketsPerCall] = {};
     CompletionPacket* packets =
-        static_cast<CompletionPacket*>(::alloca(sizeof(CompletionPacket) *
-                                                count));
+        reinterpret_cast<CompletionPacket*>(packet_storage);
     const std::uint32_t taken = iocp_take_many(*p, milliseconds, packets,
                                                count);
     if (taken == 0) {

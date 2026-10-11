@@ -19,8 +19,7 @@
 // the way the operating system does, rather than by answering a null
 // address.
 
-#ifndef OCC_RUNTIME_API_H
-#define OCC_RUNTIME_API_H
+#pragma once
 
 #include "occ/runtime/exports.h"
 
@@ -667,4 +666,3 @@ void add_module_msvcirt(ExportModule& module);
 
 }  // namespace occ::runtime::winabi
 
-#endif  // OCC_RUNTIME_API_H

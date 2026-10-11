@@ -26,6 +26,7 @@
 #include "occ/runtime/seh.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 
@@ -34,11 +35,12 @@ namespace occ::runtime::winabi {
 namespace {
 
 // The exception payload `__std_exception_copy` and `_destroy` move. The
-// real structure is four machine words -- the exception record, the copy
-// and destroy functions and the object address -- and a copy that moves
-// the header without touching the object is the safe half of the
-// contract, because the object itself is immutable once thrown.
-constexpr std::size_t kStdExceptionHeaderBytes = 4 * sizeof(void*);
+// real structure is two machine words -- the exception record and the
+// object address -- and a copy that moves exactly those is the safe half
+// of the contract, because the object itself is immutable once thrown. A
+// copy sized at four words would run eight bytes past the structure the
+// caller allocated.
+constexpr std::size_t kStdExceptionHeaderBytes = 2 * sizeof(void*);
 
 }  // namespace
 

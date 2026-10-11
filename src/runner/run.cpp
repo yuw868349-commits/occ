@@ -11,6 +11,7 @@
 #include "occ/util/string.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <utility>

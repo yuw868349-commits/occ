@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "occ/isolation/seccomp.h"
 #include "occ/syscall/capability.h"
 
 namespace occ::isolation {
@@ -112,6 +113,15 @@ struct ContainerConfig {
     // that has no use for a capability cannot use it, and cannot regain it
     // through an exec.
     std::vector<sys::Cap> keep_capabilities;
+
+    // The syscall filter installed before the target runs. The default is
+    // the refusal list `guest_default_policy()` builds; a caller that wants
+    // a stricter allow list sets `fallback = Errno` on its own policy and
+    // stores it here. `install_seccomp` false is the escape hatch for a host
+    // whose kernel has no seccomp, and it is false by the caller's choice
+    // rather than by default.
+    sys::SeccompPolicy seccomp_policy = sys::guest_default_policy();
+    bool install_seccomp = true;
 
     // Paths bind-mounted read-only into the new root after it is in place.
     // Used for things the target needs but that should not be part of the

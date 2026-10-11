@@ -168,7 +168,7 @@ void test_a_data_symbol_is_not_code() {
         ProbeRequest{path, "stdin", "the standard input object", ""});
 
     std::vector<Placement> out;
-    placer.place(requests, out, nullptr);
+    static_cast<void>(placer.place(requests, out, nullptr));
 
     check(out.size() == 1, "one placement is reported");
     // stdin is a FILE*, so its symbol type is an object. The outcome is
@@ -193,7 +193,7 @@ void test_a_real_function_resolves_to_a_file_offset() {
     requests.push_back(ProbeRequest{path, "malloc", "malloc", ""});
 
     std::vector<Placement> out;
-    placer.place(requests, out, nullptr);
+    static_cast<void>(placer.place(requests, out, nullptr));
 
     check(out.size() == 1, "one placement is reported");
     if (out[0].outcome == PlacementOutcome::Attached ||
@@ -224,7 +224,7 @@ void test_the_definition_is_preferred_over_the_import() {
     requests.push_back(ProbeRequest{path, "memcpy", "memcpy", ""});
 
     std::vector<Placement> out;
-    placer.place(requests, out, nullptr);
+    static_cast<void>(placer.place(requests, out, nullptr));
 
     check(out.size() == 1, "one placement is reported");
     check(out[0].outcome == PlacementOutcome::Attached ||
@@ -369,7 +369,7 @@ void test_the_offset_is_not_the_address() {
         ProbeRequest{lib.path, "occ_delta_target", "occ_delta_target", ""});
 
     std::vector<Placement> out;
-    placer.place(requests, out, nullptr);
+    static_cast<void>(placer.place(requests, out, nullptr));
 
     check(out.size() == 1, "one placement is reported");
     check(out[0].outcome == PlacementOutcome::Attached ||
@@ -412,7 +412,7 @@ void test_argument_names_survive_resolution() {
     ProbePlacer placer;
     std::vector<ProbeRequest> requests{req};
     std::vector<Placement> out;
-    placer.place(requests, out, nullptr);
+    static_cast<void>(placer.place(requests, out, nullptr));
 
     check(out.size() == 1, "one placement is reported");
     check(out[0].arg_names[0] == "FileHandle",
@@ -442,7 +442,7 @@ void test_a_layer_that_placed_nothing_says_why() {
     std::vector<ProbeRequest> requests;
     requests.push_back(ProbeRequest{"libNotHere.so", "x", "x", ""});
     std::vector<Placement> out;
-    placer.place(requests, out, nullptr);
+    static_cast<void>(placer.place(requests, out, nullptr));
 
     // A host without tracefs, which is most containers. The placer has to
     // be able to say so once for the whole run rather than once per probe,

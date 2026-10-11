@@ -31,7 +31,7 @@ namespace {
 // The errors the family reports.
 constexpr std::uint32_t kErrOk = 0;
 constexpr std::uint32_t kErrParam = 87;
-constexpr std::uint32_t kErrFileNotFound = 2;
+[[maybe_unused]] constexpr std::uint32_t kErrFileNotFound = 2;
 constexpr std::uint32_t kErrResourceNotFound = 1810;
 constexpr std::uint32_t kErrInvalidFormat = 11;
 
@@ -42,7 +42,7 @@ constexpr std::int32_t kFalse = 0;
 constexpr std::uint32_t kVersionSignature = 0xFEEF04BD;
 
 // The resource type a version block is.
-constexpr std::uint32_t kRtVersion = 16;
+[[maybe_unused]] constexpr std::uint32_t kRtVersion = 16;
 
 // The fixed info, at Windows' layout: every field a 32-bit word, in the
 // order the SDK documents.
@@ -93,7 +93,12 @@ struct PeView {
         return false;
     }
     const std::uint32_t pe_off = rd32(v.data + 0x3C);
-    if (pe_off + 0x18 > v.size || pe_off + 6 > v.size) {
+    // The offsets are read out of the file and the sums are checked in
+    // sixty-four bits: `pe_off + 0x18` in thirty-two bits wraps for an
+    // offset near the top of the range, and the wrapped sum passes a check
+    // that then indexes the file with the unwrapped one.
+    const std::uint64_t pe_off64 = pe_off;
+    if (pe_off64 + 0x18 > v.size || pe_off64 + 6 > v.size) {
         return false;
     }
     if (v.data[pe_off] != 'P' || v.data[pe_off + 1] != 'E') {
@@ -164,7 +169,18 @@ struct PeView {
         // entries stand after the named ones. `node` is already an
         // absolute offset into the file, which is what the read below
         // indexes with.
-        const std::size_t entries = node + 16 + named * 8;
+        // The name count is the directory's to write, and the offset the
+        // entries land at is computed from it: a count large enough to carry
+        // the sum past the end of the file is a read of whatever the file's
+        // mapping borders. The sum is computed in sixty-four bits and
+        // checked against the file before the pointer is formed.
+        const std::uint64_t entries64 =
+            static_cast<std::uint64_t>(node) + 16 +
+            static_cast<std::uint64_t>(named) * 8;
+        if (entries64 + 8 > v.size) {
+            return false;
+        }
+        const std::size_t entries = static_cast<std::size_t>(entries64);
         const std::uint8_t* entry = v.data + entries;
         const std::uint32_t field = rd32(entry + 4);
         if ((field & 0x80000000) == 0) {
@@ -185,12 +201,20 @@ struct PeView {
         const std::uint32_t va = rd32(s + 12);
         const std::uint32_t raw = rd32(s + 20);
         const std::uint32_t raw_size = rd32(s + 16);
-        if (data_rva >= va && data_rva < va + raw_size &&
-            data_rva - va + raw + static_cast<std::size_t>(data_size) <=
-                v.size) {
-            const std::size_t off = data_rva - va + raw;
-            out.assign(v.data + off, v.data + off + data_size);
-            return true;
+        // `va + raw_size` wraps in thirty-two bits, and the sum that
+        // reaches the file check is computed in sixty-four: a section whose
+        // virtual address plus size wraps would otherwise claim an RVA that
+        // is not inside it.
+        const std::uint64_t va64 = va;
+        const std::uint64_t end64 = va64 + raw_size;
+        if (data_rva >= va64 && static_cast<std::uint64_t>(data_rva) < end64) {
+            const std::uint64_t off64 =
+                static_cast<std::uint64_t>(data_rva - va) + raw;
+            if (off64 + data_size <= v.size) {
+                const std::size_t off = static_cast<std::size_t>(off64);
+                out.assign(v.data + off, v.data + off + data_size);
+                return true;
+            }
         }
     }
     return false;

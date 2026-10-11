@@ -112,8 +112,8 @@ class PacketDecoder {
 public:
     // Feeds bytes into the decoder. Returns the number of packets that
     // became complete. Callers take them with take().
-    std::size_t feed(const char* data, std::size_t length) noexcept;
-    std::size_t feed(std::string_view s) noexcept {
+    [[nodiscard]] std::size_t feed(const char* data, std::size_t length) noexcept;
+    [[nodiscard]] std::size_t feed(std::string_view s) noexcept {
         return feed(s.data(), s.size());
     }
 

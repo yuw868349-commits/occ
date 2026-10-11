@@ -174,7 +174,7 @@ void test_bad_checksum() {
 
 void test_retransmit_request() {
     PacketDecoder d;
-    d.feed("-", 1);
+    static_cast<void>(d.feed("-", 1));
     check(d.retransmit_requested(),
           "a lone minus asks for a retransmission");
     d.clear_retransmit();
@@ -208,7 +208,7 @@ void test_escaping() {
           "a literal # does not appear unescaped in a packet body");
 
     PacketDecoder d;
-    d.feed(packet);
+    static_cast<void>(d.feed(packet));
     const Packet p = d.take();
     check(p.data == payload, "the escaped payload round-trips");
     check(p.checksum_ok, "the escaped packet's checksum is over the escaped "
@@ -978,7 +978,7 @@ void test_connection_drops_corrupt_packet() {
     // write its memory on the strength of a transmission error.
     PacketDecoder decoder;
     // 'g' with a checksum that cannot match.
-    decoder.feed("$g#00", 5);
+    static_cast<void>(decoder.feed("$g#00", 5));
     check(decoder.has_packet(), "a corrupt packet is still framed");
     Packet p = decoder.take();
     check(!p.checksum_ok, "a bad checksum is reported");
@@ -991,7 +991,7 @@ void test_connection_drops_corrupt_packet() {
     // direction entirely and would put a packet on the wire nobody asked
     // for.
     PacketDecoder again;
-    again.feed("$g#00", 5);
+    static_cast<void>(again.feed("$g#00", 5));
     check(again.has_packet(), "the corrupt packet is framed");
     (void)again.take();
     check(again.pending_ack() == '-',
@@ -1009,7 +1009,7 @@ void test_connection_drops_corrupt_packet() {
     // A packet that arrives intact does not ask for one, and this is the
     // property that keeps a good connection from retransmitting forever.
     PacketDecoder good;
-    good.feed(encode_packet("g"));
+    static_cast<void>(good.feed(encode_packet("g")));
     check(good.has_packet(), "an intact packet is framed");
     const Packet ok = good.take();
     check(ok.checksum_ok, "an intact packet passes its checksum");
@@ -1908,7 +1908,7 @@ void test_a_damaged_packet_does_not_ask_for_a_retransmission() {
     // which is what makes the absence above a decision rather than a missing
     // feature.
     PacketDecoder e;
-    e.feed("-", 1);
+    static_cast<void>(e.feed("-", 1));
     check(e.retransmit_requested(),
           "a minus from the far end still asks for a retransmission");
 }

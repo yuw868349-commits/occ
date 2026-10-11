@@ -856,6 +856,26 @@ SampleDecode decode_sample(const std::uint8_t* body,
     return out;
 }
 
+// Copies `n` bytes out of the ring's data area at monotonic offset `at`,
+// taking the offset modulo the data length and splicing back together a
+// record that straddles the end of the ring. Same shape as the watchpoint
+// ring reader, for the same reason: perf's head and tail are bookkeeping
+// offsets, and indexing with the raw monotonic value reads the mapping
+// past the data area the moment the ring wraps.
+static void ring_read_at(const std::uint8_t* base, std::uint64_t data_bytes,
+                  std::uint64_t at, void* out, std::size_t n) noexcept {
+    at %= data_bytes;
+    const std::size_t at_index = static_cast<std::size_t>(at);
+    const std::size_t room =
+        static_cast<std::size_t>(data_bytes) - at_index;
+    const std::size_t first = n < room ? n : room;
+    std::memcpy(out, base + at_index, first);
+    if (n > first) {
+        std::memcpy(static_cast<std::uint8_t*>(out) + first, base,
+                    n - first);
+    }
+}
+
 std::size_t Uprobes::read_hits(std::vector<UprobeHit>& out) noexcept {
     const std::size_t before = out.size();
 
@@ -888,12 +908,11 @@ std::size_t Uprobes::read_hits(std::vector<UprobeHit>& out) noexcept {
 
         while (p.ring_tail + sizeof(RingHeader) <= head) {
             RingHeader hdr{};
-            std::memcpy(&hdr, base + p.ring_tail, sizeof(hdr));
+            ring_read_at(base, data_bytes, p.ring_tail, &hdr, sizeof(hdr));
 
             if (hdr.size < sizeof(RingHeader) ||
                 p.ring_tail + hdr.size > head ||
-                p.ring_tail + hdr.size >
-                    p.ring_data_offset + data_bytes) {
+                hdr.size > data_bytes) {
                 ring_store(p.ring, kRingDataTailByte,
                            static_cast<std::uint64_t>(head));
                 p.ring_tail = head;
@@ -908,18 +927,33 @@ std::size_t Uprobes::read_hits(std::vector<UprobeHit>& out) noexcept {
                 // to say so is to say how much is missing.
                 if (hdr.size >= sizeof(RingHeader) + 8) {
                     std::uint64_t lost = 0;
-                    std::memcpy(&lost, base + p.ring_tail + sizeof(RingHeader),
-                                8);
+                    ring_read_at(base, data_bytes,
+                                 p.ring_tail + sizeof(RingHeader), &lost, 8);
                     lost_hits_ += lost;
                 }
             } else if (hdr.type == kPerfRecordSample) {
                 // The body is everything after the header; decode_sample
                 // owns the layout, including the ordering rule that puts the
                 // registers after the raw sample rather than before it.
-                const std::uint8_t* body = base + p.ring_tail + sizeof(RingHeader);
+                // The body the decoder reads has to be one contiguous
+                // span, and a record at the end of the ring is not one: it
+                // arrives as the tail of itself at the ring's start. The
+                // splice below hands the decoder a copy; a body larger than
+                // the splice buffer is a configuration this probe never
+                // asked the kernel for, and it is skipped rather than
+                // decoded from half a record.
+                constexpr std::size_t kSpliceBytes = 512;
                 const std::size_t body_size =
                     hdr.size - sizeof(RingHeader);
-                const SampleDecode d = decode_sample(body, body_size);
+                if (body_size > kSpliceBytes) {
+                    p.ring_tail += hdr.size;
+                    continue;
+                }
+                alignas(8) std::uint8_t spliced[kSpliceBytes] = {};
+                ring_read_at(base, data_bytes,
+                             p.ring_tail + sizeof(RingHeader), spliced,
+                             body_size);
+                const SampleDecode d = decode_sample(spliced, body_size);
                 if (d.ok) {
                     UprobeHit hit;
                     hit.ip = d.ip;

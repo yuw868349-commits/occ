@@ -28,8 +28,7 @@
 // are the names, the conversions and the layouts; the decisions stay in the
 // domain that owns them, where its test can reach them.
 
-#ifndef OCC_RUNTIME_API_COMMON_H
-#define OCC_RUNTIME_API_COMMON_H
+#pragma once
 
 #include "occ/runtime/winabi.h"
 
@@ -266,5 +265,3 @@ constexpr std::uint64_t kInvalidHandleValue = ~std::uint64_t(0);
 constexpr std::uint64_t kInvalidHandle = 0;
 
 }  // namespace occ::runtime::winabi
-
-#endif  // OCC_RUNTIME_API_COMMON_H

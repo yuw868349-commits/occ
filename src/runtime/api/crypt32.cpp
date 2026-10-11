@@ -45,22 +45,22 @@ namespace {
 
 // -- the error codes the surface reports -------------------------------------
 
-constexpr std::uint32_t kErrOk = 0;
+[[maybe_unused]] constexpr std::uint32_t kErrOk = 0;
 constexpr std::uint32_t kErrNoMem = 14;
 constexpr std::uint32_t kErrInvalidParameter = 87;
-constexpr std::uint32_t kErrInsufficientBuffer = 122;
+[[maybe_unused]] constexpr std::uint32_t kErrInsufficientBuffer = 122;
 constexpr std::uint32_t kErrMoreData = 234;
 constexpr std::uint32_t kErrNoMoreItems = 259;
-constexpr std::uint32_t kErrFileNotFound = 2;
+[[maybe_unused]] constexpr std::uint32_t kErrFileNotFound = 2;
 constexpr std::uint32_t kErrInvalidData = 13;
 constexpr std::uint32_t kErrNotFound = 1168;
-constexpr std::uint32_t kErrAlreadyExists = 183;
+[[maybe_unused]] constexpr std::uint32_t kErrAlreadyExists = 183;
 constexpr std::uint32_t kErrInvalidHandle = 6;
 constexpr std::uint32_t kErrBadLength = 466;
 constexpr std::uint32_t kErrNotSupported = 50;
 constexpr std::uint32_t kErrAuthFailed = 1326;
 constexpr std::uint32_t kErrNoKey = 1010;
-constexpr std::uint32_t kErrInvalidFlags = 1008;
+[[maybe_unused]] constexpr std::uint32_t kErrInvalidFlags = 1008;
 
 constexpr std::int32_t kTrue = 1;
 constexpr std::int32_t kFalse = 0;
@@ -1755,6 +1755,14 @@ void big_to_bytes(const Big& a, std::uint8_t* out, std::size_t len) noexcept {
 // bit set -- the shape a prime candidate has.
 void random_candidate(Big& out, std::size_t bits) noexcept {
     std::uint8_t buf[kBigBytes] = {};
+    // The width is the caller's to ask for, and the buffer is one Big:
+    // a width past it sends the random bytes past the buffer, and a width
+    // of zero asks for a top bit at minus one. Both are refused, leaving
+    // `out` at zero -- which the caller's primality walk rejects, the way
+    // it rejects any candidate that is not a number.
+    if (bits == 0 || bits > kBigWords * 32) {
+        return;
+    }
     const std::size_t bytes = (bits + 7) / 8;
     if (!host_random(buf, bytes)) {
         return;
@@ -1927,8 +1935,8 @@ constexpr std::uint8_t kBlobTypeSimple = 0x01;
 constexpr std::uint32_t kCalgRsaSign = 0x00002400;
 constexpr std::uint32_t kCalgRsaKeyX = 0x0000A400;
 constexpr std::uint32_t kCalgAes256 = 0x0000660E;
-constexpr std::uint32_t kCalgRc4 = 0x00006801;
-constexpr std::uint32_t kCalgSha1 = 0x00008004;
+[[maybe_unused]] constexpr std::uint32_t kCalgRc4 = 0x00006801;
+[[maybe_unused]] constexpr std::uint32_t kCalgSha1 = 0x00008004;
 
 [[nodiscard]] std::size_t rsa_byte_len(const Big& modulus) noexcept {
     return (modulus.bits() + 7) / 8;

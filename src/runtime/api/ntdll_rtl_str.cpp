@@ -2135,7 +2135,11 @@ extern "C" __attribute__((ms_abi)) Ntstatus nrs_RtlIntegerToUnicodeString(
     // caller that sized a retry from a `Length` this function left at zero
     // would allocate nothing and fail again.
     write_u16(str, kStrLength, static_cast<std::uint16_t>(length));
-    if (length >= v.maximum || v.buffer == nullptr) {
+    // The terminator is part of the write, so the capacity has to hold the
+    // digits *and* it: a maximum equal to the length would leave the two
+    // terminator bytes nowhere to go, which is exactly the overrun the
+    // `MaximumLength` field exists to prevent.
+    if (length + sizeof(char16_t) > v.maximum || v.buffer == nullptr) {
         return kStBufferOverflow;
     }
     auto* out = static_cast<char16_t*>(v.buffer);
@@ -2161,7 +2165,11 @@ extern "C" __attribute__((ms_abi)) Ntstatus nrs_RtlInt64ToUnicodeString(
     const std::size_t length = units * sizeof(char16_t);
     const StringView v = read_string(str);
     write_u16(str, kStrLength, static_cast<std::uint16_t>(length));
-    if (length >= v.maximum || v.buffer == nullptr) {
+    // The terminator is part of the write, so the capacity has to hold the
+    // digits *and* it: a maximum equal to the length would leave the two
+    // terminator bytes nowhere to go, which is exactly the overrun the
+    // `MaximumLength` field exists to prevent.
+    if (length + sizeof(char16_t) > v.maximum || v.buffer == nullptr) {
         return kStBufferOverflow;
     }
     auto* out = static_cast<char16_t*>(v.buffer);
@@ -4510,8 +4518,13 @@ constexpr std::uint64_t kGpSlotBytes = 8;
         if (spec[k] != u'*') {
             continue;
         }
-        star_value[star_slot] =
-            static_cast<int>(static_cast<std::int32_t>(get_arg(args, insert)));
+        // Two stars are all the format defines slots for -- the width and
+        // the precision -- and a specification with more of them than that
+        // drops the extras rather than indexing past the pair.
+        if (star_slot < 2) {
+            star_value[star_slot] = static_cast<int>(
+                static_cast<std::int32_t>(get_arg(args, insert)));
+        }
         ++star_slot;
         // Only the first fetch is the positional insert; the rest follow on.
         insert = -1;
@@ -4583,6 +4596,15 @@ constexpr std::uint64_t kGpSlotBytes = 8;
     host_fmt[at++] = '%';
     int star_used = 0;
     for (std::size_t k = 1; k < lead; ++k) {
+        // Each input character writes at most a sign and twenty digits
+        // here, so the guard bounds the writes to the buffer for any
+        // specification the forty bytes can spell. A specification longer
+        // than that is a conversion this formatter does not carry, and
+        // stopping with room to close the conversion is the answer that
+        // stays inside the buffer.
+        if (at + 8 >= sizeof(host_fmt)) {
+            break;
+        }
         if (spec[k] == u'*') {
             const int width = star_value[star_used < 2 ? star_used : 1];
             ++star_used;

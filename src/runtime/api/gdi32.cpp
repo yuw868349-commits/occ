@@ -31,6 +31,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -202,8 +203,18 @@ struct Surface {
 // The stride a DIB of the given shape takes: each scan line padded to a
 // four-byte boundary, which is the rule the format fixes.
 [[nodiscard]] int dib_stride(int width, int bpp) noexcept {
-    const int bits = width * bpp;
-    return ((bits + 31) / 32) * 4;
+    // `width * bpp` overflows `int` for a shape the guest can ask for, and
+    // signed overflow is undefined: the product is computed in sixty-four
+    // bits and the answer saturates at the largest stride the return type
+    // carries, which every allocation below then refuses rather than
+    // allocating a size the copy overruns.
+    const std::int64_t bits =
+        static_cast<std::int64_t>(width) * static_cast<std::int64_t>(bpp);
+    const std::int64_t stride = ((bits + 31) / 32) * 4;
+    if (stride > 0x7FFFFFFF) {
+        return 0x7FFFFFFF;
+    }
+    return static_cast<int>(stride);
 }
 
 // The palette Windows gives a DIB whose header asked for none: the two-colour
@@ -871,7 +882,14 @@ void fill_rect_brush(DeviceContext& dc, const GdiObject& brush, int left,
             const bool ink = brush.style == kBsSolid ||
                              ((x + y) & 1) == 0;
             if (ink) {
-                const std::uint32_t dst = surface_get(*dc_surface(dc), x, y);
+                // The context may hold no surface at all -- the guard the
+                // other draw paths carry -- and dereferencing the null the
+                // accessor returns is the crash this guards against.
+                Surface* const target = dc_surface(dc);
+                if (target == nullptr) {
+                    return;
+                }
+                const std::uint32_t dst = surface_get(*target, x, y);
                 plot(dc, x, y, rop2_apply(dc.rop2, brush.color, dst));
             }
         }
@@ -1442,7 +1460,11 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_CreateFontIndirectA(
         return 0;
     }
     const auto* p = static_cast<const std::uint8_t*>(log_font);
-    std::array<std::uint8_t, 0x3C> wide{};
+    // `LOGFONTW` is 0x5C bytes -- the same 0x1C-byte head the narrow form
+    // has, then a face name of 32 wide characters. A buffer sized as the
+    // narrow structure holds 0x3C, and the name write below reaches 0x5A:
+    // the last thirty bytes of every conversion land past the array.
+    std::array<std::uint8_t, 0x5C> wide{};
     std::memcpy(wide.data(), p, 0x1C);
     const char* face = reinterpret_cast<const char*>(p + 0x1C);
     std::u16string name;
@@ -1630,6 +1652,14 @@ extern "C" __attribute__((ms_abi)) std::uint64_t u32g_CreateDIBSection(
         static_cast<std::size_t>(o.surface->stride) *
         static_cast<std::size_t>(height);
     auto* memory = static_cast<std::uint8_t*>(std::calloc(bytes, 1));
+    if (memory == nullptr) {
+        // A shape whose stride and height multiply to nothing the host will
+        // hand out is refused here rather than recorded: a section with a
+        // null bits pointer is one every later draw would dereference.
+        set_last_error(kErrParam);
+        *bits = nullptr;
+        return 0;
+    }
     o.surface->bits = memory;
     // A top-down section is stored with its first row at the lowest address,
     // which is already how the surface reads; the flag is recorded in the
@@ -2874,7 +2904,10 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32g_GetTextExtentExPointA(
     std::uint64_t hdc, const char* text, std::int32_t count,
     std::int32_t max_extent, std::int32_t* fit, std::int32_t* dxs,
     void* size) noexcept {
-    if (text == nullptr) {
+    if (text == nullptr || count < 0) {
+        // The count is the caller's, and a negative one is not a string: it
+        // reaches `string_view` as almost the whole address space, and the
+        // conversion below then reads whatever follows the caller's text.
         return kFalse;
     }
     std::u16string wide;

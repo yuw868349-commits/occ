@@ -9,6 +9,7 @@
 
 #include "occ/runtime/iat_rebuild.h"
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>

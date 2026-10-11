@@ -143,7 +143,7 @@ void test_memory_and_performance() {
 // The file is DOS header, NT headers, one section, and the resource
 // tree -- root, RT_VERSION, one id, one language, and the data.
 
-constexpr std::uint32_t kImageBase = 0x400000;
+[[maybe_unused]] constexpr std::uint32_t kImageBase = 0x400000;
 constexpr std::uint32_t kSectionRva = 0x1000;
 constexpr std::uint32_t kSectionRaw = 0x200;
 

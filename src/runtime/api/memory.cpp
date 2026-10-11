@@ -226,6 +226,20 @@ constexpr std::uint64_t kAllocationFloor = 0x10000;
 // What a caller observes is the same -- reserved memory is unreadable until
 // it is committed -- because the reservation is made PROT_NONE.
 
+// Whether a range the guest named is memory this runtime mapped.
+//
+// The addresses the memory family takes are the guest's to choose, and the
+// guest is the code this runtime exists to keep away from the host. A range
+// the ledger holds is one the loader or the allocation path placed; a range
+// outside the ledger is host memory -- the loader's own image, the runtime's
+// own stack -- and a syscall pointed there is not a virtual memory
+// operation. With no guest the caller is the host's own test or tool, and
+// the addresses in play are the ones it made.
+[[nodiscard]] bool in_ledger(const void* address,
+                             std::uint64_t bytes) noexcept {
+    return guest_range_is_ours(address, bytes);
+}
+
 template <typename T>
 [[nodiscard]] T* virtual_alloc(T* address, std::uint64_t size,
                                std::uint32_t type,
@@ -274,11 +288,36 @@ template <typename T>
     // the placement is the ascending one, the same search that placed the
     // image and the stacks. The host's own allocation is the fallback for a
     // caller with no guest, which is the state a test runs in.
-    if (address == nullptr) {
+    {
         const GuestState* g = guest_state();
         if (g != nullptr && g->mapper != nullptr) {
             const PageProtection protection = guest_protection(
                 commit ? protect : kPageNoAccess);
+            if (address != nullptr) {
+                // An explicit address is the guest's to name, and the
+                // mapper is the thing that refuses one that would sit on
+                // memory the runtime already holds -- the loader's image,
+                // the runtime's own stack. Handing the same address to the
+                // host's mmap with MAP_FIXED would answer the request by
+                // overwriting whatever is there, which is not a virtual
+                // memory operation.
+                const std::uint64_t base =
+                    reinterpret_cast<std::uint64_t>(address);
+                if (base % AddressSpace::kPageSize != 0) {
+                    set_last_error(kErrorInvalidParameter);
+                    return nullptr;
+                }
+                const Result<std::uint64_t> placed =
+                    g->mapper->map(base, rounded, protection,
+                                   RegionKind::Private);
+                if (!placed.ok()) {
+                    set_last_error(kErrorNotEnoughMemory);
+                    return nullptr;
+                }
+                set_last_error(0);
+                return static_cast<T*>(
+                    reinterpret_cast<void*>(placed.value));
+            }
             const bool top_down = (type & kMemTopDown) != 0;
             // The direction follows the request: `MEM_TOP_DOWN` searches the
             // window from the top, everything else from the bottom, and the
@@ -330,14 +369,55 @@ template <typename T>
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
+    const GuestState* g = guest_state();
+    const std::uint64_t at = reinterpret_cast<std::uint64_t>(address);
     if (decommit && !release) {
-        // A decommit without a release drops the pages back to reserved,
-        // which the host spells as a protection change rather than an
-        // unmap: the address stays the guest's, the contents do not.
+        // A decommit without a release drops the pages back to reserved:
+        // the address stays the guest's, the contents do not. The kernel
+        // half is the protection change to no access, and the ledger half
+        // is the decommit that marks the range -- and the ledger is also
+        // what refuses a range that is not this runtime's memory, which a
+        // bare mprotect would serve against the host's own mappings.
         const std::uint64_t rounded = round_to_page(size);
-        if (rounded == 0 ||
-            ::mprotect(address, static_cast<std::size_t>(rounded),
+        if (rounded == 0) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        if (g != nullptr && g->space != nullptr && g->mapper != nullptr) {
+            const Result<std::uint64_t> ledger =
+                g->space->decommit(at, rounded);
+            if (!ledger.ok()) {
+                set_last_error(kErrorInvalidParameter);
+                return 0;
+            }
+            static_cast<void>(g->mapper->protect_range(
+                at, rounded, PageProtection::NoAccess));
+            set_last_error(0);
+            return 1;
+        }
+        if (::mprotect(address, static_cast<std::size_t>(rounded),
                        PROT_NONE) != 0) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        set_last_error(0);
+        return 1;
+    }
+    if (g != nullptr && g->space != nullptr && g->mapper != nullptr) {
+        // A release frees the allocation it names, and the address is the
+        // allocation's base -- Windows requires it and so does the ledger,
+        // whose regions are the allocations the mapper placed. The unmap
+        // goes through the mapper rather than the host's munmap: an
+        // address the ledger does not hold is not this runtime's memory,
+        // and unmapping it would take out the loader's image or the
+        // runtime's own stack with it.
+        const Region* r = g->space->find(at);
+        if (r == nullptr || r->base != at) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        const Result<std::uint64_t> unmapped = g->mapper->unmap(at);
+        if (!unmapped.ok()) {
             set_last_error(kErrorInvalidParameter);
             return 0;
         }
@@ -376,6 +456,36 @@ template <typename T>
     // which is the value it wrote and the only one it could be comparing
     // against.
     *old = kPageReadWrite;
+    const GuestState* g = guest_state();
+    if (g != nullptr && g->space != nullptr && g->mapper != nullptr) {
+        // Windows widens the range to the pages it covers, and the ledger
+        // is what decides whether the range is this runtime's memory at
+        // all: a range past the ledger is the host's own memory, and a
+        // protection change there is not a service a guest gets.
+        const std::uint64_t at = reinterpret_cast<std::uint64_t>(address);
+        const std::uint64_t page_mask = AddressSpace::kPageSize - 1;
+        const std::uint64_t base = at & ~page_mask;
+        const std::uint64_t span =
+            (((at + rounded) - base + page_mask) & ~page_mask);
+        const PageProtection wanted = guest_protection(protect);
+        const Result<std::uint32_t> applied =
+            g->mapper->protect_in_range(base, span, wanted);
+        if (!applied.ok()) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        memwatch::note_protect(base, span);
+        // A protection word that asked for execution on a host that will
+        // not grant it is a request that failed, not one that succeeded
+        // quietly -- the same answer the host path below gives.
+        if (wants_execute(protect) &&
+            (protection_to_prot(wanted) & PROT_EXEC) == 0) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        set_last_error(0);
+        return 1;
+    }
     const int host = host_protection(protect);
     if (::mprotect(address, static_cast<std::size_t>(rounded), host) != 0) {
         set_last_error(errno == EACCES ? kErrorInvalidAddress
@@ -822,9 +932,15 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32m_ReadProcessMemory(
         return 0;
     }
     // The guest's address space is this process's, so the read is the read:
-    // a copy rather than a call into the host's process-memory interface,
-    // and a faulting address faults rather than being reported as a
-    // short read.
+    // a copy rather than a call into the host's process-memory interface.
+    // Both ends of the copy are addresses the guest named, and the ledger is
+    // what decides whether they are this runtime's memory: a source past the
+    // ledger is the host's own memory, and a read there is not a service a
+    // guest gets.
+    if (!in_ledger(address, bytes) || !in_ledger(buffer, bytes)) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
     std::memcpy(buffer, address, static_cast<std::size_t>(bytes));
     if (read != nullptr) {
         *read = bytes;
@@ -841,6 +957,10 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32m_WriteProcessMemory(
         return 0;
     }
     if (address == nullptr || buffer == nullptr) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    if (!in_ledger(address, bytes) || !in_ledger(buffer, bytes)) {
         set_last_error(kErrorInvalidParameter);
         return 0;
     }

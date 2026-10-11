@@ -248,6 +248,15 @@ template <typename C>
                                                const C* limit,
                                                bool insensitive) noexcept {
     const C* end = limit != nullptr ? limit : hay + length_of(hay);
+    // The bound is the caller's to pass, and a bound before the haystack is
+    // a mistake the subtraction would turn into a length of nearly the
+    // whole address space: the walk below starts at `hay_len - needle_len`
+    // and reads forward from `hay`, which with a wrapped length is a read
+    // past everything. A reversed bound finds nothing, the way an empty
+    // one does.
+    if (end < hay) {
+        return nullptr;
+    }
     const std::size_t hay_len = static_cast<std::size_t>(end - hay);
     const std::size_t needle_len = length_of(needle);
     if (needle_len == 0) {

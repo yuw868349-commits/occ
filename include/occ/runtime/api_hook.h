@@ -29,8 +29,7 @@
 // an opinion about a stub that grew by sixteen bytes. Off is the honest
 // default and on is the analyst's deliberate choice.
 
-#ifndef OCC_RUNTIME_API_HOOK_H_
-#define OCC_RUNTIME_API_HOOK_H_
+#pragma once
 
 #include <cstdint>
 #include <span>
@@ -98,4 +97,3 @@ void note_trampoline(std::uint64_t address, std::uint32_t slot) noexcept;
 
 }  // namespace occ::runtime::api_hook
 
-#endif  // OCC_RUNTIME_API_HOOK_H_

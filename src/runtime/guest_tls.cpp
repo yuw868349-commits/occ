@@ -136,8 +136,22 @@ bool register_module_tls(GuestState& state, std::uint64_t image_base) noexcept {
     // reads it. Windows numbers the modules in load order and this runtime
     // has one image, so the number is zero for the first and one more for
     // each after it.
+    //
+    // `index_va` is the file's to choose, and the file is the guest's: an
+    // address outside the image is an address the loader never mapped, and
+    // a write there lands in whatever borders the mapping -- which is the
+    // runtime's own memory. The bound is the one the loader recorded, and a
+    // directory that names an index outside it is a directory this runtime
+    // registers without writing rather than one it writes through.
     if (module.index_va != 0) {
-        write_u32(reinterpret_cast<void*>(module.index_va), 0, module.index);
+        const bool inside_image =
+            state.image_end != 0 && module.index_va >= image_base &&
+            module.index_va < state.image_end &&
+            module.index_va + sizeof(std::uint32_t) <= state.image_end;
+        if (inside_image) {
+            write_u32(reinterpret_cast<void*>(module.index_va), 0,
+                      module.index);
+        }
     }
 
     state.tls_modules.push_back(module);

@@ -139,7 +139,7 @@ public:
     // ring buffer that wrapped or was written by a kernel with a different
     // record layout is reported through the return value being lower than
     // the record count, and the caller re-syncs its tail.
-    std::size_t read_events(std::vector<WatchEvent>& out) noexcept;
+    [[nodiscard]] std::size_t read_events(std::vector<WatchEvent>& out) noexcept;
 
     [[nodiscard]] const std::vector<HardwareWatch>& all() const noexcept {
         return watches_;

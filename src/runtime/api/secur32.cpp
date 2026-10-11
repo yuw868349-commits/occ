@@ -38,18 +38,18 @@ constexpr std::uint32_t kSecEInvalidHandle = 0x80090301;
 constexpr std::uint32_t kSecEUnsupportedFunction = 0x80090302;
 constexpr std::uint32_t kSecEInvalidToken = 0x80090308;
 constexpr std::uint32_t kSecENoCredentials = 0x8009030E;
-constexpr std::uint32_t kSecEUnknownCredentials = 0x8009030C;
+[[maybe_unused]] constexpr std::uint32_t kSecEUnknownCredentials = 0x8009030C;
 constexpr std::uint32_t kSecEInvalidParameter = 0x80090305;
-constexpr std::uint32_t kSecEBufferTooSmall = 0x80090321;
+[[maybe_unused]] constexpr std::uint32_t kSecEBufferTooSmall = 0x80090321;
 constexpr std::uint32_t kSecEUnknown = 0x800903FE;
 constexpr std::uint32_t kSecELogonDenied = 0x8009030C;
 constexpr std::uint32_t kSecEMessageAltered = 0x80090304;
-constexpr std::uint32_t kSecEBadBindings = 0x8009030F;
+[[maybe_unused]] constexpr std::uint32_t kSecEBadBindings = 0x8009030F;
 constexpr std::uint32_t kStatusSuccess = 0;
 constexpr std::uint32_t kStatusInvalidParameter = 0xC000000D;
 constexpr std::uint32_t kStatusNotImplemented = 0xC0000002;
 constexpr std::uint32_t kStatusNoMemory = 0xC0000017;
-constexpr std::uint32_t kStatusUnknownRevision = 0xC00000F2;
+[[maybe_unused]] constexpr std::uint32_t kStatusUnknownRevision = 0xC00000F2;
 constexpr std::uint32_t kWinErrInvalidParameter = 87;
 constexpr std::uint32_t kWinErrInsufficientBuffer = 122;
 constexpr std::int32_t kWinTrue = 1;
@@ -57,7 +57,7 @@ constexpr std::int32_t kWinFalse = 0;
 
 // The flags the NTLM handshake exchanges.
 constexpr std::uint32_t kNtlmNegotiateUnicode = 0x00000001;
-constexpr std::uint32_t kNtlmNegotiateOem = 0x00000002;
+[[maybe_unused]] constexpr std::uint32_t kNtlmNegotiateOem = 0x00000002;
 constexpr std::uint32_t kNtlmRequestTarget = 0x00000004;
 constexpr std::uint32_t kNtlmNegotiateSign = 0x00000010;
 constexpr std::uint32_t kNtlmNegotiateSeal = 0x00000020;
@@ -1158,7 +1158,15 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_InitializeSecurityContextA
         std::vector<std::uint8_t> target_info;
         const std::uint32_t info_len = get16(token.data() + 40);
         const std::uint32_t info_off = get32(token.data() + 44);
-        if (info_len != 0 && info_off + info_len <= token.size()) {
+        // The offset and the length are both the token's to write, and their
+        // sum is checked as a difference: `info_off + info_len` wraps in
+        // thirty-two bits, so an offset near the top of the range plus a
+        // length of any size passes a check written as a sum and then
+        // indexes the token with the wrapped-away value.
+        const bool info_inside =
+            info_off <= token.size() &&
+            info_len <= token.size() - info_off;
+        if (info_len != 0 && info_inside) {
             target_info.assign(token.data() + info_off,
                                token.data() + info_off + info_len);
         }
@@ -1319,15 +1327,27 @@ extern "C" __attribute__((ms_abi)) std::uint32_t cr32_AcceptSecurityContext(
         const std::uint32_t user_off = get32(token.data() + 36);
         std::u16string domain;
         std::u16string user;
-        for (std::uint32_t i = 0; i + 1 < domain_len && domain_off + i + 1 < token.size(); i += 2) {
+        // The walks are bounded by the token on both sides: the offset has
+        // to be inside it before the subtraction that gives the room is a
+        // subtraction at all, and the declared length is then clipped to
+        // that room rather than trusted.
+        const std::size_t domain_room =
+            domain_off <= token.size() ? token.size() - domain_off : 0;
+        const std::size_t domain_end =
+            std::min<std::size_t>(domain_room, domain_len);
+        for (std::size_t i = 0; i + 1 < domain_end; i += 2) {
             domain.push_back(static_cast<char16_t>(
                 get16(token.data() + domain_off + i)));
         }
-        for (std::uint32_t i = 0; i + 1 < user_len && user_off + i + 1 < token.size(); i += 2) {
+        const std::size_t user_room =
+            user_off <= token.size() ? token.size() - user_off : 0;
+        const std::size_t user_end = std::min<std::size_t>(user_room, user_len);
+        for (std::size_t i = 0; i + 1 < user_end; i += 2) {
             user.push_back(static_cast<char16_t>(
                 get16(token.data() + user_off + i)));
         }
-        if (nt_len == 0 || nt_off + nt_len > token.size()) {
+        if (nt_len == 0 || nt_off > token.size() ||
+            nt_len > token.size() - nt_off) {
             return kSecEInvalidToken;
         }
         if (ctx->credential.password.empty()) {

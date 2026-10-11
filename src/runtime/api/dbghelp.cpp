@@ -39,7 +39,7 @@ namespace {
 constexpr std::uint32_t kErrOk = 0;
 constexpr std::uint32_t kErrParam = 87;
 constexpr std::uint32_t kErrInvalidAddress = 487;
-constexpr std::uint32_t kErrPartialCopy = 299;
+[[maybe_unused]] constexpr std::uint32_t kErrPartialCopy = 299;
 constexpr std::uint32_t kErrNoSymbols = 487;
 constexpr std::uint32_t kErrNoMoreItems = 259;
 constexpr std::uint32_t kErrInvalidData = 13;
@@ -50,19 +50,19 @@ constexpr std::int32_t kTrue = 1;
 constexpr std::int32_t kFalse = 0;
 
 // The symbol handler's options, named the way the SDK names them.
-constexpr std::uint32_t kSymOptUndname = 0x00000002;
+[[maybe_unused]] constexpr std::uint32_t kSymOptUndname = 0x00000002;
 constexpr std::uint32_t kSymOptDeferredLoads = 0x00000004;
 constexpr std::uint32_t kSymOptLoadLines = 0x00000010;
-constexpr std::uint32_t kSymOptFailCriticalErrors = 0x00000200;
-constexpr std::uint32_t kSymOptAutoPublics = 0x00010000;
-constexpr std::uint32_t kSymOptDebug = 0x80000000;
+[[maybe_unused]] constexpr std::uint32_t kSymOptFailCriticalErrors = 0x00000200;
+[[maybe_unused]] constexpr std::uint32_t kSymOptAutoPublics = 0x00010000;
+[[maybe_unused]] constexpr std::uint32_t kSymOptDebug = 0x80000000;
 
 // The sizes the family's structures carry, at the guest's layout.
 constexpr std::uint32_t kImagehlpModuleSize = 0x50;
 constexpr std::uint32_t kSymbolInfoSize = 0x58;
 constexpr std::uint32_t kLineInfoSize = 0x28;
-constexpr std::uint32_t kAddr64Size = 0x38;
-constexpr std::uint32_t kStackFrameSize = 0x108;
+[[maybe_unused]] constexpr std::uint32_t kAddr64Size = 0x38;
+[[maybe_unused]] constexpr std::uint32_t kStackFrameSize = 0x108;
 
 [[nodiscard]] std::uint16_t rd16(const std::uint8_t* p) noexcept {
     std::uint16_t v = 0;
@@ -613,7 +613,12 @@ void write_module_info(void* out, std::uint32_t cb, std::uint64_t base,
     if (out == nullptr || cb < 32) {
         return;
     }
-    std::memset(out, 0, cb);
+    // `cb` is the caller's declaration of how big its structure is, and the
+    // declaration is the guest's to write: zeroing the full `cb` would run
+    // the clear past the buffer a smaller structure actually backs. The
+    // fields this function fills are inside the documented size, and the
+    // clear is bounded by the same size.
+    std::memset(out, 0, std::min<std::uint32_t>(cb, kImagehlpModuleSize));
     auto* p = static_cast<std::uint8_t*>(out);
     const std::uint32_t size_of = cb < kImagehlpModuleSize ? cb
                                                            : kImagehlpModuleSize;
@@ -1276,7 +1281,17 @@ extern "C" __attribute__((ms_abi)) std::int32_t u32d_SearchTreeForFile(
     }
     struct ::stat st = {};
     if (::stat(mask, &st) == 0) {
-        std::memcpy(buffer, mask, std::strlen(mask) + 1);
+        // The caller's buffer is a `MAX_PATH` character array in every
+        // caller Windows documents; the name is checked against it before
+        // the copy rather than after, so a name longer than the buffer is a
+        // refusal rather than a write past it.
+        constexpr std::size_t kMaxPath = 260;
+        const std::size_t mask_len = std::strlen(mask);
+        if (mask_len + 1 > kMaxPath) {
+            set_last_error(kErrParam);
+            return kFalse;
+        }
+        std::memcpy(buffer, mask, mask_len + 1);
         return kTrue;
     }
     set_last_error(kErrFileNotFound);
@@ -1338,12 +1353,16 @@ extern "C" __attribute__((ms_abi)) std::uint32_t u32d_ImagehlpApiVersion()
     return 0x000A0000 | 0x0000000A;
 }
 
-// The one place the family's version words are named.
+// The one place the family's version words are named. API_VERSION is four
+// sixteen-bit words -- Major, Minor, Revision, Reserved -- and an eight-byte
+// structure on the 64-bit ABI; spelling the fields as thirty-two-bit words
+// turns the write back into a sixteen-byte copy into that eight-byte
+// structure.
 struct ApiVersion {
-    std::uint32_t major = 10;
-    std::uint32_t minor = 0;
-    std::uint32_t revision = 22621;
-    std::uint32_t reserved = 0;
+    std::uint16_t major = 10;
+    std::uint16_t minor = 0;
+    std::uint16_t revision = 22621;
+    std::uint16_t reserved = 0;
 };
 
 extern "C" __attribute__((ms_abi)) std::uint32_t u32d_ImagehlpApiVersionEx(

@@ -1884,9 +1884,28 @@ extern "C" __attribute__((ms_abi)) std::int32_t as_GetAce(
         set_last_error(kErrorInvalidParameter);
         return 0;
     }
+    // The ACE sizes are the ACL's to write, and the walk that collects
+    // them is bounded by the ACL's own capacity: without the bound, a size
+    // of zero leaves the walk in place and a size that is too large steps
+    // past the buffer, and the pointer the caller then receives is an
+    // address the ACL never contained.
+    const std::size_t capacity = read_u16(acl, kAclSize);
     std::size_t pos = kAclHeaderBytes;
     for (std::size_t i = 0; i < index; ++i) {
-        pos += read_u16(acl, pos + kAceSize);
+        if (pos + 4 > capacity) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        const std::size_t size = read_u16(acl, pos + kAceSize);
+        if (size < 4 || pos + size > capacity) {
+            set_last_error(kErrorInvalidParameter);
+            return 0;
+        }
+        pos += size;
+    }
+    if (pos + 4 > capacity) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
     }
     *ace = static_cast<std::uint8_t*>(const_cast<void*>(acl)) + pos;
     set_last_error(kErrorSuccess);

@@ -536,14 +536,30 @@ bool virtual_unwind(std::uint32_t type, std::uint64_t image_base,
                 const std::uint64_t slot_va =
                     frame + static_cast<std::uint64_t>(
                                 payload_u16(codes, i)) * 16;
-                set_xmm_reg(context, opcode_info(slot),
-                            reinterpret_cast<const void*>(slot_va));
+                // The integer opcodes read the stack through
+                // `load_stack_u64`, which bounds every read against the
+                // stack range the walk was given. The XMM forms read the
+                // same stack with the same guest-chosen offset, so they get
+                // the same bound: a slot outside the range reads as zero
+                // rather than as whatever borders the region.
+                alignas(16) std::uint8_t value[16] = {};
+                if (stack.holds(slot_va, sizeof(value))) {
+                    std::memcpy(value,
+                                reinterpret_cast<const void*>(slot_va),
+                                sizeof(value));
+                }
+                set_xmm_reg(context, opcode_info(slot), value);
                 break;
             }
             case kUwopSaveXmm128Far: {
                 const std::uint64_t slot_va = frame + payload_u32(codes, i);
-                set_xmm_reg(context, opcode_info(slot),
-                            reinterpret_cast<const void*>(slot_va));
+                alignas(16) std::uint8_t value[16] = {};
+                if (stack.holds(slot_va, sizeof(value))) {
+                    std::memcpy(value,
+                                reinterpret_cast<const void*>(slot_va),
+                                sizeof(value));
+                }
+                set_xmm_reg(context, opcode_info(slot), value);
                 break;
             }
             case kUwopPushMachframe: {
@@ -901,6 +917,29 @@ extern "C" __attribute__((ms_abi)) std::uint64_t seh_C_specific_handler(
     // is left to say.
     winabi::GuestState* guest = winabi::guest_state();
 
+    // The scope table and every handler it names are the guest's memory: a
+    // `count` larger than the table the image carries and a handler RVA that
+    // names an address outside the image are both shapes the guest can
+    // write, and neither is served. The row's own shape is the cheap half --
+    // rows are the format's ordered list, `begin` strictly before `end`, so
+    // a row that breaks that is not a row and the walk stops rather than
+    // reading whatever follows the table. The address half is the image's
+    // own bound: the guest state carries it, and a handler this runtime
+    // would call has to be inside the image the state describes. A walk
+    // with no guest is a walk against a stack a test built, and the
+    // addresses in it are the test's own.
+    const auto row_is_a_row =
+        [](const ScopeTable::Record& scope) noexcept {
+            return scope.begin_rva < scope.end_rva;
+        };
+    const auto within_image = [&](std::uint32_t handler_rva) noexcept {
+        if (guest == nullptr) {
+            return true;
+        }
+        const std::uint64_t address = base + handler_rva;
+        return address >= base && address < guest->image_end;
+    };
+
     using FilterFn = std::int32_t(__attribute__((ms_abi))*)(
         const void* pointers, std::uint64_t frame);
     using TerminationFn = void(__attribute__((ms_abi))*)(std::uint8_t flag,
@@ -909,6 +948,9 @@ extern "C" __attribute__((ms_abi)) std::uint64_t seh_C_specific_handler(
     if ((flags & (kExceptionUnwinding | kExceptionExitUnwind)) != 0) {
         for (std::uint32_t i = dc.scope_index; i < table->count; ++i) {
             const ScopeTable::Record& scope = table->record[i];
+            if (!row_is_a_row(scope) || !within_image(scope.handler_rva)) {
+                break;
+            }
             if (rva < scope.begin_rva || rva >= scope.end_rva) {
                 continue;
             }
@@ -938,6 +980,10 @@ extern "C" __attribute__((ms_abi)) std::uint64_t seh_C_specific_handler(
 
     for (std::uint32_t i = dc.scope_index; i < table->count; ++i) {
         const ScopeTable::Record& scope = table->record[i];
+        if (!row_is_a_row(scope) || !within_image(scope.handler_rva) ||
+            !within_image(scope.jump_rva)) {
+            break;
+        }
         if (rva < scope.begin_rva || rva >= scope.end_rva) {
             continue;
         }

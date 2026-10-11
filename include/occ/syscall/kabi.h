@@ -48,7 +48,7 @@ struct CloneArgs {
 // struct. The kernel only reads bytes up to the size passed, so passing the
 // full size with zeroed tail fields is the portable form.
 static_assert(sizeof(CloneArgs) == 88,
-              "clone_args layout does not match the 6.x kernel ABI");
+              "clone_args layout does not match the kernel ABI");
 
 // ---------------------------------------------------------------- mount flags
 //

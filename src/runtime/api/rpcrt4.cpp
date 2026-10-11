@@ -37,7 +37,7 @@ namespace occ::runtime::winabi {
 namespace {
 
 // The status codes the runtime reports.
-constexpr std::uint32_t kRpcSOk = 0;
+[[maybe_unused]] constexpr std::uint32_t kRpcSOk = 0;
 constexpr std::uint32_t kRpcSOutOfMemory = 14;
 constexpr std::uint32_t kRpcSInvalidArg = 1705;
 constexpr std::uint32_t kRpcSInvalidStringUuid = 1740;
@@ -568,17 +568,31 @@ extern "C" __attribute__((ms_abi)) void cr32_NdrByteOrder(
 // their own boundary.
 extern "C" __attribute__((ms_abi)) std::uint32_t cr32_NdrConformantArraySize(
     std::uint32_t count, std::uint32_t element_size) noexcept {
+    // The product is the guest's to choose and it is computed in sixty-four
+    // bits before it is narrowed: `count * element_size` in thirty-two bits
+    // wraps, and a wrapped size is a buffer the marshal below believes is
+    // smaller than the copy it then makes.
     const std::size_t after_count =
         ndr_align(4, element_size == 0 ? 1 : element_size);
-    return static_cast<std::uint32_t>(after_count + count * element_size);
+    const std::uint64_t total =
+        after_count + static_cast<std::uint64_t>(count) * element_size;
+    return total > 0xFFFFFFFFu ? 0xFFFFFFFFu
+                               : static_cast<std::uint32_t>(total);
 }
 
 // The varying array: the offset and the actual count, then the elements.
 extern "C" __attribute__((ms_abi)) std::uint32_t cr32_NdrVaryingArraySize(
     std::uint32_t count, std::uint32_t element_size) noexcept {
+    // Sixty-four bits before the narrowing, for the reason the conformant
+    // size above gives, and the saturation is the same: a size that does not
+    // fit is reported as the largest one that does, which every capacity
+    // check below then refuses.
     const std::size_t after_words =
         ndr_align(8, element_size == 0 ? 1 : element_size);
-    return static_cast<std::uint32_t>(after_words + count * element_size);
+    const std::uint64_t total =
+        after_words + static_cast<std::uint64_t>(count) * element_size;
+    return total > 0xFFFFFFFFu ? 0xFFFFFFFFu
+                               : static_cast<std::uint32_t>(total);
 }
 
 // The packing of a conformant array of bytes.

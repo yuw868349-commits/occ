@@ -25,8 +25,7 @@
 // `RtlUnwindEx` and does not return, and the unwind walk ends by restoring
 // the saved context with `Rip` at the handler's chosen target.
 
-#ifndef OCC_RUNTIME_SEH_H_
-#define OCC_RUNTIME_SEH_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -356,4 +355,3 @@ extern "C" __attribute__((ms_abi)) std::uint64_t seh_C_specific_handler(
 
 }  // namespace occ::runtime::seh
 
-#endif  // OCC_RUNTIME_SEH_H_

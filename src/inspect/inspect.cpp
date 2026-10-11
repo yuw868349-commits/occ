@@ -547,7 +547,13 @@ std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
                 if (image.to_file_offset(name_rva, file_offset) &&
                     in_file(file_size, file_offset, 1)) {
                     const std::uint8_t* p = file + file_offset;
-                    while (*p != 0 && p < file + file_size) {
+                    // The bound is checked *before* the byte it guards:
+                    // `p` starts in the file and the loop runs it forward,
+                    // so the first read of an iteration is at the address
+                    // the previous iteration advanced to, and that address
+                    // is the one the bound has to clear first. The other
+                    // walks in this file already read in this order.
+                    while (p < file + file_size && *p != 0) {
                         dll += static_cast<char>(*p++);
                     }
                 }
@@ -1071,6 +1077,16 @@ std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
             const std::uint32_t page_rva = read_u32(file + offset);
             const std::uint32_t block_size = read_u32(file + offset + 4);
             if (block_size < 8 || at + block_size > dir_rva + dir_size) {
+                break;
+            }
+            // The size the block header claims is the file's to lie about,
+            // and the entries below are read from the file at the offsets
+            // that size implies. The directory bound above covers the rva
+            // side; this covers the file side, because a block whose
+            // `block_size` runs past the end of the file is a block whose
+            // entries read whatever the mapping borders.
+            if (static_cast<std::uint64_t>(offset) + block_size >
+                static_cast<std::uint64_t>(file_size)) {
                 break;
             }
             ++blocks;

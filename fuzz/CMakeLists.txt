@@ -142,7 +142,10 @@ set(OCC_PE_SEEDS
     pe_bad_entry_rva.bin
     pe_entry_not_executable.bin
     pe_section_over_headers.bin
-    pe_short_data_directory.bin)
+    pe_short_data_directory.bin
+    pe_base_zero.bin
+    pe_machine_arm.bin
+    pe_machine_arm64.bin)
 
 set(OCC_PE_SEED_PATHS)
 foreach(_seed IN LISTS OCC_PE_SEEDS)

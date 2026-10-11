@@ -913,8 +913,9 @@ Status nt_close(NtContext& ctx, HandleTable& table, Handle handle) noexcept;
 // `InfoLengthMismatch` rather than a partially filled structure, which is the
 // difference between a bug the program can find and a bug that reads garbage.
 //
-// The occ classes are documented at `MemoryInformationClass`. `Wine's own
-// `MemoryWineUnixFuncs` returns `FIXME`'s nothing; this answers it.
+// The occ classes are documented at `MemoryInformationClass`. Wine's own
+// `MemoryWineUnixFuncs` returns nothing for most of them and a FIXME for the
+// rest; this answers them.
 Result<std::uint64_t> nt_query_virtual_memory(NtContext& ctx,
                                               std::uint64_t addr,
                                               MemoryInformationClass info_class,

@@ -233,7 +233,12 @@ bool Connection::pump() noexcept {
         if (got.value == 0) {
             return false; // the peer closed
         }
-        decoder_.feed(buf, static_cast<std::size_t>(got.value));
+        // `feed` consumes every byte it is given and answers with the number
+        // of *packets that became complete*, which is the count the loop
+        // below takes through `take()`. Discarding it here is therefore not
+        // a dropped return: the bytes are all in the decoder and the packets
+        // are still there to be taken.
+        static_cast<void>(decoder_.feed(buf, static_cast<std::size_t>(got.value)));
         return true;
     }
     // A read that would block means there is nothing yet, which is not a

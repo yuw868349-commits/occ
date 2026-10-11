@@ -636,7 +636,17 @@ void* heap_alloc(std::uint32_t flags, std::uint64_t bytes) noexcept {
         // program's `alloc != NULL` check into a false failure.
         bytes = 1;
     }
-    if (bytes > (0xFFFFFFFFFFFFFFFFULL - sizeof(HeapHeader) - 16)) {
+    // The bump allocator rounds up to sixteen and the header sits on top,
+    // so the bytes a call actually consumes are `bytes` plus a header plus
+    // up to fifteen more. A request within one rounding step of the top of
+    // the range passes a check written as a subtraction from the maximum
+    // and still wraps the sum below -- the zero-fill at the end of this
+    // function would then write the wrapped-away size into a block the
+    // heap never held. The bound is a constant no legitimate allocation
+    // reaches, rather than an arithmetic identity every reader has to
+    // re-derive.
+    constexpr std::uint64_t kMaxHeapAllocBytes = 1ULL << 47;
+    if (bytes > kMaxHeapAllocBytes) {
         return nullptr;
     }
     // The guest heap first, because a pointer inside the guest's own user
@@ -3858,9 +3868,19 @@ std::int32_t clip_to_ms_long(std::int64_t value) noexcept {
 }
 
 // Writes `magnitude` in `base`, digits and lower-case letters, which is
-// what the Windows spellings produce, into `out`, NUL terminated.
-void write_unsigned_radix(std::uint64_t magnitude, unsigned base,
-                          char* out) noexcept {
+// what the Windows spellings produce, into `out`, NUL terminated. The base
+// is the guest's to choose -- `_itoa` and its siblings take it as an
+// argument -- and the two values that break the loop are refused rather
+// than served: base 0 is a division by zero, and base 1 never shrinks the
+// magnitude, which turns the 64-byte digit buffer into an unbounded write.
+// A refused base writes an empty string and reports false, and the caller
+// decides what a guest sees for it.
+[[nodiscard]] bool write_unsigned_radix(std::uint64_t magnitude,
+                                        unsigned base, char* out) noexcept {
+    if (base < 2 || base > 36) {
+        *out = '\0';
+        return false;
+    }
     char digits[64];
     std::size_t n = 0;
     do {
@@ -3874,31 +3894,43 @@ void write_unsigned_radix(std::uint64_t magnitude, unsigned base,
         *p++ = digits[--n];
     }
     *p = '\0';
+    return true;
 }
 
 // The signed spelling: base 10 carries a leading minus and the magnitude
 // of the value, negated in unsigned so the minimum negates safely. Any
 // other base is Windows' bit-pattern form -- _itoa(-1, 16) is "ffffffff",
 // the complement, not a sign and a half.
-void write_signed_radix(std::int64_t value, unsigned base,
-                        char* out) noexcept {
+[[nodiscard]] bool write_signed_radix(std::int64_t value, unsigned base,
+                                      char* out) noexcept {
+    if (base < 2 || base > 36) {
+        *out = '\0';
+        return false;
+    }
     char* p = out;
     std::uint64_t magnitude = static_cast<std::uint64_t>(value);
     if (base == 10 && value < 0) {
         *p++ = '-';
         magnitude = ~magnitude + 1ULL;
     }
-    write_unsigned_radix(magnitude, base, p);
+    return write_unsigned_radix(magnitude, base, p);
 }
 
 // The 32-bit spellings: base 10 reads the value as the signed number it
 // is, and any other base reads the 32 bits themselves -- a 64-bit helper
 // would sign-extend "-1" into sixteen f's where Windows writes eight.
 char* write_itoa32(std::int32_t value, unsigned base, char* buffer) noexcept {
-    if (base == 10) {
-        write_signed_radix(value, base, buffer);
-    } else {
-        write_unsigned_radix(static_cast<std::uint32_t>(value), base, buffer);
+    const bool written = base == 10
+                             ? write_signed_radix(value, base, buffer)
+                             : write_unsigned_radix(
+                                   static_cast<std::uint32_t>(value), base,
+                                   buffer);
+    // An unusable base is the guest's mistake, and the answer a guest can
+    // branch on is the null the CRT's invalid-parameter path yields rather
+    // than a buffer holding whatever the last call left.
+    if (!written) {
+        set_last_error(kErrorInvalidParameter);
+        return nullptr;
     }
     return buffer;
 }
@@ -4130,25 +4162,37 @@ extern "C" __attribute__((ms_abi)) char* cr__ltoa(
 
 extern "C" __attribute__((ms_abi)) char* cr_ultoa(
     std::uint32_t value, char* buffer, std::int32_t base) noexcept {
-    write_unsigned_radix(value, static_cast<unsigned>(base), buffer);
+    if (!write_unsigned_radix(value, static_cast<unsigned>(base), buffer)) {
+        set_last_error(kErrorInvalidParameter);
+        return nullptr;
+    }
     return buffer;
 }
 
 extern "C" __attribute__((ms_abi)) char* cr__ultoa(
     std::uint32_t value, char* buffer, std::int32_t base) noexcept {
-    write_unsigned_radix(value, static_cast<unsigned>(base), buffer);
+    if (!write_unsigned_radix(value, static_cast<unsigned>(base), buffer)) {
+        set_last_error(kErrorInvalidParameter);
+        return nullptr;
+    }
     return buffer;
 }
 
 extern "C" __attribute__((ms_abi)) char* cr__i64toa(
     std::int64_t value, char* buffer, std::int32_t base) noexcept {
-    write_signed_radix(value, static_cast<unsigned>(base), buffer);
+    if (!write_signed_radix(value, static_cast<unsigned>(base), buffer)) {
+        set_last_error(kErrorInvalidParameter);
+        return nullptr;
+    }
     return buffer;
 }
 
 extern "C" __attribute__((ms_abi)) char* cr__ui64toa(
     std::uint64_t value, char* buffer, std::int32_t base) noexcept {
-    write_unsigned_radix(value, static_cast<unsigned>(base), buffer);
+    if (!write_unsigned_radix(value, static_cast<unsigned>(base), buffer)) {
+        set_last_error(kErrorInvalidParameter);
+        return nullptr;
+    }
     return buffer;
 }
 
@@ -4773,9 +4817,9 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_wsprintfW(
         case u'X': {
             char raw[24] = {};
             if (sixty_four) {
-                write_unsigned_radix(slots[slot++], 16, raw);
+                static_cast<void>(write_unsigned_radix(slots[slot++], 16, raw));
             } else {
-                write_unsigned_radix(slots[slot] & 0xFFFFFFFFU, 16, raw);
+                static_cast<void>(write_unsigned_radix(slots[slot] & 0xFFFFFFFFU, 16, raw));
                 ++slot;
             }
             text = raw;
@@ -4788,7 +4832,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_wsprintfW(
         }
         case u'p': {
             char raw[24] = {};
-            write_unsigned_radix(slots[slot++], 16, raw);
+            static_cast<void>(write_unsigned_radix(slots[slot++], 16, raw));
             text = raw;
             break;
         }
@@ -5455,10 +5499,12 @@ extern "C" __attribute__((ms_abi)) void k32_WakeAllConditionVariable(
     (void)condition;
 }
 
-extern "C" __attribute__((ms_abi)) void k32_WakeConditionVariable(
-    void* condition) noexcept {
-    (void)condition;
-}
+// `WakeConditionVariable` is not here: the condition-variable pair moved to
+// its own domain, and `add_kernel32_ctx2` registers both halves of it. An
+// entry left behind in this list would be a second registration of the same
+// name in the same module, which the export index resolves by keeping
+// whichever reached it first -- silently, and with the other implementation
+// unreachable.
 
 // `SetEndOfFile`: the descriptor truncated at its current position, which
 // is what the name means when the file position is where the caller wants
@@ -5664,8 +5710,6 @@ void add_kernel32(ExportModule& module) {
           reinterpret_cast<void*>(&k32_ReleaseSRWLockShared)),
         e("WakeAllConditionVariable",
           reinterpret_cast<void*>(&k32_WakeAllConditionVariable)),
-        e("WakeConditionVariable",
-          reinterpret_cast<void*>(&k32_WakeConditionVariable)),
         e("SetEndOfFile", reinterpret_cast<void*>(&k32_SetEndOfFile)),
         e("RemoveVectoredExceptionHandler",
           reinterpret_cast<void*>(&k32_RemoveVectoredExceptionHandler)),

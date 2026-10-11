@@ -16,8 +16,7 @@
 // addition lands with a test that runs it. The point of this file is not
 // to be the whole x86; it is to be true on every byte it does claim.
 
-#ifndef OCC_RUNTIME_I386_H_
-#define OCC_RUNTIME_I386_H_
+#pragma once
 
 #include <cstdint>
 #include <functional>
@@ -154,4 +153,3 @@ using GuestExecutor =
 
 }  // namespace occ::runtime::i386
 
-#endif  // OCC_RUNTIME_I386_H_

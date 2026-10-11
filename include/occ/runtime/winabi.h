@@ -247,6 +247,32 @@ struct GuestState {
 // form is the one a debug build can assert about.
 void set_guest_state(GuestState* state) noexcept;
 
+// Whether a range a guest named is memory this runtime mapped.
+//
+// The addresses a guest hands the API are the guest's to choose, and the
+// guest is the code this runtime exists to keep away from the host. A range
+// the ledger holds is one the loader or the allocation path placed; a range
+// outside the ledger is host memory -- the runtime's own image, its stack --
+// and a write pointed there is not an operation a guest gets to make. With
+// no guest installed the caller is the host's own test or tool, and the
+// addresses in play are the ones it made; the check answers yes for that
+// case and the callers keep their own discipline.
+[[nodiscard]] inline bool guest_range_is_ours(const void* address,
+                                              std::uint64_t bytes) noexcept {
+    GuestState* g = guest_state();
+    if (g == nullptr || g->space == nullptr) {
+        return true;
+    }
+    const std::uint64_t at = reinterpret_cast<std::uint64_t>(address);
+    const std::uint64_t end = at + bytes;
+    if (end < at) {
+        return false;
+    }
+    const Region* first = g->space->find(at);
+    const Region* last = g->space->find(end - 1);
+    return first != nullptr && last != nullptr;
+}
+
 // The exit path the process layer provides. A guest that calls `ExitProcess`,
 // `exit` or `abort`, or whose fault the exception filter declined, ends by
 // leaving through this -- the jump that returns to `run_pe_process`. Before

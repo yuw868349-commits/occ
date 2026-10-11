@@ -1503,16 +1503,19 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetProcessHeaps(
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetUserInfoHeap(
-    std::uint64_t heap, std::uint32_t flags, void* base, void* user_info,
-    void** user_value) noexcept {
+    std::uint64_t heap, std::uint32_t flags, void* base, void** user_value,
+    std::uint32_t* user_info) noexcept {
     static_cast<void>(heap);
     static_cast<void>(flags);
     if (base == nullptr || user_value == nullptr) {
         return kStInvalidParameter;
     }
-    // The user flags of a block this runtime's heap allocated are the two
-    // bits `RtlAllocateHeap` accepted and none others; the value slot
-    // answers zero because no entry sets one.
+    // The order the format spells is user *value* fourth and user *info*
+    // fifth: the value slot answers the pointer a set put in (no entry
+    // here sets one), and the info word answers the two flags
+    // `RtlAllocateHeap` accepted. The two are not interchangeable -- one
+    // is a pointer-sized slot and the other a four-byte word -- and a
+    // wrapper that swapped them writes eight bytes into a PULONG.
     *user_value = nullptr;
     if (user_info != nullptr) {
         write_u32(user_info, 0, 0);
@@ -1967,44 +1970,18 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetFullPathName_U(
 
 extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetFullPathName_UEx(
     const char16_t* name, std::uint32_t bytes, char16_t* buffer,
-    char16_t** file_part, std::uint32_t* file_size,
-    std::uint32_t* directory_size, char16_t* directory) noexcept {
+    char16_t** file_part) noexcept {
+    // Four parameters, the way the format spells the call: a wrapper that
+    // reads three more from the register spill area reads stack slots the
+    // caller never wrote, and a directory copy aimed at one of them is a
+    // write aimed wherever those slots point.
     const std::uint32_t written =
         nr2_RtlGetFullPathName_U(name, bytes, buffer, file_part);
     if (written == 0) {
-        // The call already reported why through `GetLastError`; the sizes
-        // are left alone rather than filled with a number that would look
-        // like a real length.
+        // The call already reported why through `GetLastError`.
         return 0;
     }
-    // `written` is the character count without the terminator on success and
-    // the required size with it on a short buffer, and the two are told
-    // apart by whether the string actually made it into the buffer.
-    const bool fitted =
-        buffer != nullptr && file_part != nullptr && *file_part != nullptr &&
-        written < bytes;
-    if (file_size != nullptr) {
-        // The file part's own size, with its terminator -- which is what a
-        // caller allocates when it only wants the name.
-        const std::size_t name_chars =
-            fitted ? static_cast<std::size_t>(written) -
-                         static_cast<std::size_t>(*file_part - buffer)
-                   : static_cast<std::size_t>(written);
-        *file_size = static_cast<std::uint32_t>(name_chars + 1);
-    }
-    if (directory_size != nullptr) {
-        *directory_size = fitted ? static_cast<std::uint32_t>(
-                                        *file_part - buffer)
-                                 : written;
-    }
-    if (directory != nullptr && fitted) {
-        // The directory is everything before the file part, with the
-        // terminator this copy adds.
-        const std::size_t dir_chars =
-            static_cast<std::size_t>(*file_part - buffer);
-        std::memcpy(directory, buffer, dir_chars * sizeof(char16_t));
-        directory[dir_chars] = u'\0';
-    }
+    static_cast<void>(written);
     return written;
 }
 
@@ -2145,7 +2122,10 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlImageNtHeader(
 }
 
 extern "C" __attribute__((ms_abi)) void* nr2_RtlImageRvaToVa(
-    std::uint32_t rva, const void* base) noexcept {
+    const void* nt_headers, void* base, std::uint32_t rva,
+    void** last_rva_section) noexcept {
+    static_cast<void>(nt_headers);
+    static_cast<void>(last_rva_section);
     const std::size_t size = mapped_image_size(base);
     if (size == 0 || !in_image(size, rva, 1)) {
         // An RVA past the end of the image has no address. The image loader
@@ -2157,7 +2137,9 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlImageRvaToVa(
 }
 
 extern "C" __attribute__((ms_abi)) void* nr2_RtlImageDirectoryEntryToData(
-    const void* base, std::uint16_t index) noexcept {
+    void* base, std::uint8_t mapped_as_image, std::uint16_t index,
+    std::uint32_t* size_out) noexcept {
+    static_cast<void>(mapped_as_image);
     const std::size_t size = mapped_image_size(base);
     if (size == 0) {
         return nullptr;
@@ -2192,11 +2174,18 @@ extern "C" __attribute__((ms_abi)) void* nr2_RtlImageDirectoryEntryToData(
         // an image says it has no exports or no imports at all.
         return nullptr;
     }
+    // The directory's own size is the fourth field of the pair the entry
+    // is, and it is the caller's answer: a caller that sized a walk by the
+    // directory needs the count the image carries, not a guess.
+    if (size_out != nullptr) {
+        *size_out = read_u32(base, entry_at + 4);
+    }
     return image_at(base, rva);
 }
 
 extern "C" __attribute__((ms_abi)) void* nr2_RtlImageRvaToSection(
-    const void* base, std::uint32_t rva) noexcept {
+    const void* nt_headers, void* base, std::uint32_t rva) noexcept {
+    static_cast<void>(nt_headers);
     const std::size_t size = mapped_image_size(base);
     if (size == 0) {
         return nullptr;
@@ -2368,19 +2357,21 @@ extern "C" __attribute__((ms_abi)) void nr2_RtlProcessFlsData(
 // ---------------------------------------------------------------- the SIDs
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlInitializeSid(
-    void* sid, Ntstatus revision, std::uint8_t sub_authorities) noexcept {
-    if (sid == nullptr || sub_authorities > kSidMaxSubAuthorities) {
+    void* sid, const void* identifier_authority,
+    std::uint8_t sub_authorities) noexcept {
+    if (sid == nullptr || identifier_authority == nullptr ||
+        sub_authorities > kSidMaxSubAuthorities) {
         return kStInvalidParameter;
     }
-    if (revision != 1) {
-        // Revision 0 is the pre-1988 form and revision 2 the SMS-era one;
-        // neither has a place in a descriptor this runtime hands out, and
-        // writing one and reporting success would produce a SID the access
-        // checks below cannot compare against anything.
-        return kStInvalidParameter;
-    }
+    // The second parameter is the identifier authority -- six bytes the
+    // caller supplies, copied to the offset the SID format fixes -- and it
+    // is a pointer, not a revision this runtime chooses. A wrapper that
+    // read it as a number would refuse every real SID and never write the
+    // authority bytes at all.
     std::memset(sid, 0, sid_bytes(sub_authorities));
-    write_u8(sid, kSidRevision, static_cast<std::uint8_t>(revision));
+    std::memcpy(static_cast<std::uint8_t*>(sid) + kSidIdentifierAuthority,
+                identifier_authority, 6);
+    write_u8(sid, kSidRevision, 1);
     write_u8(sid, kSidSubAuthorityCount, sub_authorities);
     return kStSuccess;
 }
@@ -2429,19 +2420,37 @@ constexpr std::uint32_t kGenericAllMap = 0x000000FFu;
 }  // namespace
 
 extern "C" __attribute__((ms_abi)) void nr2_RtlMapGenericMask(
-    std::uint32_t* mask, std::uint32_t generic_mask) noexcept {
-    if (mask == nullptr) {
+    std::uint32_t* mask, const void* generic_mapping) noexcept {
+    if (mask == nullptr || generic_mapping == nullptr) {
         return;
     }
-    std::uint32_t result = *mask & ~kGenericAll;
-    // Each of the four generic rights the caller asked for is mapped
-    // through the object's own specific bits, so a right the object does
-    // not define contributes nothing.
-    for (std::uint32_t bit = 0; bit < 4; ++bit) {
-        const std::uint32_t right = kGenericAll & (1u << (31 - bit));
-        if ((generic_mask & right) != 0) {
-            result |= map_generic_right(right, *mask);
-        }
+    // The second parameter is the object's own GENERIC_MAPPING -- four
+    // specific masks, GenericRead/Write/Execute/All in that order -- read
+    // from the pointer the caller named. The four rights each map through
+    // their own entry, so a right the object does not define contributes
+    // nothing.
+    std::uint32_t maps[4] = {};
+    std::memcpy(maps, generic_mapping, sizeof(maps));
+    const std::uint32_t original = *mask;
+    // The specific bits the caller set survive the mapping -- they are the
+    // access the caller asked for by name, and the mapping only decides
+    // what its generic rights stand for on this object. Each generic right
+    // present expands through its own entry, and GenericAll -- the three
+    // rights' combination in this spelling -- expands through its own when
+    // all three are present, which is the only reading under which the
+    // object's GenericAll entry is not already covered by the three above.
+    std::uint32_t result = original & ~kGenericAll;
+    if ((original & kGenericRead) != 0) {
+        result |= map_generic_right(kGenericRead, original);
+    }
+    if ((original & kGenericWrite) != 0) {
+        result |= map_generic_right(kGenericWrite, original);
+    }
+    if ((original & kGenericExecute) != 0) {
+        result |= map_generic_right(kGenericExecute, original);
+    }
+    if ((original & kGenericAll) == kGenericAll) {
+        result |= maps[3];
     }
     *mask = result;
 }
@@ -2999,8 +3008,8 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlGetExtendedContextLength
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlInitializeExtendedContext(
-    void* context, std::int32_t flags) noexcept {
-    if (context == nullptr) {
+    void* context, std::int32_t flags, void** context_ex) noexcept {
+    if (context == nullptr || context_ex == nullptr) {
         return kStInvalidParameter;
     }
     if (flags == 0) {
@@ -3013,15 +3022,33 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlInitializeExtendedContext(
         nr2_RtlGetExtendedContextLength(flags);
     std::memset(context, 0, length);
     write_u32(context, kContextFlags, static_cast<std::uint32_t>(flags));
+    // The third parameter is the extended-record pointer the caller reads
+    // the legacy CONTEXT through, and it is the answer the call exists to
+    // produce.
+    *context_ex = context;
     return kStSuccess;
 }
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlInitializeExtendedContext2(
-    void* context, std::int32_t flags, std::uint32_t* bytes) noexcept {
+    void* context, std::int32_t flags, void** context_ex,
+    std::uint32_t* bytes) noexcept {
+    // The size is an in/out pair: in, the bytes the caller's buffer holds;
+    // out, the bytes the record needs. A buffer smaller than the record is
+    // refused before the clear below runs -- the clear is the write the
+    // size exists to bound, and writing `length` bytes into a buffer the
+    // caller sized by another number is a write past the buffer whatever
+    // else the call answers.
+    const std::uint32_t needed = nr2_RtlGetExtendedContextLength2(flags);
+    if (bytes == nullptr || *bytes < needed) {
+        if (bytes != nullptr) {
+            *bytes = needed;
+        }
+        return kStBufferTooSmall;
+    }
     const Ntstatus status =
-        nr2_RtlInitializeExtendedContext(context, flags);
-    if (status == kStSuccess && bytes != nullptr) {
-        *bytes = nr2_RtlGetExtendedContextLength2(flags);
+        nr2_RtlInitializeExtendedContext(context, flags, context_ex);
+    if (status == kStSuccess) {
+        *bytes = needed;
     }
     return status;
 }

@@ -137,7 +137,8 @@ extern "C" __attribute__((ms_abi)) std::uint32_t nr2_RtlLengthRequiredSid(
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlIdentifierAuthoritySid(
     const void* sid, void** authority) noexcept;
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlInitializeSid(
-    void* sid, Ntstatus revision, std::uint8_t sub_authorities) noexcept;
+    void* sid, const void* identifier_authority,
+    std::uint8_t sub_authorities) noexcept;
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGetVersion(
     void* info) noexcept;
@@ -172,11 +173,13 @@ extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlIsDosDeviceName_U(
 extern "C" __attribute__((ms_abi)) void* nr2_RtlImageNtHeader(
     const void* base) noexcept;
 extern "C" __attribute__((ms_abi)) void* nr2_RtlImageRvaToVa(
-    std::uint32_t rva, const void* base) noexcept;
+    const void* nt_headers, void* base, std::uint32_t rva,
+    void** last_rva_section) noexcept;
 extern "C" __attribute__((ms_abi)) void* nr2_RtlImageDirectoryEntryToData(
-    const void* base, std::uint16_t index) noexcept;
+    void* base, std::uint8_t mapped_as_image, std::uint16_t index,
+    std::uint32_t* size_out) noexcept;
 extern "C" __attribute__((ms_abi)) void* nr2_RtlImageRvaToSection(
-    const void* base, std::uint32_t rva) noexcept;
+    const void* nt_headers, void* base, std::uint32_t rva) noexcept;
 extern "C" __attribute__((ms_abi)) void* nr2_RtlGetCurrentPeb() noexcept;
 extern "C" __attribute__((ms_abi)) std::int32_t nr2_RtlIsCurrentProcess(
     std::uint64_t process) noexcept;
@@ -207,7 +210,7 @@ extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlGenerate8dot3Name(
     void** short_name_out, std::int32_t* allocate) noexcept;
 
 extern "C" __attribute__((ms_abi)) void nr2_RtlMapGenericMask(
-    std::uint32_t* mask, std::uint32_t generic_mask) noexcept;
+    std::uint32_t* mask, const void* generic_mapping) noexcept;
 
 extern "C" __attribute__((ms_abi)) Ntstatus nr2_RtlPropertySetNameToGuid(
     const char16_t* name, void* guid) noexcept;
@@ -934,13 +937,16 @@ void test_security_descriptors() {
 
 void test_sids() {
     alignas(8) std::uint8_t sid[8 + 3 * 4] = {};
-    check(nr2_RtlInitializeSid(sid, 1, 2) == kStatusSuccess,
+    alignas(8) std::uint8_t id_authority[6] = {0, 0, 0, 0, 5, 0};
+    check(nr2_RtlInitializeSid(sid, id_authority, 2) == kStatusSuccess,
           "sid: initializing a two-sub-authority SID succeeds");
     check(sid[0] == 1, "sid: with revision 1 written");
     check(sid[1] == 2, "sid: and the sub-authority count");
-    check(nr2_RtlInitializeSid(sid, 2, 2) == kStatusInvalidParameter,
-          "sid: and a revision that is not 1 is refused");
-    check(nr2_RtlInitializeSid(sid, 1, 16) == kStatusInvalidParameter,
+    check(std::memcmp(sid + 2, id_authority, 6) == 0,
+          "sid: and the identifier authority copied from the caller");
+    check(nr2_RtlInitializeSid(sid, nullptr, 2) == kStatusInvalidParameter,
+          "sid: and a missing authority is refused");
+    check(nr2_RtlInitializeSid(sid, id_authority, 16) == kStatusInvalidParameter,
           "sid: as is a count above the fifteen the structure holds");
 
     check(nr2_RtlLengthRequiredSid(2) == 8 + 2 * 4,
@@ -1177,22 +1183,26 @@ void test_pe_queries() {
     check(nr2_RtlImageNtHeader(image + 1) == nullptr,
           "pe: and a base that is not an image base answers null");
 
-    check(nr2_RtlImageRvaToVa(0x900, image) == image + 0x900,
+    check(nr2_RtlImageRvaToVa(nt, image, 0x900, nullptr) == image + 0x900,
           "pe: an RVA inside the image resolves to base plus RVA");
-    check(nr2_RtlImageRvaToVa(0x3000, image) == nullptr,
+    check(nr2_RtlImageRvaToVa(nt, image, 0x3000, nullptr) == nullptr,
           "pe: and an RVA past the image end has no address");
 
+    std::uint32_t directory_size = 0;
     void* directory =
-        nr2_RtlImageDirectoryEntryToData(image, 0);
+        nr2_RtlImageDirectoryEntryToData(image, 1, 0, &directory_size);
     check(directory == image + 0x800,
           "pe: data directory zero resolves through its RVA");
-    check(nr2_RtlImageDirectoryEntryToData(image, 1) == nullptr,
+    check(directory_size != 0,
+          "pe: and the directory's own size comes back with it");
+    check(nr2_RtlImageDirectoryEntryToData(image, 1, 1, &directory_size) ==
+                  nullptr,
           "pe: and an index past the count names nothing");
 
-    void* section = nr2_RtlImageRvaToSection(image, 0x900);
+    void* section = nr2_RtlImageRvaToSection(nt, image, 0x900);
     check(section == image + 0x188,
           "pe: an RVA inside the section finds the section header");
-    check(nr2_RtlImageRvaToSection(image, 0x1800) == nullptr,
+    check(nr2_RtlImageRvaToSection(nt, image, 0x1800) == nullptr,
           "pe: and an RVA outside every section finds none");
 
     // A truncated image is refused rather than believed: the header walk
@@ -1314,15 +1324,17 @@ void test_locales_and_names() {
     // The generic mask expands through the object's own specific bits, so a
     // right the object does not define contributes nothing.
     std::uint32_t mask = 0x80000000u | 0x00000003u;  // generic read + bits
-    nr2_RtlMapGenericMask(&mask, 0x80000000u);
+    alignas(8) std::uint32_t mapping[4] = {0x00000001u, 0x00000002u,
+                                           0x00000020u, 0x000000FFu};
+    nr2_RtlMapGenericMask(&mask, mapping);
     check(mask == 0x00000003u,
           "mask: generic read maps onto the specific bits it stands for");
     mask = 0x80000000u | 0x00000040u;  // generic read + an unrelated bit
-    nr2_RtlMapGenericMask(&mask, 0x80000000u);
+    nr2_RtlMapGenericMask(&mask, mapping);
     check(mask == 0x00000040u,
           "mask: and a bit the read mapping does not define survives");
     mask = 0x0000000Fu;  // no generic bit at all
-    nr2_RtlMapGenericMask(&mask, 0);
+    nr2_RtlMapGenericMask(&mask, mapping);
     check(mask == 0x0000000Fu, "mask: a mask with no generic bit is itself");
 
     // The property-set names round-trip through their GUIDs.

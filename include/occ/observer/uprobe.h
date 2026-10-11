@@ -350,7 +350,7 @@ public:
     // A record that cannot be decoded is skipped rather than guessed at.
     // The rings are per probe, so a corrupt record costs its own probe's
     // events and not the others'.
-    std::size_t read_hits(std::vector<UprobeHit>& out) noexcept;
+    [[nodiscard]] std::size_t read_hits(std::vector<UprobeHit>& out) noexcept;
 
     [[nodiscard]] const std::vector<Uprobe>& all() const noexcept {
         return probes_;

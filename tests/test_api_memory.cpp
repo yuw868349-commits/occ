@@ -7,7 +7,9 @@
 // state every run here is in -- so the checks below are that they fail, and
 // fail with the error a caller branches on.
 
+#include "occ/runtime/address_space.h"
 #include "occ/runtime/api.h"
+#include "occ/runtime/mapper.h"
 #include "occ/runtime/winabi.h"
 
 #include <cstdint>
@@ -40,6 +42,28 @@ constexpr std::uint64_t kCurrentProcess = 0xFFFFFFFFFFFFFFFFULL;
 constexpr std::uint32_t kErrorInvalidHandle = 6;
 
 void test_virtual_memory() {
+    // A guest state is installed for this case, and it is what makes the
+    // assertions below answerable. Both halves of them read the same ledger:
+    // `VirtualAlloc` places from the guest's own user window when there is a
+    // guest to place for, and `VirtualQuery` reports a committed range only
+    // for a region the ledger holds. With no guest installed both fall back
+    // to the host -- the allocation is a bare `mmap` and every address is
+    // free -- which is honest but says nothing about the state a query
+    // reports for a block a caller just asked for.
+    AddressSpace space;
+    Mapper mapper(space);
+    GuestState guest;
+    guest.space = &space;
+    guest.mapper = &mapper;
+    // The TEB the last-error pair lives in. Without one, `set_last_error`
+    // drops the code on the floor rather than storing it -- a state with no
+    // TEB is a state whose caller owns the slot -- and the check that an
+    // error is reported below would read a zero that means "nothing was
+    // stored" instead of "the call failed".
+    std::uint8_t teb[0x2000] = {};
+    guest.teb = reinterpret_cast<std::uint64_t>(&teb[0]);
+    set_guest_state(&guest);
+
     // A commit-and-reserve is one mapping on this host, and the returned
     // block is one the guest can actually use -- which is what the write
     // below checks rather than assuming.
@@ -63,13 +87,15 @@ void test_virtual_memory() {
               "memory: and can be undone");
         bytes[0] = 0xEF;
         check(bytes[0] == 0xEF, "memory: the region is writable again");
-
-        check(k32m_VirtualFree(block, 0, kMemRelease) == 1,
-              "memory: the region is released");
     }
 
     // A query answers the structure Windows answers, and the fields a
     // caller reads are in it at the offsets Windows puts them.
+    //
+    // The block is still committed here on purpose. A query after the
+    // release below reports a free range -- that is the Windows answer for
+    // one -- so asking there would test the free arm of the query and
+    // nothing about the fields this case is about.
     std::uint8_t info[48];
     std::memset(info, 0, sizeof(info));
     const std::uint64_t got =
@@ -85,11 +111,21 @@ void test_virtual_memory() {
     check(protect == kPageReadWrite, "memory: and its protection");
     check(type == kMemPrivate, "memory: and that it is private");
 
+    if (block != nullptr) {
+        check(k32m_VirtualFree(block, 0, kMemRelease) == 1,
+              "memory: the region is released");
+    }
+
     // A request that names no type is a request with no meaning.
     set_last_error(0);
     check(k32m_VirtualAlloc(nullptr, 4096, 0, kPageReadWrite) == nullptr,
           "memory: an allocation with no type is refused");
     check(k32_GetLastError() != 0, "memory: and reports an error");
+
+    // The state goes away with the case. `set_guest_state` is not
+    // idempotent, so leaving it installed would have the next case running
+    // against a ledger nobody meant to give it.
+    set_guest_state(nullptr);
 }
 
 void test_the_three_allocators_are_one() {

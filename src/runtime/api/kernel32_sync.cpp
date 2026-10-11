@@ -1066,7 +1066,14 @@ void timer_worker(std::shared_ptr<WaitableTimer> state,
         if (state->cancelled) {
             break;
         }
-        objects::set_event(state->event);
+        // The signal is the whole of what the timer exists to do, and a
+        // false here means the event the timer was created with is gone --
+        // the guest closed the handle while the worker slept. Signalling
+        // nothing and looping would be a timer that never fires and never
+        // says so; the worker stops, which is what its own state records.
+        if (!objects::set_event(state->event)) {
+            break;
+        }
         if (period_ms == 0) {
             break;
         }
@@ -1173,7 +1180,15 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32s_SetWaitableTimer(
         std::this_thread::yield();
     }
     state->cancelled = false;
-    objects::reset_event(state->event);
+    // The set below arms a timer whose event has to start unsignalled, and
+    // a reset that failed means there is no event to arm: reporting the
+    // invalid handle is the honest answer, where starting the worker anyway
+    // would make a timer whose first wait returns at once for the previous
+    // set's signal.
+    if (!objects::reset_event(state->event)) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
     const std::uint64_t first_ms = due_time_to_ms(*due_time);
     const std::uint32_t period_ms =
         period > 0 ? static_cast<std::uint32_t>(period) : 0;

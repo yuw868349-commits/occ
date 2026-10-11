@@ -3476,11 +3476,16 @@ void test_tls_refuses_a_template_outside_the_image() {
 // it.
 //
 // The image is mapped writable during the load and given its final
-// protections afterwards, so a file whose index lands in .text would be
-// refused here rather than faulting. The fixture puts the index in .text on
-// purpose -- that is the shape a hand-written or hostile file has, and the
-// shape a loader that writes first and asks later has.
-void test_tls_refuses_an_index_that_is_not_writable() {
+// protections afterwards, so whether the index lands in .text is a question
+// only the finished image can answer. A file whose index lands there is not
+// refused: the slot number is the loader's own write, and Windows grants a
+// loader write into a section the file declared read-only. The loader raises
+// the page, stores the number, and puts the protection back -- and the
+// assertions below are the proof that all three happened: the load succeeds,
+// the number the guest's own TLS lookup will read is in the image, and .text
+// is executable-read again rather than the writable thing the raise left
+// behind.
+void test_tls_writes_an_index_in_a_read_only_section() {
     Spec s = a_tls_spec(0x20);
     s.sections[0].virtual_address = 0x1000;
     // The index goes into .text, which is read+execute and not writable.
@@ -3505,35 +3510,39 @@ void test_tls_refuses_an_index_that_is_not_writable() {
 
     const LoadResult r =
         load_image(p, ByteSpan{b.bytes.data(), b.bytes.size()}, 0, sp, ctx);
-    check(!r.ok, "read-only index: the load is refused");
-    check(r.error == LoadError::TlsRefused,
-          "read-only index: refused as a TLS problem");
-    // The refusal has to give the slot back, or every failed load would
-    // grow the table by one and the reuse search would skip the entries
-    // forever. This is the assertion that case is really about.
-    // The entry is *zeroed*, not erased, and the difference is the whole
-    // point of the design: erasing an entry from the middle of the table
-    // would move every later module's slot down by one, and a module's slot
-    // number is written into its own image where nothing rewrites it. So the
-    // table keeps its length and the freed entry reads as empty -- which is
-    // exactly what the reuse search looks for.
-    //
-    // An earlier version of this asserted `table.modules.empty()`, on the
-    // reasonable-sounding grounds that a load that consumed nothing should
-    // leave nothing behind. It fails against an implementation that frees
-    // correctly, which is the wrong way round: the assertion described a
-    // different (and worse) policy rather than the policy in the code.
+    check(r.ok, "read-only index: the load succeeds");
+    check(r.error == LoadError::None,
+          "read-only index: with no error attached");
+
+    // The slot number is in the image, readable through the section the file
+    // declared read-only. This is the read the guest's own TLS lookup makes,
+    // which is why a load that left nothing written here would make the
+    // module unworkable rather than merely unusual.
+    const std::uint64_t index_va = r.module.base + 0x1400;
+    std::uint32_t stored = 0;
+    std::memcpy(&stored, reinterpret_cast<const void*>(index_va),
+                sizeof(stored));
+    check(stored == 0, "read-only index: the slot number was written");
+
+    // The raise went back. A section the file declared read+execute must be
+    // read+execute after the load: a loader that left it writable would hand
+    // the guest a permission the file never asked for, and the raise's whole
+    // contract is that it covers the loader's store and nothing else.
+    const Region* text = sp.find(index_va);
+    check(text != nullptr &&
+              text->protection == PageProtection::ExecuteRead,
+          "read-only index: and .text is executable-read again, not writable");
+
+    // The slot stays taken. The load succeeded, so the entry the reuse search
+    // handed out is the module's own -- zeroing it here would be the failure
+    // path's cleanup applied to a success.
     check(table.modules.size() == 1,
-          "read-only index: the table kept its length, because erasing an "
-          "entry would renumber the modules after it");
-    check(table.modules[0].template_va == 0 &&
-              table.modules[0].template_size == 0 &&
-              table.modules[0].zero_fill == 0 &&
-              table.modules[0].callbacks_va == 0,
-          "read-only index: and the entry the failed load took was zeroed, so "
-          "the reuse search will offer it again");
-    check(table.slots_allocated == 0,
-          "read-only index: and the high-water mark went back with it");
+          "read-only index: the table keeps the entry the load took");
+    check(table.modules[0].template_va != 0,
+          "read-only index: and the entry is the module's, not a zeroed "
+          "leftover");
+    check(table.slots_allocated == 1,
+          "read-only index: and the high-water mark covers it");
 }
 
 // A TLS index whose four bytes do not fit in the region it names.
@@ -4199,10 +4208,13 @@ void test_tls_va_encoded_directory_survives_only_where_it_is_true() {
         // design choice rather than an accident: the template, callback and
         // index bounds are all checked *before* a slot is allocated, so a
         // directory this runtime cannot build never reaches the table. The
-        // refusals that happen after the allocation -- the index not being
-        // writable, in `commit_tls_index` -- are the ones that have to give
-        // a slot back, and test_tls_refuses_an_index_that_is_not_writable
-        // is the case for that.
+        // only refusal that happens after the allocation is one the kernel
+        // produces -- a raise the mapper could not apply, in
+        // `commit_tls_index` -- and that path gives the slot back through
+        // the `release` lambda there. The ordinary read-only-index case is
+        // not a refusal any more; it is written through a raised page, and
+        // test_tls_writes_an_index_in_a_read_only_section is the case for
+        // that.
         check(table.modules.empty(),
               "va-moved: no slot was taken, because the directory is checked "
               "before a slot is allocated");
@@ -4973,7 +4985,7 @@ int main() {
     test_tls_pe32_fields_are_read_at_their_own_width();
     test_tls_refuses_a_reversed_template();
     test_tls_refuses_a_template_outside_the_image();
-    test_tls_refuses_an_index_that_is_not_writable();
+    test_tls_writes_an_index_in_a_read_only_section();
     test_tls_refuses_an_index_whose_field_does_not_fit();
     test_tls_without_a_mapper_decides_without_writing();
     test_a_refused_load_leaves_the_space_as_it_was();

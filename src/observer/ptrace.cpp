@@ -439,7 +439,17 @@ sys::Result Tracer::event_message(int pid) noexcept {
 }
 
 sys::Result Tracer::siginfo(int pid, void* out, std::size_t size) noexcept {
-    (void)size;
+    // PTRACE_GETSIGINFO has one shape: the kernel copies a whole
+    // `siginfo_t` and nothing less. A caller that offered a smaller buffer
+    // would have the kernel write past the buffer it named, so the size is
+    // checked here rather than trusted, and the refusal is the syscall's
+    // own currency -- an error result, not a shorter copy.
+    if (out == nullptr || size < sizeof(siginfo_t)) {
+        sys::Result refused;
+        refused.value = 0;
+        refused.error = sys::kEinval;
+        return refused;
+    }
     return request(kPtraceGetsiginfo, pid, nullptr, out);
 }
 

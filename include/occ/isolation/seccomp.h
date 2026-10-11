@@ -37,6 +37,7 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 
+#include "occ/syscall/errno.h"
 #include "occ/util/span.h"
 
 namespace occ::sys {
@@ -113,8 +114,11 @@ enum class SeccompDefault : std::uint8_t {
 struct SeccompPolicy {
     // Applied to any syscall no rule mentions.
     SeccompDefault fallback = SeccompDefault::Errno;
-    // Used only when the fallback is Errno.
-    int fallback_error = 38; // ENOSYS
+    // Used only when the fallback is Errno. ENOSYS is the default the
+    // reference container runtimes use for an unlisted call, and it is the
+    // errno a caller reads as "this kernel does not have that call" rather
+    // than as a policy decision.
+    int fallback_error = kEnosys;
     std::vector<SeccompRule> rules;
     // Anything above this number is rejected without being dispatched, which
     // is what closes the x32 hole described above.
@@ -143,6 +147,21 @@ private:
     bool valid_ = false;
     const char* error_ = "not built";
 };
+
+// The policy the container installs when the caller names none.
+//
+// It is a refusal list rather than an allow list, and that choice is worth
+// stating: the runtime's own thunks reach the kernel on the target's behalf
+// for everything the target asks through the Windows API, and a target that
+// needs a syscall the list forgot is a target that stops with ENOSYS for
+// reasons nobody can see from inside the container. The always-allowed
+// fallback keeps a usable target usable while the list below takes away the
+// calls a Windows target has no business making: the mount family, the
+// module family, kernel debugging and tracing, namespace changes, and the
+// io_uring, keyring and cross-process memory interfaces. A caller that wants
+// the stricter allow list can set `fallback = Errno` on its own policy and
+// install that instead; the container takes the policy it is given.
+[[nodiscard]] SeccompPolicy guest_default_policy() noexcept;
 
 // Compiles the policy into bytecode. Building never throws and never installs
 // anything. On failure the result reports valid() == false together with a
