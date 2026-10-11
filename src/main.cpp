@@ -32,6 +32,8 @@ void print_usage(const char* argv0) {
         "  stop <session>     tear down a session\n"
         "  inspect <path>     static report: headers, sections, imports,\n"
         "                     exports, tls, exceptions, resources, strings\n"
+        "  devirt <trace> <dump>  offline VM de-virtualization report from\n"
+        "                     a dispatch trace and a decrypted image dump\n"
         "  doctor             report host capabilities and limitations\n"
         "\n"
         "options:\n"
@@ -83,6 +85,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "inspect") {
         return occ::cmd_inspect(argc - 2, argv + 2);
+    }
+    if (cmd == "devirt") {
+        return occ::cmd_devirt(argc - 2, argv + 2);
     }
     if (cmd == "run32") {
         if (argc < 3) {

@@ -8,5 +8,6 @@ int cmd_run(int argc, char** argv);
 int cmd_attach(int argc, char** argv);
 int cmd_stop(int argc, char** argv);
 int cmd_inspect(int argc, char** argv);
+int cmd_devirt(int argc, char** argv);
 
 } // namespace occ

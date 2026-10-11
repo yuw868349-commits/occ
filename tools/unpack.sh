@@ -26,7 +26,6 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 occ="${root}/build/occ"
-devirt="${root}/tools/devirt.py"
 
 sample="${1:?usage: unpack.sh <sample.exe> [dispatch-va] [prefix]}"
 dispatch="${2:-0x140006b2a}"
@@ -55,7 +54,7 @@ fi
 
 cp "${prefix}.vmf" unpacked.exe
 
-python3 "${devirt}" "${prefix}.jsonl" "${prefix}.vmf" \
+"${occ}" devirt "${prefix}.jsonl" "${prefix}.vmf" \
     -o "${prefix}.report.txt" >/dev/null 2>&1 || true
 
 echo "unpacked:"
