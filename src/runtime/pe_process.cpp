@@ -1529,7 +1529,22 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // for the next dispatch. A guest that single-steps on purpose is not
     // confused by this -- the step here belongs to the trap, not to it.
     if (sig == SIGTRAP && (info == nullptr || info->si_code == TRAP_TRACE) &&
-        vm_trace::step_outstanding()) {
+        vm_trace::active() && !vm_trace::step_outstanding() &&
+        !vm_trace::handles_step(rip)) {
+        // A trace trap the trace cannot name: the trace is armed, but this
+        // thread has no outstanding step. Either the guest is
+        // single-stepping itself, or a trap flag leaked past its step --
+        // and the guest is about to die on the instrument's own signal.
+        // The state dump is the evidence.
+        std::fprintf(stderr,
+                     "occ vm: stray TRAP rip=0x%llx tid=%llu code=%d\n",
+                     static_cast<unsigned long long>(rip),
+                     static_cast<unsigned long long>(::syscall(SYS_gettid)),
+                     info == nullptr ? -1 : info->si_code);
+        vm_trace::debug_dump();
+    }
+    if (sig == SIGTRAP && (info == nullptr || info->si_code == TRAP_TRACE) &&
+        vm_trace::handles_step(rip)) {
         if (vm_trace::service_step(uc, rip)) {
             uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
             return;

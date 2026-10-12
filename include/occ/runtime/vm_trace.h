@@ -88,7 +88,17 @@ void arm_trap(std::uint64_t image_base) noexcept;
 [[nodiscard]] bool handles_fetch(std::uint64_t rip) noexcept;
 
 // Whether the last dispatch record left a single step outstanding.
+// The step is the trace's only while the trap's instruction pointer
+// still lies inside the page it restored: a guest that single-steps on
+// purpose, or a sibling thread executing the same page, raises the same
+// SIGTRAP and must not consume the trace's step.
 [[nodiscard]] bool step_outstanding() noexcept;
+
+// Whether this SIGTRAP belongs to the trace's outstanding single step:
+// the saved rip names an instruction inside the page the last service
+// fetch restored. Answers false for a guest's own trap or for a trap
+// raised in another thread's context.
+[[nodiscard]] bool handles_step(std::uint64_t rip) noexcept;
 
 // Services a dispatch fetch: records the virtual instruction from the
 // faulting frame, restores the page's execute permission, and arms the
@@ -106,5 +116,12 @@ void arm_trap(std::uint64_t image_base) noexcept;
 // about to end the run: the dispatches immediately before the crash are
 // the virtual instruction stream the crash came from.
 void flush_on_fault() noexcept;
+
+// The trace's internal state, for the fault handler to report when a
+// SIGTRAP is about to end the guest: which pages are trapped and which
+// threads own outstanding steps. A stray trap the trace cannot name is
+// the difference between a guest's own breakpoint and an instrument
+// failure, and the report is what tells them apart.
+void debug_dump() noexcept;
 
 }  // namespace occ::runtime::vm_trace

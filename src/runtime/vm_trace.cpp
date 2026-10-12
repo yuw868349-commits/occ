@@ -9,6 +9,8 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace occ::runtime::vm_trace {
 
@@ -16,22 +18,37 @@ namespace {
 
 constexpr std::uint64_t kPage = 4096;
 
-// The dispatch idioms this runtime recognizes, as byte patterns. The
-// first is the one VMProtect 3.x emits for its main loop:
+// The dispatch idioms this runtime recognizes, as byte patterns. Each
+// names the registers a handler table is read through and how the read
+// is made, because the trace must know where the opcode index and the
+// table base live at the moment of the jump. The first family is the one
+// VMProtect 3.x emits for its main loop:
 //   49 8b 0c c4   mov rcx, [r12+rax*8]
 // followed by an indirect jump. Siblings cover the other register
 // choices: r8 (`4c 8b 04 c4`), rax (`49 8b 04 c4`), and the plain
-// `[r12+rax*8]` read into rcx without REX.B (`48 8b 0c c4`).
+// `[r12+rax*8]` read into rcx without REX.B (`48 8b 0c c4`). The second
+// family is a table-driven handler select with relative offsets -- the
+// shape a hand-rolled interpreter keeps: the jump table holds the
+// distance from its own base, and the dispatch adds the base back:
+//   48 63 14 93        movslq (%rbx,%rdx,4),%rdx
+//   48 01 da           add    %rbx,%rdx
+//   ff e2              jmp    *%rdx
+// The seven bytes up to the jump are the idiom; the jump byte follows.
 struct DispatchIdiom {
     const char* bytes;
     std::size_t length;
+    int index_reg;        // the register holding the opcode index
+    int base_reg;         // the register holding the handler table base
+    std::uint64_t scale;  // the index stride in the table
+    bool relative;        // true: table cells hold offsets from the base
 };
 
 constexpr DispatchIdiom kIdioms[] = {
-    {"\x49\x8b\x0c\xc4", 4},  // mov rcx, [r12+rax*8]
-    {"\x4c\x8b\x04\xc4", 4},  // mov r8,  [r12+rax*8]
-    {"\x49\x8b\x04\xc4", 4},  // mov rax, [r12+rax*8]
-    {"\x48\x8b\x0c\xc4", 4},  // mov rcx, [r12+rax*8] (no REX.B)
+    {"\x49\x8b\x0c\xc4", 4, REG_RAX, REG_R12, 8, false},
+    {"\x4c\x8b\x04\xc4", 4, REG_RAX, REG_R12, 8, false},
+    {"\x49\x8b\x04\xc4", 4, REG_RAX, REG_R12, 8, false},
+    {"\x48\x8b\x0c\xc4", 4, REG_RAX, REG_R12, 8, false},
+    {"\x48\x63\x14\x93\x48\x01\xda", 7, REG_RDX, REG_RBX, 4, true},
 };
 
 // The ring buffer's depth: the tail the trace can show around a crash.
@@ -60,12 +77,21 @@ bool g_to_stderr = false;
 std::string g_path;
 std::FILE* g_file = nullptr;
 
-// The dispatch addresses, resolved at arm time. A packed image can carry
+// The dispatch sites, resolved at arm time. A packed image can carry
 // more than one engine (VMProtect emits a separate VM per protected
 // function), so every idiom site is a candidate; the trace records
-// whichever ones the guest actually reaches.
+// whichever ones the guest actually reaches. Each site keeps the
+// register roles its idiom named, because a table-driven interpreter
+// may index through any pair.
 constexpr std::size_t kMaxCandidates = 16;
-std::uint64_t g_dispatchs[kMaxCandidates] = {};
+struct DispatchSite {
+    std::uint64_t address = 0;
+    int index_reg = REG_RAX;
+    int base_reg = REG_R12;
+    std::uint64_t scale = 8;
+    bool relative = false;
+};
+DispatchSite g_sites[kMaxCandidates];
 std::size_t g_dispatch_count = 0;
 bool g_resolved = false;
 
@@ -79,14 +105,24 @@ constexpr std::uint64_t kDispatchesPerMs = 1000;
 std::uint64_t g_tick_epoch_ms = 0;
 
 // The trapped pages (dispatch pages without execute permission), and the
-// single step the last service_fetch armed to re-trap the page it
-// restored. A dispatch page holds ordinary code too -- the engine's own
-// prologue and the jump network around it -- so every fetch into it
-// faults, and only the fetch whose instruction pointer is a dispatch
-// address becomes a record.
+// single steps armed to re-trap them. A dispatch page holds ordinary code
+// too -- the engine's own prologue and the jump network around it -- so
+// every fetch into it faults, and only the fetch whose instruction
+// pointer is a dispatch address becomes a record. The step state is
+// thread-local, not a shared table: the trap flag is per-thread hardware
+// state, and the SIGTRAP a step raises can only land on the thread that
+// armed it. A shared owner table would race -- two threads fetching the
+// same page at once would both write it, and one thread's step could be
+// overwritten before its own trap arrived, leaving a trap flag with no
+// owner and a guest that dies on the instrument's own signal.
 std::uint64_t g_trapped_pages[kMaxCandidates] = {};
 std::size_t g_trapped_count = 0;
-std::uint64_t g_stepping_page = 0;
+thread_local bool g_step_pending = false;
+thread_local std::uint64_t g_step_page = 0;
+
+[[nodiscard]] std::uint64_t current_tid() noexcept {
+    return static_cast<std::uint64_t>(::syscall(SYS_gettid));
+}
 
 // The ring buffer and its write position.
 DispatchRecord g_ring[kRingDepth];
@@ -147,7 +183,7 @@ std::size_t dispatch_count() noexcept {
 }
 
 std::uint64_t dispatch_at(std::size_t index) noexcept {
-    return index < g_dispatch_count ? g_dispatchs[index] : 0;
+    return index < g_dispatch_count ? g_sites[index].address : 0;
 }
 
 bool active() noexcept {
@@ -168,7 +204,7 @@ void arm_trap(std::uint64_t image_base) noexcept {
         const std::uint64_t at =
             static_cast<std::uint64_t>(std::strtoull(named, nullptr, 0));
         if (at != 0) {
-            g_dispatchs[0] = at;
+            g_sites[0].address = at;
             g_dispatch_count = 1;
         }
     } else {
@@ -193,7 +229,10 @@ void arm_trap(std::uint64_t image_base) noexcept {
                     }
                     const std::uint8_t next = img[off + idiom.length];
                     if (next == 0xe9 || next == 0xff) {
-                        g_dispatchs[g_dispatch_count++] = image_base + off;
+                        g_sites[g_dispatch_count] = DispatchSite{
+                            image_base + off, idiom.index_reg, idiom.base_reg,
+                            idiom.scale, idiom.relative};
+                        ++g_dispatch_count;
                         break;
                     }
                 }
@@ -208,7 +247,7 @@ void arm_trap(std::uint64_t image_base) noexcept {
                  g_dispatch_count);
     for (std::size_t i = 0; i < g_dispatch_count; ++i) {
         std::fprintf(stderr, " 0x%llx",
-                     static_cast<unsigned long long>(g_dispatchs[i]));
+                     static_cast<unsigned long long>(g_sites[i].address));
     }
     std::fprintf(stderr, "\n");
 
@@ -216,7 +255,7 @@ void arm_trap(std::uint64_t image_base) noexcept {
     // site. The first fetch into each faults; service_fetch restores and
     // re-traps on the step, so the guest runs free between dispatches.
     for (std::size_t i = 0; i < g_dispatch_count; ++i) {
-        const std::uint64_t page = g_dispatchs[i] & ~(kPage - 1);
+        const std::uint64_t page = g_sites[i].address & ~(kPage - 1);
         // A page already trapped is not trapped twice.
         bool known = false;
         for (std::size_t j = 0; j < g_trapped_count; ++j) {
@@ -239,7 +278,7 @@ void arm_trap(std::uint64_t image_base) noexcept {
         std::fprintf(stderr,
                      "occ vm: trapped page 0x%llx (dispatch 0x%llx)\n",
                      static_cast<unsigned long long>(page),
-                     static_cast<unsigned long long>(g_dispatchs[i]));
+                     static_cast<unsigned long long>(g_sites[i].address));
     }
 }
 
@@ -257,7 +296,16 @@ bool handles_fetch(std::uint64_t rip) noexcept {
 }
 
 bool step_outstanding() noexcept {
-    return g_stepping_page != 0;
+    return g_step_pending;
+}
+
+bool handles_step(std::uint64_t rip) noexcept {
+    static_cast<void>(rip);
+    // The step's own thread decided: the trap flag is per-thread state,
+    // and only the thread that armed it can raise its trace trap. The
+    // page test is deliberately absent -- a dispatch that jumps across
+    // pages raises its step with a rip on the destination page.
+    return g_step_pending;
 }
 
 bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
@@ -272,16 +320,21 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
     // fetch whose instruction pointer is a dispatch address is a virtual
     // instruction worth recording.
     bool is_dispatch = false;
+    std::size_t site = 0;
     for (std::size_t i = 0; i < g_dispatch_count; ++i) {
-        if (rip == g_dispatchs[i]) {
+        if (rip == g_sites[i].address) {
             is_dispatch = true;
+            site = i;
             break;
         }
     }
 
     if (is_dispatch) {
-        const std::uint64_t rax = static_cast<std::uint64_t>(g[REG_RAX]);
-        const std::uint64_t r12 = static_cast<std::uint64_t>(g[REG_R12]);
+        const DispatchSite& s = g_sites[site];
+        const std::uint64_t index =
+            static_cast<std::uint64_t>(g[s.index_reg]);
+        const std::uint64_t base =
+            static_cast<std::uint64_t>(g[s.base_reg]);
 
         DispatchRecord rec{};
         rec.t = static_cast<std::uint64_t>([] {
@@ -291,8 +344,8 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
                    static_cast<std::uint64_t>(ts.tv_nsec);
         }());
         rec.rip = rip;
-        rec.index = rax;
-        rec.base = r12;
+        rec.index = index;
+        rec.base = base;
         rec.rsi = static_cast<std::uint64_t>(g[REG_RSI]);
         rec.rdi = static_cast<std::uint64_t>(g[REG_RDI]);
         rec.rsp = static_cast<std::uint64_t>(g[REG_RSP]);
@@ -317,14 +370,22 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
         // guest's own memory, which is the one source that cannot lie.
         // No alignment is assumed: VMProtect runs its base pointer through
         // a constant first (r12 often ends one byte off a table entry),
-        // and the read the guest itself makes is the one that decides.
+        // and the read the guest itself makes is the one that decides. A
+        // relative table stores the distance from its own base -- the
+        // shape a hand-rolled interpreter keeps -- so the target adds
+        // the base back instead of being read whole.
         rec.target = 0;
-        if (r12 >= 0x10000 && r12 < 0x7ffffffff000ull) {
-            const std::uint64_t cell = r12 + (rax & 0xfffff) * 8;
+        if (base >= 0x10000 && base < 0x7ffffffff000ull) {
+            const std::uint64_t cell = base + (index & 0xfffff) * s.scale;
             if (cell >= 0x10000 && cell < 0x7ffffffff000ull) {
-                const auto* table =
-                    reinterpret_cast<const std::uint64_t*>(cell);
-                rec.target = *table;
+                if (s.relative) {
+                    const std::int32_t off =
+                        *reinterpret_cast<const std::int32_t*>(cell);
+                    rec.target = base + static_cast<std::uint64_t>(off);
+                } else {
+                    rec.target =
+                        *reinterpret_cast<const std::uint64_t*>(cell);
+                }
             }
         }
 
@@ -386,7 +447,13 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
                      static_cast<unsigned long long>(page));
         return true;
     }
-    g_stepping_page = page;
+    // Arm this thread's step: the page is executable again, and the trap
+    // flag turns the next instruction into a SIGTRAP the trace owns. The
+    // state is this thread's own -- a worker crossing the dispatch page
+    // mid-step raises its own trap, which its own state answers and the
+    // main thread's state ignores.
+    g_step_page = page;
+    g_step_pending = true;
     uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
     return true;
 }
@@ -394,11 +461,15 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
 bool service_step(::ucontext_t* uc, std::uint64_t rip) noexcept {
     static_cast<void>(uc);
     static_cast<void>(rip);
-    if (g_stepping_page == 0) {
+    if (!g_step_pending) {
         return false;
     }
-    const std::uint64_t page = g_stepping_page;
-    g_stepping_page = 0;
+    // The step is this thread's own: the trap flag is per-thread state,
+    // so the trap that landed here was armed by this thread's own fetch.
+    // Its page is the one to re-trap; a sibling thread's outstanding step
+    // is untouched, and its trap will be answered by its own state.
+    const std::uint64_t page = g_step_page;
+    g_step_pending = false;
     // Re-trap: execute permission off again. The dispatch page's next
     // fetch -- the next dispatch -- faults, which is the instrument.
     if (!set_page_protection(page, PROT_READ | PROT_WRITE)) {
@@ -428,6 +499,22 @@ void flush_on_fault() noexcept {
                      static_cast<unsigned long long>(rec.rip),
                      static_cast<unsigned long long>(rec.index),
                      static_cast<unsigned long long>(rec.target));
+    }
+}
+
+void debug_dump() noexcept {
+    const std::uint64_t tid = current_tid();
+    std::fprintf(stderr, "occ vm: debug tid=%llu trapped=%zu step_pending=%d\n",
+                 static_cast<unsigned long long>(tid), g_trapped_count,
+                 static_cast<int>(g_step_pending));
+    for (std::size_t i = 0; i < g_trapped_count; ++i) {
+        std::fprintf(stderr,
+                     "occ vm:   trapped page 0x%llx\n",
+                     static_cast<unsigned long long>(g_trapped_pages[i]));
+    }
+    if (g_step_pending) {
+        std::fprintf(stderr, "occ vm:   pending step page 0x%llx\n",
+                     static_cast<unsigned long long>(g_step_page));
     }
 }
 
