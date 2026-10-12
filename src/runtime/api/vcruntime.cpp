@@ -295,12 +295,18 @@ void add_vcruntime140(ExportList& out) {
     e("__CxxFrameHandler2", reinterpret_cast<void*>(&vcr___CxxFrameHandler2));
     e("__CxxFrameHandler3", reinterpret_cast<void*>(&vcr___CxxFrameHandler3));
     e("__CxxThrowException", reinterpret_cast<void*>(&vcr___CxxThrowException));
+    // The two spellings of the throw entry and the exception context
+    // differ across toolchain generations; a binary built with either
+    // resolves the same implementation.
+    e("_CxxThrowException", reinterpret_cast<void*>(&vcr___CxxThrowException));
     e("__std_terminate", reinterpret_cast<void*>(&vcr___std_terminate));
     e("__std_exception_copy", reinterpret_cast<void*>(&vcr___std_exception_copy));
     e("__std_exception_destroy",
       reinterpret_cast<void*>(&vcr___std_exception_destroy));
     e("__current_exception", reinterpret_cast<void*>(&vcr___current_exception));
     e("_current_exception_context",
+      reinterpret_cast<void*>(&vcr__current_exception_context));
+    e("__current_exception_context",
       reinterpret_cast<void*>(&vcr__current_exception_context));
     // The secure memory family.
     e("memcpy_s", reinterpret_cast<void*>(&vcr_memcpy_s));
