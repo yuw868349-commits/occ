@@ -1734,6 +1734,19 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         from_memory ? reinterpret_cast<std::uint64_t>(info->si_addr)
                     : static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
 
+    // A fault with the instruction pointer at zero is not a memory walk:
+    // the guest took an indirect branch through a NULL pointer, and the
+    // address the branch chose is the diagnosis. It happens when a
+    // function pointer was never filled in -- a dead import slot, a
+    // callback table the guest forgot to build, or a register that was
+    // meant to carry the target and carried zero instead.
+    if ((sig == SIGSEGV || sig == SIGBUS) &&
+        static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]) == 0) {
+        std::fprintf(stderr,
+                     "occ fault: indirect branch through a NULL pointer "
+                     "(the guest called or jumped to address zero)\n");
+    }
+
     winabi::GuestState* state = g_run_frame.state;
     if (state != nullptr) {
         state->faulted = true;
