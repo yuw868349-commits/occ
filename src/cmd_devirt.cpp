@@ -17,13 +17,17 @@
 //   API address in the stack slots.
 
 #include "occ/commands.h"
+#include "occ/devirt/lift.h"
+#include "occ/parser/pe.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <string>
@@ -45,6 +49,9 @@ struct Row {
     std::uint64_t seq = 0;
     std::uint64_t rsi = 0;   // bytecode cursor
     std::uint64_t rbp = 0;   // virtual stack pointer
+    std::uint64_t rdi = 0;   // the engine's stack base
+    std::uint64_t rsp = 0;
+    std::uint64_t r12 = 0;   // the handler table base the dispatcher indexes
     std::uint64_t st0 = 0;   // virtual stack top
     std::uint64_t st1 = 0;
     std::uint64_t st2 = 0;
@@ -130,10 +137,16 @@ bool load_trace(const std::string& path, std::vector<Row>& rows) {
             continue;
         }
         Row r;
-        r.seq = json_hex(f["seq"]);
+        // `seq` is the runtime's dispatch counter, written in decimal
+        // (`%llu` in the tracer); every other field is %llx and is read
+        // as hex.
+        r.seq = std::strtoull(f["seq"].c_str(), nullptr, 10);
         r.word = json_hex(f["target"]);
         r.rsi = json_hex(f["rsi"]);
         r.rbp = json_hex(f["rbp"]);
+        r.rdi = json_hex(f["rdi"]);
+        r.rsp = json_hex(f["rsp"]);
+        r.r12 = json_hex(f["base"]);
         r.st0 = json_hex(f["st0"]);
         r.st1 = json_hex(f["st1"]);
         r.st2 = json_hex(f["st2"]);
@@ -183,6 +196,88 @@ std::string api_name(std::uint64_t v) {
     }
     return std::string();
 }
+
+// ----------------------------------------------------------- lifting image
+
+// The .vmf as an addressable image: the file bytes plus the PE map that
+// turns the virtual addresses the trace records into offsets into them.
+// The lifter decodes handlers straight from these bytes -- it does not
+// need objdump for its model, only the raw encoding -- and the
+// conformance check reads the bytecode bytes through the same map.
+struct ImageMap {
+    std::vector<std::uint8_t> bytes;
+    parser::PeImage pe;
+    std::uint64_t base = 0;
+    bool ok = false;
+
+    bool load(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+        bytes.assign(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+        pe = parser::PeImage::parse(ByteSpan(bytes.data(), bytes.size()));
+        if (!pe.ok()) {
+            return false;
+        }
+        base = pe.image_base();
+        ok = true;
+        return true;
+    }
+
+    // The whole section that holds `va`, as a window for the lifter: the
+    // handler's blocks are chained by direct jumps scattered through the
+    // section, so the walk needs the section, not the handler's bytes.
+    // Null when `va` is in no file-backed section.
+    const std::uint8_t* window(std::uint64_t va, std::uint64_t* window_va,
+                               std::size_t* available) const {
+        if (!ok || va < base) {
+            return nullptr;
+        }
+        const std::uint64_t rva = va - base;
+        for (const parser::PeSection& s : pe.sections()) {
+            const std::uint64_t within = rva - s.virtual_address;
+            if (rva < s.virtual_address || rva >= s.virtual_end()) {
+                continue;
+            }
+            if (within >= s.raw_size || s.raw_offset >= bytes.size()) {
+                return nullptr;
+            }
+            const std::size_t limit =
+                std::min<std::size_t>(s.raw_size,
+                                      bytes.size() - s.raw_offset);
+            *window_va = base + s.virtual_address;
+            *available = limit;
+            return bytes.data() + s.raw_offset;
+        }
+        return nullptr;
+    }
+
+    // The code reader the conformance check binds bytecode and image
+    // inputs with: `width` bits from the image at `va`.
+    static bool read(void* ctx, std::uint64_t va, unsigned width,
+                     std::uint64_t* out) {
+        const auto* self = static_cast<const ImageMap*>(ctx);
+        if (!self->ok || va < self->base) {
+            return false;
+        }
+        std::uint64_t value = 0;
+        for (unsigned i = 0; i < width / 8; ++i) {
+            std::uint64_t off = 0;
+            bool zero = false;
+            if (!self->pe.resolve_rva(va - self->base + i, off, zero)) {
+                return false;
+            }
+            if (!zero) {
+                value |= static_cast<std::uint64_t>(self->bytes[off])
+                         << (8 * i);
+            }
+        }
+        *out = value;
+        return true;
+    }
+};
 
 // -------------------------------------------------------------- disasm
 
@@ -408,6 +503,18 @@ std::string fmt_slots(const Row& r) {
 }
 
 // -------------------------------------------------------------- report
+
+// A handler's effect expressions can nest deeply -- the junk does a lot
+// of arithmetic, and a merged branch wraps both arms in a select -- and a
+// report line past a few hundred characters stops being read by anyone.
+// The checked truth is the expression itself; what is printed is a
+// summary of it, one clause per line.
+std::string brief(const std::string& text, std::size_t limit = 110) {
+    if (text.size() <= limit) {
+        return text;
+    }
+    return text.substr(0, limit - 3) + "...";
+}
 
 class Report {
 public:
@@ -645,6 +752,145 @@ int cmd_devirt(int argc, char** argv) {
                       bi++, lo, hi, static_cast<unsigned long long>(rs),
                       static_cast<unsigned long long>(re), hi - lo + 1);
         rep.emit(std::string(b) + edge);
+    }
+
+    // The lift: every handler modelled as a micro-program over the
+    // virtual state, and the model checked against the trace. This is
+    // the part that makes the semantics above checkable rather than
+    // plausible -- each dispatch's prediction is evaluated with the
+    // previous row's values and compared with the next row's, field by
+    // field.
+    {
+        ImageMap img;
+        if (!img.load(dump_path)) {
+            rep.emit("");
+            rep.emit("handler lifting: skipped (the dump does not parse as "
+                     "a PE image)");
+        } else {
+            lift::Model model;
+            std::map<std::uint64_t, std::size_t> index_of;
+            std::vector<lift::Handler> lhandlers;
+            std::size_t incomplete = 0;
+            for (const auto& [h, rs] : by_handler) {
+                (void)rs;
+                std::uint64_t window_va = 0;
+                std::size_t avail = 0;
+                const std::uint8_t* p = img.window(h, &window_va, &avail);
+                lift::Handler handler;
+                handler.va = h;
+                if (p != nullptr && avail != 0) {
+                    // A handler is a chain of blocks scattered through
+                    // the section, and the budget has to cover the whole
+                    // chain -- the sample's handlers run 70 to 150
+                    // instructions.
+                    handler = lift::summarize(model, p, avail, window_va, h,
+                                              1024);
+                } else {
+                    handler.reason = "handler bytes are not file-backed";
+                }
+                if (!handler.modeled) {
+                    ++incomplete;
+                }
+                index_of[h] = lhandlers.size();
+                lhandlers.push_back(std::move(handler));
+            }
+
+            rep.emit("");
+            rep.emit("handler lifting: " + std::to_string(lhandlers.size()) +
+                     " handlers, " +
+                     std::to_string(lhandlers.size() - incomplete) +
+                     " fully modelled, " + std::to_string(incomplete) +
+                     " incomplete");
+            for (const auto& [h, rs] : by_handler) {
+                (void)rs;
+                const lift::Handler& lh = lhandlers[index_of[h]];
+                char b[24];
+                std::snprintf(b, sizeof(b), "  0x%010llx  ",
+                              static_cast<unsigned long long>(h));
+                const std::string head = b;
+                const std::string indent(head.size(), ' ');
+                if (!lh.modeled) {
+                    rep.emit(head + "(incomplete: " + lh.reason + ")");
+                    continue;
+                }
+                rep.emit(head + "fully modelled");
+                rep.emit(indent + "rbp' = " +
+                         brief(lift::render(model, lh.rbp_new)));
+                rep.emit(indent + "rsi' = " +
+                         brief(lift::render(model, lh.rsi_new)));
+                for (const lift::Handler::Write& w : lh.writes) {
+                    if (w.to_slot) {
+                        rep.emit(indent + "vst[" + std::to_string(w.disp) +
+                                 "] = " + brief(lift::render(model, w.value)));
+                    } else {
+                        rep.emit(indent + "mem" + std::to_string(w.width) +
+                                 "[" + brief(lift::render(model, w.addr)) +
+                                 "] = " + brief(lift::render(model, w.value)));
+                    }
+                }
+                if (lh.transfer == lift::Handler::Transfer::Dispatch) {
+                    rep.emit(indent + "-> " +
+                             brief(lift::render(model, lh.target_expr)));
+                } else if (lh.transfer == lift::Handler::Transfer::Call) {
+                    rep.emit(indent + "-> call-out");
+                } else if (lh.transfer == lift::Handler::Transfer::Return) {
+                    rep.emit(indent + "-> return");
+                }
+                // What the walk met and handled: the model is exact, but
+                // the analyst should know where it had to approximate.
+                for (const std::string& n : lh.notes) {
+                    rep.emit(indent + "note: " + n);
+                }
+            }
+
+            std::vector<lift::Row> lrows;
+            std::vector<std::size_t> which;
+            lrows.reserve(rows.size());
+            which.reserve(rows.size());
+            for (const Row& r : rows) {
+                lift::Row lr;
+                lr.seq = r.seq;
+                lr.rsi = r.rsi;
+                lr.rbp = r.rbp;
+                lr.rdi = r.rdi;
+                lr.rsp = r.rsp;
+                lr.r12 = r.r12;
+                lr.st0 = r.st0;
+                lr.st1 = r.st1;
+                lr.st2 = r.st2;
+                lr.target = r.word;
+                lrows.push_back(lr);
+                which.push_back(index_of[rol10(r.word)]);
+            }
+            const lift::Conformance conf = lift::check_trace(
+                model, lhandlers, lrows, which, ImageMap::read, &img);
+            char b[224];
+            std::snprintf(b, sizeof(b),
+                          "  trace conformance: %llu checked, %llu mismatched, "
+                          "%llu unverifiable, %llu to incomplete models "
+                          "(agreement %.1f%%)",
+                          static_cast<unsigned long long>(conf.checked),
+                          static_cast<unsigned long long>(conf.mismatched),
+                          static_cast<unsigned long long>(conf.unverifiable),
+                          static_cast<unsigned long long>(conf.unmodeled),
+                          conf.rate() * 100.0);
+            rep.emit(b);
+            if (!conf.worst_handlers.empty()) {
+                std::string tally = "  mismatches by handler:";
+                for (const lift::Conformance::PerHandler& ph :
+                     conf.worst_handlers) {
+                    char hb[40];
+                    std::snprintf(hb, sizeof(hb), " 0x%llx x%llu",
+                                  static_cast<unsigned long long>(ph.va),
+                                  static_cast<unsigned long long>(ph.count));
+                    tally += hb;
+                }
+                rep.emit(tally);
+            }
+            for (const std::string& f : conf.failures) {
+                rep.emit("  ! " + f);
+            }
+        }
     }
 
     // The assembly-like listing.

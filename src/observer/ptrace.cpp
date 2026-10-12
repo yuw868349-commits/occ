@@ -254,9 +254,24 @@ sys::Result Tracer::set_regs(int pid, const Registers& in) noexcept {
 }
 
 sys::Result Tracer::peek(int pid, std::uint64_t addr) noexcept {
-    return request(kPtracePeekData, pid,
-                   reinterpret_cast<void*>(static_cast<std::uintptr_t>(addr)),
-                   nullptr);
+    // The kernel does not return the peeked word in the syscall's return
+    // value: it writes the word to the pointer in the fourth argument and
+    // returns zero, and returns -EIO (not -EFAULT) when the target range
+    // cannot be read. Passing a null fourth argument therefore makes
+    // every peek fail with EFAULT -- the kernel faults writing the word
+    // -- which reads as "this address is unreadable" and silently
+    // disables every caller that has no other way to read memory. The
+    // word has to travel through a local, the way the C library's
+    // wrapper does it.
+    unsigned long word = 0;
+    const auto r =
+        request(kPtracePeekData, pid,
+                reinterpret_cast<void*>(static_cast<std::uintptr_t>(addr)),
+                &word);
+    if (r.failed()) {
+        return r;
+    }
+    return sys::Result{static_cast<long>(word), 0};
 }
 
 sys::Result Tracer::poke(int pid, std::uint64_t addr,
@@ -289,10 +304,18 @@ sys::Result Tracer::read_memory(int pid, std::uint64_t addr, void* buffer,
     }
     // A short read is reported as the count that did move, which is what a
     // caller looping for a whole buffer needs.
-    if (r.error != sys::kEperm && r.error != sys::kEinval) {
-        return r;
-    }
-
+    //
+    // Every failure falls through to the word-at-a-time path rather than
+    // a list of errnos being judged retryable here. The one-syscall path
+    // is missing on kernels before 3.2 (ENOSYS), refused by policy
+    // (EPERM), refused for the range it will not take (EINVAL), and
+    // refused by sandboxes that answer a policy errno of their own
+    // choosing -- this interpreter met one that answers ENOSYS, and
+    // another could answer EFAULT. Deciding here which of those is
+    // worth a retry means the read path works only on the hosts whose
+    // answer happened to be on the list. The fallback is ptrace itself,
+    // the interface every kernel this observer runs on has, and its
+    // answer is the honest one.
     auto* out = static_cast<std::uint8_t*>(buffer);
     std::size_t moved = 0;
     while (moved < length) {
@@ -332,10 +355,8 @@ sys::Result Tracer::write_memory(int pid, std::uint64_t addr,
     if (r.ok()) {
         return r;
     }
-    if (r.error != sys::kEperm && r.error != sys::kEinval) {
-        return r;
-    }
-
+    // Writes go through the same fallback for the same reason the read
+    // does; see the comment there.
     const auto* in = static_cast<const std::uint8_t*>(buffer);
     std::size_t moved = 0;
     while (moved < length) {

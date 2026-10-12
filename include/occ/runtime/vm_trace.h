@@ -43,6 +43,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 #include <signal.h>
 

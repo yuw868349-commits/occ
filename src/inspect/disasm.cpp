@@ -50,22 +50,22 @@ enum : std::uint8_t {
 // instruction with no immediate, which is most of the map. X marks the
 // opcodes that cannot exist in 64-bit mode, refused rather than guessed.
 constexpr std::uint8_t kOp1[256] = {
-    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kInvalid64, kInvalid64,
-    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kImm8, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kInvalid64, kHasModrm,
-    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kImm8, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kImm8, kHasModrm,
-    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kImm8, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kImm8, kHasModrm,
+    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kInvalid64, kInvalid64, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kInvalid64, kInvalid64,
+    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kImm8, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kInvalid64, kHasModrm,
+    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kImm8, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kImm8, kHasModrm,
+    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kImm8, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kImm8, kHasModrm,
     kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64, kInvalid64,
     kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm,
     kInvalid64, kInvalid64, kHasModrm, kHasModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kImmZ, kHasModrm, kImm8, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
     kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8,
     kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
     kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kInvalid64, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm,
-    kImmV, kImmV, kImmV, kImmV, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kImm8, kImmZ, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm,
+    kImmV, kImmV, kImmV, kImmV, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kImm8, kImmZ, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm,
     kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImmZ, kImmZ, kImmZ, kImmZ, kImmZ, kImmZ, kImmZ, kImmZ,
     kHasModrm, kHasModrm, kImm16F, kNoModrm, kNoModrm, kNoModrm, kHasModrm, kHasModrm, kImmP, kNoModrm, kImm16F, kNoModrm, kNoModrm, kImm8, kInvalid64, kNoModrm,
     kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kInvalid64, kNoModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
     kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImm8, kImmZ, kImmZ, kInvalid64, kImm8, kNoModrm, kNoModrm, kNoModrm, kNoModrm,
-    kInvalid64, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
+    kInvalid64, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kHasModrm, kHasModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kHasModrm, kHasModrm,
 };
 
 // The two-byte opcode map (0F xx). The same encoding of the entries; the
@@ -84,7 +84,7 @@ constexpr std::uint8_t kOp2[256] = {
     kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
     kNoModrm, kNoModrm, kNoModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kNoModrm, kNoModrm, kNoModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
     kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kInvalid64, kInvalid64, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
-    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
+    kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm, kNoModrm,
     kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
     kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
     kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm, kHasModrm,
@@ -97,6 +97,10 @@ constexpr std::uint8_t kOp2[256] = {
     case 0x71:
     case 0x72:
     case 0x73:
+    // The double shifts carry the count either as an imm8 (A4/AC) or in
+    // CL (A5/AD), and only the first pair has a byte to read here.
+    case 0xA4:
+    case 0xAC:
     case 0xBA:
     case 0xC2:
     case 0xC4:
@@ -462,6 +466,15 @@ std::uint32_t x64_instruction_length(const std::uint8_t* bytes,
         case 0x90: return "nop";
         case 0x98: return "cwde";
         case 0x99: return "cdq";
+        case 0x9C: return "pushf";
+        case 0x9D: return "popf";
+        case 0x9E: return "sahf";
+        case 0x9F: return "lahf";
+        case 0xA4: case 0xA5: return "movs";
+        case 0xA6: case 0xA7: return "cmps";
+        case 0xAA: case 0xAB: return "stos";
+        case 0xAC: case 0xAD: return "lods";
+        case 0xAE: case 0xAF: return "scas";
         case 0xA8: case 0xA9: return "test";
         case 0xB0: case 0xB1: case 0xB2: case 0xB3:
         case 0xB4: case 0xB5: case 0xB6: case 0xB7:
@@ -475,9 +488,19 @@ std::uint32_t x64_instruction_length(const std::uint8_t* bytes,
         case 0xC6: case 0xC7: return "mov";
         case 0xC9: return "leave";
         case 0xCC: return "int3";
+        case 0xE0: case 0xE1: case 0xE2: case 0xE3:
+            return "loop";
         case 0xE8: return "call";
         case 0xE9: case 0xEB: return "jmp";
+        case 0xF4: return "hlt";
+        case 0xF5: return "cmc";
         case 0xF6: case 0xF7: return "grp3";
+        case 0xF8: return "clc";
+        case 0xF9: return "stc";
+        case 0xFA: return "cli";
+        case 0xFB: return "sti";
+        case 0xFC: return "cld";
+        case 0xFD: return "std";
         case 0xFE: case 0xFF: return "grp5";
         default:
             return nullptr;

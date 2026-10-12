@@ -1834,6 +1834,14 @@ void test_hex_fields_accept_both_cases() {
     const std::string upper = server.handle(upper_addr).payload;
     // Sixteen bytes is thirty-two hex digits, and the count is what says the
     // read reached the tracee rather than being refused.
+    if (lower.size() != 32) {
+        std::fprintf(stderr,
+                     "note: read at page base 0x%llx (rsp 0x%llx) answered "
+                     "\"%s\" (%zu bytes)\n",
+                     static_cast<unsigned long long>(page),
+                     static_cast<unsigned long long>(regs.rsp),
+                     lower.c_str(), lower.size());
+    }
     check(lower.size() == 32, "a lowercase memory read reaches the tracee");
     check(lower == upper,
           "an uppercase memory address parses like a lowercase one");

@@ -1,0 +1,897 @@
+// Handler lifting tests.
+//
+// The handlers here are hand-assembled byte sequences whose effects are
+// known by construction, and the traces are built the same way: the
+// expected post-state of each handler is computed by hand from the
+// micro-program, fed in as an observed row, and the model has to agree.
+// That is the same agreement the pipeline runs against a real trace --
+// the difference is only who supplied the numbers.
+//
+// The cases are the ones that would pass a weaker analysis: a write to a
+// stack slot, a stack shift that moves which slot is on top, a bytecode
+// read whose value lands in a slot, and the decrypt-and-dispatch handler
+// whose jump target is an expression over the bytecode rather than a
+// constant. One case has junk in the middle that the interpreter cannot
+// model, to check that the model is reported incomplete *and* still
+// recovers the effect that matters. One case mutates the observed trace
+// so the checker has to fail: a conformance check that cannot fail is
+// not a check.
+
+#include "occ/devirt/lift.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+using namespace occ::devirt;
+
+namespace {
+
+int failures = 0;
+int checks = 0;
+
+void check(bool ok, const char* what) {
+    ++checks;
+    if (!ok) {
+        ++failures;
+        std::fprintf(stderr, "FAIL %s\n", what);
+    }
+}
+
+// ------------------------------------------------------------- programs
+
+// add:  rax = st0; rax += st1; st1 = rax; rbp += 8 -> the virtual
+// "pop both, push the sum" instruction.
+const std::vector<std::uint8_t> kAdd = {
+    0x48, 0x8B, 0x45, 0x00,  // mov rax, [rbp+0x0]
+    0x48, 0x03, 0x45, 0x08,  // add rax, [rbp+0x8]
+    0x48, 0x89, 0x45, 0x08,  // mov [rbp+0x8], rax
+    0x48, 0x83, 0xC5, 0x08,  // add rbp, 0x8
+    0xFF, 0xE1,              // jmp rcx
+};
+
+// byte:  al = [rsi]; rsi += 1; st0 = al -> the virtual "push immediate
+// byte" instruction, with the byte coming from the bytecode.
+const std::vector<std::uint8_t> kByte = {
+    0x48, 0x0F, 0xB6, 0x06,  // movzx rax, byte [rsi]
+    0x48, 0x83, 0xC6, 0x01,  // add rsi, 0x1
+    0x48, 0x89, 0x45, 0x00,  // mov [rbp+0x0], rax
+    0xFF, 0xE1,              // jmp rcx
+};
+
+// decrypt: the sample's dispatch handler -- read the bytecode word,
+// rotate it, advance the cursor, jump to it.
+const std::vector<std::uint8_t> kDecrypt = {
+    0x48, 0x8B, 0x06,        // mov rax, [rsi]
+    0x48, 0xC1, 0xC0, 0x0A,  // rol rax, 0xa
+    0x48, 0x83, 0xC6, 0x08,  // add rsi, 0x8
+    0xFF, 0xE0,              // jmp rax
+};
+
+// junk: a cpuid the interpreter does not model, then a real effect.
+const std::vector<std::uint8_t> kJunk = {
+    0x0F, 0xA2,              // cpuid
+    0x48, 0x83, 0xC6, 0x02,  // add rsi, 0x2
+    0xFF, 0xE1,              // jmp rcx
+};
+
+constexpr std::uint64_t kHandlerVa = 0x1000;
+
+struct Image {
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t base = 0x2000;
+};
+
+bool read_image(void* ctx, std::uint64_t va, unsigned width, std::uint64_t* out) {
+    const auto* img = static_cast<const Image*>(ctx);
+    std::uint64_t value = 0;
+    for (unsigned i = 0; i < width / 8; ++i) {
+        const std::uint64_t at = va - img->base + i;
+        if (at >= img->bytes.size()) {
+            return false;
+        }
+        value |= static_cast<std::uint64_t>(img->bytes[at]) << (8 * i);
+    }
+    *out = value;
+    return true;
+}
+
+// -------------------------------------------------------------- decoding
+
+void test_decode_insn() {
+    {
+        lift::Insn in;
+        const bool ok = lift::decode_insn(kAdd.data(), kAdd.size(), kHandlerVa, in);
+        check(ok, "the first instruction decodes");
+        check(in.length == 4 && in.mnemonic == "mov", "mov rax, [rbp+0x0]");
+        check(in.operands.size() == 2, "mov has two operands");
+        if (in.operands.size() == 2) {
+            check(in.operands[0].kind == lift::Operand::Kind::Reg &&
+                      in.operands[0].reg == "rax" &&
+                      in.operands[0].width == 64,
+                  "the destination is rax at 64 bits");
+            check(in.operands[1].kind == lift::Operand::Kind::Mem &&
+                      in.operands[1].base == "rbp" && in.operands[1].disp == 0 &&
+                      in.operands[1].width == 64,
+                  "the source is [rbp+0] at 64 bits");
+        }
+    }
+    {
+        lift::Insn in;
+        const bool ok =
+            lift::decode_insn(kAdd.data() + 12, kAdd.size() - 12, kHandlerVa + 12, in);
+        check(ok && in.mnemonic == "add", "add rbp, 0x8 decodes");
+        check(in.operands.size() == 2 && in.operands[1].kind == lift::Operand::Kind::Imm &&
+                  in.operands[1].imm == 8,
+              "the immediate is 8");
+    }
+    {
+        lift::Insn in;
+        const bool ok = lift::decode_insn(kByte.data(), kByte.size(), kHandlerVa, in);
+        check(ok && in.mnemonic == "movzx", "movzx rax, byte [rsi] decodes");
+        check(in.operands.size() == 2 &&
+                  in.operands[1].kind == lift::Operand::Kind::Mem &&
+                  in.operands[1].base == "rsi" && in.operands[1].width == 8,
+              "the source is a byte of the bytecode");
+    }
+    {
+        lift::Insn in;
+        const bool ok =
+            lift::decode_insn(kDecrypt.data() + 4, kDecrypt.size() - 4, kHandlerVa + 4, in);
+        check(ok && in.mnemonic == "rol", "rol rax, 0xa decodes");
+        check(in.operands.size() == 2 && in.operands[1].imm == 10,
+              "the rotate amount is 10");
+    }
+}
+
+// ----------------------------------------------------------- summarizing
+
+void test_add_handler() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kAdd.data(), kAdd.size(), kHandlerVa, kHandlerVa);
+    check(h.modeled, "the add handler is fully modelled");
+    check(h.transfer == lift::Handler::Transfer::Dispatch,
+          "it ends by dispatching");
+    check(!h.writes.empty() && h.writes[0].disp == 8,
+          "it writes the slot at +8");
+    check(h.writes[0].value != expr::kNoId, "the written value is an expression");
+    if (h.writes[0].value != expr::kNoId) {
+        // st1 = st0 + st1, expressed over the two slot inputs.
+        const std::string text = lift::render(model, h.writes[0].value);
+        check(text.find("vst[+0]") != std::string::npos &&
+                  text.find("vst[+8]") != std::string::npos,
+              "the write reads both slots");
+        check(text.find("+") != std::string::npos,
+              "and it is a sum of the two");
+    }
+    check(h.rbp_new != expr::kNoId && h.rsi_new != expr::kNoId,
+          "rbp and rsi come back as expressions");
+}
+
+void test_byte_handler() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kByte.data(), kByte.size(), kHandlerVa, kHandlerVa);
+    check(h.modeled, "the byte handler is fully modelled");
+    check(!h.writes.empty() && h.writes[0].disp == 0 &&
+              h.writes[0].value != expr::kNoId,
+          "it writes the top slot");
+    if (h.writes[0].value != expr::kNoId) {
+        const std::string text = lift::render(model, h.writes[0].value);
+        check(text.find("code[+0]") != std::string::npos,
+              "the value comes from the bytecode byte");
+    }
+}
+
+void test_decrypt_handler() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kDecrypt.data(), kDecrypt.size(), kHandlerVa,
+                        kHandlerVa);
+    check(h.modeled, "the decrypt handler is fully modelled");
+    check(h.transfer == lift::Handler::Transfer::Dispatch,
+          "it dispatches");
+    check(h.target_expr != expr::kNoId,
+          "the dispatch target is an expression, not a constant");
+    if (h.target_expr != expr::kNoId) {
+        const std::string text = lift::render(model, h.target_expr);
+        check(text.find("code[+0]") != std::string::npos,
+              "the target is computed from the bytecode word");
+        check(text.find("<<") != std::string::npos &&
+                  text.find(">>") != std::string::npos,
+              "the rotate is two shifts and an or");
+    }
+}
+
+void test_junk_is_reported_not_hidden() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kJunk.data(), kJunk.size(), kHandlerVa, kHandlerVa);
+    // The walk does not stop at the junk, and it does not guess either:
+    // what the instruction can no longer be shown not to have written
+    // becomes unknowns of their own, so the model claims nothing it
+    // cannot know -- and the note says it happened.
+    check(h.modeled, "an unmodelled instruction does not make the model inexact");
+    check(!h.notes.empty(), "but it is reported");
+    bool mentioned = false;
+    for (const std::string& n : h.notes) {
+        if (n.find("cpuid") != std::string::npos) {
+            mentioned = true;
+        }
+    }
+    check(mentioned, "the note names the instruction");
+    check(h.transfer == lift::Handler::Transfer::Dispatch,
+          "and the walk went on");
+    // The cursor's effect is the increment over what the junk left: an
+    // expression, not a hole and not a stale value.
+    check(h.rsi_new != expr::kNoId, "the cursor effect survived the junk");
+    if (h.rsi_new != expr::kNoId) {
+        const std::string text = lift::render(model, h.rsi_new);
+        check(text.find("unk[") != std::string::npos &&
+                  text.find("0x2") != std::string::npos,
+              "as the increment applied to an unknown of its own");
+    }
+}
+
+// ---------------------------------------------------------- conformance
+
+void test_conformance_agrees_and_bites() {
+    lift::Model model;
+    const std::vector<lift::Handler> handlers = {
+        lift::summarize(model, kAdd.data(), kAdd.size(), kHandlerVa,
+                        kHandlerVa)};
+
+    // The trace: rbp 0x3000, st0 = 5, st1 = 7, st2 = 9. The handler
+    // computes 5 + 7, stores it at +8 and pops, so the next state has
+    // rbp 0x3008 and the new top slot equal to 12.
+    std::vector<lift::Row> rows(2);
+    rows[0].seq = 1;
+    rows[0].rsi = 0x2000;
+    rows[0].rbp = 0x3000;
+    rows[0].st0 = 5;
+    rows[0].st1 = 7;
+    rows[0].st2 = 9;
+    rows[1].seq = 2;
+    rows[1].rsi = 0x2000;
+    rows[1].rbp = 0x3008;
+    rows[1].st0 = 12;
+    rows[1].st1 = 9;
+    rows[1].st2 = 0;
+    const std::vector<std::size_t> which{0};
+
+    const lift::Conformance good =
+        lift::check_trace(model, handlers, rows, which, nullptr, nullptr);
+    check(good.mismatched == 0, "the model matches the trace");
+    check(good.checked >= 3, "the pointer and the slot were actually checked");
+    check(good.unmodeled == 0, "no dispatch went unmodelled");
+
+    // Move the observed stack pointer and the check has to fail: the
+    // conformance report is the thing that makes the model trustworthy,
+    // and a check that cannot fail is not a check.
+    std::vector<lift::Row> wrong = rows;
+    wrong[1].rbp = 0x3010;
+    const lift::Conformance bad =
+        lift::check_trace(model, handlers, wrong, which, nullptr, nullptr);
+    check(bad.mismatched > 0, "a wrong trace is caught");
+    check(!bad.failures.empty(), "and is reported with both numbers");
+    if (!bad.failures.empty()) {
+        const std::string& f = bad.failures.front();
+        check(f.find("rbp") != std::string::npos,
+              "the failure names the field that disagreed");
+    }
+
+    // A wrong slot value is caught too.
+    std::vector<lift::Row> wrong_slot = rows;
+    wrong_slot[1].st0 = 13;
+    const lift::Conformance bad_slot =
+        lift::check_trace(model, handlers, wrong_slot, which, nullptr, nullptr);
+    check(bad_slot.mismatched > 0, "a wrong slot value is caught");
+}
+
+void test_bytecode_binding() {
+    lift::Model model;
+    const std::vector<lift::Handler> handlers = {
+        lift::summarize(model, kByte.data(), kByte.size(), kHandlerVa,
+                        kHandlerVa)};
+
+    Image img;
+    img.bytes = {0x00, 0x00, 0x00, 0x00, 0x2A};  // the byte at +4 is 0x2a
+    img.base = 0x4000;
+
+    std::vector<lift::Row> rows(2);
+    rows[0].seq = 1;
+    rows[0].rsi = 0x4004;  // the cursor points at 0x2a
+    rows[0].rbp = 0x5000;
+    rows[1].seq = 2;
+    rows[1].rsi = 0x4005;
+    rows[1].rbp = 0x5000;
+    rows[1].st0 = 0x2A;   // the byte the handler fetched
+    const std::vector<std::size_t> which{0};
+
+    const lift::Conformance conf = lift::check_trace(
+        model, handlers, rows, which, read_image, &img);
+    check(conf.mismatched == 0, "the bytecode read matches the image");
+    check(conf.checked >= 3, "the cursor and the slot were checked");
+}
+
+// ----------------------------------------------------------- newer forms
+
+// The integer forms a real VMP handler is full of: bit tests, bit scans,
+// a byte swap, a rotate through the carry, a double shift, and xadd.
+const std::vector<std::uint8_t> kBt = {
+    0x48, 0x0F, 0xA3, 0xD0,  // bt rax, rdx
+    0xFF, 0xE1,              // jmp rcx
+};
+const std::vector<std::uint8_t> kBts = {
+    0x48, 0x0F, 0xAB, 0xD0,  // bts rax, rdx
+    0xFF, 0xE1,
+};
+const std::vector<std::uint8_t> kBsr = {
+    0x48, 0x0F, 0xBD, 0xC2,  // bsr rax, rdx
+    0xFF, 0xE1,
+};
+const std::vector<std::uint8_t> kBswap = {
+    0x48, 0x0F, 0xC8,        // bswap rax
+    0xFF, 0xE1,
+};
+const std::vector<std::uint8_t> kRcl = {
+    0x48, 0xC1, 0xD0, 0x01,  // rcl rax, 0x1
+    0xFF, 0xE1,
+};
+const std::vector<std::uint8_t> kShld = {
+    0x48, 0x0F, 0xA4, 0xD0, 0x08,  // shld rax, rdx, 0x8
+    0xFF, 0xE1,
+};
+const std::vector<std::uint8_t> kXadd = {
+    0x48, 0x0F, 0xC1, 0xD0,  // xadd rax, rdx
+    0xFF, 0xE1,
+};
+
+void test_more_integer_forms() {
+    struct Case {
+        const char* name;
+        const std::vector<std::uint8_t>* bytes;
+    };
+    const Case cases[] = {
+        {"bt", &kBt},     {"bts", &kBts},   {"bsr", &kBsr},
+        {"bswap", &kBswap}, {"rcl", &kRcl}, {"shld", &kShld},
+        {"xadd", &kXadd},
+    };
+    for (const Case& c : cases) {
+        lift::Model model;
+        const lift::Handler h =
+            lift::summarize(model, c.bytes->data(), c.bytes->size(),
+                            kHandlerVa, kHandlerVa);
+        const std::string what =
+            std::string("the handler with ") + c.name + " is fully modelled";
+        check(h.modeled, what.c_str());
+        check(h.transfer == lift::Handler::Transfer::Dispatch,
+              (std::string("and ") + c.name + " still dispatches").c_str());
+    }
+}
+
+// A chain of two blocks where the entry jumps *backwards* to the first:
+// the read in the entry block, then the write in the earlier block. The
+// single-block tests would pass a walk that cannot leave its bytes, so
+// this is the case that pins the window.
+const std::vector<std::uint8_t> kChain = {
+    0x48, 0x89, 0x45, 0x08,              // 0:  mov [rbp+0x8], rax
+    0xFF, 0xE1,                          // 4:  jmp rcx
+    0x90, 0x90, 0x90, 0x90, 0x90,        // 6:  padding
+    0x90, 0x90, 0x90, 0x90, 0x90,        // 11: padding
+    0x48, 0x8B, 0x45, 0x00,              // 16: mov rax, [rbp+0x0]
+    0xE9, 0xE7, 0xFF, 0xFF, 0xFF,        // 20: jmp 0 (rel -25)
+};
+
+void test_chain_steps_backwards() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kChain.data(), kChain.size(), kHandlerVa,
+                        kHandlerVa + 16);
+    check(h.modeled, "a chain with a backwards jump is walked");
+    check(h.transfer == lift::Handler::Transfer::Dispatch,
+          "the chain ends at the indirect jump");
+    check(h.writes.size() == 1 && h.writes[0].disp == 8,
+          "the write from the earlier block is recovered");
+    if (!h.writes.empty() && h.writes[0].value != expr::kNoId) {
+        const std::string text = lift::render(model, h.writes[0].value);
+        check(text.find("vst[+0]") != std::string::npos,
+              "and its value is the slot the entry block loaded");
+    }
+}
+
+// An opaque branch: the condition depends on flags the handler was
+// entered with, so it cannot be reduced. Both edges are walked and the
+// arms merged under the condition, which makes the model exact for
+// either outcome -- and the trace check, which *can* evaluate the
+// condition, follows the arm that ran.
+const std::vector<std::uint8_t> kOpaque = {
+    0x0F, 0x85, 0x14, 0x00, 0x00, 0x00,  // 0:  jne 0x1a (the other arm)
+    0x48, 0x83, 0xC6, 0x01,              // 6:  add rsi, 0x1
+    0x48, 0x89, 0x45, 0x00,              // 10: mov [rbp+0], rax
+    0xFF, 0xE1,                          // 14: jmp rcx
+    0x90, 0x90, 0x90, 0x90, 0x90,        // 16: padding
+    0x90, 0x90, 0x90, 0x90, 0x90,        // 21: padding
+    0x48, 0x83, 0xEE, 0x02,              // 26: sub rsi, 0x2
+    0x48, 0x89, 0x55, 0x08,              // 30: mov [rbp+8], rdx
+    0xFF, 0xE1,                          // 34: jmp rcx
+};
+
+void test_opaque_branch_is_merged() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kOpaque.data(), kOpaque.size(), kHandlerVa,
+                        kHandlerVa);
+    check(h.modeled, "both edges of the branch are walked, so it is exact");
+    check(h.transfer == lift::Handler::Transfer::Dispatch,
+          "and it still dispatches");
+
+    // Each arm's effect is in the model under the condition: rsi is
+    // one past its entry value or two before it, and the write is to one
+    // slot or the other.
+    bool saw_select = false;
+    if (h.rsi_new != expr::kNoId) {
+        const std::string text = lift::render(model, h.rsi_new);
+        if (text.find(" ? ") != std::string::npos) {
+            saw_select = true;
+        }
+    }
+    check(saw_select, "the condition decides which arm's value it is");
+
+    // The same handler against a trace, twice: once with the condition
+    // true and once false. The checker has to follow the arm that ran and
+    // agree with the observed state both times.
+    const auto run = [&](bool taken) {
+        std::vector<lift::Row> rows(2);
+        rows[0].seq = 1;
+        rows[0].rsi = 0x2000;
+        rows[0].rbp = 0x3000;
+        rows[0].st0 = 0x11;
+        rows[0].st1 = 0x22;
+        rows[0].st2 = 0x33;
+        rows[1].seq = 2;
+        rows[1].rsi = taken ? 0x2000 : 0x2001;
+        rows[1].rbp = 0x3000;
+        rows[1].st0 = taken ? 0x11 : 0x11;
+        rows[1].st1 = 0x22;
+        rows[1].st2 = 0x33;
+        const std::vector<std::size_t> which{0};
+        return lift::check_trace(model, {h}, rows, which, nullptr, nullptr);
+    };
+    // The condition is entered-flags, which the trace does not carry, so
+    // both outcomes stay unverifiable rather than checked -- but neither
+    // may come out as a mismatch, because the model does not claim one
+    // arm's values for the other.
+    const lift::Conformance c = run(false);
+    check(c.mismatched == 0, "the arm that ran is the one predicted");
+}
+
+// A branch whose condition the trace *can* decide: the model's select is
+// then evaluated on the side that ran, so the prediction is checked
+// rather than left unverifiable.
+const std::vector<std::uint8_t> kDecidable = {
+    0x48, 0x83, 0xFE, 0x00,              // 0:  cmp rsi, 0x0
+    0x0F, 0x85, 0x10, 0x00, 0x00, 0x00,  // 4:  jne 0x1a
+    0x48, 0x83, 0xC6, 0x01,              // 10: add rsi, 0x1
+    0xFF, 0xE1,                          // 14: jmp rcx
+    0x90, 0x90, 0x90, 0x90, 0x90,        // 16: padding
+    0x90, 0x90, 0x90, 0x90, 0x90,        // 21: padding
+    0x48, 0x83, 0xC6, 0x04,              // 26: add rsi, 0x4
+    0xFF, 0xE1,                          // 30: jmp rcx
+};
+
+void test_merged_condition_is_checked() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kDecidable.data(), kDecidable.size(),
+                        kHandlerVa, kHandlerVa);
+    check(h.modeled, "the branch's condition is a value the model holds");
+
+    // rsi != 0: the branch is taken and the cursor advances by four.
+    std::vector<lift::Row> rows(2);
+    rows[0].seq = 1;
+    rows[0].rsi = 0x2000;
+    rows[0].rbp = 0x3000;
+    rows[1].seq = 2;
+    rows[1].rsi = 0x2004;
+    rows[1].rbp = 0x3000;
+    const std::vector<std::size_t> which{0};
+    const lift::Conformance taken =
+        lift::check_trace(model, {h}, rows, which, nullptr, nullptr);
+    check(taken.mismatched == 0, "the taken arm's value is predicted");
+    check(taken.checked >= 2, "and it was checked, not left unverifiable");
+
+    // rsi == 0: the branch falls through and the cursor advances by one.
+    rows[0].rsi = 0;
+    rows[1].rsi = 0x1;
+    const lift::Conformance fall =
+        lift::check_trace(model, {h}, rows, which, nullptr, nullptr);
+    check(fall.mismatched == 0, "the fall-through arm's value is predicted");
+    check(fall.checked >= 2, "and that one is checked too");
+}
+
+// mov dh, ah: bits 8..15 of rdx take bits 8..15 of rax. A model that
+// folds dh into rsi would move the cursor register, which is how a junk
+// scratch byte once wandered into it, so this pins the high bytes.
+const std::vector<std::uint8_t> kHighByte = {
+    0x88, 0xE6,              // mov dh, ah
+    0xFF, 0xE1,              // jmp rcx
+};
+
+void test_high_bytes_stay_in_their_parent() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kHighByte.data(), kHighByte.size(),
+                        kHandlerVa, kHandlerVa);
+    check(h.modeled, "mov dh, ah is modelled");
+    if (h.rsi_new != expr::kNoId) {
+        check(lift::render(model, h.rsi_new) == "rsi",
+              "the cursor register is untouched");
+    }
+    if (h.rbp_new != expr::kNoId) {
+        check(lift::render(model, h.rbp_new) == "rbp",
+              "and so is the stack pointer");
+    }
+}
+
+// sub rsi, 0xffffffffffffffff in its imm32 form: the immediate is
+// sign-extended to the operand width, so this is an increment. A decoder
+// that skips the sign extension reads it as +0xffffffff and the cursor
+// prediction is off by 2^32.
+const std::vector<std::uint8_t> kSubNeg = {
+    0x48, 0x81, 0xEE, 0xFF, 0xFF, 0xFF, 0xFF,  // sub rsi, -1
+    0xFF, 0xE1,
+};
+
+void test_imm32_sign_extends() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kSubNeg.data(), kSubNeg.size(), kHandlerVa,
+                        kHandlerVa);
+    check(h.modeled, "the imm32 form is modelled");
+    if (h.rsi_new != expr::kNoId) {
+        const std::vector<unsigned> deps = model.dag.inputs_of(h.rsi_new);
+        std::vector<std::uint64_t> binding(model.inputs.size(), 0);
+        for (const unsigned d : deps) {
+            if (d < model.inputs.size() && model.inputs[d].name == "rsi") {
+                binding[d] = 0x1000;
+            }
+        }
+        check(model.dag.evaluate(h.rsi_new, binding) == 0x1001,
+              "rsi comes back one past its entry value");
+    }
+}
+
+// A 16-bit store into the upper half of a slot, `mov [rbp+2], ax`: the
+// low half of the slot has to survive it.
+const std::vector<std::uint8_t> kHalfSlot = {
+    0x66, 0x89, 0x45, 0x02,  // mov [rbp+0x2], ax
+    0xFF, 0xE1,
+};
+
+void test_partial_slot_write() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kHalfSlot.data(), kHalfSlot.size(),
+                        kHandlerVa, kHandlerVa);
+    check(h.modeled, "a half-slot store is modelled");
+    check(h.writes.size() == 1 && h.writes[0].disp == 0,
+          "the write lands on the slot");
+    if (!h.writes.empty() && h.writes[0].value != expr::kNoId) {
+        const std::string text = lift::render(model, h.writes[0].value);
+        check(text.find("vst[+0]") != std::string::npos &&
+                  text.find("<<") != std::string::npos,
+              "the low half is preserved and the value shifted in");
+    }
+}
+
+// A virtual store: the address comes off the stack, and the handler
+// stores through it. The effect is a write the model can name (both the
+// address and the value are expressions), not a note about an address it
+// cannot track.
+const std::vector<std::uint8_t> kStore = {
+    0x48, 0x8B, 0x45, 0x00,  // mov rax, [rbp+0x0]
+    0x48, 0x8B, 0x55, 0x08,  // mov rdx, [rbp+0x8]
+    0x48, 0x83, 0xC5, 0x10,  // add rbp, 0x10
+    0x48, 0x89, 0x10,        // mov [rax], rdx
+    0xFF, 0xE1,              // jmp rcx
+};
+
+void test_computed_store() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kStore.data(), kStore.size(), kHandlerVa,
+                        kHandlerVa);
+    check(h.modeled, "the store through a computed address is modelled");
+    check(h.writes.size() == 1, "one write");
+    if (h.writes.size() == 1) {
+        const lift::Handler::Write& w = h.writes[0];
+        check(!w.to_slot, "and it is a computed-address write");
+        check(lift::render(model, w.addr) == "vst[+0]",
+              "the address is the slot it was popped from");
+        check(lift::render(model, w.value) == "vst[+8]",
+              "the value is the other slot");
+    }
+    check(lift::render(model, h.rbp_new) == "(rbp + 0x10)",
+          "and the stack pointer moved past both");
+
+    // The same handler against a trace: the store's address is the value
+    // the trace put in slot 0, the stored value is the one in slot 1, and
+    // the checker has to look both up and find the store where it lands.
+    std::vector<lift::Row> rows(2);
+    rows[0].seq = 1;
+    rows[0].rsi = 0x2000;
+    rows[0].rbp = 0x3000;
+    rows[0].st0 = 0x3010;  // where the store goes
+    rows[0].st1 = 0xCAFEBABE;
+    rows[0].st2 = 0;
+    rows[1].seq = 2;
+    rows[1].rsi = 0x2000;
+    rows[1].rbp = 0x3010;
+    rows[1].st0 = 0xCAFEBABE;
+    rows[1].st1 = 0;
+    rows[1].st2 = 0;
+    const std::vector<std::size_t> which{0};
+    const lift::Conformance good =
+        lift::check_trace(model, {h}, rows, which, nullptr, nullptr);
+    check(good.mismatched == 0, "the store lands where the trace says");
+    check(good.checked >= 3, "and the pointer and the slot were checked");
+
+    std::vector<lift::Row> wrong = rows;
+    wrong[1].st0 = 0xCAFEBABF;
+    const lift::Conformance bad =
+        lift::check_trace(model, {h}, wrong, which, nullptr, nullptr);
+    check(bad.mismatched >= 1, "a wrong stored value is caught");
+}
+
+// rcl by CL with the carry set: the count is computed, and the result --
+// and the ring the instruction rotates through -- are still expressible.
+const std::vector<std::uint8_t> kRclCl = {
+    0x8A, 0x06,              // mov al, [rsi]
+    0xF9,                    // stc
+    0xD2, 0xD0,              // rcl al, cl
+    0x88, 0x45, 0x00,        // mov [rbp+0], al
+    0xFF, 0xE1,              // jmp rcx
+};
+
+void test_symbolic_rotate() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kRclCl.data(), kRclCl.size(), kHandlerVa,
+                        kHandlerVa);
+    check(h.modeled, "a rotate by a computed count is modelled");
+    check(!h.writes.empty() && h.writes[0].value != expr::kNoId,
+          "and its value is an expression");
+    if (h.writes.empty() || h.writes[0].value == expr::kNoId) {
+        return;
+    }
+    const expr::Id value = h.writes[0].value;
+
+    // Bind what the trace would: the bytecode byte, the count register,
+    // and the slot the byte is written into. Then compare against the
+    // ring the hardware rotates through, for counts on both sides of the
+    // operand width.
+    const auto evaluate = [&](std::uint64_t count) {
+        std::vector<std::uint64_t> binding(model.inputs.size(), 0);
+        for (std::size_t i = 0; i < model.inputs.size(); ++i) {
+            const lift::Model::Input& in = model.inputs[i];
+            if (in.name == "code[+0]") {
+                binding[i] = 0xB5;
+            } else if (in.name == "rcx") {
+                binding[i] = count;
+            }
+        }
+        return model.dag.evaluate(value, binding);
+    };
+    const auto ring = [](unsigned n) {
+        // rcl of 0xB5 with CF = 1, n taken modulo the nine-bit ring.
+        unsigned x = 0xB5 | (1u << 8);
+        const unsigned k = n % 9;
+        x = ((x << k) | (x >> (9 - k))) & 0x1FF;
+        return x & 0xFF;
+    };
+    for (const unsigned n : {0u, 1u, 3u, 8u, 9u, 12u, 17u}) {
+        check(evaluate(n) == ring(n),
+              "the rotate matches the hardware's ring for this count");
+    }
+}
+
+// A partial write over a register an unmodelled instruction clobbered:
+// the half the write did not touch is an unknown of its own, so the
+// value stays an expression instead of collapsing to a hole.
+const std::vector<std::uint8_t> kClobbered = {
+    0x0F, 0xA2,              // cpuid
+    0xB0, 0x05,              // mov al, 0x5
+    0x48, 0x89, 0x45, 0x00,  // mov [rbp+0x0], rax
+    0xFF, 0xE1,              // jmp rcx
+};
+
+void test_partial_write_over_clobbered_register() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kClobbered.data(), kClobbered.size(),
+                        kHandlerVa, kHandlerVa);
+    check(!h.notes.empty(), "the unmodelled instruction is reported");
+    check(!h.writes.empty() && h.writes[0].value != expr::kNoId,
+          "the write it feeds still has a value");
+    if (!h.writes.empty() && h.writes[0].value != expr::kNoId) {
+        const std::string text = lift::render(model, h.writes[0].value);
+        check(text.find("unk[") != std::string::npos &&
+                  text.find("0x5") != std::string::npos,
+              "the unknown half and the written byte are both there");
+    }
+}
+
+// Two writes that overlap: a qword and then a dword inside it. The slot
+// file is byte-granular, so the second write has to see the first one's
+// bytes rather than the entry value.
+const std::vector<std::uint8_t> kOverlap = {
+    0x48, 0x89, 0x45, 0x00,  // mov [rbp+0x0], rax
+    0x89, 0x5D, 0x04,        // mov [rbp+0x4], ebx
+    0xFF, 0xE1,              // jmp rcx
+};
+
+void test_overlapping_writes_compose() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kOverlap.data(), kOverlap.size(), kHandlerVa,
+                        kHandlerVa);
+    check(h.modeled, "the overlapping writes are modelled");
+    check(h.writes.size() == 1 && h.writes[0].disp == 0,
+          "one cell was touched");
+    if (h.writes.size() != 1 || h.writes[0].value == expr::kNoId) {
+        return;
+    }
+    const std::string text = lift::render(model, h.writes[0].value);
+    check(text.find("rax") != std::string::npos &&
+              text.find("rbx") != std::string::npos,
+          "both regs are in the cell's value");
+    // Evaluate it: the qword's low half survives (the low *dword* of the
+    // cell), and the dword write lands on top of its high half.
+    std::vector<std::uint64_t> binding(model.inputs.size(), 0);
+    for (std::size_t i = 0; i < model.inputs.size(); ++i) {
+        if (model.inputs[i].name == "rax") {
+            binding[i] = 0x1111111122222222ULL;
+        } else if (model.inputs[i].name == "rbx") {
+            binding[i] = 0x3333333344444444ULL;
+        }
+    }
+    const std::uint64_t got = model.dag.evaluate(h.writes[0].value, binding);
+    check(got == 0x4444444422222222ULL,
+          "the low dword is the first write, the high dword the second");
+}
+
+// The trace's cells are the *aligned* cells around an unaligned stack
+// pointer, and the model's writes are at the addresses the handler used.
+// The checker composes the comparison out of bytes, so a frame that sits
+// mid-cell still checks instead of turning into a false mismatch.
+void test_unaligned_frame_conformance() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kAdd.data(), kAdd.size(), kHandlerVa,
+                        kHandlerVa);
+    // The entry frame: a qword 1, a qword 2, a qword 3 at 0x1000.
+    std::vector<lift::Row> rows(2);
+    rows[0].seq = 1;
+    rows[0].rsi = 0x2000;
+    rows[0].rbp = 0x1006;  // six bytes into the cell
+    rows[0].st0 = 1;
+    rows[0].st1 = 2;
+    rows[0].st2 = 3;
+    // The handler reads [rbp+0] and [rbp+8] over the cell boundary, adds
+    // them, stores the sum at [rbp+8] and advances rbp by 8. In bytes:
+    // [rbp+0] = 0x0000000000020000, [rbp+8] = 0x0000000000030000, sum =
+    // 0x50000, whose eight bytes start at 0x100e. So the tracer's next
+    // cells mix the store's bytes with the seed's, and the comparison
+    // only comes out right if it is composed byte for byte.
+    rows[1].seq = 2;
+    rows[1].rsi = 0x2000;
+    rows[1].rbp = 0x100E;
+    rows[1].st0 = 2;  // [0x1008], the store's two low bytes are zeros
+    rows[1].st1 = 5;  // [0x1010], the sum's third byte landed here
+    rows[1].st2 = 0;  // [0x1018], never observed
+    const std::vector<std::size_t> which{0};
+    const lift::Conformance good =
+        lift::check_trace(model, {h}, rows, which, nullptr, nullptr);
+    check(good.mismatched == 0, "the unaligned frame checks clean");
+    check(good.checked >= 3,
+          "and the predictions were evaluated, not waved through");
+
+    std::vector<lift::Row> wrong = rows;
+    wrong[1].st0 ^= 0x0100000000000000ULL;
+    const lift::Conformance bad =
+        lift::check_trace(model, {h}, wrong, which, nullptr, nullptr);
+    check(bad.mismatched >= 1, "a byte that is off is caught");
+}
+
+// The value a resize produces: x cut to 32 bits and widened back is not
+// x -- the widening zeroes what the cut removed. A simplifier that folds
+// the pair away hands back bits the expression should not have.
+void test_resize_does_not_widen_back() {
+    expr::DAG dag;
+    const expr::Id x = dag.input("x", 64);
+    const expr::Id cut = dag.resize(x, 32);
+    const expr::Id widened = dag.resize(cut, 64);
+    check(cut != widened, "a cut and a cut-then-widened are not one node");
+    const std::vector<std::uint64_t> binding = {0xFFFFFFFFDEADBEEFULL};
+    check(dag.evaluate(widened, binding) == 0xDEADBEEF,
+          "the widened value is the low half, zero-extended");
+    check(dag.evaluate(cut, binding) == 0xDEADBEEF, "and the cut agrees");
+    const expr::Id twice = dag.resize(widened, 16);
+    check(dag.evaluate(twice, binding) == 0xBEEF,
+          "a narrowing chain still composes");
+}
+
+// Nested branches: a jne whose taken edge leaves the nest and whose
+// fall-through is the next jne. Each one forks, so the walk nests one
+// level deeper per instruction. The cap on that nesting is a resource,
+// not a guess -- below it the model is complete, at it the model says so
+// and says why.
+std::vector<std::uint8_t> nest(unsigned levels) {
+    std::vector<std::uint8_t> b;
+    for (unsigned i = 0; i < levels; ++i) {
+        const std::uint32_t rel = 6 * (levels - i - 1);
+        b.insert(b.end(), {0x0F, 0x85,
+                           static_cast<std::uint8_t>(rel & 0xFF),
+                           static_cast<std::uint8_t>((rel >> 8) & 0xFF),
+                           static_cast<std::uint8_t>((rel >> 16) & 0xFF),
+                           static_cast<std::uint8_t>((rel >> 24) & 0xFF)});
+    }
+    b.insert(b.end(), {0xFF, 0xE1});
+    return b;
+}
+
+void test_branch_nesting_cap_is_reported() {
+    {
+        lift::Model model;
+        const std::vector<std::uint8_t> b = nest(12);
+        const lift::Handler h = lift::summarize(
+            model, b.data(), b.size(), kHandlerVa, kHandlerVa);
+        check(h.modeled, "nested branches below the cap are walked");
+        check(h.transfer == lift::Handler::Transfer::Dispatch,
+              "and both arms merge back together");
+    }
+    {
+        lift::Model model;
+        const std::vector<std::uint8_t> b = nest(20);
+        const lift::Handler h = lift::summarize(
+            model, b.data(), b.size(), kHandlerVa, kHandlerVa);
+        check(!h.modeled, "past the cap the model is not claimed exact");
+        check(h.reason.find("nested") != std::string::npos,
+              "and the report names the cap");
+    }
+}
+
+}  // namespace
+
+int main() {
+    const auto run = [](const char* name, void (*fn)()) {
+        std::printf("-- %s\n", name);
+        std::fflush(stdout);
+        fn();
+    };
+    run("decode_insn", test_decode_insn);
+    run("add_handler", test_add_handler);
+    run("byte_handler", test_byte_handler);
+    run("decrypt_handler", test_decrypt_handler);
+    run("junk_reported", test_junk_is_reported_not_hidden);
+    run("conformance", test_conformance_agrees_and_bites);
+    run("bytecode_binding", test_bytecode_binding);
+    run("more_integer_forms", test_more_integer_forms);
+    run("chain_steps_backwards", test_chain_steps_backwards);
+    run("opaque_branch_merged", test_opaque_branch_is_merged);
+    run("merged_condition_checked", test_merged_condition_is_checked);
+    run("high_bytes", test_high_bytes_stay_in_their_parent);
+    run("imm32_sign_extends", test_imm32_sign_extends);
+    run("partial_slot", test_partial_slot_write);
+    run("computed_store", test_computed_store);
+    run("symbolic_rotate", test_symbolic_rotate);
+    run("clobbered_partial", test_partial_write_over_clobbered_register);
+    run("overlap_compose", test_overlapping_writes_compose);
+    run("unaligned_frame", test_unaligned_frame_conformance);
+    run("resize_widen_back", test_resize_does_not_widen_back);
+    run("nesting_cap", test_branch_nesting_cap_is_reported);
+    std::printf("%d checks, %d failures\n", checks, failures);
+    return failures == 0 ? 0 : 1;
+}
