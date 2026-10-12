@@ -1676,6 +1676,23 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
             return;
         }
     }
+    // The hardware scan: a trace trap whose address is about to run a
+    // hardware breakpoint parks the guest, with no byte of the guest's
+    // code touched -- the breakpoint a program with an integrity scan
+    // cannot see, because there is nothing there to scan for. A miss
+    // keeps the scan alive: the trap flag goes back up and the next
+    // instruction lands here to be compared again.
+    if (guestdbg::active() && sig == SIGTRAP &&
+        (info == nullptr || info->si_code == TRAP_TRACE) &&
+        guestdbg::hardware_scan_active()) {
+        if (guestdbg::is_hard_breakpoint_hit(rip)) {
+            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+            guestdbg::enter_stop(uc, rip);
+            return;
+        }
+        uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
+        return;
+    }
     if (guestdbg::active() && sig == SIGTRAP &&
         (info == nullptr || info->si_code != TRAP_TRACE) &&
         guestdbg::is_breakpoint_hit(rip)) {
@@ -2386,8 +2403,11 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
         // first instruction the guest runs lands in the trace only if the
         // flag is already set when that call happens. The `sigsetjmp`
         // above restores the host's own state on the way home, which is
-        // what keeps this flag from outliving the run.
-        if (memwatch::step_trace_active()) {
+        // what keeps this flag from outliving the run. A hardware
+        // breakpoint wants the same first step: its scan is the same trap
+        // flag, held up across every instruction until the address about
+        // to run is the one the debugger named.
+        if (memwatch::step_trace_active() || guestdbg::hardware_scan_active()) {
             __asm__ volatile("pushfq\n\t"
                              "orq $0x100, (%%rsp)\n\t"
                              "popfq"

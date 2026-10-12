@@ -58,6 +58,12 @@ struct Stop {
     // one below the rip the kernel reported, and the reason the stop
     // happened rather than a step or a fault.
     std::uint64_t breakpoint = 0;
+    // The hardware breakpoint that was hit, when the stop came from the
+    // single-step scan instead of an INT3. Zero when the stop had another
+    // reason. A stop that names one of these has not touched the guest's
+    // bytes, which is the point: the guest's own integrity scans cannot
+    // see it.
+    std::uint64_t hardware = 0;
     bool stopped = false;
 };
 
@@ -95,6 +101,29 @@ struct BreakpointInfo {
 };
 [[nodiscard]] std::size_t breakpoint_count() noexcept;
 [[nodiscard]] BreakpointInfo breakpoint_at(std::size_t index) noexcept;
+
+// -- hardware breakpoints, from the driving thread ------------------------
+
+// A hardware breakpoint is an address the debugger wants to stop at
+// without writing over the guest's bytes. The guest is single-stepped
+// with the trap flag while one is armed; each trace trap compares the
+// address about to run against the list, and a match parks the guest.
+// The cost is a trap per instruction while the scan is live, which is
+// the price of not touching the memory the guest may be integrity-
+// scanning -- the entire reason this exists.
+[[nodiscard]] bool set_hard_breakpoint(std::uint64_t address) noexcept;
+[[nodiscard]] bool clear_hard_breakpoint(std::uint64_t address) noexcept;
+[[nodiscard]] std::size_t hard_breakpoint_count() noexcept;
+[[nodiscard]] std::uint64_t hard_breakpoint_at(std::size_t index) noexcept;
+
+// Whether any hardware breakpoint is armed. The handler keeps the trap
+// flag up while this is true and the guest is running.
+[[nodiscard]] bool hardware_scan_active() noexcept;
+
+// Whether this trace trap is the instruction just before a hardware
+// breakpoint. `rip` on a trace trap names the instruction about to
+// run, which is the instruction the scan is looking for.
+[[nodiscard]] bool is_hard_breakpoint_hit(std::uint64_t rip) noexcept;
 
 // -- memory, from the driving thread --------------------------------------
 

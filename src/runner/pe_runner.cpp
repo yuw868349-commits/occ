@@ -425,6 +425,9 @@ constexpr RegName kRegNames[] = {
         if (stop.breakpoint != 0) {
             std::fprintf(stdout, "stop: breakpoint at 0x%llx\n",
                          static_cast<unsigned long long>(stop.breakpoint));
+        } else if (stop.hardware != 0) {
+            std::fprintf(stdout, "stop: hardware breakpoint at 0x%llx\n",
+                         static_cast<unsigned long long>(stop.hardware));
         } else {
             std::fprintf(stdout, "stop: step at 0x%llx\n",
                          static_cast<unsigned long long>(stop.rip));
@@ -577,8 +580,36 @@ int dbg_pe_runner(int argc, char** argv) noexcept {
                              static_cast<unsigned long long>(info.address),
                              info.displaced);
             }
-            if (count == 0) {
+            const std::size_t hard =
+                runtime::guestdbg::hard_breakpoint_count();
+            for (std::size_t i = 0; i < hard; ++i) {
+                std::fprintf(stdout, "  0x%llx (hardware, no byte "
+                                     "replaced)\n",
+                             static_cast<unsigned long long>(
+                                 runtime::guestdbg::hard_breakpoint_at(i)));
+            }
+            if (count == 0 && hard == 0) {
                 std::fprintf(stdout, "  (none)\n");
+            }
+            continue;
+        }
+        if (std::strcmp(cmd, "hb") == 0) {
+            if (fields < 2) {
+                std::fprintf(stdout, "hb: needs an rva\n");
+            } else if (runtime::guestdbg::set_hard_breakpoint(base + a)) {
+                std::fprintf(stdout, "hardware breakpoint at 0x%llx "
+                                     "(the guest single-steps from "
+                                     "resume)\n",
+                             static_cast<unsigned long long>(base + a));
+            }
+            continue;
+        }
+        if (std::strcmp(cmd, "hbd") == 0) {
+            if (fields < 2) {
+                std::fprintf(stdout, "hbd: needs an rva\n");
+            } else {
+                static_cast<void>(runtime::guestdbg::clear_hard_breakpoint(
+                    base + a));
             }
             continue;
         }

@@ -54,6 +54,11 @@ std::uint64_t g_rearm_address = 0;
 // makes `step` repeatable: every stop's release re-arms the flag.
 bool g_step_pending = false;
 
+// The hardware breakpoints: addresses to stop at without patching the
+// guest. The scan is a trap flag held up across every instruction, so a
+// set is what arms the scan and an erase is what ends it.
+std::map<std::uint64_t, bool> g_hard_breakpoints;
+
 [[nodiscard]] int guest_mem_fd() noexcept {
     static const int fd = ::open("/proc/self/mem", O_RDWR);
     return fd;
@@ -133,6 +138,35 @@ BreakpointInfo breakpoint_at(std::size_t index) noexcept {
     return info;
 }
 
+bool set_hard_breakpoint(std::uint64_t address) noexcept {
+    g_hard_breakpoints[address] = true;
+    return true;
+}
+
+bool clear_hard_breakpoint(std::uint64_t address) noexcept {
+    return g_hard_breakpoints.erase(address) != 0;
+}
+
+std::size_t hard_breakpoint_count() noexcept {
+    return g_hard_breakpoints.size();
+}
+
+std::uint64_t hard_breakpoint_at(std::size_t index) noexcept {
+    auto it = g_hard_breakpoints.begin();
+    for (std::size_t i = 0; i < index && it != g_hard_breakpoints.end(); ++i) {
+        ++it;
+    }
+    return it == g_hard_breakpoints.end() ? 0 : it->first;
+}
+
+bool hardware_scan_active() noexcept {
+    return !g_hard_breakpoints.empty();
+}
+
+bool is_hard_breakpoint_hit(std::uint64_t rip) noexcept {
+    return g_hard_breakpoints.contains(rip);
+}
+
 std::size_t read_memory(std::uint64_t address, void* out,
                         std::size_t bytes) noexcept {
     const int fd = guest_mem_fd();
@@ -201,6 +235,9 @@ void enter_stop(::ucontext_t* uc, std::uint64_t trap_address) noexcept {
     g_stop.rip = trap_address;
     g_stop.eflags = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_EFL]);
     g_stop.breakpoint = g_breakpoints.contains(trap_address) ? trap_address : 0;
+    g_stop.hardware = (hardware_scan_active() && is_hard_breakpoint_hit(trap_address))
+                          ? trap_address
+                          : 0;
     g_stop.stopped = true;
     g_state.store(kStopped, std::memory_order_seq_cst);
 
@@ -235,8 +272,13 @@ void enter_stop(::ucontext_t* uc, std::uint64_t trap_address) noexcept {
             static_cast<::greg_t>(g_stop.eflags | 0x100);
     } else {
         uc->uc_mcontext.gregs[REG_RIP] = static_cast<::greg_t>(g_stop.rip);
+        // A release starts the hardware scan when one is armed: the trap
+        // flag goes up, and the next instruction lands in the handler to
+        // be compared. A step's own flag is the same bit, so the two ask
+        // for the same thing and the step's stop just happens first.
         const std::uint64_t flags =
-            g_step_pending ? (g_stop.eflags | 0x100) : g_stop.eflags;
+            (g_step_pending || hardware_scan_active()) ? (g_stop.eflags | 0x100)
+                                                       : g_stop.eflags;
         uc->uc_mcontext.gregs[REG_EFL] = static_cast<::greg_t>(flags);
     }
     g_state.store(kRunning, std::memory_order_seq_cst);
@@ -258,7 +300,11 @@ void complete_rearm(::ucontext_t* uc) noexcept {
     }
     g_rearm_pending = false;
     g_rearm_address = 0;
-    if (!g_step_pending) {
+    // The step's flag comes down unless the release wanted the next
+    // instruction too -- and the scan's flag stays up while a hardware
+    // breakpoint is armed, because the re-arm's step is just one more
+    // instruction the scan has to walk.
+    if (!g_step_pending && !hardware_scan_active()) {
         uc->uc_mcontext.gregs[REG_EFL] &=
             static_cast<::greg_t>(~0x100);
     }
