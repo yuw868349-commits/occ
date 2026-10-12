@@ -1796,6 +1796,42 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
                          uc->uc_mcontext.gregs[REG_R14]),
                      static_cast<unsigned long long>(
                          uc->uc_mcontext.gregs[REG_R15]));
+        // The stack window around the frame pointer: a fault whose operand
+        // came out of a stack slot -- a nulled register reloaded from the
+        // frame, an uninitialized local, a caller's shadow -- is read from
+        // the bytes the frame actually holds. The window is bounded to the
+        // frame and its caller's shadow, which is the region a frame read
+        // like `mov 0x18(%rbp),%rax` addresses; the read is guarded so a
+        // wild frame pointer never walks outside the process's memory.
+        auto dump_window = [](const char* tag, std::uint64_t base) {
+            if (base < 0x1000 || base > 0x7fffffffffffULL) {
+                std::fprintf(stderr, "occ trace: %s window at 0x%llx is "
+                                     "out of range\n",
+                             tag, static_cast<unsigned long long>(base));
+                return;
+            }
+            const std::uint64_t lo = base & ~std::uint64_t{0xf};
+            std::fprintf(stderr, "occ trace: %s window 0x%llx:\n", tag,
+                         static_cast<unsigned long long>(lo));
+            for (std::uint64_t off = 0; off < 96; off += 16) {
+                const unsigned char* p = reinterpret_cast<const unsigned char*>(
+                    lo + off);
+                const std::uint64_t delta = (lo + off) >= base
+                                                ? (lo + off) - base
+                                                : base - (lo + off);
+                std::fprintf(stderr, "  %c%03llx",
+                             (lo + off) >= base ? '+' : '-',
+                             static_cast<unsigned long long>(delta));
+                for (std::size_t b = 0; b < 16; ++b) {
+                    std::fprintf(stderr, " %02x", p[b]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        };
+        dump_window("rbp", static_cast<std::uint64_t>(
+                               uc->uc_mcontext.gregs[REG_RBP]));
+        dump_window("rsp", static_cast<std::uint64_t>(
+                               uc->uc_mcontext.gregs[REG_RSP]));
         // The mapping the faulting instruction came from, read from the
         // process's own map: a fault whose rip is not in the image is
         // usually a call into a slot that held an address from another

@@ -1733,6 +1733,12 @@ void scan_skip_leading_space(ScanSource& s, std::size_t& chars_read) noexcept {
 // C startup that walks its own arguments expects.
 char** g_u32_argv_ptr = nullptr;
 
+// The `_crt_argv_mode` recorded by `_configure_narrow_argv`. The argument
+// table itself is already wired by the process builder; the mode only
+// tells a guest startup whether a wide command line is in play, so it is
+// stored as observable state rather than acted on.
+std::int32_t g_u32_argv_mode = 1;
+
 // The guest's `wchar_t` is sixteen bits, which is not the host's. Every
 // wide conversion below parses or copies the guest's own code units
 // rather than handing the host a buffer it would read as thirty-two-bit
@@ -2232,7 +2238,22 @@ extern "C" __attribute__((ms_abi)) char** u32u__get_initial_narrow_environment()
 
 extern "C" __attribute__((ms_abi)) void u32u__initialize_narrow_environment() noexcept {}
 
-extern "C" __attribute__((ms_abi)) void u32u__configure_narrow_argv() noexcept {}
+// `_configure_narrow_argv` selects how the command line becomes the
+// argument vector. The mode is a `_crt_argv_mode` value: 0 says the wide
+// argv is never used, 1 says it is the primary one, 2 says the wide
+// command line is not consulted. Anything outside that range is rejected
+// the way the real CRT rejects it -- a failed return that a guest
+// startup turns into a fast fail. The argument table itself is wired by
+// the process builder, so this records the mode as observable state and
+// reports success.
+extern "C" __attribute__((ms_abi)) std::int32_t u32u__configure_narrow_argv(
+    std::int32_t mode) noexcept {
+    if (mode < 0 || mode > 2) {
+        return -1;
+    }
+    g_u32_argv_mode = mode;
+    return 0;
+}
 
 extern "C" __attribute__((ms_abi)) const unsigned short* u32u___pctype_func() noexcept {
     return *::__ctype_b_loc();

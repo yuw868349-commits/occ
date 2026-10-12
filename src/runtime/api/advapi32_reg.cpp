@@ -209,6 +209,75 @@ RegKey* g_root_target[kRootCount] = {&g_roots[0], &g_roots[1], &g_roots[2],
                                      &g_roots[3], &g_roots[4], &g_roots[5],
                                      &g_roots[6]};
 
+// The machine identity every Windows installation carries. A guest that
+// derives a key or a fingerprint from the machine GUID reads through
+// `RegOpenKeyExW` into this tree, and an empty tree would answer
+// `ERROR_FILE_NOT_FOUND`, which changes that guest's behaviour for no
+// reason this runtime has. The value below is the one a real box stores;
+// the GUID itself is a stable stand-in for "this machine", which is all
+// the contract promises a caller. The OS-identity values under
+// `Windows NT\CurrentVersion` are the ones a product or upgrade check
+// reads, and they are seeded the same way: present, well-formed, and
+// describing an ordinary installation.
+void seed_machine_identity() noexcept {
+    RegKey* hklm = &g_roots[2];
+    RegKey* software = hklm->find_child(u"SOFTWARE");
+    if (software == nullptr) {
+        software = hklm->children
+                       .emplace_back(std::make_unique<RegKey>(u"SOFTWARE"))
+                       .get();
+    }
+    RegKey* microsoft = software->find_child(u"Microsoft");
+    if (microsoft == nullptr) {
+        microsoft = software->children
+                        .emplace_back(std::make_unique<RegKey>(u"Microsoft"))
+                        .get();
+    }
+    const auto add_value = [](RegKey* key, std::u16string_view name,
+                              std::u16string_view text) {
+        if (key->find_value(name) != nullptr) {
+            return;
+        }
+        // A REG_SZ is the text plus its terminator, and the query answers
+        // the stored bytes -- so the null is stored, not appended on read.
+        const std::uint8_t* begin =
+            reinterpret_cast<const std::uint8_t*>(text.data());
+        const std::uint8_t* end =
+            begin + static_cast<std::size_t>((text.size() + 1) * sizeof(char16_t));
+        key->values.push_back(
+            RegValue{std::u16string(name), kRegSz,
+                     std::vector<std::uint8_t>(begin, end)});
+    };
+    RegKey* crypto = microsoft->find_child(u"Cryptography");
+    if (crypto == nullptr) {
+        crypto = microsoft->children
+                     .emplace_back(std::make_unique<RegKey>(u"Cryptography"))
+                     .get();
+    }
+    add_value(crypto, u"MachineGuid",
+              u"{7B9A2C3D-4E5F-4A6B-9C8D-0E1F2A3B4C5D}");
+    RegKey* nt = microsoft->find_child(u"Windows NT");
+    if (nt == nullptr) {
+        nt = microsoft->children
+                 .emplace_back(std::make_unique<RegKey>(u"Windows NT"))
+                 .get();
+    }
+    RegKey* version = nt->find_child(u"CurrentVersion");
+    if (version == nullptr) {
+        version = nt->children
+                      .emplace_back(std::make_unique<RegKey>(u"CurrentVersion"))
+                      .get();
+    }
+    add_value(version, u"ProductName", u"Microsoft Windows 10 Pro");
+    add_value(version, u"CurrentVersion", u"6.3");
+    add_value(version, u"CurrentBuild", u"19045");
+    add_value(version, u"CurrentBuildNumber", u"19045");
+}
+
+// The seed runs once, at file scope, after the roots exist and before any
+// guest call can reach the tree.
+const bool kMachineIdentitySeeded = (seed_machine_identity(), true);
+
 std::unordered_map<std::uint64_t, RegKey*> g_open_handles;
 std::uint64_t g_next_key_handle = kDynamicHandleBase;
 std::uint64_t g_next_event_source = kEventSourceHandleBase;
@@ -217,20 +286,37 @@ std::uint64_t g_next_event_source = kEventSourceHandleBase;
 
 // The one exit every LSTATUS entry takes: the status is both the return
 // value the registry contract answers and the code `GetLastError` reads.
+// Under `OCC_API_TRACE` a failing return is reported, because the call a
+// guest made failed is the call worth seeing; a stream of successes tells
+// the observer nothing the absence of the line would not.
 std::int32_t finish(std::int32_t status) noexcept {
     set_last_error(static_cast<std::uint32_t>(status));
+    if (status != kStatusOk) {
+        const char* trace = ::getenv("OCC_API_TRACE");
+        if (trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr, "occ reg: -> %d\n", status);
+        }
+    }
     return status;
 }
 
 [[nodiscard]] bool is_predefined(std::uint64_t handle) noexcept {
-    return handle >= kFirstPredefined && handle <= kLastPredefined;
+    // The predefined roots are 32-bit handle values. A guest that passes
+    // one through a 32-bit register -- `mov ecx, 0x80000002` -- delivers
+    // it sign-extended: HKEY_LOCAL_MACHINE arrives as
+    // 0xffffffff80000002, which is outside any 64-bit range test. The
+    // handle the API means is the low 32 bits, which is the comparison a
+    // Windows caller makes and this runtime must make the same one.
+    const std::uint32_t low = static_cast<std::uint32_t>(handle);
+    return low >= kFirstPredefined && low <= kLastPredefined;
 }
 
 // The key node a handle names: a predefined root resolves through its
 // current target, anything else through the open-handle table.
 [[nodiscard]] RegKey* base_key(std::uint64_t handle) noexcept {
     if (is_predefined(handle)) {
-        return g_root_target[static_cast<std::size_t>(handle - kFirstPredefined)];
+        return g_root_target[static_cast<std::size_t>(
+            static_cast<std::uint32_t>(handle) - kFirstPredefined)];
     }
     const auto it = g_open_handles.find(handle);
     return it == g_open_handles.end() ? nullptr : it->second;
@@ -1230,7 +1316,25 @@ extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryValueExW(
         // that the query reports what is there.
         *type = stored;
     }
-    return finish(emit_w_data(bytes, data, size));
+    const std::int32_t emitted = finish(emit_w_data(bytes, data, size));
+    if (emitted == kStatusOk && data != nullptr) {
+        const char* trace = ::getenv("OCC_API_TRACE");
+        if (trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr, "occ reg: value name units=%zu bytes=%u \"",
+                         static_cast<std::size_t>(view_of(value_name).size()),
+                         stored);
+            const std::size_t shown =
+                bytes.size() < 48 ? bytes.size() : std::size_t{48};
+            for (std::size_t i = 0; i < shown; ++i) {
+                std::fprintf(stderr, "%02x", bytes[i]);
+            }
+            if (shown < bytes.size()) {
+                std::fprintf(stderr, "...");
+            }
+            std::fprintf(stderr, "\"\n");
+        }
+    }
+    return emitted;
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t ar_RegQueryValueExA(
