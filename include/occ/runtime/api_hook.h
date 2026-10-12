@@ -59,13 +59,16 @@ namespace occ::runtime::api_hook {
 // implementation rather than to its caller. `r11` carries the slot.
 extern "C" void occ_api_hook() noexcept;
 
-// What the hook calls: the slot and the first three argument registers as
-// they were on entry -- `rcx`, `rdx` and `r8`. The values are passed raw
-// and are not interpreted here: what an argument means depends on which
-// API it belongs to, and a report that guessed would be worse than one
-// that prints the number it was given.
+// What the hook calls: the slot, the first three argument registers as
+// they were on entry -- `rcx`, `rdx` and `r8` -- and the address the
+// guest returned to after the call it made through the trampoline, which
+// is the call site the report can point a reader at. The values are
+// passed raw and are not interpreted here: what an argument means depends
+// on which API it belongs to, and a report that guessed would be worse
+// than one that prints the number it was given.
 extern "C" void occ_api_note(std::uint64_t index, std::uint64_t a0,
-                             std::uint64_t a1, std::uint64_t a2) noexcept;
+                             std::uint64_t a1, std::uint64_t a2,
+                             std::uint64_t caller_rip) noexcept;
 
 // Writes the address-to-name map as JSON lines ({"addr":N,"name":"..."})
 // to the given path, one line per known export. This is what lets an

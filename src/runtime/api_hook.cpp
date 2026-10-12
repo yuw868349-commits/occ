@@ -225,7 +225,8 @@ void note_trampoline(std::uint64_t address, std::uint32_t slot) noexcept {
 // instead, because the number is the one thing that is true without a
 // guess and a wrong string is worse than no string.
 extern "C" void occ_api_note(std::uint64_t index, std::uint64_t a0,
-                             std::uint64_t a1, std::uint64_t a2) noexcept {
+                             std::uint64_t a1, std::uint64_t a2,
+                             std::uint64_t caller_rip) noexcept {
     const std::size_t at = static_cast<std::size_t>(index);
     if (at >= g_names.size()) {
         std::fprintf(stderr, "occ api: slot %llu is not registered\n",
@@ -300,14 +301,16 @@ extern "C" void occ_api_note(std::uint64_t index, std::uint64_t a0,
         break;
     }
     if (args.empty()) {
-        std::fprintf(stderr, "occ api: %s(0x%llx, 0x%llx, 0x%llx)\n",
+        std::fprintf(stderr, "occ api: %s(0x%llx, 0x%llx, 0x%llx) @ 0x%llx\n",
                      g_names[at].c_str(),
                      static_cast<unsigned long long>(a0),
                      static_cast<unsigned long long>(a1),
-                     static_cast<unsigned long long>(a2));
+                     static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(caller_rip));
     } else {
-        std::fprintf(stderr, "occ api: %s(%s)\n", g_names[at].c_str(),
-                     args.c_str());
+        std::fprintf(stderr, "occ api: %s(%s) @ 0x%llx\n",
+                     g_names[at].c_str(), args.c_str(),
+                     static_cast<unsigned long long>(caller_rip));
     }
 }
 
@@ -393,11 +396,15 @@ __asm__(
     "    movaps %xmm14, 128(%rsp)\n"
     "    movaps %xmm15, 144(%rsp)\n"
     // The host convention's arguments: the slot, then the guest's first
-    // three argument registers.
+    // three argument registers, then the guest's return address -- the
+    // address the guest pushed when it called through the trampoline,
+    // which sits at the top of the guest stack at hook entry (`248(%rsp)`
+    // after the seven pushes and the shadow allocation).
     "    movq  208(%rsp), %rdi\n"
     "    movq  240(%rsp), %rsi\n"
     "    movq  232(%rsp), %rdx\n"
     "    movq  224(%rsp), %rcx\n"
+    "    movq  248(%rsp), %r8\n"
     "    call  occ_api_note\n"
     "    movaps  0(%rsp), %xmm6\n"
     "    movaps  16(%rsp), %xmm7\n"
