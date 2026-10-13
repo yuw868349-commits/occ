@@ -203,4 +203,153 @@ struct Plan {
 // wires it into its API surface and PEB image.
 [[nodiscard]] Plan build_plan(const Config& cfg) noexcept;
 
+// ---------------------------------------------------------------------------
+// Extended surfaces (ScyllaHide-class coverage)
+// ---------------------------------------------------------------------------
+
+// The process-information classes this module models. Everything else is
+// passed through with `modeled = false`; refusing to guess is the
+// contract.
+enum class ProcessInfoClass : std::uint32_t {
+    kHandleCount = 4,        // NtQueryInformationProcess ProcessHandleCount
+    kDebugPort = 7,          // ProcessDebugPort
+    kDebugObjectHandle = 8,  // ProcessDebugObjectHandle
+    kWow64Information = 26,  // ProcessWow64Information
+    kDebugFlags = 30,        // ProcessDebugFlags
+    kIoCounters = 36,        // ProcessIoCounters (read as zero I/O)
+};
+
+// The thread-information classes this module models. Class 0x11 is
+// ThreadHideFromDebugger, the hide flag a packer sets on its own thread.
+enum class ThreadInfoClass : std::uint32_t {
+    kHideFromDebugger = 0x11,
+};
+
+// Answers NtQueryInformationThread for the hide-from-debugger class: an
+// undebugged thread reports "not hidden". Other classes pass through.
+[[nodiscard]] QueryAnswer answer_thread_info(
+    std::uint32_t info_class) noexcept;
+
+// Answers NtSetInformationThread for the hide-from-debugger class: the
+// hide request succeeds. Other classes pass through.
+[[nodiscard]] QueryAnswer answer_set_thread_info(
+    std::uint32_t info_class) noexcept;
+
+// One coherent read of every time-visible surface, all derived from the
+// same ClockModel so no two clocks can disagree. The integration feeds
+// one host (qpc, wall-ms) sample and this module answers everything.
+struct TimeAnswers {
+    std::uint64_t tick_count_ms = 0;    // GetTickCount (32-bit at caller)
+    std::uint64_t tick_count64_ms = 0;  // GetTickCount64
+    std::uint64_t qpc = 0;              // QueryPerformanceCounter
+    std::uint64_t system_time_ft = 0;   // GetSystemTimeAsFileTime (100ns
+                                        // ticks since 1601-01-01)
+    std::uint32_t rdtsc = 0;            // RDTSC low dword
+};
+
+// Derives the coherent time answers from the model. `host_ms` is the
+// wall clock in Unix-epoch milliseconds that corresponds to `host_qpc`.
+[[nodiscard]] TimeAnswers clock_reads(const ClockModel& model,
+                                      std::uint64_t host_qpc,
+                                      std::uint64_t host_ms) noexcept;
+
+// The kind of an analyst fingerprint. A self-defending guest probes
+// several namespaces; answering "not found" in the wrong namespace is
+// itself a fingerprint, so each entry carries its kind.
+enum class FingerprintKind : std::uint8_t {
+    kWindowClass,
+    kMutex,
+    kPipe,
+    kDriver,
+    kRegistryKey,
+    kProcessName,
+    kModuleName,
+    kFilePath,
+};
+
+struct Fingerprint {
+    FingerprintKind kind;
+    std::string_view name;
+};
+
+// The documented analyst fingerprint table, as data. Every entry is a
+// name a debugging or analysis tool leaves in a namespace a packed
+// binary probes. The table is intentionally curated: each entry has a
+// comment naming the tool, so growth stays reviewable.
+[[nodiscard]] const std::vector<Fingerprint>& fingerprint_table() noexcept;
+
+// Whether the name is a known fingerprint of the given kind (the exact
+// and case-insensitive comparison lives in the implementation).
+[[nodiscard]] bool environment_hidden(std::string_view name,
+                                      FingerprintKind kind) noexcept;
+
+// The trap kinds a self-defending guest can execute. The policy per kind
+// is data; the integration acts on it.
+enum class TrapKind : std::uint8_t {
+    kInt3,
+    kSingleStep,
+    kBreakpointFault,
+    kInt2D,                 // int 0x2D, the old anti-debug trap
+    kIllegalInstruction,    // 0x0F 0x0B etc. (UD2 family)
+    kPrivilegedInstruction, // anti-VM ring-0 probes from user mode
+};
+
+// The trap policy for one trap kind. An undebugged process gets the
+// exception delivered to its own handler; a debugger swallows it. The
+// honest default is delivery; integration chooses otherwise per surface.
+[[nodiscard]] TrapDisposition policy_for(const TrapPolicy& policy,
+                                         TrapKind kind) noexcept;
+
+// The debug registers as an undebugged process sees them: no hardware
+// breakpoints and no pending debug status.
+struct DebugRegisters {
+    std::uint64_t dr0 = 0;
+    std::uint64_t dr1 = 0;
+    std::uint64_t dr2 = 0;
+    std::uint64_t dr3 = 0;
+    std::uint64_t dr6 = 0;
+    std::uint64_t dr7 = 0;
+};
+
+// The canonical "no debugger" debug-register image. DR6 is zero (no
+// pending debug exception) and DR7 is zero (no enabled breakpoints).
+[[nodiscard]] DebugRegisters undebugged_dr() noexcept;
+
+// A software breakpoint found in an image: an int3 (0xCC) at an offset,
+// with the byte that was there before (unavailable in a pure scan, so
+// `original` carries 0xCC and `original_known` is false unless the
+// caller supplies the pristine image).
+struct BreakpointHit {
+    std::uint64_t offset = 0;
+    std::uint8_t original = 0xCC;
+    bool original_known = false;
+};
+
+// Scans a byte range for int3 software breakpoints. The scan is
+// offset-based and reports every 0xCC; the integration decides which
+// hits are its own traps versus planted ones. When `pristine` is
+// non-null and covers the same range, `original` is the pristine byte at
+// each hit (what the debugger overwrote).
+[[nodiscard]] std::vector<BreakpointHit> scan_breakpoints(
+    const std::uint8_t* bytes, std::size_t n,
+    const std::uint8_t* pristine = nullptr) noexcept;
+
+// The host-side view an integration can act on: is this process itself
+// under a tracer, who is the parent, and does the address map contain an
+// analyst's image. This is computed from the text of /proc/self/status,
+// /proc/self/stat and /proc/self/maps -- parsing is pure so the tests
+// can exercise every field without a real procfs.
+struct HostProbe {
+    bool traced = false;             // TracerPid != 0
+    std::uint32_t tracer_pid = 0;
+    std::uint32_t parent_pid = 0;    // from stat field 4
+    bool analyst_in_maps = false;    // a known analyst image mapped
+};
+
+// Parses the host's procfs text. Each argument may be empty; missing
+// fields read as the safe value (not traced, parent 0).
+[[nodiscard]] HostProbe probe_host(std::string_view status_text,
+                                   std::string_view stat_text,
+                                   std::string_view maps_text) noexcept;
+
 }  // namespace occ::hostile

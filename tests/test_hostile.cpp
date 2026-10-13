@@ -128,6 +128,146 @@ void test_build_plan() {
 
 } // namespace
 
+void test_thread_queries() {
+    using occ::hostile::answer_thread_info;
+    using occ::hostile::answer_set_thread_info;
+    const occ::hostile::QueryAnswer q =
+        answer_thread_info(static_cast<std::uint32_t>(
+            occ::hostile::ThreadInfoClass::kHideFromDebugger));
+    check(q.modeled, "thread: hide query modeled");
+    check(q.status == 0, "thread: hide query success");
+    const occ::hostile::QueryAnswer other = answer_thread_info(0x1234);
+    check(!other.modeled, "thread: unknown class passed through");
+    const occ::hostile::QueryAnswer s =
+        answer_set_thread_info(static_cast<std::uint32_t>(
+            occ::hostile::ThreadInfoClass::kHideFromDebugger));
+    check(s.modeled, "thread: set-hide modeled");
+    check(s.status == 0, "thread: set-hide succeeds");
+}
+
+void test_clock_reads() {
+    // Calibrate on two samples: 1000->2000 qpc over 50 ms is 20 qpc/ms.
+    const occ::hostile::ClockModel m =
+        occ::hostile::ClockModel::calibrate(1000, 50000, 2000, 50050);
+    check(m.valid(), "clock: calibrated");
+    const occ::hostile::TimeAnswers a =
+        occ::hostile::clock_reads(m, 3000, 100000);
+    // Elapsed qpc is 2000 at 20 qpc/ms -> 100 ms of uptime.
+    check(a.tick_count64_ms == 50100, "clock: tick64 from model");
+    check(a.tick_count_ms == 50100, "clock: tick32 raw value");
+    check(a.qpc == 3000, "clock: qpc is the host sample");
+    check(a.rdtsc == 3000, "clock: rdtsc low dword");
+    const std::uint64_t ft = (100000ull + 11644473600000ull) * 10000ull;
+    check(a.system_time_ft == ft, "clock: filetime 1601 epoch");
+}
+
+void test_fingerprint_kinds() {
+    using occ::hostile::FingerprintKind;
+    using occ::hostile::environment_hidden;
+    check(environment_hidden("OLLYDBG", FingerprintKind::kWindowClass),
+          "fp: OllyDbg class by kind");
+    check(!environment_hidden("ollydbg.exe", FingerprintKind::kWindowClass),
+          "fp: wrong kind not matched");
+    check(environment_hidden("ollydbg.exe", FingerprintKind::kProcessName),
+          "fp: process by kind");
+    check(environment_hidden("OLLYDBG.EXE", FingerprintKind::kProcessName),
+          "fp: process case-insensitive");
+    check(environment_hidden("Software\\OLLYDBG",
+                             FingerprintKind::kRegistryKey),
+          "fp: registry key by kind");
+    check(environment_hidden("TsDebug", FingerprintKind::kMutex),
+          "fp: TitanHide legacy mutex");
+    const auto& table = occ::hostile::fingerprint_table();
+    check(!table.empty(), "fp: table non-empty");
+    bool has_process = false;
+    bool has_class = false;
+    for (const occ::hostile::Fingerprint& f : table) {
+        has_process = has_process ||
+                      f.kind == FingerprintKind::kProcessName;
+        has_class = has_class ||
+                    f.kind == FingerprintKind::kWindowClass;
+    }
+    check(has_process, "fp: table covers processes");
+    check(has_class, "fp: table covers window classes");
+}
+
+void test_trap_policy() {
+    using occ::hostile::TrapDisposition;
+    using occ::hostile::TrapKind;
+    using occ::hostile::TrapPolicy;
+    using occ::hostile::policy_for;
+    const TrapPolicy p; // all honest defaults
+    check(policy_for(p, TrapKind::kInt3) == TrapDisposition::kDeliverToGuest,
+          "trap: int3 delivered");
+    check(policy_for(p, TrapKind::kInt2D) == TrapDisposition::kDeliverToGuest,
+          "trap: int2d delivered");
+    check(policy_for(p, TrapKind::kPrivilegedInstruction) ==
+              TrapDisposition::kDeliverToGuest,
+          "trap: privileged probe delivered");
+    TrapPolicy s;
+    s.int3 = TrapDisposition::kSwallow;
+    check(policy_for(s, TrapKind::kInt3) == TrapDisposition::kSwallow,
+          "trap: int3 swallow honors config");
+    check(policy_for(s, TrapKind::kBreakpointFault) ==
+              TrapDisposition::kFault,
+          "trap: bp fault stays fault");
+}
+
+void test_debug_registers() {
+    const occ::hostile::DebugRegisters dr = occ::hostile::undebugged_dr();
+    check(dr.dr0 == 0 && dr.dr1 == 0 && dr.dr2 == 0 && dr.dr3 == 0,
+          "dr: no addresses");
+    check(dr.dr6 == 0, "dr: no pending status");
+    check(dr.dr7 == 0, "dr: no enabled breakpoints");
+}
+
+void test_breakpoint_scan() {
+    const std::uint8_t img[] = {
+        0x48, 0x89, 0xE5, 0xCC, 0x90, 0xCC, 0xC3,
+    };
+    const std::uint8_t pristine[] = {
+        0x48, 0x89, 0xE5, 0x8B, 0x90, 0x48, 0xC3,
+    };
+    const auto hits = occ::hostile::scan_breakpoints(img, sizeof(img));
+    check(hits.size() == 2, "bp: two int3 found");
+    check(hits[0].offset == 3, "bp: first offset");
+    check(hits[1].offset == 5, "bp: second offset");
+    check(!hits[0].original_known, "bp: pristine unknown without source");
+    const auto with_src =
+        occ::hostile::scan_breakpoints(img, sizeof(img), pristine);
+    check(with_src.size() == 2, "bp: with pristine still two");
+    check(with_src[0].original == 0x8B, "bp: original byte recovered");
+    check(with_src[0].original_known, "bp: original known with source");
+    const auto none =
+        occ::hostile::scan_breakpoints(pristine, sizeof(pristine));
+    check(none.empty(), "bp: clean image has no hits");
+}
+
+void test_probe_host() {
+    using occ::hostile::probe_host;
+    const occ::hostile::HostProbe clean = probe_host(
+        "Name:\tocc\nTracerPid:\t0\nUid:\t1000\n",
+        "12345 (occ) S 1 12345 12345 0 -1 4194304 82 0 0 0 0 0 0 0 20 0 "
+        "1 0 12345 0 0\n",
+        "00400000-00401000 r-xp 00000000 00:00 0 /occ\n"
+        "7f0000000000-7f0000001000 rw-p 00000000 00:00 0 [heap]\n");
+    check(!clean.traced, "host: not traced");
+    check(clean.tracer_pid == 0, "host: tracer pid zero");
+    check(clean.parent_pid == 1, "host: parent parsed from stat");
+    check(!clean.analyst_in_maps, "host: clean maps");
+
+    const occ::hostile::HostProbe traced = probe_host(
+        "TracerPid:\t4242\n",
+        "77 (weird) name) S 9 77 77 0 -1 0 0 0 0 0 0 0 0 0 0 20 0 1 0 "
+        "77 0 0\n",
+        "7f0000000000-7f0000001000 r-xp 00000000 00:00 0 /opt/x64dbg/"
+        "x64dbg\n");
+    check(traced.traced, "host: traced detected");
+    check(traced.tracer_pid == 4242, "host: tracer pid parsed");
+    check(traced.parent_pid == 9, "host: parent with parens in comm");
+    check(traced.analyst_in_maps, "host: analyst image in maps");
+}
+
 int main() {
     test_peb_patches();
     test_clock_model();
@@ -135,6 +275,13 @@ int main() {
     test_answer_system_info();
     test_environment_hidden();
     test_build_plan();
+    test_thread_queries();
+    test_clock_reads();
+    test_fingerprint_kinds();
+    test_trap_policy();
+    test_debug_registers();
+    test_breakpoint_scan();
+    test_probe_host();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
