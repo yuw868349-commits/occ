@@ -695,6 +695,7 @@ add_library(occ_core STATIC
     src/concolic/taint.cpp
     src/dbi/dbi.cpp
     src/emu/emu.cpp
+    src/hostile/hostile.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)
