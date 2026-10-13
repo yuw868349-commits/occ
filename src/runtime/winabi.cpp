@@ -5794,6 +5794,15 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_sysinfo_ext(module.host_exports);
     add_kernel32_proc_ext(module.host_exports);
     add_kernel32_dbg_ext(module.host_exports);
+    // The anti-debug and anti-vm answering surface, the shell-runtime
+    // memory and heap surface, the loader pair, the OEM/case family, the
+    // self-check surface and the file families beyond the classic one.
+    add_kernel32_antidebug2(module.host_exports);
+    add_kernel32_shell_mem(module.host_exports);
+    add_kernel32_ldr_ext2(module.host_exports);
+    add_kernel32_strcase_ext(module.host_exports);
+    add_kernel32_selfcheck_ext(module.host_exports);
+    add_kernel32_file3(module.host_exports);
 }
 
 void add_module_psapi(ExportModule& module) {
@@ -5854,6 +5863,11 @@ void add_user32(ExportModule& module) {
     };
     add_user32_extra(module.host_exports);
     add_user32_windows(module.host_exports);
+    // The keyboard answers of the headless station, the case and
+    // pointer-walk family, and the GUI-resource count.
+    add_user32_antidebug2(module.host_exports);
+    add_user32_strcase_ext(module.host_exports);
+    add_user32_selfcheck(module.host_exports);
 }
 
 void add_kernelbase(ExportModule& module) {

@@ -709,18 +709,47 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32s2_GetThreadPriority(
     return -15;      // IDLE
 }
 
+// The process's priority-boost flag, kept so the Get/Set pair round-trips.
+std::int32_t g_priority_boost_disabled = 0;
+
+extern "C" __attribute__((ms_abi)) std::int32_t
+k32s2_GetProcessPriorityBoost(std::uint64_t process,
+                              std::int32_t* disabled) noexcept {
+    // The handle names the process the flag belongs to -- the current
+    // pseudo-handle is the only one a caller inside the process passes,
+    // and the flag is this process's state, so the handle names a fact
+    // the answer already assumes. Anything but the two self spellings is
+    // a handle no process of this runtime answers to.
+    if (process != 0 && process != 0xFFFFFFFFFFFFFFFFull) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    if (disabled == nullptr) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    *disabled = g_priority_boost_disabled;
+    set_last_error(kErrorSuccess);
+    return 1;
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t
 k32s2_SetProcessPriorityBoost(std::uint64_t process,
                               std::int32_t disable) noexcept {
-    static_cast<void>(process);
-    static_cast<void>(disable);
+    if (process != 0 && process != 0xFFFFFFFFFFFFFFFFull) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
     // The boost is a Windows scheduler policy: a thread that has been
     // waiting gets its priority raised for a short while after it wakes.
     // The host's scheduler has its own anti-starvation behaviour and no
-    // switch for it, so accepting the request would be recording a policy
-    // that is not in force.
-    set_last_error(kErrorCallNotImplemented);
-    return 0;
+    // switch for it, so the request is not enforced -- but it is recorded,
+    // the same way `WerSetFlags` records a flag nothing consumes, because
+    // the Get/Set pair is what makes the setter observable and a caller
+    // that disables the boost and reads it back sees its own value.
+    g_priority_boost_disabled = disable != 0 ? 1 : 0;
+    set_last_error(kErrorSuccess);
+    return 1;
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t k32s2_WerGetFlags(
@@ -843,6 +872,8 @@ void add_kernel32_sys2(ExportList& out) {
     e("IsValidCodePage", reinterpret_cast<void*>(&k32s2_IsValidCodePage));
     e("QueryInformationJobObject",
       reinterpret_cast<void*>(&k32s2_QueryInformationJobObject));
+    e("GetProcessPriorityBoost",
+      reinterpret_cast<void*>(&k32s2_GetProcessPriorityBoost));
     e("SetProcessPriorityBoost",
       reinterpret_cast<void*>(&k32s2_SetProcessPriorityBoost));
     e("SetThreadPriority", reinterpret_cast<void*>(&k32s2_SetThreadPriority));

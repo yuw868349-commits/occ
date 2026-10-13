@@ -503,6 +503,32 @@ void add_kernel32_proc_ext(ExportList& out);
 // kernel32's debugger-side extension: the kill-on-exit flag.
 void add_kernel32_dbg_ext(ExportList& out);
 
+// The anti-debug and anti-vm answering surface: the wow64 and DEP queries,
+// the process times and affinity, the firmware and drive families, the
+// locale ids and the session/window-station answers.
+void add_kernel32_antidebug2(ExportList& out);
+
+// The shell-runtime memory surface: virtual locking, the extended
+// allocation, the heap walk, the thread ideal processors, the priority and
+// mitigation policies and the locale names.
+void add_kernel32_shell_mem(ExportList& out);
+
+// The loader-facing kernel32 pair: `LoadLibraryExA` and
+// `GetProcAddressForCaller`, bridged to the Win32 loader.
+void add_kernel32_ldr_ext2(ExportList& out);
+
+// The OEM/ANSI conversion pair and the case and pointer-walk family.
+void add_kernel32_strcase_ext(ExportList& out);
+
+// The self-check surface: the image-name query, the IsBad* families, the
+// IO counters, the affinity-update mode and the fatal-exit paths.
+void add_kernel32_selfcheck_ext(ExportList& out);
+
+// The file extensions beyond `kernel32_file2`: the pointer-based file
+// position, the copy-with-callback, the directory walk, the time and lock
+// families and the volume-path and hard-link pair.
+void add_kernel32_file3(ExportList& out);
+
 // The file-mapping section registry, shared with the close path in
 // `winabi.cpp`: whether a handle names a section this family issued, and
 // the release of its record.
@@ -513,6 +539,28 @@ void filemap_close_section(std::uint64_t handle) noexcept;
 // `LdrGetProcedureAddress` and the Nt context pair, bridged to the Win32
 // implementations.
 void add_ntdll_ldr_ext(ExportList& out);
+
+// The ntdll half of the anti-debug surface: the debug-filter, debug-control
+// and thread-suspend queries, the exception raise and continue, the alert
+// and debug-event waits, the DbgPrint pair, the timer resolution and the
+// valid-handler check.
+void add_ntdll_antidebug2(ExportList& out);
+
+// The shell-runtime ntdll surface: the Nt virtual-memory family bridged to
+// the host `nt_*` layer, the section and view family bridged to the
+// file-mapping registry, and the dynamic function table.
+void add_ntdll_shell_mem(ExportList& out);
+
+// The loader-facing ntdll family: the unload, handle, lock, path, refcount
+// and notification queries, the entry lookup, the procedure-address
+// extension and the resource walk, all bridged to the Win32 loader and the
+// guest image.
+void add_ntdll_ldr_ext2(ExportList& out);
+
+// The ntdll file surface: the Nt create/open/read/write and information
+// families over the file-handle table, the firmware-environment refusals
+// and the random and TEB queries.
+void add_ntdll_file2(ExportList& out);
 
 // shell32's launcher: `ShellExecuteA` and `ShellExecuteW`.
 void add_shell32_exec(ExportList& out);
@@ -540,6 +588,18 @@ void add_user32_extra(ExportList& out);
 // clipboard, the keyboard, the menus and the dialogs, as one headless
 // station keeps them.
 void add_user32_windows(ExportList& out);
+
+// The user32 half of the anti-debug surface: the keyboard-layout and
+// keyboard-type answers of the headless station.
+void add_user32_antidebug2(ExportList& out);
+
+// The user32 case and pointer-walk family: `CharUpperA/W`,
+// `CharLowerA/W`, `AnsiNext` and `AnsiPrev`.
+void add_user32_strcase_ext(ExportList& out);
+
+// The user32 self-check query: `GetGuiResources`, answered from the
+// headless station's object counts.
+void add_user32_selfcheck(ExportList& out);
 
 // The process-status surface: the module list, the memory counters and
 // the performance view, answered from this runtime's own state.
@@ -622,6 +682,11 @@ void add_advapi32_reg(ExportList& out);
 // rather than copies, which is the one behaviour here a caller is allowed
 // to write through.
 void add_advapi32_sec(ExportList& out);
+
+// The token-manipulation half of ADVAPI32: the group adjustment and the
+// token duplication and thread attachment, over the same token model the
+// security half keeps.
+void add_advapi32_token2(ExportList& out);
 
 // The RPCRT4 surface.
 void add_rpcrt4(ExportList& out);

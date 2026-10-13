@@ -177,6 +177,7 @@ target_compile_definitions(occ_test_seeds PRIVATE
 occ_add_test(occ_test_api_psapi_version test_api_psapi_version.cpp)
 occ_add_test(occ_test_api_dbghelp test_api_dbghelp.cpp)
 occ_add_test(occ_test_api_ext test_api_ext.cpp)
+occ_add_test(occ_test_api_ext2 test_api_ext2.cpp)
 occ_add_test(occ_test_api_ucrt test_api_ucrt.cpp)
 occ_add_test(occ_test_api_ntdll_debug test_api_ntdll_debug.cpp)
 occ_add_test(occ_test_api_crypt32_full test_api_crypt32_full.cpp)

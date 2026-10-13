@@ -297,6 +297,21 @@ std::unordered_map<std::uint64_t, std::size_t> g_views;
 
 }  // namespace
 
+// Whether an address falls inside any live view this runtime mapped. The
+// flush path needs this because the host's `msync` accepts anonymous memory
+// too and would report success for the stack or the heap; only an address
+// the view ledger knows is a file view worth flushing. Exposed rather than
+// left in the anonymous namespace because the flush path lives in
+// `kernel32_file3`.
+bool filemap_view_contains(std::uint64_t address) noexcept {
+    for (const auto& view : g_views) {
+        if (address >= view.first && address - view.first < view.second) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // A section over a file this runtime opened, or an anonymous section when
 // `INVALID_HANDLE_VALUE` is passed. The section holds the file's descriptor
 // and the resolved size; the mapping of the bytes into the address space is

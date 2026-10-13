@@ -27,6 +27,13 @@ void add_module_ntdll(ExportModule& module) {
     // `LdrGetProcedureAddress` reach the same registry the Win32 pair
     // uses, and the Nt context pair is the Win32 pair's spelling.
     add_ntdll_ldr_ext(module.host_exports);
+    // The anti-debug and anti-vm answering surface, the shell-runtime
+    // memory and section family, the loader-facing family beyond the first
+    // one, and the Nt file surface.
+    add_ntdll_antidebug2(module.host_exports);
+    add_ntdll_shell_mem(module.host_exports);
+    add_ntdll_ldr_ext2(module.host_exports);
+    add_ntdll_file2(module.host_exports);
 }
 
 void add_module_gdi32(ExportModule& module) {
@@ -39,6 +46,9 @@ void add_module_advapi32(ExportModule& module) {
     add_advapi32(module.host_exports);
     add_advapi32_reg(module.host_exports);
     add_advapi32_sec(module.host_exports);
+    // The token manipulation: the group adjustment, the duplication and
+    // the thread attachment, over the same token model.
+    add_advapi32_token2(module.host_exports);
 }
 
 void add_module_rpcrt4(ExportModule& module) {

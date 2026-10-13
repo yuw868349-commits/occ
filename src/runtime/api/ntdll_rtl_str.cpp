@@ -5330,6 +5330,31 @@ nrs_RtlInstallFunctionTableCallback(std::uint64_t table_identifier,
     return 1;
 }
 
+extern "C" __attribute__((ms_abi)) std::int32_t nrs_RtlAddFunctionTable(
+    void* function_table, std::uint32_t entry_count,
+    std::uint64_t base_address) noexcept {
+    if (function_table == nullptr || entry_count == 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    // The array-based registration: the caller hands a table of
+    // RUNTIME_FUNCTION records (BeginAddress, EndAddress and
+    // UnwindInfoAddress, four bytes each on x64) that the unwinder is to
+    // consult for addresses between BaseAddress and the end of the array.
+    // The table pointer itself is the identifier the delete path matches,
+    // the same way the callback-based registration's identifier is the
+    // caller's handle.
+    DynamicFunctionTable table;
+    table.identifier = reinterpret_cast<std::uint64_t>(function_table);
+    table.base = base_address;
+    table.length =
+        static_cast<std::uint64_t>(entry_count) * 12;  // x64 RUNTIME_FUNCTION
+    std::lock_guard<std::mutex> lock(g_function_table_lock());
+    g_function_tables().push_back(table);
+    set_last_error(0);
+    return 1;
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t nrs_RtlDeleteFunctionTable(
     void* table) noexcept {
     if (table == nullptr) {
@@ -5635,6 +5660,8 @@ void add_ntdll_rtl_str(ExportList& out) {
     // address it was registered for.
     e("RtlInstallFunctionTableCallback",
       reinterpret_cast<void*>(&nrs_RtlInstallFunctionTableCallback));
+    e("RtlAddFunctionTable",
+      reinterpret_cast<void*>(&nrs_RtlAddFunctionTable));
     e("RtlDeleteFunctionTable",
       reinterpret_cast<void*>(&nrs_RtlDeleteFunctionTable));
 }

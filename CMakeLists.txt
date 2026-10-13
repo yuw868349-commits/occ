@@ -654,6 +654,14 @@ add_library(occ_core STATIC
     src/runtime/api/proc_ext.cpp
     src/runtime/api/dbg_ext.cpp
     src/runtime/api/ldr_ext.cpp
+    src/runtime/api/antidebug2.cpp
+    src/runtime/api/shell_mem.cpp
+    src/runtime/api/ldr_ext2.cpp
+    src/runtime/api/strcase_ext.cpp
+    src/runtime/api/selfcheck_ext.cpp
+    src/runtime/api/ntdll_file2.cpp
+    src/runtime/api/kernel32_file3.cpp
+    src/runtime/api/advapi32_token2.cpp
     src/runtime/api/shell_exec.cpp
     src/runtime/api/imagehlp.cpp
     src/runtime/api/wininet.cpp
