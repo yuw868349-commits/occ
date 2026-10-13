@@ -171,6 +171,17 @@ public:
     std::size_t deterministic(const std::vector<std::uint8_t>& base,
                               EmitFn emit, void* ctx) noexcept;
 
+    // The dictionary: tokens inserted/overwritten by the deterministic
+    // stage. Format-critical values (magic numbers, section names, shell
+    // markers) belong here; the stage tries each token at every offset.
+    void set_dict(std::vector<std::vector<std::uint8_t>> tokens) noexcept {
+        dict_ = std::move(tokens);
+    }
+    [[nodiscard]] const std::vector<std::vector<std::uint8_t>>& dict()
+        const noexcept {
+        return dict_;
+    }
+
     // One havoc round over `base` and `other`. Returns the candidate
     // (possibly equal to base when the round produced nothing new).
     void havoc(const std::vector<std::uint8_t>& base,
@@ -182,6 +193,7 @@ public:
     [[nodiscard]] std::size_t next_below(std::size_t n) noexcept;
 
 private:
+    std::vector<std::vector<std::uint8_t>> dict_;
     std::uint64_t rng_ = 0;
     [[nodiscard]] std::uint64_t next_u64() noexcept;
 };

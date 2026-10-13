@@ -138,6 +138,36 @@ void test_mutator_deterministic() {
     check(m.interest_bytes().size() >= 10, "mut: interest table present");
 }
 
+void test_mutator_dict() {
+    Mutator m;
+    m.set_dict({{'M', 'Z'}, {'P', 'E'}});
+    const std::vector<std::uint8_t> base = {0x41, 0x42, 0x43};
+    struct Seen {
+        std::size_t emitted = 0;
+        bool mz = false;
+        bool pe = false;
+    } seen;
+    m.deterministic(
+        base,
+        [](const std::uint8_t* d, std::size_t n, void* ctx) noexcept {
+            auto* s = static_cast<Seen*>(ctx);
+            ++s->emitted;
+            for (std::size_t i = 0; i + 1 < n; ++i) {
+                if (d[i] == 'M' && d[i + 1] == 'Z') {
+                    s->mz = true;
+                }
+                if (d[i] == 'P' && d[i + 1] == 'E') {
+                    s->pe = true;
+                }
+            }
+        },
+        &seen);
+    check(seen.mz, "dict: MZ token reached as candidate");
+    check(seen.pe, "dict: PE token reached as candidate");
+    check(seen.emitted > 0, "dict: candidates emitted");
+    check(m.dict().size() == 2, "dict: accessor returns tokens");
+}
+
 void test_mutator_havoc() {
     Mutator m;
     std::vector<std::uint8_t> out;
@@ -179,6 +209,7 @@ int main() {
     test_coverage();
     test_corpus();
     test_mutator_deterministic();
+    test_mutator_dict();
     test_mutator_havoc();
     test_guided_search();
     test_trivial_one_byte();

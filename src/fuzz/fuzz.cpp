@@ -322,6 +322,32 @@ std::size_t Mutator::deterministic(const std::vector<std::uint8_t>& base,
             candidate(v);
         }
     }
+    // Dictionary stage: try each token at every offset, both overwriting
+    // (same length where it fits) and inserting (grows the input). This
+    // is what finds format-critical values -- magic numbers, section
+    // names, shell markers -- that blind mutation would take forever to
+    // rediscover.
+    for (const auto& token : dict_) {
+        if (token.empty()) {
+            continue;
+        }
+        for (std::size_t i = 0; i < base.size(); ++i) {
+            if (i + token.size() <= base.size()) {
+                std::vector<std::uint8_t> v = base;
+                std::copy(token.begin(), token.end(),
+                          v.begin() + static_cast<std::ptrdiff_t>(i));
+                candidate(v);
+            }
+            // Insert at i (kept short: a handful of offsets per token
+            // keeps the deterministic stage from exploding combinatorially).
+            if (i < 8 && base.size() + token.size() <= 64 * 1024) {
+                std::vector<std::uint8_t> v = base;
+                v.insert(v.begin() + static_cast<std::ptrdiff_t>(i),
+                         token.begin(), token.end());
+                candidate(v);
+            }
+        }
+    }
     return emitted;
 }
 
