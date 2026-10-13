@@ -23,6 +23,10 @@ void add_module_ntdll(ExportModule& module) {
     add_ntdll_nt(module.host_exports);
     add_ntdll_debug(module.host_exports);
     add_ntdll_antidebug(module.host_exports);
+    // The loader and context spellings: `LdrLoadDll` and
+    // `LdrGetProcedureAddress` reach the same registry the Win32 pair
+    // uses, and the Nt context pair is the Win32 pair's spelling.
+    add_ntdll_ldr_ext(module.host_exports);
 }
 
 void add_module_gdi32(ExportModule& module) {
@@ -50,6 +54,9 @@ void add_module_setupapi(ExportModule& module) {
 void add_module_shell32(ExportModule& module) {
     module.name = "SHELL32.dll";
     add_shell32(module.host_exports);
+    // The launcher: `ShellExecuteA` and `ShellExecuteW`, which start a
+    // document or a program the way the shell would.
+    add_shell32_exec(module.host_exports);
 }
 
 void add_module_crypt32(ExportModule& module) {
@@ -80,6 +87,16 @@ void add_module_mscoree(ExportModule& module) {
 void add_module_ws2_32(ExportModule& module) {
     module.name = "WS2_32.dll";
     add_ws2_32(module.host_exports);
+}
+
+void add_module_wininet(ExportModule& module) {
+    module.name = "WININET.dll";
+    add_wininet(module.host_exports);
+}
+
+void add_module_urlmon(ExportModule& module) {
+    module.name = "URLMON.dll";
+    add_urlmon(module.host_exports);
 }
 
 void add_module_iphlpapi(ExportModule& module) {

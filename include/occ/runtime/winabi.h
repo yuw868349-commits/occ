@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -245,6 +246,31 @@ struct GuestState {
     // state is per thread because the flag is: it is a bit a thread carries,
     // and a fresh thread starts with it clear.
     bool hide_from_debugger = false;
+
+    // The asynchronous procedure calls queued to this thread.
+    // `QueueUserAPC` appends from any thread and an alertable wait on this
+    // one consumes, running each routine and answering `WAIT_IO_COMPLETION`.
+    // The queue is per thread because the delivery is: a routine queued to a
+    // thread that never waits alertably stays queued, which is what Windows
+    // does with one too.
+    struct ApcEntry {
+        std::uint64_t routine = 0;
+        std::uint64_t argument = 0;
+    };
+    // The queue and its lock, as one copyable unit. The state is copied
+    // when a new thread is cloned from this one (`guest_thread.cpp`), and a
+    // mutex cannot be copied, so the copy constructor is written out: the
+    // new state's queue is empty, because an APC is delivered to the thread
+    // it was queued to and a fresh thread has none queued, and the lock is
+    // rebuilt rather than shared.
+    struct ApcState {
+        std::vector<ApcEntry> queue;
+        std::mutex mutex;
+        ApcState() = default;
+        ApcState(const ApcState&) : queue() {}
+        ApcState& operator=(const ApcState&) { return *this; }
+    };
+    ApcState apc;
 };
 
 // The state the thunks serve, or nullptr before the guest has been installed.
@@ -315,6 +341,11 @@ struct GuestThreadRequest {
 // is the address space, the PEB and the modules, which is what a process is.
 [[nodiscard]] std::uint64_t create_guest_thread(
     const GuestThreadRequest& request, std::uint32_t* thread_id) noexcept;
+
+// Runs the calling thread's queued asynchronous procedure calls, each with
+// the guest ABI. Answers true when at least one routine ran, which is what
+// an alertable wait tests before answering `WAIT_IO_COMPLETION`.
+[[nodiscard]] bool run_pending_apcs(GuestState& state) noexcept;
 
 // Ends the thread this call is running on, with the code the guest asked
 // for. On the process's first thread this ends the process, which is what

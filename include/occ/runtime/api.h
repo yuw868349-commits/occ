@@ -484,6 +484,52 @@ void add_kernel32_ctx2(ExportList& out);
 // result, the cancellation, and the file-information setter.
 void add_kernel32_io2(ExportList& out);
 
+// kernel32's file-mapping family: the sections `CreateFileMapping` makes,
+// the views `MapViewOfFile` places, and the names that open them.
+void add_kernel32_filemap(ExportList& out);
+
+// kernel32's remote-thread and APC family: a thread started in "another"
+// process and a routine queued to an alertable waiter.
+void add_kernel32_threads_ext(ExportList& out);
+
+// kernel32's system-information and code-page family: the firmware table,
+// the version query, the locale id and the OEM conversions.
+void add_kernel32_sysinfo_ext(ExportList& out);
+
+// kernel32's process-and-file extensions: the legacy process launch and the
+// temporary-name maker.
+void add_kernel32_proc_ext(ExportList& out);
+
+// kernel32's debugger-side extension: the kill-on-exit flag.
+void add_kernel32_dbg_ext(ExportList& out);
+
+// The file-mapping section registry, shared with the close path in
+// `winabi.cpp`: whether a handle names a section this family issued, and
+// the release of its record.
+bool filemap_handle_is_section(std::uint64_t handle) noexcept;
+void filemap_close_section(std::uint64_t handle) noexcept;
+
+// ntdll's loader and context spellings: `LdrLoadDll`,
+// `LdrGetProcedureAddress` and the Nt context pair, bridged to the Win32
+// implementations.
+void add_ntdll_ldr_ext(ExportList& out);
+
+// shell32's launcher: `ShellExecuteA` and `ShellExecuteW`.
+void add_shell32_exec(ExportList& out);
+
+// dbghelp's image-checksum pair: `CheckSumMappedFile` and
+// `MapFileAndCheckSumA`.
+void add_dbghelp_imagehlp(ExportList& out);
+
+// The WinINet surface: the session, the connection, the URL and the HTTP
+// request a downloader is built from, over the host's sockets.
+void add_wininet(ExportList& out);
+void add_module_wininet(ExportModule& module);
+
+// The urlmon surface: `URLDownloadToFileA`, the one-call download.
+void add_urlmon(ExportList& out);
+void add_module_urlmon(ExportModule& module);
+
 // The KERNELBASE names a guest imports from it directly.
 void add_kernelbase_extra(ExportList& out);
 

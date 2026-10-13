@@ -618,25 +618,51 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32s_WaitForMultipleObjects(
     }
 }
 
-// The alertable variant. This runtime delivers no asynchronous procedure
-// calls, so there is nothing a wait could be alerted by, and a caller that
-// asked for alertable waiting gets the same wait. The alternative -- an
-// answer of `WAIT_IO_COMPLETION` for an APC this runtime cannot run -- would
-// be a status no program could act on.
+// The alertable variant. An alertable wait is interrupted by an
+// asynchronous procedure call, so the queue is drained before the wait and
+// at each poll step, and a routine that is waiting is run and the wait
+// answers `WAIT_IO_COMPLETION`.
+//
+// `WAIT_IO_COMPLETION` is `0xC0`. A routine that is already queued is run
+// without sleeping at all, which is what Windows does when the delivery
+// does not need to wait for anything.
+constexpr std::uint32_t kWaitIoCompletion = 0x000000C0u;
+
 extern "C" __attribute__((ms_abi)) std::uint32_t k32s_WaitForMultipleObjectsEx(
     std::uint32_t count, const std::uint64_t* handles, std::int32_t wait_all,
     std::uint32_t milliseconds, std::int32_t alertable) noexcept {
-    (void)alertable;
+    GuestState* self = guest_state();
+    if (alertable && self != nullptr && run_pending_apcs(*self)) {
+        return kWaitIoCompletion;
+    }
     return k32s_WaitForMultipleObjects(count, handles, wait_all, milliseconds);
 }
 
-// `SleepEx` with no APCs to run is `Sleep`: it returns zero because nothing
-// was executed, and an alertable request is honoured the only way it can be,
-// by behaving as the non-alertable call.
+// `SleepEx` with an APC queued runs it and answers `WAIT_IO_COMPLETION`;
+// with none queued it is `Sleep`, returning zero because nothing was
+// executed. An APC can arrive during the sleep, so an alertable sleep is
+// polled in short steps with the queue checked between them.
 extern "C" __attribute__((ms_abi)) std::uint32_t k32s_SleepEx(
     std::uint32_t milliseconds, std::int32_t alertable) noexcept {
-    (void)alertable;
-    sleep_ms(milliseconds);
+    GuestState* self = guest_state();
+    if (!alertable || self == nullptr) {
+        sleep_ms(milliseconds);
+        return 0;
+    }
+    if (run_pending_apcs(*self)) {
+        return kWaitIoCompletion;
+    }
+    constexpr std::uint32_t kApcPollMs = 16;
+    std::uint32_t remaining = milliseconds;
+    while (remaining > 0) {
+        const std::uint32_t step =
+            remaining > kApcPollMs ? kApcPollMs : remaining;
+        sleep_ms(step);
+        remaining -= step;
+        if (run_pending_apcs(*self)) {
+            return kWaitIoCompletion;
+        }
+    }
     return 0;
 }
 

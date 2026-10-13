@@ -69,6 +69,10 @@ constexpr std::uint32_t kErrorNoMoreFiles = 18;
 // failed write of an open handle is retried or reported, not re-opened.
 constexpr std::uint32_t kErrorWriteFault = 29;
 constexpr std::uint32_t kErrorAlreadyExists = 183;
+// ERROR_FILE_EXISTS: the name the caller asked for is taken. `GetTempFileNameA`
+// answers it when a caller-supplied unique number names an existing file and
+// refuses rather than searching past it.
+constexpr std::uint32_t kErrorFileExists = 80;
 constexpr std::uint32_t kErrorDirectoryNotEmpty = 145;
 constexpr std::uint32_t kErrorNotSupported = 50;
 constexpr std::uint32_t kErrorInsufficientBuffer = 122;

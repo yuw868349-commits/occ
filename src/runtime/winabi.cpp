@@ -2534,6 +2534,13 @@ extern "C" __attribute__((ms_abi)) std::int32_t k32_CloseHandle(
         // record is released once the thread has stopped as well.
         return close_guest_thread(handle) ? 1 : 0;
     }
+    if (filemap_handle_is_section(handle)) {
+        // A section handle ends its record in the file-mapping family. The
+        // views stay mapped, which is what Windows does too: the pages are
+        // alive as long as a view holds them.
+        filemap_close_section(handle);
+        return 1;
+    }
     (void)objects::close(handle);
     return 1;
 }
@@ -2642,15 +2649,58 @@ extern "C" __attribute__((ms_abi)) std::uint32_t k32_WaitForSingleObject(
     return wait_status(objects::wait_one(handle, milliseconds));
 }
 
-// The alertable variant. This runtime delivers no asynchronous procedure
-// calls, so there is nothing a wait could be alerted by, and a caller that
-// asked for alertable waiting gets the same wait. The alternative -- a
-// wait that returned `WAIT_IO_COMPLETION` for an APC this runtime cannot
-// run -- would be a status no program could act on.
+// The alertable variant. An alertable wait is interrupted by an
+// asynchronous procedure call: the queue is drained before the wait and at
+// each poll step, and a routine that is waiting is run and the wait answers
+// `WAIT_IO_COMPLETION`. The alternative -- a wait that returned the status
+// for an APC this runtime never ran -- would be a status no program could
+// act on.
+//
+// `WAIT_IO_COMPLETION` is `0xC0`, below the timeout value, which is what
+// lets a caller test the result the way Windows documents it.
+constexpr std::uint32_t kWaitIoCompletion = 0x000000C0u;
+
 extern "C" __attribute__((ms_abi)) std::uint32_t k32_WaitForSingleObjectEx(
     std::uint64_t handle, std::uint32_t milliseconds,
     std::int32_t alertable) noexcept {
-    (void)alertable;
+    GuestState* self = guest_state();
+    if (alertable && self != nullptr) {
+        if (run_pending_apcs(*self)) {
+            return kWaitIoCompletion;
+        }
+        // An APC can arrive at any point of the wait, so the wait is polled
+        // in short steps with the queue checked between them. The step is
+        // a scheduling slice, not a timeout: an infinite wait polls forever
+        // and a finite one returns the timeout only when the caller's time
+        // is actually gone.
+        constexpr std::uint32_t kApcPollMs = 16;
+        std::uint32_t remaining = milliseconds;
+        for (;;) {
+            const std::uint32_t step =
+                (remaining == 0xFFFFFFFFu || remaining > kApcPollMs)
+                    ? kApcPollMs
+                    : remaining;
+            std::uint32_t outcome = 0;
+            if (is_guest_thread_handle(handle)) {
+                outcome = wait_guest_thread(handle,
+                                            static_cast<std::int64_t>(step));
+            } else {
+                outcome = wait_status(objects::wait_one(handle, step));
+            }
+            if (outcome != kWaitTimeout) {
+                return outcome;
+            }
+            if (remaining != 0xFFFFFFFFu) {
+                remaining -= step;
+                if (remaining == 0) {
+                    return kWaitTimeout;
+                }
+            }
+            if (run_pending_apcs(*self)) {
+                return kWaitIoCompletion;
+            }
+        }
+    }
     if (is_guest_thread_handle(handle)) {
         const std::int64_t bound =
             (milliseconds == 0xFFFFFFFFu) ? -1
@@ -5735,6 +5785,15 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_state2(module.host_exports);
     add_kernel32_ctx2(module.host_exports);
     add_kernel32_io2(module.host_exports);
+    // The families a probe or a loader reaches for beyond the classic
+    // surface: the file-mapping sections and views, the remote-thread and
+    // APC queue, the firmware and version queries, the legacy launch and
+    // the temporary-name maker, and the debugger's kill-on-exit flag.
+    add_kernel32_filemap(module.host_exports);
+    add_kernel32_threads_ext(module.host_exports);
+    add_kernel32_sysinfo_ext(module.host_exports);
+    add_kernel32_proc_ext(module.host_exports);
+    add_kernel32_dbg_ext(module.host_exports);
 }
 
 void add_module_psapi(ExportModule& module) {
@@ -5752,6 +5811,9 @@ void add_module_secur32(ExportModule& module) {
 void add_module_dbghelp(ExportModule& module) {
     module.name = "DBGHELP.dll";
     add_dbghelp(module.host_exports);
+    // The image-checksum pair, named for the module the calls originally
+    // lived in: `CheckSumMappedFile` and `MapFileAndCheckSumA`.
+    add_dbghelp_imagehlp(module.host_exports);
 }
 
 void add_module_version(ExportModule& module) {
@@ -5863,6 +5925,8 @@ void register_host_modules(ExportRegistry& registry) {
         {"winmm.dll", &add_module_winmm},
         {"MSCOREE.dll", &add_module_mscoree},
         {"WS2_32.dll", &add_module_ws2_32},
+        {"WININET.dll", &add_module_wininet},
+        {"URLMON.dll", &add_module_urlmon},
         {"IPHLPAPI.dll", &add_module_iphlpapi},
         {"OLE32.dll", &add_module_ole32},
         {"UCRTBASE.dll", &add_module_ucrtbase},

@@ -648,6 +648,16 @@ add_library(occ_core STATIC
     src/runtime/api/kernel32_state2.cpp
     src/runtime/api/kernel32_ctx2.cpp
     src/runtime/api/kernel32_io2.cpp
+    src/runtime/api/filemap.cpp
+    src/runtime/api/threads_ext.cpp
+    src/runtime/api/sysinfo_ext.cpp
+    src/runtime/api/proc_ext.cpp
+    src/runtime/api/dbg_ext.cpp
+    src/runtime/api/ldr_ext.cpp
+    src/runtime/api/shell_exec.cpp
+    src/runtime/api/imagehlp.cpp
+    src/runtime/api/wininet.cpp
+    src/runtime/api/urlmon.cpp
     src/runtime/api/bcrypt.cpp
     src/runtime/api/winmm.cpp
     src/runtime/api/mscoree.cpp
