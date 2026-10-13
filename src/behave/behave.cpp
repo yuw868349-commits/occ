@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 
 namespace occ::behave {
 
@@ -48,24 +49,19 @@ CallContext decode(CallingConvention conv, std::uint64_t callee,
     if (max_args > ctx.args.size()) {
         max_args = ctx.args.size();
     }
-    // Register slots depend on the convention; the stack slots are the
-    // same for both (first four spill slots are shadow space on Win64).
+    // Register slots depend on the convention (Win64: RCX,RDX,R8,R9;
+    // SysV: RDI,RSI,RDX,RCX,R8,R9). regs[] arrives in hardware order, so
+    // the register argument i reads regs[i]. Stack slots begin after the
+    // register count (and after the Win64 shadow space).
+    const std::size_t reg_arg_count = (conv == CallingConvention::kSysV) ? 6
+                                                                         : 4;
     for (std::size_t i = 0; i < max_args; ++i) {
         Arg a;
         a.slot = i;
-        if (i < 4) {
-            std::size_t reg = 0;
-            switch (conv) {
-            case CallingConvention::kWin64:
-                reg = i; // RCX, RDX, R8, R9
-                break;
-            case CallingConvention::kSysV:
-                reg = i; // RDI, RSI, RDX, RCX, R8, R9
-                break;
-            }
-            a.value = regs[reg];
+        if (i < reg_arg_count) {
+            a.value = regs[i];
         } else {
-            a.value = sp[i - 4];
+            a.value = sp[i - reg_arg_count];
         }
         a.is_pointer = looks_like_pointer(a.value);
         a.string_candidate = looks_like_string(a.value);
@@ -268,11 +264,11 @@ void Simulator::set_failure_fraction(double f) noexcept {
 
 bool Simulator::generic_status() const noexcept {
     if (failure_fraction_ > 0.0) {
-        // Deterministic for a fixed seed isn't meaningful here: the
-        // fraction is used by stress runs, where a pseudorandom draw is
-        // the point. Keep it simple and honest.
-        const double r =
-            std::fmod(static_cast<double>(std::rand()), 100.0) / 100.0;
+        // Fixed-seed PRNG: the answer sequence is reproducible for a
+        // given failure fraction, so the sandbox stays deterministic
+        // (the header contract) while still exercising failure paths.
+        std::mt19937_64 rng(0x4f545f524e47);  // "OCC_RNG" tag
+        const double r = static_cast<double>(rng() % 100) / 100.0;
         return r >= failure_fraction_;
     }
     return status_;
@@ -382,6 +378,15 @@ Hooks& Sandbox::hooks() noexcept {
     return hooks_;
 }
 
+void Sandbox::set_classifier(std::function<BehaviorClass(std::uint64_t)> fn) {
+    classifier_ = std::move(fn);
+}
+
+const std::function<BehaviorClass(std::uint64_t)>& Sandbox::classifier()
+    const noexcept {
+    return classifier_;
+}
+
 CallRecord Sandbox::run(const CallContext& ctx) {
     if (hooks_.on_call) {
         hooks_.on_call(ctx);
@@ -395,7 +400,7 @@ CallRecord Sandbox::run(const CallContext& ctx) {
     r.callee = ctx.callee;
     r.caller = ctx.caller;
     r.thread_id = ctx.thread_id;
-    r.cls = classifier_ ? classifier_(ctx.callee) : BehaviorClass::kOther;
+    r.cls = classifier_ ? classifier_(ctx.callee) : ctx.cls;
     r.argc = ctx.argc;
     for (std::size_t i = 0; i < ctx.argc; ++i) {
         r.args[i] = ctx.args[i].value;

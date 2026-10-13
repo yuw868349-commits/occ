@@ -67,16 +67,6 @@ struct Arg {
     bool string_candidate = false; // value looks like an ASCII/UTF-16 ptr
 };
 
-// The decoded view of one call site.
-struct CallContext {
-    std::uint64_t callee = 0; // target API address
-    std::uint64_t caller = 0; // return address
-    std::uint32_t thread_id = 0;
-    CallingConvention conv = CallingConvention::kWin64;
-    std::array<Arg, 8> args{};
-    std::size_t argc = 0;
-};
-
 // What an API call touches.
 enum class BehaviorClass {
     kFile,
@@ -95,6 +85,17 @@ enum class BehaviorClass {
 
 constexpr std::size_t kBehaviorClassCount = 12;
 
+// The decoded view of one call site.
+struct CallContext {
+    std::uint64_t callee = 0; // target API address
+    std::uint64_t caller = 0; // return address
+    std::uint32_t thread_id = 0;
+    CallingConvention conv = CallingConvention::kWin64;
+    BehaviorClass cls = BehaviorClass::kOther;
+    std::array<Arg, 8> args{};
+    std::size_t argc = 0;
+};
+
 // Decoder entry point: fills a CallContext from raw register/stack values.
 // regs[0..5] are the convention registers (RCX..R9 or RDI..R9), stack
 // values are read by the caller into sp[0..]. max_args caps argc.
@@ -107,6 +108,12 @@ constexpr std::size_t kBehaviorClassCount = 12;
 
 // Human-readable class name (used by logging and describe()).
 [[nodiscard]] std::string_view class_name(BehaviorClass c) noexcept;
+
+// Classify an API by its module-qualified name (e.g. "kernel32.CreateFileA"
+// or "ws2_32.WSASocketA"). The classifier is name-prefix based and coarse
+// by design; a consumer with a real symbol table can supply its own.
+[[nodiscard]] BehaviorClass classify(std::string_view module,
+                                     std::string_view name) noexcept;
 
 // Policy actions. kMonitor observes and logs without restricting; kDeny
 // refuses; kSimulate hands the call to the Simulator; kAllow passes it to
@@ -206,7 +213,6 @@ public:
 
 private:
     std::vector<CallRecord> records_;
-    std::uint64_t seq_ = 0;
 };
 
 // Address-range taint. Coarse by design: mark a guest memory range as
@@ -255,6 +261,13 @@ public:
     [[nodiscard]] const TaintTracker& taint() const noexcept;
     [[nodiscard]] Hooks& hooks() noexcept;
 
+    // Optional classifier: maps a callee address to a BehaviorClass when
+    // the consumer has a symbol table. Without one, calls classify as
+    // kOther and the policy's kOther default applies.
+    void set_classifier(std::function<BehaviorClass(std::uint64_t)> fn);
+    [[nodiscard]] const std::function<BehaviorClass(std::uint64_t)>&
+    classifier() const noexcept;
+
     // Run one call through the sandbox. Returns the record; ret is the
     // value a simulated call produced, or 0 for denied/monitored calls
     // (the caller decides what to do with it).
@@ -266,6 +279,7 @@ private:
     CallLog log_;
     TaintTracker taint_;
     Hooks hooks_;
+    std::function<BehaviorClass(std::uint64_t)> classifier_;
     std::uint64_t seq_ = 0;
 };
 
