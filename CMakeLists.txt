@@ -19,7 +19,7 @@ cmake_minimum_required(VERSION 3.20)
 set(OCC_LIBCXX_CANDIDATES
     /usr/lib/llvm-23 /usr/lib/llvm-22 /usr/lib/llvm-21
     /usr/lib/llvm-20 /usr/lib/llvm-19 /usr/lib/llvm-18
-    /usr/lib/llvm-17 /opt/LLVM-23.1.2-Linux-X64)
+    /usr/lib/llvm-17)
 
 # A libc++ is usable only if the same tree supplies its headers and its
 # libraries. Accepting a root on the strength of its headers alone is what
@@ -96,7 +96,13 @@ if(_occ_cxx_name MATCHES "^clang")
     # header with "Libc++ only supports Clang 21 and later" -- fatal here,
     # because this build treats warnings as errors.
     if(DEFINED ENV{CXX})
-        get_filename_component(_occ_cxx_bin "$ENV{CXX}" DIRECTORY)
+        # The compiler may be reached through a symlink (e.g. a bin dir that
+        # points into an unpacked LLVM release tree). Resolve the binary
+        # itself -- the link lives on the file, not on its directory -- so the
+        # root that owns the libc++ is the tree the binary actually lives in,
+        # rather than wherever the symlink happens to sit.
+        get_filename_component(_occ_cxx_real "$ENV{CXX}" REALPATH)
+        get_filename_component(_occ_cxx_bin "${_occ_cxx_real}" DIRECTORY)
         get_filename_component(_occ_cxx_root "${_occ_cxx_bin}" DIRECTORY)
         occ_libcxx_root_is_llvm_tree("${_occ_cxx_root}" _occ_cxx_is_tree)
         if(_occ_cxx_is_tree)
@@ -152,7 +158,11 @@ if(NOT DEFINED OCC_LIBCXX_ROOT)
     # priority. A distribution clang sits above a sysroot rather than above a
     # toolchain, and a sysroot is not a libc++ root however complete it looks.
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        get_filename_component(_occ_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        # Same resolution as the $CXX branch above: resolve the compiler
+        # binary itself, not its directory, so a clang reached through a link
+        # still owns the libc++ of the tree it really lives in.
+        get_filename_component(_occ_compiler_real "${CMAKE_CXX_COMPILER}" REALPATH)
+        get_filename_component(_occ_compiler_bin "${_occ_compiler_real}" DIRECTORY)
         get_filename_component(_occ_compiler_root "${_occ_compiler_bin}" DIRECTORY)
 
         occ_libcxx_root_is_llvm_tree("${_occ_compiler_root}" _occ_compiler_is_tree)
