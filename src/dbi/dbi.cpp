@@ -125,7 +125,32 @@ enum : std::uint8_t {
     // Grouped by the arithmetic families, then by the odd members that
     // still take a ModRM.
     if (op <= 0x3F) {
-        return true; // 00-3F: ALU r/m, r and mov r/m, r.
+        // 00-3F is the ALU r/m, r family -- with one exception: the
+        // accumulator-immediate forms 04/05/0C/0D/14/15/1C/1D/24/25/
+        // 2C/2D/34/35/3C/3D (add/or/adc/sbb/and/sub/xor/cmp al|eax,
+        // imm) take no ModRM. The decoder must not consume the immediate
+        // as a ModRM byte; the length is resolved by opcode_imm_size.
+        switch (op) {
+        case 0x04:
+        case 0x05:
+        case 0x0C:
+        case 0x0D:
+        case 0x14:
+        case 0x15:
+        case 0x1C:
+        case 0x1D:
+        case 0x24:
+        case 0x25:
+        case 0x2C:
+        case 0x2D:
+        case 0x34:
+        case 0x35:
+        case 0x3C:
+        case 0x3D:
+            return false;
+        default:
+            return true;
+        }
     }
     switch (op) {
     case 0x62: // bound (the 64-bit form is a trap, but the encoding
@@ -256,6 +281,24 @@ enum : std::uint8_t {
         return 1; // Jcc rel8.
     }
     switch (op) {
+    case 0x04:
+    case 0x0C:
+    case 0x14:
+    case 0x1C:
+    case 0x24:
+    case 0x2C:
+    case 0x34:
+    case 0x3C:
+        return 1; // ALU al, imm8.
+    case 0x05:
+    case 0x0D:
+    case 0x15:
+    case 0x1D:
+    case 0x25:
+    case 0x2D:
+    case 0x35:
+    case 0x3D:
+        return 4; // ALU eax, imm32 (narrows to imm16 under 66).
     case 0x6A: // push imm8.
     case 0x6B: // imul r, r/m, imm8.
     case 0x80:
