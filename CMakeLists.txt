@@ -674,6 +674,7 @@ add_library(occ_core STATIC
     src/devirt/sat.cpp
     src/devirt/bitblast.cpp
     src/devirt/lift.cpp
+    src/dbi/dbi.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)
