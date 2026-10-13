@@ -47,3 +47,6 @@ fuzz/corpus/
 # docs/RUNTIME.md, milestone M5.
 tests/local/
 tools/local/
+
+# Ad-hoc parallel-agent build dirs that escaped the build-* pattern.
+build6/
