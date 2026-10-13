@@ -674,6 +674,17 @@ add_library(occ_core STATIC
     src/devirt/sat.cpp
     src/devirt/bitblast.cpp
     src/devirt/lift.cpp
+    src/deobf/deobf.cpp
+    src/deobf/flatten.cpp
+    src/deobf/mba.cpp
+    src/deobf/opaque.cpp
+    src/packer/identify.cpp
+    src/packer/pe_view.cpp
+    src/packer/pipeline.cpp
+    src/packer/smc.cpp
+    src/concolic/engine.cpp
+    src/concolic/program.cpp
+    src/concolic/taint.cpp
     src/dbi/dbi.cpp
 )
 
