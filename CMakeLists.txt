@@ -696,6 +696,9 @@ add_library(occ_core STATIC
     src/dbi/dbi.cpp
     src/emu/emu.cpp
     src/hostile/hostile.cpp
+    src/behave/behave.cpp
+    src/fuzz/fuzz.cpp
+    src/replay/replay.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)
