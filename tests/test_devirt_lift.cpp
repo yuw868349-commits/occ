@@ -953,6 +953,43 @@ void test_effect_label_names_the_operation() {
           "and it says where the handler went");
 }
 
+// The layout a VM addresses is read out of the handlers' own code, not
+// guessed at: the base of an indexed access and the step it takes. The
+// step is what tells a register file from a byte stream, and it is the
+// only thing that does.
+void test_infer_layout_reads_the_handlers() {
+    // A register machine: slots at `[rbx + rax*4]`, the bytecode at
+    // `[rdi + rcx*1]`. One step is four bytes and one is a byte, and that
+    // difference is the whole of what separates the two.
+    const std::vector<std::uint8_t> body = {
+        0x8B, 0x0C, 0x83,        // mov   ecx, [rbx + rax*4]
+        0x89, 0x0C, 0x83,        // mov   [rbx + rax*4], ecx
+        0x0F, 0xB6, 0x14, 0x0F,  // movzx edx, BYTE PTR [rdi + rcx*1]
+        0xFF, 0xE1,              // jmp   rcx
+    };
+    const lift::HandlerBytes hb{kHandlerVa, body.data(), body.size()};
+    const lift::Layout layout = lift::infer_layout({hb});
+    check(layout.regfile == "rbx",
+          "the wider step names the register file");
+    check(layout.regfile_width == 32, "and says how wide its elements are");
+    check(layout.code == "rdi", "the byte step names the bytecode buffer");
+}
+
+// A stack machine indexes nothing, so it has neither a file nor a buffer.
+// The inference has to leave both empty rather than name the first
+// register it happens to see.
+void test_infer_layout_leaves_a_stack_machine_alone() {
+    const std::vector<std::uint8_t> body = {
+        0x48, 0x8B, 0x45, 0x00,  // mov rax, [rbp+0x0]
+        0x48, 0x03, 0x45, 0x08,  // add rax, [rbp+0x8]
+        0xFF, 0xE1,              // jmp rcx
+    };
+    const lift::HandlerBytes hb{kHandlerVa, body.data(), body.size()};
+    const lift::Layout layout = lift::infer_layout({hb});
+    check(layout.regfile.empty(), "a stack machine has no register file");
+    check(layout.code.empty(), "and no bytecode buffer");
+}
+
 }  // namespace
 
 int main() {
@@ -985,6 +1022,8 @@ int main() {
     run("handler_resolution", test_handler_resolution);
     run("shared_boundary", test_shared_boundary_ends_the_walk);
     run("effect_label", test_effect_label_names_the_operation);
+    run("infer_layout", test_infer_layout_reads_the_handlers);
+    run("infer_layout_stack", test_infer_layout_leaves_a_stack_machine_alone);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

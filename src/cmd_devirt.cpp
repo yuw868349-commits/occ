@@ -719,6 +719,31 @@ int cmd_devirt(int argc, char** argv) {
     std::vector<lift::Handler> lhandlers;
     std::map<std::uint64_t, std::size_t> index_of;
     if (have_img) {
+        // The register file the handlers index, read out of their own code
+        // before anything is lifted. A stack machine reaches its slots by
+        // offset from a base and has none; a register machine reaches them
+        // by an index and names its base here. Setting it first is what
+        // makes the model read in slots instead of in addresses.
+        std::vector<lift::HandlerBytes> handler_bytes;
+        for (const auto& [h, rs] : by_handler) {
+            (void)rs;
+            std::uint64_t window_va = 0;
+            std::size_t avail = 0;
+            const std::uint8_t* p = img.window(h, &window_va, &avail);
+            // The window is the whole section; the scan starts at the
+            // handler, so the view handed over starts there too.
+            if (p == nullptr || h < window_va || h - window_va >= avail) {
+                handler_bytes.push_back(lift::HandlerBytes{h, nullptr, 0});
+            } else {
+                handler_bytes.push_back(lift::HandlerBytes{
+                    h, p + (h - window_va), avail - (h - window_va)});
+            }
+        }
+        const lift::Layout layout = lift::infer_layout(handler_bytes);
+        model.convention.regfile = layout.regfile;
+        model.convention.regfile_width = layout.regfile_width;
+        model.convention.code = layout.code;
+
         for (const auto& [h, rs] : by_handler) {
             (void)rs;
             std::uint64_t window_va = 0;
@@ -915,6 +940,20 @@ int cmd_devirt(int argc, char** argv) {
                 }
                 rep.emit(b);
             }
+            if (!model.convention.regfile.empty() ||
+                !model.convention.code.empty()) {
+                std::string line = "layout read from the handlers:";
+                if (!model.convention.regfile.empty()) {
+                    line += " register file " + model.convention.regfile + " (" +
+                            std::to_string(model.convention.regfile_width) +
+                            "-bit elements, slots read as vst[...])";
+                }
+                if (!model.convention.code.empty()) {
+                    line += "; bytecode " + model.convention.code +
+                            " (read as code[...])";
+                }
+                rep.emit(line);
+            }
             rep.emit("handler lifting: " + std::to_string(lhandlers.size()) +
                      " handlers, " +
                      std::to_string(lhandlers.size() - incomplete) +
@@ -949,9 +988,9 @@ int cmd_devirt(int argc, char** argv) {
                         rep.emit(indent + "vst[" + std::to_string(w.disp) +
                                  "] = " + brief(lift::render(model, w.value)));
                     } else {
-                        rep.emit(indent + "mem" + std::to_string(w.width) +
-                                 "[" + brief(lift::render(model, w.addr)) +
-                                 "] = " + brief(lift::render(model, w.value)));
+                        rep.emit(indent + lift::address_label(model, w.addr,
+                                                             w.width) +
+                                 " = " + brief(lift::render(model, w.value)));
                     }
                 }
                 if (lh.transfer == lift::Handler::Transfer::Dispatch) {

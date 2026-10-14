@@ -106,6 +106,19 @@ struct Convention {
     std::string cursor = "rsi";   // bytecode cursor
     std::string table = "r12";    // handler table base
     std::string engine = "rdi";   // engine stack base
+    // The register file of a VM whose slots are addressed by an index the
+    // bytecode supplies -- `[rsp + rax*4]` -- rather than a constant offset
+    // from a base -- `[rbp+8]`. The two are different machines, and the
+    // code says which: a stack is reached by offset, a register file by
+    // index. Empty when no handler indexes memory by a register, which is
+    // a stack machine's whole code, and what keeps its model exactly as it
+    // was. See infer_regfile.
+    std::string regfile;
+    unsigned regfile_width = 0;   // bits per element
+    // The bytecode buffer the VM indexes into, when it has one. It names
+    // what the machine reads -- a report says `code[i]` -- without
+    // changing the symbolic execution, which the `cursor` role governs.
+    std::string code;
     bool operator==(const Convention&) const = default;
 };
 inline const Convention kDefaultConvention{};
@@ -382,6 +395,53 @@ struct Row {
 // cannot resolve still reports exactly as it did before.
 [[nodiscard]] std::uint64_t resolve_handler(std::uint64_t target,
                                             bool target_is_code);
+
+// One handler's bytes, as the caller mapped them. `va` is where the scan
+// begins -- the handler's entry -- and `bytes` is mapped at `va` itself,
+// not at the containing section's start.
+struct HandlerBytes {
+    std::uint64_t va = 0;
+    const std::uint8_t* bytes = nullptr;
+    std::size_t available = 0;
+};
+
+// The memory layout a VM's handlers address, read out of their own code
+// rather than guessed at: the register file its slots hang off, and the
+// bytecode buffer its operands come from.
+struct Layout {
+    // The base of the accesses whose index is a register and whose
+    // elements are wider than a byte -- a file of elements, not a stream.
+    // Empty when the VM is a stack machine.
+    std::string regfile;
+    unsigned regfile_width = 0;  // bits per element
+    // The base of the accesses whose index is a register and whose
+    // elements are a byte -- the bytecode itself. Empty when no handler
+    // reads a buffer that way.
+    std::string code;
+};
+
+// Reads the register file out of the handlers' own code. A stack machine
+// reaches its slots by a constant offset from a base (`[rbp+8]`); a
+// register machine reaches them by an index a register holds
+// (`[rsp + rax*4]`). The register that appears as the base of such an
+// indexed access is the file's base, and the access's scale says how wide
+// an element is.
+//
+// An access indexed by a byte is not one of these: that walks a stream of
+// bytes -- the bytecode itself, a string -- and its base is a buffer, not
+// a file of elements, so only accesses whose elements are wider than a
+// byte count. A base more than one handler indexes wins; ties go to the
+// width the most accesses agree on. An empty base means no handler
+// indexed an array of elements, which is a stack machine's whole code.
+[[nodiscard]] Layout infer_layout(const std::vector<HandlerBytes>& handlers);
+
+// The report's name for an address a model computed. An access into the
+// convention's register file reads as `vst[index]` -- the index is what
+// the machine itself thinks it is using -- and everything else keeps its
+// address, because naming an address a slot would be a claim the model
+// cannot back.
+[[nodiscard]] std::string address_label(const Model& model, expr::Id addr,
+                                        unsigned width);
 
 struct Conformance {
     std::uint64_t checked = 0;    // predictions evaluated and equal

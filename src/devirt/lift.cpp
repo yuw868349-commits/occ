@@ -1030,13 +1030,10 @@ expr::Id Model::input_load(expr::Id addr, unsigned width) {
     in.kind = Input::Kind::Load;
     in.addr = addr;
     in.width = width;
-    // The name is the address as the report renders it, so a model's
-    // expression reads as "the value at <this address>".
-    std::string text = dag.pretty(addr);
-    if (text.size() > 40) {
-        text = text.substr(0, 37) + "...";
-    }
-    in.name = "mem[" + text + "]";
+    // The name is the address as the report renders it -- or the slot it
+    // is, when the address is the register file indexed. The machine
+    // thinks in slots, so the model reads the way the machine does.
+    in.name = address_label(*this, addr, width);
     in.id = dag.input(in.name, in.width);
     inputs.push_back(in);
     return in.id;
@@ -3186,6 +3183,81 @@ std::uint64_t resolve_handler(std::uint64_t target, bool target_is_code) {
     return (target << 10) | (target >> 54);
 }
 
+Layout infer_layout(const std::vector<HandlerBytes>& handlers) {
+    struct Tally {
+        std::size_t accesses = 0;
+        unsigned width = 0;
+    };
+    std::map<std::string, Tally> files;          // element wider than a byte
+    std::map<std::string, std::size_t> buffers;  // element is a byte
+    for (const HandlerBytes& h : handlers) {
+        if (h.bytes == nullptr || h.available == 0) {
+            continue;
+        }
+        std::uint64_t at = h.va;
+        for (std::size_t i = 0; i < 128 && at - h.va < h.available; ++i) {
+            Insn insn;
+            if (!decode_insn(h.bytes + (at - h.va), h.available - (at - h.va),
+                             at, insn)) {
+                break;
+            }
+            for (const Operand& o : insn.operands) {
+                // An indexed access is what tells either apart from a
+                // stack: the offset is a value the machine holds, not one
+                // the instruction spells.
+                if (o.kind != Operand::Kind::Mem || o.index.empty()) {
+                    continue;
+                }
+                if (o.base.empty() || o.base == "rip") {
+                    continue;
+                }
+                const unsigned element = static_cast<unsigned>(o.scale) * 8u;
+                if (element <= 8) {
+                    // Steps of a byte walk a stream -- the bytecode, a
+                    // string -- so the base is a buffer, not a file.
+                    ++buffers[o.base];
+                    continue;
+                }
+                Tally& t = files[o.base];
+                if (t.width == 0) {
+                    t.width = element;
+                }
+                ++t.accesses;
+            }
+            // The scan follows the handler to where it leaves: a
+            // conditional branch's fall-through is still the handler, and
+            // an unconditional jump, a return or a call is where it ends.
+            if (insn.kind == inspect::InsnKind::Jcc) {
+                at += insn.length;
+                continue;
+            }
+            if (insn.kind == inspect::InsnKind::Jmp ||
+                insn.kind == inspect::InsnKind::Ret ||
+                insn.kind == inspect::InsnKind::Call) {
+                break;
+            }
+            at += insn.length;
+        }
+    }
+    Layout best;
+    std::size_t found = 0;
+    for (const auto& [base, t] : files) {
+        if (t.accesses > found) {
+            found = t.accesses;
+            best.regfile = base;
+            best.regfile_width = t.width;
+        }
+    }
+    found = 0;
+    for (const auto& [base, n] : buffers) {
+        if (n > found) {
+            found = n;
+            best.code = base;
+        }
+    }
+    return best;
+}
+
 Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
                         const std::vector<Row>& rows,
                         const std::vector<std::size_t>& handler_of_row,
@@ -3585,6 +3657,93 @@ std::string effect_label(const Model& model, const Handler& handler) {
         label += t;
     }
     return label.empty() ? std::string("?") : label;
+}
+
+namespace {
+
+// Steps through the resizes a width change wraps an access in: `(32)(...)`
+// is the same value at a different width, and it is the value that indexes
+// the file.
+expr::Id strip_resize(const Model& model, expr::Id id) {
+    while (model.dag.valid(id) && model.dag.node(id).op == expr::Op::Resize) {
+        id = model.dag.node(id).a;
+    }
+    return id;
+}
+
+// The index of an access whose address is `base + index*scale`, when
+// `base` is the register the caller named and the step matches what it
+// walks: one byte for a stream, more for a file of elements. kNoId when
+// the address is not of that form -- and then the model has an address,
+// not a slot, which is a different thing and has to read as one.
+expr::Id indexed_by(const Model& model, expr::Id addr,
+                    const std::string& base, bool bytes) {
+    if (base.empty() || !model.dag.valid(addr)) {
+        return expr::kNoId;
+    }
+    const expr::Node& n = model.dag.node(addr);
+    if (n.op != expr::Op::Add) {
+        return expr::kNoId;
+    }
+    const auto is_base = [&](expr::Id id) {
+        return model.dag.valid(id) &&
+               model.dag.node(id).op == expr::Op::Input &&
+               model.dag.node(id).name == base;
+    };
+    const auto stepped = [&](expr::Id step_side,
+                             expr::Id index_side) -> expr::Id {
+        if (!model.dag.is_const(step_side)) {
+            return expr::kNoId;
+        }
+        const std::uint64_t step = model.dag.const_value(step_side);
+        if ((bytes && step != 1) || (!bytes && step <= 1)) {
+            return expr::kNoId;
+        }
+        return strip_resize(model, index_side);
+    };
+    const auto scaled = [&](expr::Id id) -> expr::Id {
+        if (!model.dag.valid(id)) {
+            return expr::kNoId;
+        }
+        const expr::Node& m = model.dag.node(id);
+        if (m.op == expr::Op::Mul) {
+            // The step is the constant half and the index is the other.
+            const expr::Id a = stepped(m.b, m.a);
+            return a != expr::kNoId ? a : stepped(m.a, m.b);
+        }
+        // A step of one is folded away -- `base + index*1` simplifies to
+        // `base + index` -- so a bare index is how a byte stream's access
+        // arrives here. A file of wider elements never does: its step is
+        // not one, and the multiply survives.
+        return bytes ? strip_resize(model, id) : expr::kNoId;
+    };
+    if (is_base(n.a)) {
+        return scaled(n.b);
+    }
+    if (is_base(n.b)) {
+        return scaled(n.a);
+    }
+    return expr::kNoId;
+}
+
+std::string clipped(const std::string& text) {
+    return text.size() <= 40 ? text : text.substr(0, 37) + "...";
+}
+
+}  // namespace
+
+std::string address_label(const Model& model, expr::Id addr, unsigned width) {
+    expr::Id index = indexed_by(model, addr, model.convention.regfile, false);
+    if (index != expr::kNoId) {
+        return "vst[" + clipped(model.dag.pretty(index)) + "]";
+    }
+    index = indexed_by(model, addr, model.convention.code, true);
+    if (index != expr::kNoId) {
+        return "code[" + clipped(model.dag.pretty(index)) + "]";
+    }
+    char b[16];
+    std::snprintf(b, sizeof(b), "mem%u[", width);
+    return std::string(b) + clipped(model.dag.pretty(addr)) + "]";
 }
 
 }  // namespace occ::devirt::lift
