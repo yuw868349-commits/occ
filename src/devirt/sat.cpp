@@ -1,10 +1,14 @@
 // The CDCL SAT solver: heap, watched propagation, 1UIP analysis,
 // recursive minimization, Luby restarts, LBD-driven reduction, DRUP
-// proofs.
+// proofs. Search budgets: see the header -- a conflict cap and a
+// wall-clock cap installed by `set_limits`, both checked from inside the
+// main search loop, both returning `Interrupted` (an undecided answer,
+// never a verdict).
 
 #include "occ/devirt/sat.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 namespace occ::devirt::sat {
@@ -24,6 +28,15 @@ constexpr double kClauseMax = 1e20;
 // cannot overflow.
 constexpr std::uint64_t kVarRescale = std::uint64_t{1} << 50;
 constexpr unsigned kVarRescaleShift = 30;
+
+// The time cap is checked once every this many conflicts. 256 is a
+// rounding error against the work one conflict costs on the formulas
+// this project generates, and it keeps the steady-clock read off the
+// hot path. The cap is still honored promptly: a check also runs on
+// every iteration while no conflict has happened yet, which is exactly
+// the phase -- a long satisfiable-looking decision walk -- where a
+// pure "every 256 conflicts" cadence would stop checking.
+constexpr std::uint64_t kBudgetCheckMask = 255;
 
 }  // namespace
 
@@ -659,6 +672,12 @@ void Solver::proof_empty() {
 
 // ----------------------------------------------------------------- solve
 
+void Solver::set_limits(std::uint64_t max_conflicts,
+                        double max_seconds) noexcept {
+    budget_conflicts_ = max_conflicts;
+    budget_seconds_ = max_seconds;
+}
+
 Solver::Status Solver::solve(std::span<const Lit> assumptions) {
     failed_.clear();
     if (!ok_) {
@@ -672,14 +691,39 @@ Solver::Status Solver::solve(std::span<const Lit> assumptions) {
     // is present exactly once.
     order_heap_.rebuild(activity_);
 
+    // Arm the wall-clock deadline. A zero time budget means "unlimited"
+    // and arms nothing; the deadline is recomputed per solve so a
+    // long-lived solver does not accumulate the clock between calls.
+    budget_timed_ = budget_seconds_ > 0.0;
+    if (budget_timed_) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(budget_seconds_));
+        budget_deadline_ = std::chrono::steady_clock::now() + ns;
+    }
+
     std::uint64_t restart_at =
         conflicts_ + static_cast<std::uint64_t>(restart_base_) *
                          luby(restart_index_);
 
     for (;;) {
+        // Time cap. Checked every 256 conflicts -- and on every
+        // iteration before the first conflict, which is the phase that
+        // would otherwise dodge a "every N conflicts" cadence entirely.
+        if (budget_timed_ && (conflicts_ & kBudgetCheckMask) == 0 &&
+            std::chrono::steady_clock::now() >= budget_deadline_) {
+            return Status::Interrupted;
+        }
         const std::uint32_t confl = propagate();
         if (confl != 0) {
             conflicts_++;
+            // Conflict cap: the search is cut the moment the cap is
+            // reached. Interrupted is not a verdict -- in particular it
+            // is not the Unsat that a level-0 conflict would have proven
+            // one step later. A caller with a budget prefers an honest
+            // "undecided" over a proof it did not pay for.
+            if (budget_conflicts_ != 0 && conflicts_ >= budget_conflicts_) {
+                return Status::Interrupted;
+            }
             if (decision_level_ == 0) {
                 ok_ = false;
                 proof_empty();

@@ -682,6 +682,10 @@ add_library(occ_core STATIC
     src/devirt/sat.cpp
     src/devirt/bitblast.cpp
     src/devirt/lift.cpp
+    src/devirt/adapt.cpp
+    src/devirt/cert.cpp
+    src/devirt/codegen.cpp
+    src/devirt/semlib.cpp
     src/deobf/deobf.cpp
     src/deobf/flatten.cpp
     src/deobf/mba.cpp

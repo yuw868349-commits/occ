@@ -45,9 +45,23 @@
 // Variables are 0-based at the API; literals are `2 * var + sign` with
 // sign 1 meaning negated. Internal literals are the same encoding, so
 // watch lists and the heap index off them directly.
+//
+// Search budgets. A caller that only wants an answer when the search is
+// cheap -- an interactive reconstruction step, a pipeline pass with a
+// deadline of its own -- can cap the search before calling `solve`:
+// `set_limits(max_conflicts, max_seconds)` installs a conflict cap and a
+// wall-clock cap. A search that reaches either cap stops cleanly and
+// reports `Status::Interrupted`, which is *not* an answer: the caller
+// must treat it as "the question was not decided", never as Sat or
+// Unsat. Both caps are off by default (0 / 0.0), and a solver that has
+// never been given limits behaves exactly as it did before this
+// mechanism existed. The time cap is checked against a steady clock
+// every 256 conflicts, which amortizes the clock read without letting
+// the search run arbitrarily long past the deadline.
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -98,7 +112,16 @@ private:
 
 class Solver {
 public:
-    enum class Status : std::uint8_t { Sat, Unsat };
+    enum class Status : std::uint8_t {
+        Sat,
+        Unsat,
+        // The search stopped because a budget cap was reached. This is
+        // not a verdict: neither Sat nor Unsat is claimed, and the
+        // assignment in progress carries no information. Callers that
+        // cannot live with an undecided answer must compare against Sat
+        // and Unsat explicitly and treat Interrupted as "unproven".
+        Interrupted,
+    };
 
     Solver();
 
@@ -118,8 +141,17 @@ public:
 
     // Solves under the assumptions (may be empty). Learned clauses are
     // retained between calls. On Unsat with non-empty assumptions, the
-    // contradictory subset is recorded.
+    // contradictory subset is recorded. A solve can also return
+    // Interrupted when the installed budget ran out; see set_limits.
     Status solve(std::span<const Lit> assumptions = {});
+
+    // Installs a search budget. A conflict cap of 0 and a time cap of
+    // 0.0 mean "unlimited", which is the default; setting a cap only
+    // ever turns answers into Interrupted, it never changes a Sat or
+    // Unsat verdict that the search reaches before the cap. The time cap
+    // is wall-clock and checked against a steady clock (monotonic, not
+    // affected by NTP steps).
+    void set_limits(std::uint64_t max_conflicts, double max_seconds) noexcept;
 
     // The model's value for a variable; only meaningful after Sat.
     [[nodiscard]] bool value(Var v) const noexcept {
@@ -305,6 +337,13 @@ private:
     // Clause deletion skips the first several restarts (MiniSat keeps all
     // learned clauses early, when every one of them is still teaching).
     std::uint32_t reduce_skip_ = 3;
+
+    // The installed search budget. Zero means unlimited; the time cap is
+    // re-armed at the top of every `solve`.
+    std::uint64_t budget_conflicts_ = 0;
+    double budget_seconds_ = 0.0;
+    bool budget_timed_ = false;
+    std::chrono::steady_clock::time_point budget_deadline_{};
 
     std::vector<Var> failed_;
     std::vector<std::string>* proof_ = nullptr;

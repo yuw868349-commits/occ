@@ -18,10 +18,19 @@
 // time, and it is expressed over `expr::DAG` because that is the IR the
 // equivalence layers consume:
 //
-//   st[+d]    the virtual stack slot at rbp+d
-//   code[+d]  the bytecode byte(s) at rsi+d -- the instruction operand a
-//             handler fetches and (in this engine) decrypts
+//   st[+d]    the virtual stack slot at stack+d
+//   code[+d]  the bytecode byte(s) at cursor+d -- the instruction operand
+//             a handler fetches and (in this engine) decrypts
 //   reg:name  a host register the engine's own prologue left behind
+//
+// which two registers play "stack" and "cursor" is the engine's choice,
+// recorded in `Convention`. The default -- rbp for the virtual stack,
+// rsi for the bytecode cursor, r12 for the handler table, rdi for the
+// engine's own stack base -- is the convention this engine's trace
+// records. Setting `Model::convention` to another assignment makes the
+// same abstract interpreter classify `[stack+d]` accesses as slots and
+// `[cursor+d]` accesses as bytecode, and makes the conformance check bind
+// the two roles to the Row fields those register names sample.
 //
 // A handler that does `mov rax, [rbp+0x8]; add [rbp+0x0], rax; add rbp,
 // 8; jmp rcx` summarizes to "slot 0 += slot 1; rbp += 8", which is what
@@ -37,11 +46,15 @@
 // a handler pushes a word as readily as a qword -- so the tracer reads
 // the *aligned* cells containing it and the checker composes the
 // comparison out of bytes, over a shadow of the stack the trace's own
-// observations keep grounded. A prediction whose inputs are all known is
+// observations keep grounded. When the convention moves the stack role to
+// another register, the trace's st0/st1/st2 cells are the aligned cells
+// around *that* register's value, and the checker reads them from the Row
+// field that register names. A prediction whose inputs are all known is
 // evaluated in the DAG and compared; a mismatch is a model error and is
 // reported as one, per dispatch, with both numbers. Predictions that
 // depend on a value the trace does not carry -- an unknown of the model's
-// own, a load from an address the trace never observed -- are counted as
+// own, a load from an address the trace never observed, a register the
+// convention names but the trace does not sample -- are counted as
 // unverifiable rather than silently counted as correct; the conformance
 // report says which is which.
 //
@@ -70,6 +83,32 @@
 #include "occ/inspect/disasm.h"
 
 namespace occ::devirt::lift {
+
+// The register assignment the virtual machine was built on. The handler
+// model hangs off the registers these roles name:
+//
+//   stack   the virtual stack pointer -- `[stack+d]` accesses are slots
+//   cursor  the bytecode cursor       -- `[cursor+d]` accesses are code
+//   table   the handler-table base    -- what the dispatcher's tail indexes
+//   engine  the engine's stack base
+//
+// The trace samples five physical registers by name (rsi/rbp/rdi/rsp/r12);
+// a convention whose stack or cursor names one of them is bindable from a
+// Row, and a convention that names anything else simply cannot be bound --
+// the conformance check counts the predictions that lean on it as
+// unverifiable rather than assuming a value. The default is the
+// convention this engine's own trace records. st0/st1/st2 in a Row are
+// the aligned cells *around the stack pointer*, so under a permuted
+// convention a trace must be constructed with its cells around the
+// permuted stack register.
+struct Convention {
+    std::string stack = "rbp";    // virtual stack pointer
+    std::string cursor = "rsi";   // bytecode cursor
+    std::string table = "r12";    // handler table base
+    std::string engine = "rdi";   // engine stack base
+    bool operator==(const Convention&) const = default;
+};
+inline const Convention kDefaultConvention{};
 
 // One decoded instruction with its operands in structured form. The
 // mnemonic and the operand kinds come from the inspector's decoder; the
@@ -163,6 +202,15 @@ struct Model {
     expr::DAG dag;
     std::vector<Input> inputs;  // in ordinal order: inputs[i] is ordinal i
 
+    // The register assignment this model was lifted under. `summarize`
+    // classifies `[stack+d]` as slot accesses and `[cursor+d]` as
+    // bytecode, and names the entry stack/cursor inputs after the
+    // convention's registers; `check_trace` binds those roles to the Row
+    // fields the registers sample. Defaults to the engine's own
+    // convention, so a default-constructed model behaves exactly as it
+    // always has.
+    Convention convention = kDefaultConvention;
+
     [[nodiscard]] expr::Id input_slot(std::int64_t disp);
     [[nodiscard]] expr::Id input_code(std::int64_t disp, unsigned width);
     [[nodiscard]] expr::Id input_image(std::uint64_t va, unsigned width);
@@ -214,7 +262,7 @@ struct Handler {
     // checker needs to tell the two apart.
     struct Write {
         bool to_slot = true;
-        std::int64_t disp = 0;        // to_slot: from the entry rbp
+        std::int64_t disp = 0;        // to_slot: from the entry stack pointer
         expr::Id addr = expr::kNoId;  // !to_slot: the computed address
         expr::Id value = expr::kNoId;
         unsigned width = 64;
@@ -260,6 +308,10 @@ struct Handler {
 //
 // `max_instructions` covers the handler and every arm a branch forks
 // into: a diamond costs what it costs.
+//
+// The model's `convention` member selects which registers play the
+// stack and cursor roles; the default convention reproduces the
+// engine's own behavior.
 [[nodiscard]] Handler summarize(Model& model, const std::uint8_t* bytes,
                                 std::size_t available, std::uint64_t window_va,
                                 std::uint64_t va,
@@ -267,11 +319,19 @@ struct Handler {
 
 // ------------------------------------------------------------ conformance
 
-// One dispatch's worth of ground truth, as the tracer recorded it.
+// One dispatch's worth of ground truth, as the tracer recorded it. The
+// five sampled registers are named after the default convention's roles;
+// under a permuted `Convention` the stack and cursor roles read the Row
+// fields those registers name instead. st0/st1/st2 are the three cells
+// the tracer read around the *stack pointer* -- under the default
+// convention the aligned cells containing rbp; under a permuted one, the
+// aligned cells containing whatever register the convention names as
+// stack -- so a permuted trace must place its cells around the permuted
+// stack register.
 struct Row {
     std::uint64_t seq = 0;
-    std::uint64_t rsi = 0;   // bytecode cursor
-    std::uint64_t rbp = 0;   // virtual stack pointer
+    std::uint64_t rsi = 0;   // bytecode cursor (default convention)
+    std::uint64_t rbp = 0;   // virtual stack pointer (default convention)
     std::uint64_t rdi = 0;   // the engine's stack base pointer
     std::uint64_t rsp = 0;
     // The engine's handler-table base. It is what the dispatcher's own
@@ -281,7 +341,7 @@ struct Row {
     // The three cells the tracer read around the stack pointer. The
     // virtual stack pointer is not kept eight-aligned (a handler pushes
     // a word or a dword as readily as a qword), so the tracer reads the
-    // cells at `rbp & ~7` -- the aligned cells *containing* the pointer,
+    // cells at `stack & ~7` -- the aligned cells *containing* the pointer,
     // not the pointer itself. The checker composes its comparison out of
     // bytes for exactly that reason.
     std::uint64_t st0 = 0;
@@ -320,7 +380,10 @@ struct Conformance {
 // Checks a model against a trace. A row records the virtual state at one
 // dispatch, so the handler that row names runs from that row's state and
 // produces the next row's state -- the check is between adjacent rows,
-// with the earlier row's values bound to the model's inputs.
+// with the earlier row's values bound to the model's inputs. The model's
+// `convention` member selects which Row field supplies the stack and
+// cursor roles; under the default convention the behavior is exactly the
+// engine's original one.
 //
 // The virtual stack is compared byte by byte rather than slot by slot.
 // The trace's cells are the aligned ones containing the stack pointer and

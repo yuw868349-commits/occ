@@ -136,9 +136,26 @@ enum class Method : std::uint8_t {
     Ring,
 };
 
+// The budget for a SAT-backed question. Zero means unlimited. A question
+// that exhausts its budget is not answered -- it is reported unproven,
+// which is a different claim from "different". The word-level layer runs
+// first regardless (it is cheap and exact within its fragment), so the
+// budget caps the circuit phase; the fallback order is ring, then CDCL,
+// then an honest "unproven".
+struct Budget {
+    std::uint64_t max_conflicts = 0;  // CDCL conflicts before giving up; 0 = unlimited
+    double max_seconds = 0.0;         // wall-clock before giving up; 0 = unlimited
+};
+
 // The outcome of an equivalence question.
 struct Equivalence {
     bool equal = false;
+    // True when the question was not answered: the budget ran out before
+    // either layer could decide. `equal` is then false but carries no
+    // information, and no counterexample exists either. A caller must
+    // distinguish "proved different" from "not proved", or it will
+    // misreport a timeout as a bug in the rebuilt code.
+    bool unproven = false;
     // When not equal: one assignment to the inputs that distinguishes the
     // two expressions, indexed by input ordinal.
     std::vector<std::uint64_t> counterexample;
@@ -171,7 +188,8 @@ struct Equivalence {
 [[nodiscard]] Equivalence prove_equivalent(expr::DAG& dag, expr::Id a,
                                            expr::Id b,
                                            bool want_proof = false,
-                                           bool force_sat = false);
+                                           bool force_sat = false,
+                                           const Budget& budget = {});
 
 // Proves `a == b` on every input satisfying every constraint (each a
 // 1-bit expression asserted true). A word-level answer applies here too:
@@ -180,11 +198,15 @@ struct Equivalence {
 [[nodiscard]] Equivalence prove_equivalent_under(
     expr::DAG& dag, expr::Id a, expr::Id b,
     const std::vector<expr::Id>& constraints, bool want_proof = false,
-    bool force_sat = false);
+    bool force_sat = false, const Budget& budget = {});
 
 // A satisfying assignment of the constraints.
 struct Model {
     bool sat = false;
+    // True when the budget ran out before an answer: `sat` is then false
+    // but carries no information, and `inputs` is empty. The concolic
+    // driver must not treat an unproven model as an unsatisfiable one.
+    bool unproven = false;
     std::vector<std::uint64_t> inputs;
     std::uint64_t conflicts = 0;
 };
@@ -192,6 +214,7 @@ struct Model {
 // Finds an input satisfying every constraint. The concolic driver uses
 // this to build an input that reaches a chosen virtual branch.
 [[nodiscard]] Model solve_constraints(expr::DAG& dag,
-                                      const std::vector<expr::Id>& constraints);
+                                      const std::vector<expr::Id>& constraints,
+                                      const Budget& budget = {});
 
 }  // namespace occ::devirt::bb

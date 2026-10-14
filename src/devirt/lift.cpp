@@ -1416,9 +1416,13 @@ struct Machine {
         }
         const Value v = mk_value(m->dag, m->input_reg(name));
         regs[name] = v;
-        if (name == "rbp") {
+        // The two pointers the virtual state hangs off are the registers
+        // the model's convention assigns to the stack and the cursor.
+        // Reading either one for the first time names it as the entry
+        // value the slot and code displacements are relative to.
+        if (name == m->convention.stack) {
             entry_rbp = id_of(v);
-        } else if (name == "rsi") {
+        } else if (name == m->convention.cursor) {
             entry_rsi = id_of(v);
         }
         return v;
@@ -1672,7 +1676,7 @@ struct Machine {
     // place. False when rbp has been moved in a way this layer cannot
     // follow.
     [[nodiscard]] bool rbp_slot_disp(std::int64_t disp, std::int64_t* out) {
-        const Value cur = reg_read("rbp");
+        const Value cur = reg_read(m->convention.stack);
         const expr::Id cid = id_of(cur);
         if (entry_rbp != expr::kNoId && cid == entry_rbp) {
             *out = disp;
@@ -1696,7 +1700,7 @@ struct Machine {
     }
 
     [[nodiscard]] bool rsi_cursor_disp(std::int64_t disp, std::int64_t* out) {
-        const Value cur = reg_read("rsi");
+        const Value cur = reg_read(m->convention.cursor);
         const expr::Id cid = id_of(cur);
         if (entry_rsi != expr::kNoId && cid == entry_rsi) {
             *out = disp;
@@ -1884,8 +1888,8 @@ struct Runner {
             mc.reg_write(o.reg, mc.unknown_value(o.reg));
             return;
         }
-        if (o.kind == Operand::Kind::Mem && o.base == "rbp" &&
-            o.index.empty()) {
+        if (o.kind == Operand::Kind::Mem &&
+            o.base == mc.m->convention.stack && o.index.empty()) {
             std::int64_t slot = 0;
             if (mc.rbp_slot_disp(o.disp, &slot)) {
                 for (unsigned i = 0; i < width / 8; ++i) {
@@ -1928,7 +1932,7 @@ struct Runner {
                 r.v = mc.image_read(static_cast<std::uint64_t>(o.disp), width);
                 return r;
             }
-            if (o.base == "rbp" && o.index.empty()) {
+            if (o.base == mc.m->convention.stack && o.index.empty()) {
                 std::int64_t slot = 0;
                 if (mc.rbp_slot_disp(o.disp, &slot)) {
                     r.ok = true;
@@ -1942,7 +1946,7 @@ struct Runner {
                 // it falls through to the general form below rather than
                 // giving up on the byte.
             }
-            if (o.base == "rsi" && o.index.empty()) {
+            if (o.base == mc.m->convention.cursor && o.index.empty()) {
                 std::int64_t off = 0;
                 if (mc.rsi_cursor_disp(o.disp, &off)) {
                     r.ok = true;
@@ -2034,7 +2038,7 @@ struct Runner {
             return;
         }
         case Operand::Kind::Mem: {
-            if (o.base == "rbp" && o.index.empty()) {
+            if (o.base == mc.m->convention.stack && o.index.empty()) {
                 std::int64_t slot = 0;
                 if (mc.rbp_slot_disp(o.disp, &slot)) {
                     mc.mem_write(slot, width, v);
@@ -2117,10 +2121,10 @@ struct Runner {
         // now, so the displacements below are comparable across the two.
         const auto name_entry = [](Machine& m) {
             if (m.entry_rbp == expr::kNoId) {
-                m.entry_rbp = m.m->input_reg("rbp");
+                m.entry_rbp = m.m->input_reg(m.m->convention.stack);
             }
             if (m.entry_rsi == expr::kNoId) {
-                m.entry_rsi = m.m->input_reg("rsi");
+                m.entry_rsi = m.m->input_reg(m.m->convention.cursor);
             }
         };
         name_entry(mc);
@@ -2447,7 +2451,13 @@ struct Runner {
                 // and stores at addresses it can still write down.
                 mc.reg_write("rsp", mc.unknown_value("rsp"));
                 mc.reg_write("rbp", mc.unknown_value("rbp"));
-                mc.note("leave: the virtual stack pointer is gone");
+                const bool stack_gone =
+                    mc.m->convention.stack == "rbp" ||
+                    mc.m->convention.stack == "rsp";
+                mc.note(stack_gone
+                             ? "leave: the virtual stack pointer is gone"
+                             : "leave: the host frame is gone, the virtual "
+                               "stack pointer survives");
                 mc.taint_memory();
                 break;
             }
@@ -2976,8 +2986,8 @@ Handler summarize(Model& model, const std::uint8_t* bytes,
     // rbp and rsi as expressions: reading them here gives their entry
     // input when the handler never touched them, which is the honest
     // statement that the pointer is unchanged.
-    h.rbp_new = run.mc.id_of(run.mc.reg_read("rbp"));
-    h.rsi_new = run.mc.id_of(run.mc.reg_read("rsi"));
+    h.rbp_new = run.mc.id_of(run.mc.reg_read(model.convention.stack));
+    h.rsi_new = run.mc.id_of(run.mc.reg_read(model.convention.cursor));
     // The handler's writes to the virtual stack, one entry per eight-byte
     // cell it touched: the cell's final value, composed out of the bytes
     // the handler left there and the entry bytes it did not touch. The
@@ -3088,12 +3098,56 @@ struct Shadow {
 
     // The three cells the tracer read at a dispatch: the aligned cells
     // containing the pointer, not the pointer's own byte range.
-    void adopt(const Row& r) {
-        const std::uint64_t base = r.rbp & ~std::uint64_t{7};
+    // The three cells the tracer read at a dispatch: the aligned cells
+    // containing the pointer, not the pointer's own byte range. `stack`
+    // is the value the convention's stack register held at this row --
+    // the register the trace's own cells were read around.
+    void adopt(const Row& r, std::uint64_t stack) {
+        const std::uint64_t base = stack & ~std::uint64_t{7};
         const std::uint64_t cells[3] = {r.st0, r.st1, r.st2};
         for (int k = 0; k < 3; ++k) {
             write(base + 8 * static_cast<std::uint64_t>(k), cells[k]);
         }
+    }
+};
+
+// Which Row field carries the value of a convention register. The trace
+// samples five physical registers by name (rsi/rbp/rdi/rsp/r12); a
+// convention whose stack or cursor names one of them reads that field.
+// A convention that names anything else has no field at all -- the
+// register was not sampled -- and the role is reported unbound rather
+// than guessed.
+struct TraceField {
+    const Convention& conv;
+    [[nodiscard]] bool stack(const Row& r, std::uint64_t* out) const {
+        return pick(r, conv.stack, out);
+    }
+    [[nodiscard]] bool cursor(const Row& r, std::uint64_t* out) const {
+        return pick(r, conv.cursor, out);
+    }
+    static bool pick(const Row& r, const std::string& name,
+                     std::uint64_t* out) {
+        if (name == "rbp") {
+            *out = r.rbp;
+            return true;
+        }
+        if (name == "rsi") {
+            *out = r.rsi;
+            return true;
+        }
+        if (name == "rdi") {
+            *out = r.rdi;
+            return true;
+        }
+        if (name == "rsp") {
+            *out = r.rsp;
+            return true;
+        }
+        if (name == "r12") {
+            *out = r.r12;
+            return true;
+        }
+        return false;
     }
 };
 
@@ -3106,8 +3160,12 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
     Conformance out;
     std::map<std::uint64_t, std::uint64_t> failures_by_handler;
     Shadow shadow;
+    const TraceField tf{model.convention};
     if (!rows.empty()) {
-        shadow.adopt(rows[0]);
+        std::uint64_t stack = 0;
+        if (tf.stack(rows[0], &stack)) {
+            shadow.adopt(rows[0], stack);
+        }
     }
     for (std::size_t i = 0; i + 1 < rows.size(); ++i) {
         if (i >= handler_of_row.size()) {
@@ -3211,10 +3269,16 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
             case Model::Input::Kind::Slot: {
                 // A slot read is the memory the handler was entered
                 // with: whatever the shadow knows before this handler's
-                // own writes are applied.
+                // own writes are applied. The base is the Row field the
+                // convention's stack register samples; a convention that
+                // names an unsampled register leaves the slot unbound.
+                std::uint64_t base = 0;
+                if (!tf.stack(prev, &base)) {
+                    break;
+                }
                 std::uint64_t v = 0;
                 const std::uint64_t addr =
-                    prev.rbp + static_cast<std::uint64_t>(in.disp);
+                    base + static_cast<std::uint64_t>(in.disp);
                 if (shadow.read(addr, &v)) {
                     b.bind(ord, v);
                 }
@@ -3224,9 +3288,13 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
                 if (code_bytes == nullptr) {
                     break;
                 }
+                std::uint64_t base = 0;
+                if (!tf.cursor(prev, &base)) {
+                    break;
+                }
                 std::uint64_t v = 0;
                 const std::uint64_t addr =
-                    prev.rsi + static_cast<std::uint64_t>(in.disp);
+                    base + static_cast<std::uint64_t>(in.disp);
                 if (code_bytes(code_ctx, addr, in.width, &v)) {
                     b.bind(ord, v);
                 }
@@ -3306,14 +3374,24 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
             ++out.unmodeled;
         }
         {
+            // The pointers are compared against the next row's value of
+            // the register the convention assigns to each role, not
+            // against fixed Row fields: under a permuted convention the
+            // stack pointer lives in whatever field the stack register
+            // samples, and a convention that names an unsampled register
+            // makes the prediction unverifiable rather than wrong.
             std::uint64_t v = 0;
             const bool known = eval(h.rbp_new, &v);
-            record("rbp", known, v, cur.rbp);
+            std::uint64_t want = 0;
+            const bool want_known = tf.stack(cur, &want);
+            record("rbp", known && want_known, v, want);
         }
         {
             std::uint64_t v = 0;
             const bool known = eval(h.rsi_new, &v);
-            record("rsi", known, v, cur.rsi);
+            std::uint64_t want = 0;
+            const bool want_known = tf.cursor(cur, &want);
+            record("rsi", known && want_known, v, want);
         }
         // Where the handler goes next. The trace's next row says which
         // handler ran next, and the model's jump target should name the
@@ -3336,7 +3414,10 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
             std::uint64_t addr = 0;
             bool placed = true;
             if (wr.to_slot) {
-                addr = prev.rbp + static_cast<std::uint64_t>(wr.disp);
+                placed = tf.stack(prev, &addr);
+                if (placed) {
+                    addr += static_cast<std::uint64_t>(wr.disp);
+                }
             } else {
                 placed = eval(wr.addr, &addr);
             }
@@ -3355,19 +3436,29 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
 
         // The cells the tracer observed at the next dispatch, against
         // the shadow the model left behind -- then adopted from the
-        // trace, so the comparison stays grounded on ground truth.
-        const std::uint64_t base = cur.rbp & ~std::uint64_t{7};
+        // trace, so the comparison stays grounded on ground truth. The
+        // base and the displacement are read from the Row fields the
+        // convention's stack register samples.
+        std::uint64_t cur_stack = 0;
+        std::uint64_t prev_stack = 0;
+        const bool cur_ok = tf.stack(cur, &cur_stack);
+        const bool prev_ok = tf.stack(prev, &prev_stack);
+        const std::uint64_t base =
+            cur_ok ? (cur_stack & ~std::uint64_t{7}) : 0;
         const std::uint64_t observed[3] = {cur.st0, cur.st1, cur.st2};
         for (int k = 0; k < 3; ++k) {
             const std::uint64_t addr = base + 8 * static_cast<std::uint64_t>(k);
             const std::int64_t disp =
-                static_cast<std::int64_t>(addr) -
-                static_cast<std::int64_t>(prev.rbp);
+                prev_ok ? static_cast<std::int64_t>(addr) -
+                              static_cast<std::int64_t>(prev_stack)
+                        : 0;
             std::uint64_t got = 0;
             const bool known = shadow.read(addr, &got);
             record("vst[" + std::to_string(disp) + "]", known, got, observed[k]);
         }
-        shadow.adopt(cur);
+        if (cur_ok) {
+            shadow.adopt(cur, cur_stack);
+        }
     }
     out.worst_handlers.reserve(failures_by_handler.size());
     for (const auto& [va, count] : failures_by_handler) {

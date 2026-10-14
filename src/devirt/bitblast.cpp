@@ -1,4 +1,16 @@
 // The bit-blaster: expression DAG to CNF, miter equivalence.
+//
+// The budget wiring lives at the bottom of this file, in the three
+// entry points. `bb::Budget` caps the circuit phase only: the word-level
+// layer runs first and unconditionally (it is cheap and exact within its
+// fragment), and only the CDCL search that follows is told the caps.
+// A search that exhausts either cap comes back `Interrupted` from the
+// solver, and each entry point maps that to its own "unproven" flag --
+// `Equivalence::unproven` / `Model::unproven` -- with `equal`/`sat`
+// false and no counterexample, no proof, no formula. The caller must
+// read that flag, because an unproven answer is not the same claim as a
+// refutation: it says "the budget ran out", nothing about the truth of
+// the question.
 
 #include "occ/devirt/bitblast.h"
 
@@ -620,13 +632,16 @@ std::vector<sat::Lit> Encoder::build(expr::Id e) {
 // ----------------------------------------------------------------- miter
 
 Equivalence prove_equivalent(expr::DAG& dag, expr::Id a, expr::Id b,
-                             bool want_proof, bool force_sat) {
-    return prove_equivalent_under(dag, a, b, {}, want_proof, force_sat);
+                             bool want_proof, bool force_sat,
+                             const Budget& budget) {
+    return prove_equivalent_under(dag, a, b, {}, want_proof, force_sat,
+                                  budget);
 }
 
 Equivalence prove_equivalent_under(expr::DAG& dag, expr::Id a, expr::Id b,
                                    const std::vector<expr::Id>& constraints,
-                                   bool want_proof, bool force_sat) {
+                                   bool want_proof, bool force_sat,
+                                   const Budget& budget) {
     Equivalence out;
     // The word-level layer goes first. A polynomial identity is decided
     // by normalizing both sides -- no circuit, no search -- while the
@@ -634,6 +649,7 @@ Equivalence prove_equivalent_under(expr::DAG& dag, expr::Id a, expr::Id b,
     // which is the instance CDCL is worst at and which climbs steeply
     // with width. The answer here is unconditional, so the constraints
     // do not weaken it: equal over the ring means equal under them too.
+    // The budget does not reach this layer: it caps the CDCL phase only.
     if (!force_sat) {
         const ring::Verdict verdict =
             ring::prove_equal(dag, a, b, want_proof ? &out.witness : nullptr);
@@ -644,6 +660,10 @@ Equivalence prove_equivalent_under(expr::DAG& dag, expr::Id a, expr::Id b,
         }
     }
     sat::Solver solver;
+    // Install the budget before a single clause is encoded, so the cap
+    // covers the whole circuit phase. A default Budget leaves the solver
+    // unlimited, exactly the pre-budget behavior.
+    solver.set_limits(budget.max_conflicts, budget.max_seconds);
     Encoder enc(dag, solver);
     if (want_proof) {
         solver.enable_proof(&out.proof);
@@ -692,6 +712,19 @@ Equivalence prove_equivalent_under(expr::DAG& dag, expr::Id a, expr::Id b,
     const sat::Solver::Status st = solver.solve();
     out.conflicts = solver.conflicts();
     out.propagations = solver.propagations();
+    if (st == sat::Solver::Status::Interrupted) {
+        // The budget ran out. This is *not* "not equal": no assignment
+        // distinguishes the two sides, no proof refutes the miter, and
+        // the flag says so. `equal` stays false and carries no
+        // information; the counterexample, proof and formula are empty
+        // by construction -- nothing was read from the interrupted
+        // assignment.
+        out.unproven = true;
+        out.counterexample.clear();
+        out.proof.clear();
+        out.formula.clear();
+        return out;
+    }
     if (st == sat::Solver::Status::Unsat) {
         out.equal = true;
         out.counterexample.clear();
@@ -705,9 +738,11 @@ Equivalence prove_equivalent_under(expr::DAG& dag, expr::Id a, expr::Id b,
 }
 
 Model solve_constraints(expr::DAG& dag,
-                        const std::vector<expr::Id>& constraints) {
+                        const std::vector<expr::Id>& constraints,
+                        const Budget& budget) {
     Model out;
     sat::Solver solver;
+    solver.set_limits(budget.max_conflicts, budget.max_seconds);
     Encoder enc(dag, solver);
     for (const expr::Id c : constraints) {
         const std::vector<sat::Lit> cb = enc.bits(c);
@@ -718,6 +753,15 @@ Model solve_constraints(expr::DAG& dag,
     }
     const sat::Solver::Status st = solver.solve();
     out.conflicts = solver.conflicts();
+    if (st == sat::Solver::Status::Interrupted) {
+        // Same rule as the miter: an interrupted model is not an
+        // unsatisfiable one. `sat` stays false and carries no
+        // information; the concolic driver must not treat this as "no
+        // input reaches the branch".
+        out.unproven = true;
+        out.inputs.clear();
+        return out;
+    }
     if (st == sat::Solver::Status::Sat) {
         out.sat = true;
         out.inputs = enc.read_inputs();
