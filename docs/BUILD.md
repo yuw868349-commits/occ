@@ -1,306 +1,179 @@
-# Build
+# BUILD
 
-## Toolchain
+Requirements, options, and what each one costs. Everything here comes from `CMakeLists.txt` and the source, not from any earlier revision of this document.
 
-Occ requires C++23.
+---
 
-The compiler and the standard library are chosen separately, and the pair has
-to be one that works. A compiler that is new enough for the language is not
-automatically able to use a libc++ that happens to be installed, and the two
-failures look nothing alike.
+## Contents
 
-### Verified combinations
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Options](#options)
+- [Sanitizers](#sanitizers)
+- [Fuzzing](#fuzzing)
+- [Static linking](#static-linking)
+- [Warnings](#warnings)
+- [Build targets](#build-targets)
+- [Tests](#tests)
+- [Cross-compilation notes](#cross-compilation-notes)
+- [Troubleshooting](#troubleshooting)
 
-Every row below was built from a clean configure with warnings as errors on,
-and the full test suite run. "Clean" means zero errors and zero warnings.
+---
 
-| Compiler | Standard library | Result |
+## Requirements
+
+- A C++23 compiler. Clang is what the code is written against; the build detects clang and applies clang-specific paths.
+- CMake 3.16 or later.
+- Ninja or Make.
+- No third-party libraries. There is nothing to install.
+
+Optional:
+
+- libc++ rather than libstdc++, on by default when a clang root can be found.
+- libFuzzer, only for `OCC_ENABLE_FUZZ`.
+
+## Quick start
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build -j8
+```
+
+One static library, one binary, 86 tests.
+
+## Options
+
+| Option | Default | Effect |
 |---|---|---|
-| Clang 23.1.2 | libc++ 23 | clean, 20/20 |
-| Clang 20.1.2 | libc++ 20 | not re-verified since the suite grew |
-| GCC 16.0.1 | libstdc++ | clean, 20/20 |
-| GCC 16.0.1 | libc++ 23 | falls back to libstdc++ |
-| GCC 14.2 | libc++ 20 | falls back to libstdc++ |
-| GCC 13.3 | libc++ 23 | falls back to libstdc++ |
+| `OCC_USE_LIBCXX` | `ON` | Build against libc++ instead of libstdc++ |
+| `OCC_LIBCXX_ROOT` | detected | libc++ root, searched through `OCC_LIBCXX_CANDIDATES` |
+| `OCC_STATIC_LINK` | `ON` | Link the main binary statically, as a static PIE |
+| `OCC_ENABLE_TESTS` | `ON` | Build the test suite |
+| `OCC_WERROR` | `ON` | Treat warnings as errors |
+| `OCC_ENABLE_FUZZ` | `OFF` | Build libFuzzer harnesses |
+| `OCC_GCC_LIB_DIR` | detected | GCC library directory, used for the libc++ link |
 
-The fraction is the test binaries, of which there are twenty; it is the
-suite's size rather than a compiler count.
+`OCC_COMPILER_IS_CLANG` and `OCC_SANITIZED_BUILD` are internal, set by the build rather than by a user.
 
-The two rows marked clean were re-run most recently; the older Clang row is
-left as it was rather than restated as current, because a number nobody has
-re-measured is not a result. It was true when it was written and the suite
-has grown since, so treat it as history.
+`OCC_LIBCXX_CANDIDATES` is the list of libc++ roots probed. It is not a cache variable; it is the search order.
 
-The reference build is Clang with libc++ from the LLVM release tree. The
-reason is the static link: libc++'s static archives are self-contained and are
-what the shipped binary is built against.
+Turning `OCC_USE_LIBCXX` off selects libstdc++. That combination compiles, and it is the path to take when a toolchain's libc++ is incomplete.
 
-GCC is supported and reaches the same clean result, on libstdc++. It is not
-able to use libc++ 23 at all — the two standard libraries' headers are
-mutually exclusive here, and libc++ asks for GCC 15 or newer regardless. That
-is a property of the two implementations coexisting on one machine, not
-something a flag resolves, and the build says so rather than failing later.
+## Sanitizers
 
-### Warnings the two compilers do not share
+Supported. Two triggers:
 
-The build is warning-clean under both, and getting there is not automatic:
-`-Wall` does not mean the same set of diagnostics on each. A construct that
-Clang accepts silently can be an error under GCC with `-Werror` on, and the
-reverse.
+- `-fsanitize` appearing in `CMAKE_CXX_FLAGS` or `CMAKE_CXX_FLAGS_<CONFIG>`
+- `OCC_ENABLE_FUZZ=ON`
 
-The one that has bitten this tree is a trailing backslash at the end of a
-`//` comment. The preprocessor splices the following line onto it, so the
-comment swallows a line the author meant to be a new one. GCC reports this
-under `-Wcomment`; Clang does not. A shell example wrapped with a `\`
-continuation inside a comment is the usual way to write it by accident:
+Both force `OCC_STATIC_LINK=OFF`, because a static PIE and a sanitizer runtime do not combine.
 
-```c++
-    //     $ env -i PATH=/usr/bin:/bin TMPDIR=/tmp wine64 cmd.exe /c \
-    //           --some-long-flag
-    //                            ^ the backslash above is the bug
-```
+Under fuzzing, the flags are `-fsanitize=fuzzer-no-link,address,undefined` for compilation and `-fsanitize=fuzzer,address,undefined` for linking, plus `-fno-omit-frame-pointer`.
 
-Written without the backslash the same example is clean under both:
+For the binary and tests, `-fsanitize=address,undefined`.
 
-```c++
-    //     $ env -i PATH=/usr/bin:/bin TMPDIR=/tmp wine64 cmd.exe /c
-    //           --some-long-flag
-```
+Three tests install real kernel state and are excluded from sanitized builds: `occ_test_seccomp`, which installs a real seccomp filter and denies a syscall; `occ_test_container`, which ptrace-attaches to a child and depends on ASan's shadow; and `occ_test_seh`, the third of that family. The exclusion is stated in `tests/CMakeLists.txt` with the reason, so it is a documented decision rather than a silently skipped test.
 
-Since a Clang-only build would never show this, the GCC row in the table above
-is worth running before a release, and the reference build being Clang is not
-a reason to skip it.
-
-### When a libc++ cannot be used
-
-A libc++ is not usable merely because it is installed. The build compiles a
-small probe with the include path it would really use, covering the headers
-this project actually opens, and links it against the library directory it
-would really use. If that fails, the build falls back to libstdc++ and reports
-why, naming the compiler, its version, and the diagnostic it produced:
+## Fuzzing
 
 ```
-occ: GNU 16.0.1 cannot use the libc++ at /usr/lib/llvm-23
-(error: 'abort' has not been declared in 'std'); falling back to libstdc++.
+cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DOCC_ENABLE_FUZZ=ON -DOCC_STATIC_LINK=OFF
+cmake --build build-fuzz -j
 ```
 
-To use a libc++ the compiler cannot find for itself, name it:
+Harnesses live in `fuzz/`. Each runs under `ctest` with a per-harness time budget of `OCC_FUZZ_CTEST_SECONDS`, default 30.
 
-```
-cmake -S . -B build -DOCC_LIBCXX_ROOT=/opt/LLVM-23.1.2-Linux-X64
-```
+`occ_test_seeds` guards the corpus against the generator that writes it, so a corrupted corpus is caught by the suite rather than by a fuzzer that stops finding anything.
 
-The GCC installation Clang is told to use is read from the compiler itself, so
-that the version named is the version running. Override it when that answer is
-right but the path is not — a sysroot, or a cross setup:
-
-```
-cmake -S . -B build -DOCC_GCC_LIB_DIR=/usr/lib/gcc/x86_64-linux-gnu/15
-```
-
-`-DOCC_USE_LIBCXX=OFF` forces libstdc++ and skips the probe.
-
-CMake 3.20 or newer. Ninja is recommended but not required.
-
-## Configure and build
-
-```
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-Output is `build/occ`, a single statically linked executable.
-
-## Pointing at a libc++ tree
-
-The installed libc++ is located automatically for the common cases. When
-it is installed somewhere non-standard — a release tarball under `/opt`,
-for instance — pass the root:
-
-```
-cmake -S . -B build -G Ninja \
-  -DOCC_LIBCXX_ROOT=/opt/LLVM-23.1.2-Linux-X64 \
-  -DOCC_GCC_LIB_DIR=/usr/lib/gcc/x86_64-linux-gnu/16
-```
-
-`occ doctor` prints both paths so a build can be reproduced from a working
-binary.
+The targets cover the parsers that take untrusted input: PE, ELF, the RSP decoder, and the seccomp filter compiler.
 
 ## Static linking
 
-Fully static, including libc++. The flags, in the order they matter:
+`-static-pie`, on by default. The binary has no runtime library dependency.
+
+Two warnings are expected and benign, from glibc's NSS:
 
 ```
--stdlib=libc++
--static
---unwindlib=libgcc
--I${OCC_LIBCXX_ROOT}/include/x86_64-unknown-linux-gnu/c++/v1
--L${OCC_LIBCXX_ROOT}/lib/x86_64-unknown-linux-gnu
--lc++ -lc++abi
+warning: Using 'getservbyname' in statically linked applications requires at
+runtime the shared libraries from the glibc version used for linking
+warning: Using 'getservbyport' in statically linked applications requires at
+runtime the shared libraries from the glibc version used for linking
 ```
 
-Three things about this are worth writing down because each failed first:
+They come from `ws2_32.cpp`'s `getservbyname` and `getservbyport` paths. They do not affect a run unless a guest calls those two functions, and the alternative is a dynamically linked binary.
 
-**`--unwindlib=libgcc` is required.** libc++abi needs `_Unwind_*` symbols.
-Both LLVM's libunwind and GCC's libgcc_eh provide them, and linking both
-produces a wall of duplicate symbol errors that does not name the cause.
-Picking one is the fix. libgcc is chosen because it is already present
-where the toolchain is.
-
-**`__gcc_personality_v0` is referenced from static libc.** It lives in
-`libgcc_eh`. With `--unwindlib=libgcc` the link resolves it without an
-explicit `-lgcc_eh`.
-
-**Do not add `-lc++experimental`.** It pulls in a second definition of
-several facilities that overlap with libc++ proper.
-
-Verify the result:
+## Warnings
 
 ```
-file build/occ
-# build/occ: ELF 64-bit LSB executable, x86-64, statically linked, ...
-ldd build/occ
-# not a dynamic executable
+-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+-Wcast-qual -Wdouble-promotion -Wformat=2 -Wundef
+-Wnull-dereference -Wimplicit-fallthrough
 ```
+
+plus `-Werror` when `OCC_WERROR` is on.
+
+On a non-clang compiler, `-Wno-error=null-dereference` is added, because GCC's null-dereference analysis produces different results than clang's and turning it into an error would block the build on a different compiler's opinion.
+
+`-Wconversion` and `-Wsign-conversion` are on deliberately. They are why the relocation code computes `delta` unsigned, why the capacity checks exist before every wide-to-narrow conversion, and why the hex helpers specify widths. Those are not stylistic choices; they are what the warnings force.
+
+`occ_core` additionally gets `-fno-exceptions -fno-rtti`, applied privately to that target only.
+
+## Build targets
+
+| Target | Kind |
+|---|---|
+| `occ_core` | Static library, the bottom four layers |
+| `occ` | The executable |
+| `occ_test_*` | 86 test executables |
+| fuzz harnesses | One per `fuzz/` entry, only under `OCC_ENABLE_FUZZ` |
+
+`occ_core` is built with the private `-fno-exceptions -fno-rtti`, so a translation unit that needs exceptions does not belong in that library.
 
 ## Tests
 
-```
-cmake -S . -B build -G Ninja -DOCC_ENABLE_TESTS=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-Tests are built into the static configuration. They run against the same
-isolation code the binary ships, which is the point.
-
-## Fuzz harnesses
-
-**Built, and only in a build that asks for them.** `fuzz/` holds six
-`LLVMFuzzerTestOneInput` targets -- the ELF reader, the zip reader, the PE
-reader, the PE loader, the GDB RSP codec and the seccomp-BPF emitter -- plus a
-`seeds/` directory of thirty-six seeds that `tools/make_pe_seeds.py` writes
-and `occ_test_seeds` checks against it.
-`fuzz/README.md` records what each harness asserts and, at more length, what
-each one deliberately does not.
-
-They need Clang, because libFuzzer's runtime is linked against libstdc++ and a
-GCC build rejects `-fsanitize=fuzzer-no-link` outright. `OCC_ENABLE_FUZZ=ON`
-therefore forces `OCC_USE_LIBCXX=OFF` in the cache; asking for both does not
-fail, it quietly builds against libstdc++ instead. Sanitizers and libFuzzer
-cannot be combined with a fully static link, so the fuzz build is separate and
-dynamic:
+86 tests, registered through `occ_add_test` in `tests/CMakeLists.txt`.
 
 ```
-cmake -S . -B build-fuzz -G Ninja \
-  -DOCC_ENABLE_FUZZ=ON \
-  -DOCC_ENABLE_TESTS=OFF \
-  -DCMAKE_CXX_COMPILER=/usr/lib/llvm-23/bin/clang++ \
-  -DCMAKE_C_COMPILER=/usr/lib/llvm-23/bin/clang \
-  -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer,address,undefined"
-cmake --build build-fuzz
+ctest --test-dir build -j8
 ```
 
-`occ_fuzz_smoke` runs each harness briefly. Each is also a bounded ctest, so
-an ordinary `ctest` in this build really does reach them:
+Two tests drive the built binary rather than the library: `occ_test_check` depends on the `occ` target and takes its path through a compile definition. `occ_test_seeds` likewise.
 
-```
-ctest --test-dir build-fuzz -R occ_fuzz_run
-```
+The API simulation tests are one file per area: `test_api_crt`, `test_api_ucrt`, `test_api_gdi32`, `test_api_advapi32`, `test_api_advapi32_reg`, `test_api_advapi32_sec`, `test_api_crypt32`, `test_api_crypt32_full`, `test_api_secur32`, `test_api_ole32`, `test_api_rpcrt4`, `test_api_setupapi`, `test_api_shell32`, `test_api_kernel32_sync`, `test_api_kernel32_proc`, `test_api_kernel32_str`, `test_api_kernel32_err`, `test_api_kernel32_extra`, `test_api_kernelbase_extra`, `test_api_user32_extra`, `test_api_user32_windows`, `test_api_ntdll_rtl`, `test_api_ntdll_rtl_str`, `test_api_ntdll_rtl_mem1`, `test_api_ntdll_rtl_mem2`, `test_api_ntdll_nt`, `test_api_ntdll_debug`, `test_api_psapi_version`, `test_api_dbghelp`, `test_api_ext`, `test_api_ext2`, `test_api_antidebug`, `test_api_shlwapi`, `test_api_file`, `test_api_time`, `test_api_memory`, `test_api_common`.
 
-`OCC_FUZZ_CTEST_SECONDS` sets how long each runs, 30 by default. The ctest
-`TIMEOUT` is not decoration -- libFuzzer handed a malformed `-max_total_time`
-does not fail, it runs forever -- so a test whose only limit is libFuzzer's
-has no limit at all.
+The runtime tests cover loader, exports, winabi, mapper, placement, ntdll, containment, SEH, seccomp, container, plain spawn.
 
-What the harnesses do not cover is stated in `fuzz/README.md` rather than
-left to be discovered. It is worth knowing before reading a green run as more
-than it was: nothing needing a real process is exercised, so the container, the
-probe plumbing and the uprobe path are unverified by anything in that
-directory.
+The devirt tests cover each stage separately: `test_devirt_lift`, `test_devirt_sat`, `test_devirt_solve`, `test_devirt_cert`, `test_devirt_codegen`, `test_devirt_semlib`, `test_devirt_adapt`.
 
-The seccomp emitter is the interesting one, because it is 467 lines of
-arithmetic producing a structure the kernel either executes or refuses without
-explaining why, and because its input is a typed `SeccompPolicy` rather than
-bytes -- so the harness has to invent a surface before there is anything to
-fuzz. It does: the bytes are read as a fixed-width record of the policy's
-fields, and the emitted bytecode is read back for the emitter's own promises
-about it. What it does not do is install the program, which is where the
-kernel's opinion would come in. That was the first design and it does not
-survive libFuzzer: a harness that forks per input deadlocks against the
-driver's process management often enough to make a suite unreliable, and not
-as a function of the input. `occ_test_seccomp` is where the kernel is asked,
-in a build without a sanitizer, and it makes 91 assertions of which 37 install
-a real filter in a forked child.
-`fuzz/README.md` has the measurements.
+The observer tests cover events, sessions, registry, wx, uprobe, ntdll probes, placer, probe wiring, and gdb interop.
 
-**`occ_test_seccomp` hangs under ASan, and that is structural rather than a
-defect in either.** The test installs real seccomp filters in forked children,
-and one of them denies `sigaltstack`. When something then goes wrong in such a
-child, ASan reports it by calling `sigaltstack` -- which that same filter
-denies -- so the reporting path fails, and ASan's own failure path calls
-`mmap`, which is denied too. What follows is `AsanDie` calling
-`internal_sched_yield` in a loop that never exits, and a process that spins at
-0% CPU and never returns. Observed under `build-asan`: every assertion reports
-PASS, and the binary then hangs indefinitely.
+The remaining tests cover detect, inspect analysis, elf, engine, export duplicates, dbi, emu, hostile, behave, fuzz, replay, the three deobf areas, the three packer areas, and the two concolic areas.
 
-The lesson is worth stating because the symptom is misleading. A hang with no
-output looks like a deadlock in the code under test, and the filters being
-installed at the time are this file's own, so the first suspicion falls on the
-seccomp emitter. The emitter is fine; the sanitizer is reporting a failure
-using the resource the test just took away. Any test that deliberately makes a
-syscall fail has this shape, and the fix is a property of the harness rather
-than of the code: either exclude the test from the sanitizer build, or have the
-child allow the small set of calls the sanitizer needs to die (`sigaltstack`,
-`mmap`, `exit_group`). It is listed here rather than left to be rediscovered
-because a timeout in `ctest` reads as a failure of whatever ran last, and the
-thing that ran last is not the thing that broke.
+## Cross-compilation notes
 
-**`occ_test_seh` reports a stack overflow under ASan, and that too is
-structural.** The SEH tests have no guest process, so they hand
-`seh::dispatch` the test's own stack addresses as the unwinding window and put
-the fixture's RSP inside it. The unwinder then reads the stack by design, and
-`load_stack_u64` bounds every read with `StackRange::holds` -- a subtraction
-against the window, which is what a real unwind does. ASan cannot see the
-window: it sees a read of an address that lies past the end of `dispatch`'s
-`walked` buffer, or inside a frame whose function already returned, and calls
-it a `stack-buffer-overflow` or a `stack-use-after-return`. Both are the
-sanitizer being right about the address and wrong about the meaning -- the
-address is a guest stack address that happens to live in a host frame, which is
-the entire method. `detect_stack_use_after_return=0` removes the second report
-and not the first, and the first is a core check that cannot be turned off for
-one binary without turning it off for the build. So `occ_test_seh` is not built
-in a sanitized build, for the same reason the two above are not: a sanitizer
-there would be testing its own shadow memory's disagreement with a forged stack
-rather than this project's unwinder. The ordinary build runs it, and that is
-where its assertions about unwinding and the window belong.
+The code is x86-64 specific in places, and the places are deliberate:
 
-## Sanitizer build of the test suite
+- `runtime/winabi.cpp` uses `__attribute__((ms_abi))`, a GCC and clang extension available on x86-64 targets
+- `runtime/pe_process.cpp` has inline asm for entering the guest
+- `runtime/i386.cpp` interprets 32-bit code, which is what makes 32-bit guests possible on a 64-bit host
+- `runtime/mapper.cpp` names AddressSanitizer's shadow range, which is an x86-64 layout property
 
-```
-cmake -S . -B build-asan -G Ninja \
-  -DOCC_ENABLE_TESTS=ON \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
-cmake --build build-asan
-ctest --test-dir build-asan --output-on-failure
-```
+A non-x86-64 target is not a supported configuration.
 
-## Memory
+## Troubleshooting
 
-A full build of a C++23 tree with sanitizers is not small. On a host with
-2 GiB and a swap file, limit parallelism:
+**`could not read Username for 'https://github.com'`** when fetching: the repository is private and the credential helper is not populated. Use a token in the remote URL.
 
-```
-cmake --build build -j2
-```
+**`Using 'getservbyname' in statically linked applications`** at link time: expected, from `ws2_32.cpp`. Harmless unless a guest calls those two functions.
 
-Without a swap file the linker will be killed on a 2 GiB host. This is
-recorded because it happened.
+**`libc++` not found**: set `OCC_LIBCXX_ROOT` explicitly, or turn `OCC_USE_LIBCXX` off.
 
-## Reproducing a reported environment
+**`no member named 'unsat_prefix_hits'`**: that field was missing from `PathReport::SolverStats` while `concolic/engine.cpp` incremented it. It is declared now. If the error reappears, the tree predates that fix.
 
-`docs/COMPAT.md` lists hosts this has been built and run on, with the kernel
-release string, the toolchain paths, and the `occ doctor` output for each.
-A build that differs from every entry there is not wrong, it is just not
-one of the verified cases.
+**Tests that install kernel state are skipped under sanitizers**: by design, listed above.
+
+---
+
+Related: [DESIGN.md](DESIGN.md) for the module structure, [CONTRIBUTING.md](../CONTRIBUTING.md) for how to change the code, [SECURITY.md](SECURITY.md) for the threat model.

@@ -1,295 +1,195 @@
-# The GDB Remote Serial Protocol
+# RSP
 
-What occ implements, packet by packet, and what it deliberately does not.
+The remote serial protocol. This is a GDB-compatible stub: the wire format, the packet framing, the checksum, the escapes, and the command set are GDB's, not this project's. A stock GDB can attach to an occ session and debug a guest.
 
-This is a stub server, not a debugger. It answers what GDB needs to attach,
-read and single-step a target, and it declines the rest rather than
-answering it approximately. A packet that gets an empty reply is one occ does
-not implement — the protocol's own convention for "unsupported" — and a
-debugger falls back to a path it already knows. That fallback is why the
-server can be this small and still be usable: the parts that are missing are
-the parts GDB has defaults for.
+This is the most delicate code in the observer, because the protocol has two ways of saying "no" and encoding one as the other breaks a debugger in a way that looks like the debugger's fault.
 
-The implementation is `src/observer/rsp.cpp` for framing and hex, and the
-dispatcher in `src/observer/session.cpp` for the packets themselves.
+---
 
-## Using it
+## Contents
+
+- [Packet framing](#packet-framing)
+- [The two kinds of nothing](#the-two-kinds-of-nothing)
+- [Decoder state machine](#decoder-state-machine)
+- [Hex and byte order](#hex-and-byte-order)
+- [Command set](#command-set)
+- [Register description](#register-description)
+- [vCont](#vcont)
+- [Stop replies](#stop-replies)
+- [What is not implemented](#what-is-not-implemented)
+
+---
+
+## Packet framing
+
+A packet on the wire is:
 
 ```
-occ run --gdb-port 9000 --gdb-wait ./target
+$<payload>#<checksum-hi><checksum-lo>
 ```
 
-Then attach from another terminal:
+`encode_packet` escapes the payload, computes the checksum over the escaped bytes, and frames. `unescape` reverses it. The escape byte is `}` and the byte after it has `0x20` exclusive-or'd into it.
+
+An empty payload frames as `$#00`, and that is a valid packet, not a failure. It is the protocol's "not implemented" answer.
+
+`PacketDecoder::feed(data, length)` consumes bytes and `PacketDecoder::take()` returns the next complete packet.
+
+## The two kinds of nothing
+
+This is the central design point of the module.
+
+The protocol has exactly two ways to be unhelpful, and they are not interchangeable:
+
+**"Nothing to send."** The request was acted on and the answer, if any, comes from somewhere else. Continue is the case that matters: the resume is the answer, and the stop reply follows when the target stops again. A stub that framed an empty packet here would tell the debugger "unsupported", and the debugger would conclude the target cannot be resumed.
+
+**"An empty packet."** The request was understood and is not implemented. This is `$#00` on the wire, and it is a real packet: it has framing and a checksum, and the peer reads it as an answer. `vMustReplyEmpty` exists precisely to test this, because a stub that cannot produce it is one that goes silent on every packet it does not know, which reads as a hung connection.
+
+Encoding either as the other is the bug `Reply` exists to prevent:
+
+```cpp
+struct Reply {
+    bool send = true;      // false: nothing is written; the session loop answers
+    std::string payload;   // ignored when send is false
+
+    static Reply packet(std::string body) noexcept;   // an answer the peer reads
+    static Reply unsupported() noexcept;              // "$#00"
+    static Reply nothing() noexcept;                  // send = false
+};
+```
+
+`Reply::nothing()` sends nothing at all. `Reply::unsupported()` sends a well-formed empty packet. They are different functions because they mean different things.
+
+The `'c'` and `'s'` handlers return `Reply::nothing()`: a continue is not a question, so there is nothing to answer now. The `'v'` handler for an unimplemented subcommand returns `Reply::unsupported()`, so the debugger falls back to the single-threaded packets it knows.
+
+`vMustReplyEmpty` is the test named for this. A stub that stays silent on it fails, and that failure is the only way this bug class is observable from outside.
+
+## Decoder state machine
+
+```cpp
+enum class State : std::uint8_t {
+    Idle, Payload, FirstChecksum, SecondChecksum, Ack,
+};
+```
+
+The `Ack` state exists because after a `+`, the next byte decides whether it is an acknowledgment or the start of a three-byte packet. Skipping that state means misreading one as the other.
+
+`want_retransmit_` is set on checksum failure, and `has_packet()` refuses to report a packet until a retransmission has been asked for. A corrupt packet is not handled; it is requested again.
+
+`needs_ack_` and `pending_ack_` carry the acknowledgment to send after the next packet.
+
+## Hex and byte order
+
+GDB's wire format is hexadecimal for every binary quantity, and the byte order is the target's, not the protocol's.
 
 ```
-gdb -ex 'target remote localhost:9000'
+hex_u64_le / hex_u64_be
+hex_u32_le
+hex_u8
+hex_number          // variable width, no padding
+parse_hex_u64_le / parse_hex_u32_le / parse_hex_number / parse_hex_bytes
 ```
 
-`--gdb-wait` holds the target at its first stop until a debugger connects, so
-the debugger's initial breakpoint does not land after the program's interesting
-part. Without it, occ serves GDB and runs the target at the same time, and a
-program that finishes quickly is gone before the debugger arrives. Port 0 asks
-the kernel for any free port, and the chosen port is printed before the target
-starts, so a debugger can attach at any point during the run.
+A register value is sent in the target's byte order. For a little-endian target that is least significant byte first, which is why these are not the same as a general hex read and why they live in the protocol layer rather than in a utility.
 
-These three are the only GDB flags: `--gdb-port`, `--gdb` (a synonym), and
-`--gdb-wait`. There is no flag for an inherited file descriptor — occ always
-listens on loopback, and the `gdb_read_fd`/`gdb_listen_fd` fields in
-`RunOptions` are how the test suite drives the same server without a socket.
+`hex_number` is variable-width because protocol numbers arrive that way: `p0` asks for the first register and `p1a` for the twenty-sixth. Reading a register number as a fixed-width field would refuse both.
 
-## Framing
+`parse_hex_bytes` decodes a byte string, used for memory reads and writes.
 
-Standard: `$<payload>#<two hex checksum digits>`, checksummed over the escaped
-payload. `}`, `$` and `#` are escaped as `}` XOR 0x20. A `+` acknowledges, a
-`-` asks for a retransmit, and both are parsed as well as emitted.
+## Command set
 
-Three details in `PacketDecoder` are worth naming because a decoder that gets
-them wrong interoperates with nothing:
+`DebugServer::handle(packet)` dispatches on the first byte of the payload.
 
-**A damaged packet is acknowledged too.** A bad checksum produces `-`, not
-silence, because silence is the one answer a sender cannot act on — it would
-resend until it gave up. A packet that arrives framed but corrupt is a fact
-about the wire, and the protocol has a way to report it.
+| Packet | Meaning |
+|---|---|
+| `?` | Why did we stop |
+| `vCont...` | Multiplexed continue/step |
+| `q...` | Query |
+| `g` | Read all registers |
+| `G` | Write all registers |
+| `p<n>` | Read one register by number |
+| `m<addr>,<len>` | Read memory |
+| `M<addr>,<len>:<data>` | Write memory |
+| `Z`/`z` | Insert/remove breakpoint |
+| `H` | Set thread |
+| `c` | Continue |
+| `s` | Step |
+| `D` | Detach |
+| `k` | Kill |
 
-**A `$` inside a payload restarts framing.** The earlier packet was cut short,
-and restarting is what the protocol asks of a receiver that sees framing it
-cannot complete. Discarding the partial payload rather than appending it is
-what keeps the two packets from merging into one longer wrong one.
+### `?`
 
-**A truncated escape is passed through.** A payload ending in a lone `}` is
-returned as-is rather than shortened, so the caller sees a payload that is
-wrong instead of one that is silently short. Those fail differently and only
-one of them is a mystery.
+The stop reply carries the program counter, because that is the register a debugger needs to decide what the stop was, and it should not have to ask separately. Answering with zero is the bug this avoids: a debugger that resumes from address zero because the stub returned zero is looking at a target that has already faulted.
 
-## The packets
+### `p<n>`
 
-### `qSupported` → features
+The number is the one GDB assigned in its own register enum, not the position in the `g` block. The two agree only across the forty core registers, because GDB reserves 40 through 51 for the SSE and AVX banks this description does not declare.
+
+Three distinct answers, and they are not the same:
+
+- `which > kOrigRaxRegnum`: the register does not exist. Not "unsupported". An empty packet would send the debugger looking for a different way to ask.
+- `bits == 0`: inside the range but outside the description, one of the SSE or AVX banks. There is no width to send it at, and zero bytes would read as "unsupported" rather than as a zero of some width.
+- Otherwise: the register at the width the description declares.
+
+That last point matters. GDB reads exactly as many bytes as the description says the register is wide, so a `%eflags` answered with sixteen hex digits is four bytes of the register followed by four bytes of whatever the debugger then reads as the next register.
+
+### `c` and `s`
+
+The session does not resume inside the handler. The loop owns the tracee and has to be the one that decides when it runs. So the handler sets `resume_requested_`, `step_`, and `resume_signal_`, and returns nothing.
+
+`c` takes an optional signal to deliver, as a variable-width hexadecimal value.
+
+### `k`
+
+A kill request is reported as a detach and the caller decides. Killing a process the user did not ask to kill is not something a debugger stub does on its own. The detach is the answer, and it is carried by the session ending, so nothing is sent on the wire.
+
+### `#`
+
+A payload beginning with `#` never reaches a command byte, because the decoder has already consumed the checksum. Reaching this case means a malformed packet, and it is answered as unsupported.
+
+## Register description
+
+`qSupported` answers:
 
 ```
 qXfer:features:read+;swbreak+;hwbreak+;vContSupported+;xmlRegisters=i386
 ```
 
-The list is a contract and it is kept honest in both directions. Claiming a
-feature that is not implemented sends the debugger down a path that then fails
-in a way that looks like the debugger's bug; omitting one that is implemented
-makes it take a slower path it did not have to.
+The list is a contract and is kept honest in both directions. Claiming a feature that is not implemented makes the debugger take a code path that then fails in a way that looks like a bug in the debugger. Omitting one that is implemented makes the debugger fall back to a slower or less precise path it did not have to take. Every entry names the packet that implements it.
 
-`xmlRegisters=i386` is the load-bearing one. Without it GDB keeps its built-in
-default, which describes a 32-bit i386 target with 17 registers, and every
-register read is then the wrong width at the wrong offset: the `g` reply is
-rejected as truncated and no register is shown at all. The name is `i386`
-even for an x86-64 target — it names the register *description format*, not
-the processor.
+`xmlRegisters=i386` is what makes the debugger fetch the target description at all. Without it GDB keeps its built-in default, which describes a 32-bit i386 target with 17 registers, and every register read is then the wrong width at the wrong offset: the `g` reply is rejected as truncated and no register is shown. The name is `i386` even for an x86-64 target because it names the register description format, not the processor.
 
-`qAttached` → `1`. The session was created from a process occ already owns,
-rather than by asking a target to spawn one, so there is nothing to attach to.
+`qXfer:features:read:` serves the target description itself, through `handle_qxfer_features()`.
 
-`qC` → `QC<pid>`, `qfThreadInfo` → `m<pid>`, `qsThreadInfo` → `l`,
-`qTStatus` → `T0`. One process, one thread, always that process.
+`qAttached` answers `1`, because the session was created from a process it owns rather than by asking the target to spawn one.
 
-`qSymbol` and every other query fall through to an empty reply.
+`qC` answers `QC<pid>`: this stub observes one process, so the answer is always that process.
 
-### `qXfer:features:read:target.xml:OFFSET,LENGTH`
+## vCont
 
-Serves the target description, which is a literal string in
-`src/observer/session.cpp`. Chunking works, and a request past the end answers
-`l` so the debugger stops asking rather than treating the end as an error. Any
-annex other than `target.xml` also answers `l`.
+`vCont` is the multiplexed form of `c`, `s`, `C`, and `S`. The packet is `vCont[;action[:thread-id]]...` where an action is a letter.
 
-The description declares three features: the core integer registers, the x87
-block, then `org.gnu.gdb.i386.segments` (`fs_base`, `gs_base`) and
-`org.gnu.gdb.i386.syscall` (`orig_rax`).
+Implementing `vCont` does not replace the single-threaded packets, because a debugger that does not use `vCont` still needs `c` and `s` to work.
 
-### `g` / `G` — all registers
+`vCont?` asks which actions are supported. The answer is the list, and it is answered with a real packet so a stub's reply is recognizable as a `vCont` answer rather than as an empty one. A debugger that cannot tell the difference will not choose `vCont` at all, so the answer has to be a packet.
 
-The block is **300 bytes**, and that number is not a round figure. GDB packs a
-target description end to end with no padding, so the layout is the sum of the
-declared widths:
+`handle_vcont()` implements the actions. A `vCont` naming no action this stub can perform is "unsupported" and gets the empty packet. One that named a resume gets silence, because the resume is the answer.
 
-| Registers | Width | Bytes |
-|---|---|---|
-| 17 general + `rip` | 64 bits | 136 |
-| `eflags` + 6 segment selectors | 32 bits | 28 |
-| 8 x87 stack (`st0`–`st7`) | 80 bits | 80 |
-| 8 x87 control | 32 bits | 32 |
-| `fs_base`, `gs_base`, `orig_rax` | 64 bits | 24 |
-| | | **300** |
+The capability query and the resume are told apart by the query itself, not by the emptiness of the returned string, because "no reply" and "an empty packet" are the same string and mean opposite things.
 
-A field is 8 or 20 hex characters depending on which register it is. Parsing
-the block as a fixed-stride array reads `st0` out of the middle of `fop`; that
-mistake is invisible from either side alone — each path is self-consistent —
-and it does not corrupt one register, it shifts every register after the gap,
-so a backtrace names the wrong frame.
+## Stop replies
 
-`G` writes only the first seventeen. `eflags` and the segment selectors are
-named because the description has to name them, and the kernel's `SETREGS`
-rejects them on this architecture; the x87 block is not accepted at all; and
-the last three belong to the syscall entry path. Writing any of them would be
-either refused or silently undone, which is worse than ignoring the request.
-The current values are read rather than zeroed, so the ignored registers stay
-what the kernel last had.
+`encode_stop_reply(signal, rip)` builds the stop notification. The signal comes from `gdb_signal_for_trap()`, and the PC is carried alongside so the debugger does not have to ask for it.
 
-### `p` / `P` — one register
-
-`p<num>` reads by **register number**, not by position in the `g` block. The
-two agree across the forty core registers and part company past that, because
-GDB reserves 40–51 for the SSE and AVX banks this description does not
-declare. `fs_base` is position 40 in the block and register **152** to GDB;
-`gs_base` is 153; `orig_rax`, which has no number in GDB's enum at all, is
-reported at 154. Reading by a different index than the description gives is
-how a debugger ends up displaying one register's value under another's name.
-
-The bound is 154 — the highest number this server answers for — rather than
-the register count. `p0` asks for the first register and `p1a` for the
-twenty-sixth; the number is variable-width hex and is read as a protocol
-number, not as a register block, which would want eight digits and refuse
-both.
-
-`P` is **not implemented** and answers empty. GDB falls back to `G`.
-
-### `m` / `M` — memory
-
-`m<addr>,<len>` reads, `M<addr>,<len>:<bytes>` writes, both little-endian hex.
-A read is capped at 4096 bytes: the protocol's reply has to fit in one packet,
-and a debugger asking for more is asking for a transfer the framing cannot
-carry, so the cap is what keeps the answer well-formed. A zero length or one
-past the cap returns `E01`, as does a read that failed or returned nothing.
-
-A read that succeeded partway returns what it managed, and its length is
-shorter than requested. That is the protocol's own convention for a short
-read, and it is what lets a debugger read up to a page boundary without first
-asking where the mapping ends.
-
-### `Z` / `z` — breakpoints
-
-`Z0,<addr>,<kind>` sets and `z0,<addr>,<kind>` clears, where kind 0 is a
-software breakpoint and kind 1 is a hardware one. Software breakpoints are
-`int3`: the byte is written, the original is saved, and stepping over it puts
-the original back for one instruction. A failure to install answers `E01`.
-
-### `?` — why we stopped
-
-Returns the `T` form carrying the signal and `rip` as register 16:
-
-```
-T05:7f3e46875540;
-```
-
-`rip` is read, not zero-filled. A debugger that resumes from address zero
-because this returned zero is looking at a target that has already faulted.
-
-### `c` / `s` — resume
-
-`c[<signal>]` continues, `s` single-steps, and the optional signal is
-variable-width hex. Neither resumes inside the handler: the trace loop owns
-the process and decides when it runs, so these set a flag the loop reads. That
-is why the reply comes back immediately, and why `c` has no reply body at all
-— the next thing on the wire is a stop reply when the target stops.
-
-`s` does not take a signal. The protocol allows one; occ ignores it, because a
-single step that delivers a signal is a different operation from a single step
-and answering `OK` would claim the one that was not requested happened.
-
-### `vCont` — multi-threaded resume
-
-`vCont?` reports the supported actions. `vCont;c` and `vCont;s` resume. As with
-`c`, the reply is returned whether or not a resume was requested, because
-`vCont?` produces an answer with no resume behind it.
-
-Only `c` and `s` are answered. `C`, `S`, `r`, and `t` are not.
-
-### `D` / `k` — detach and kill
-
-`D` replies `OK` and detaches. `k` detaches too, and this is a deliberate
-choice rather than an omission: killing a process the user did not ask to kill
-is not something a debugger stub does on its own. The session reports it and
-lets the caller decide.
-
-### `#` — deprecated
-
-Answers empty, which is the protocol's "unsupported". Extended-remote mode is
-not implemented, and this packet is what a stub that does not want extended
-mode uses to say so.
-
-### `vMustReplyEmpty`
-
-Answers empty, and the name is the requirement. The packet exists so a
-debugger can confirm that a stub answers an *unknown* request with an empty
-packet rather than with nothing at all, and it is the only way to tell those
-two apart over the wire.
-
-This stub answered it with silence until the answer was made a distinct type.
-The reason is worth keeping because the mistake is easy to repeat: "not
-implemented" is `$#00`, a framed packet with no payload, and "not now" is no
-bytes at all — a continue is the request that means this, and its answer is
-the stop reply that arrives later. Both were spelled as an empty
-`std::string`, so the encoder could not tell them apart and settled on
-sending nothing for both. GDB reported the consequence as `Remote replied
-unexpectedly to 'vMustReplyEmpty'` at `target remote`, before anything else
-could be tried.
-
-`Reply::unsupported()` and `Reply::nothing()` are now different values and
-`tests/test_gdb_interop.cpp` asserts on both, in both directions.
+The distinction between `Reply::nothing()` and a stop reply is the same distinction as everywhere else: the stop reply is sent by the session loop when the target actually stops, never by the command handler.
 
 ## What is not implemented
 
-`qXfer:memory-map:read` and `qXfer:threads:read` — occ's memory map is in the
-event stream instead, and it is not available to the debugger. `qRcmd` — no
-monitor command channel. `P` — one-register write; use `G`. `vAttach`,
-`vRun` — occ starts the process itself and attaches to what it started.
-Multiprocess and multi-thread `vCont`. Non-stop mode. Reverse execution.
+Only `vCont` among the `v` packets. Every other `v` packet answers with an empty packet, and the debugger falls back.
 
-None of these are silent. Each answers with `$#00` — the protocol's own
-"unsupported", framed and checksummed like any other reply — and each is a
-thing GDB has a working fallback for.
+Single-register reads outside the described range, SSE and AVX banks, and any packet not in the table are answered with an empty packet, which is the protocol's "not implemented".
 
-## Interoperability
+That is the whole surface. It is small on purpose: a stub that claims more than it implements produces failures that look like debugger bugs, and the cost of an honest empty packet is a debugger taking a slower path.
 
-Verified against **GDB 15.1** (`GNU gdb (Ubuntu 15.1-1ubuntu1~24.04.1)`) on
-x86-64 Linux. Attached to a live `occ run --gdb-wait --observe /bin/sleep`,
-`info all-registers` returned all 51 declared registers, and `x/4i` gave
-correct disassembly:
+---
 
-```
-0x00007f0cd35d1540 in ?? ()
-rip            0x7f0cd35d1540      0x7f0cd35d1540
-eflags         0x200               [ IF ]
-   0x7f0cd35d1538:	jmp    0x7f0cd35d13d2
-   0x7f0cd35d153d:	nopl   (%rax)
-=> 0x7f0cd35d1540:	mov    %rsp,%rdi
-   0x7f0cd35d1543:	call   0x7f0cd35d21d0
-orig_rax       0x3b                59
-st0            0                   (raw 0x00000000000000000000)
-...
-```
-
-`orig_rax` reading 59 (`0x3b`, `SYS_exit`) at a stop in `_start` is the check
-that matters most: it confirms the register number 154 lines up with GDB's own
-numbering, since a mismatch here would answer a question about the exit
-syscall with the value of `gs_base` and look entirely plausible.
-
-**No warnings from GDB's side.** The one message a bare `target remote`
-produces — "No executable has been specified and target does not support
-determining executable automatically" — is about GDB not knowing the
-executable, not about the protocol, and passing the binary as an argument to
-GDB removes it.
-
-The x86-64 register layout passes GDB's own `i386_validate_tdesc_p()`, which
-is a stricter check than looking correct: it verifies the description against
-the numbering GDB will actually use, and it runs before any register is read.
-A block that was 300 bytes and correct-looking but declared a width GDB
-disagrees with is rejected there rather than showing up later as a wrong
-value.
-
-Every feature announced in `qSupported` is exercised by the test suite;
-`include/occ/observer/session.h` notes this as an invariant, because a
-feature announced and not implemented is the failure mode this protocol hides
-best.
-
-The transcript above is a manual run, and a manual run is a claim that decays:
-the same paragraph was here while `target remote` was failing, and it looked
-exactly like this. What keeps it honest is `tests/test_gdb_interop.cpp`,
-which forks the host's gdb, serves it over a listener, and fails if gdb does
-not attach and detach with exit status zero. It runs under `ctest` with the
-rest, and it skips — reporting which binary was missing — rather than passing
-on a host that has no gdb.
+Related: [EVENTS.md](EVENTS.md) for the event stream, [DESIGN.md](DESIGN.md) for the module map, [RUNTIME.md](RUNTIME.md) for the guest debugger that this protocol fronts.

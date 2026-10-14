@@ -1694,7 +1694,7 @@ void compare(Check& out, expr::DAG& dag, const std::string& what, expr::Id a,
              expr::Id b, const bb::Budget& budget) {
     ++out.miters;
     if (a == expr::kNoId || b == expr::kNoId) {
-        out.failures.push_back(what + ": UNPROVEN (缺少表达式)");
+        out.failures.push_back(what + ": UNPROVEN (no expression)");
         return;
     }
     const unsigned wa = dag.width(a);
@@ -1716,7 +1716,7 @@ void compare(Check& out, expr::DAG& dag, const std::string& what, expr::Id a,
         return;
     }
     if (eq.unproven) {
-        out.failures.push_back(what + ": UNPROVEN (预算耗尽)");
+        out.failures.push_back(what + ": UNPROVEN (budget exhausted)");
         return;
     }
     out.failures.push_back(what + ": NOT EQUAL");
@@ -1777,7 +1777,7 @@ Check verify(const lift::Model& model, const lift::Handler& h,
                           i, static_cast<long long>(w.disp));
             if (!present) {
                 out.failures.push_back(std::string(b) +
-                                       ": IR 未在该槽位写入");
+                                       ": IR did not write this slot");
             } else {
                 out.items.push_back(std::string(b) + " (present)");
             }
@@ -1794,10 +1794,10 @@ Check verify(const lift::Model& model, const lift::Handler& h,
             }
             if (found == nullptr) {
                 out.failures.push_back("write[" + std::to_string(i) +
-                                       "] addr: IR 无对应计算地址写入");
+                                       "] addr: no IR write at the computed address");
             } else {
                 out.items.push_back("write[" + std::to_string(i) +
-                                    "] addr: 计算地址一致");
+                                    "] addr: computed address agrees");
             }
             compare(out, sim.dag, "write[" + std::to_string(i) + "] value",
                     found != nullptr ? sim.truncw(found->value, w.width)
@@ -1818,7 +1818,7 @@ Check verify(const lift::Model& model, const lift::Handler& h,
                 }
             }
             if (!claimed) {
-                out.failures.push_back("IR 执行了模型未声称的写入 @ slot " +
+                out.failures.push_back("IR performed a write the model does not claim @ slot " +
                                        std::to_string(s.disp));
             }
         } else {
@@ -1831,7 +1831,7 @@ Check verify(const lift::Model& model, const lift::Handler& h,
             }
             if (!claimed) {
                 out.failures.push_back(
-                    "IR 执行了模型未声称的写入 @ 计算地址");
+                    "IR performed a write the model does not claim @ computed address");
             }
         }
     }
@@ -1842,21 +1842,21 @@ Check verify(const lift::Model& model, const lift::Handler& h,
 
     if (f.transfer == lift::Handler::Transfer::Dispatch) {
         if (!sim.transfer_set || sim.transfer != f.transfer) {
-            out.failures.push_back("transfer: IR 未以 Dispatch 结束");
+            out.failures.push_back("transfer: IR did not end in Dispatch");
         } else {
             compare(out, sim.dag, "target", sim.target, f.target_expr,
                     budget);
         }
     } else if (f.transfer == lift::Handler::Transfer::Return) {
         if (!sim.transfer_set || sim.transfer != f.transfer) {
-            out.failures.push_back("transfer: IR 未以 Ret 结束");
+            out.failures.push_back("transfer: IR did not end in Ret");
         }
     } else if (f.transfer == lift::Handler::Transfer::Call) {
         if (!sim.transfer_set || sim.transfer != f.transfer) {
-            out.failures.push_back("transfer: IR 未以 Call 结束");
+            out.failures.push_back("transfer: IR did not end in Call");
         }
     } else if (sim.transfer_set) {
-        out.failures.push_back("transfer: 模型无转移，IR 却执行了转移");
+        out.failures.push_back("transfer: model has no transfer, IR performed one");
     }
 
     char b[64];

@@ -104,7 +104,7 @@ struct Insn {
         Cmp, Jmp, Jcc, Ret, Call,
     };
     Op op = Op::Mov;
-    Operand dst, a, b;  // 按 op 使用；Jcc 的 a 是 1-bit 条件表达式
+    Operand dst, a, b;  // Meaning depends on op; for Jcc, `a` is a 1-bit condition
 };
 
 // A rebuilt handler: the linear IR plus the model effects it must reproduce
