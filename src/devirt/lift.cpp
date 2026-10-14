@@ -3153,6 +3153,19 @@ struct TraceField {
 
 }  // namespace
 
+std::uint64_t resolve_handler(std::uint64_t target, bool target_is_code) {
+    if (target_is_code) {
+        // The table held the handler's address; the dispatcher jumped to
+        // it as read.
+        return target;
+    }
+    // The table held it rotated left by ten. The rotate is written out
+    // rather than shifted through a helper because the word is 64 bits
+    // wide and the two halves meet at the top: `<< 10` alone would drop
+    // the high ten bits, and the rotate is the whole point.
+    return (target << 10) | (target >> 54);
+}
+
 Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
                         const std::vector<Row>& rows,
                         const std::vector<std::size_t>& handler_of_row,

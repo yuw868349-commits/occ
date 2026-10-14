@@ -358,10 +358,13 @@ struct Xref {
 
 std::string analyze_pe_json(const parser::PeImage& image,
                             ByteSpan bytes) {
-    // A parse that failed has no sections and no directories to walk; the
-    // honest answer is no document, and the caller reports the parse's
-    // own error -- the same contract inspect_pe_json states.
-    if (!image.ok()) {
+    // The same gate inspect_pe_json uses: any PE has an analysis worth
+    // producing, including one whose layout the reader does not trust. The
+    // sections and imports the file declares are still the facts an analysis
+    // is built from, and a caller that wants to know which of them to doubt
+    // reads the diagnostics on the report it came from. Only a file that is
+    // not a PE has nothing to analyse.
+    if (!image.is_pe()) {
         return "";
     }
     const auto* file = static_cast<const std::uint8_t*>(bytes.data());

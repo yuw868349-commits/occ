@@ -260,6 +260,26 @@ Built build(const Spec& s) {
 // ByteSpan is a pointer and a length, not a container, so every call site
 // would otherwise repeat the same construction. It goes through here instead,
 // which also keeps the fixtures' type out of the assertions.
+// The contract the reader keeps now, stated once. A malformed structure is a
+// diagnostic and never a refusal: a test that used to assert `!ok()` asserts
+// instead that the file is still a PE, that the fact is recorded with the code
+// and severity the test names, and -- where it matters -- that the parts which
+// did parse are the parts the test expects. Callers judge a fact by
+// `loadable()` and the severity, not by whether the parse succeeded, because
+// it always does.
+void check_recorded(const PeImage& p, PeError code, PeSeverity severity,
+                    const char* what) {
+    check(p.is_pe(), what);
+    check(p.error() == code, what);
+    bool found = false;
+    for (const PeDiagnostic& d : p.diagnostics()) {
+        if (d.code == code && d.severity == severity) {
+            found = true;
+        }
+    }
+    check(found, what);
+}
+
 PeImage parse_image(const std::vector<std::uint8_t>& bytes) {
     return PeImage::parse(ByteSpan{bytes.data(), bytes.size()});
 }
@@ -602,19 +622,23 @@ void test_headers_size_larger_than_the_file() {
 
         char msg[96];
         std::snprintf(msg, sizeof msg,
-                      "SizeOfHeaders of 0x%x in a %zu-byte file is refused",
-                      claim, size);
-        check(!p.ok(), msg);
-        std::snprintf(msg, sizeof msg,
-                      "SizeOfHeaders of 0x%x is reported as a bad size", claim);
-        check(p.error() == PeError::BadHeaderSize, msg);
+                      "SizeOfHeaders of 0x%x is recorded as a bad size", claim);
+        check_recorded(p, PeError::BadHeaderSize, PeSeverity::Structural, msg);
 
-        // A refused parse reports nothing. A caller checks ok() and then
-        // trusts everything else, so sections surviving a refusal would be
-        // worse than the refusal itself.
+        // The number cannot be true, so the layout cannot be trusted and
+        // `loadable()` is false -- but the section table below is still read,
+        // because the parts are worth having to a caller that only reports on
+        // the file. A loader that would map the image asks `loadable()`; an
+        // inspector that only wants the sections reads them off a file whose
+        // layout it does not trust.
         std::snprintf(msg, sizeof msg,
-                      "SizeOfHeaders of 0x%x leaves no sections behind", claim);
-        check(p.sections().empty(), msg);
+                      "SizeOfHeaders of 0x%x leaves the image unloadable",
+                      claim);
+        check(!p.loadable(), msg);
+        std::snprintf(msg, sizeof msg,
+                      "SizeOfHeaders of 0x%x still reads the section table",
+                      claim);
+        check(!p.sections().empty(), msg);
         std::snprintf(msg, sizeof msg,
                       "SizeOfHeaders of 0x%x states the size it claimed", claim);
         check(p.error_detail().find("SizeOfHeaders") != std::string::npos, msg);
@@ -896,12 +920,17 @@ void test_import_directory_too_small() {
         const PeImage p = build_import_image(names, 1, declared);
         char msg[96];
         std::snprintf(msg, sizeof msg,
-                      "import: a %zu-byte directory is refused", declared);
-        check(!p.ok(), msg);
-        std::snprintf(msg, sizeof msg,
-                      "import: a %zu-byte directory reports truncation",
+                      "import: a %zu-byte directory is recorded as truncated",
                       declared);
-        check(p.error() == PeError::TruncatedImportTable, msg);
+        check_recorded(p, PeError::TruncatedImportTable, PeSeverity::Damaged,
+                       msg);
+        // Damage to a directory is not damage to the layout: the image still
+        // loads, and the import list is empty because the walk was skipped,
+        // not because the file turned out to have no imports.
+        check(p.loadable(),
+              "import: a short directory leaves the image loadable");
+        check(p.imports().empty(),
+              "import: a short directory reports no imports");
     }
 }
 
@@ -914,9 +943,10 @@ void test_import_directory_claims_more_than_it_has() {
     // whole descriptors than that even before the names take their space.
     const PeImage p = build_import_image(names, 1, 200 * 20);
 
-    check(!p.ok(), "import: an over-declared directory is refused");
-    check(p.error() == PeError::TruncatedImportTable,
-          "import: an over-declared directory reports truncation");
+    check_recorded(p, PeError::TruncatedImportTable, PeSeverity::Damaged,
+                   "import: an over-declared directory is recorded");
+    check(p.loadable(),
+          "import: an over-declared directory leaves the image loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("fit in the file") != std::string::npos,
               "import: the message says the file ran out, not the walk");
@@ -930,8 +960,10 @@ void test_import_directory_count_is_capped() {
     std::vector<std::string> names;
     const PeImage p = build_import_image(names, 1, 100000 * 20);
 
-    check(!p.ok(), "import: an enormous directory is refused");
-    check(p.error() == PeError::TruncatedImportTable, "import: reports truncation");
+    check_recorded(p, PeError::TruncatedImportTable, PeSeverity::Damaged,
+                   "import: an enormous directory is recorded");
+    check(p.loadable(),
+          "import: an enormous directory leaves the image loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("4096") != std::string::npos,
               "import: the message names the cap");
@@ -946,8 +978,10 @@ void test_import_directory_out_of_file() {
     const Built b = build(s);
     const PeImage p = parse_image(b.bytes);
 
-    check(!p.ok(), "import: an unresolvable directory is refused");
-    check(p.error() == PeError::DirectoryOutOfFile, "import: reports the directory");
+    check_recorded(p, PeError::DirectoryOutOfFile, PeSeverity::Damaged,
+                   "import: an unresolvable directory is recorded");
+    check(p.loadable(),
+          "import: an unresolvable directory leaves the image loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("0x8000") != std::string::npos,
               "import: the message names the RVA");
@@ -967,9 +1001,12 @@ void test_import_directory_in_zero_fill() {
     const Built b = build(s);
     const PeImage p = parse_image(b.bytes);
 
-    check(!p.ok(), "import: a zero-filled directory is refused");
-    check(p.error() == PeError::DirectoryOutOfFile,
-          "import: a zero-filled directory is not 'no imports'");
+    check_recorded(p, PeError::DirectoryOutOfFile, PeSeverity::Damaged,
+                   "import: a zero-filled directory is recorded");
+    check(p.loadable(),
+          "import: a zero-filled directory leaves the image loadable");
+    check(p.imports().empty(),
+          "import: a zero-filled directory is not 'no imports' by silence");
 }
 
 // A descriptor naming a string with no terminator before the end of the
@@ -1672,15 +1709,24 @@ void test_export_forwarder_malformed() {
         e.forwarders = {{0, target}};
         const PeImage p = build_export_image(e);
         char msg[128];
-        std::snprintf(msg, sizeof msg, "bad forwarder \"%s\": refused",
-                      target);
-        check(!p.ok(), msg);
         std::snprintf(msg, sizeof msg,
-                      "bad forwarder \"%s\": reports a bad export table",
+                      "bad forwarder \"%s\": recorded and the export kept as a "
+                      "forwarder",
                       target);
-        check(p.error() == PeError::BadExportTable, msg);
+        // The address is inside the extent, so the export is a forwarder by
+        // the rule that defines one; what is wrong is the parse of its target,
+        // and that is recorded. The image is still a PE and still loadable:
+        // the forwarder is wrong, not the image.
+        check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged, msg);
+        check(p.loadable(), "bad forwarder: the image is still loadable");
+        if (p.exports().size() == 1) {
+            check(p.exports()[0].is_forwarder,
+                  "bad forwarder: the export is still a forwarder");
+            check(p.exports()[0].forwarder_dll.empty(),
+                  "bad forwarder: with no usable target");
+        }
     }
-    check(true, "bad forwarder: every malformed form was refused");
+    check(true, "bad forwarder: every malformed form was recorded");
 }
 
 // The ordinal forms that are legal, next to the ones that are not, so the
@@ -1714,8 +1760,9 @@ void test_export_forwarder_ordinal_forms() {
     e.names = {{"Alpha", 0}};
     e.forwarders = {{0, "KERNEL32.#0"}};
     const PeImage p = build_export_image(e);
-    check(!p.ok(), "forwarder #0: refused");
-    check(p.error() == PeError::BadExportTable, "forwarder #0: bad table");
+    check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged,
+                   "forwarder #0: recorded");
+    check(p.loadable(), "forwarder #0: the image is still loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("ordinal zero") != std::string::npos,
               "forwarder #0: the message says why");
@@ -1738,12 +1785,15 @@ void test_export_directory_too_small() {
         const PeImage p = build_export_image(e);
         char msg[96];
         std::snprintf(msg, sizeof msg,
-                      "export: a %zu-byte directory is refused", declared);
-        check(!p.ok(), msg);
-        std::snprintf(msg, sizeof msg,
-                      "export: a %zu-byte directory reports a truncated "
-                      "record", declared);
-        check(p.error() == PeError::TruncatedExportDirectory, msg);
+                      "export: a %zu-byte directory is recorded as a truncated "
+                      "record",
+                      declared);
+        check_recorded(p, PeError::TruncatedExportDirectory, PeSeverity::Damaged,
+                       msg);
+        check(p.loadable(),
+              "export: a short directory leaves the image loadable");
+        check(p.exports().empty(),
+              "export: a short directory reports no exports");
     }
     // 40 exactly is enough, and the boundary is the interesting part.
     ExportLayout e;
@@ -1766,9 +1816,10 @@ void test_export_directory_out_of_file() {
     e.dir_rva = 0x8000;
     const PeImage p = build_export_image(e);
 
-    check(!p.ok(), "export: an unresolvable directory is refused");
-    check(p.error() == PeError::DirectoryOutOfFile,
-          "export: reports the directory");
+    check_recorded(p, PeError::DirectoryOutOfFile, PeSeverity::Damaged,
+                   "export: an unresolvable directory is recorded");
+    check(p.loadable(),
+          "export: an unresolvable directory leaves the image loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("0x8000") != std::string::npos,
               "export: the message names the RVA");
@@ -1788,9 +1839,12 @@ void test_export_directory_in_zero_fill() {
     const Built b = build(s);
     const PeImage p = parse_image(b.bytes);
 
-    check(!p.ok(), "export: a zero-filled directory is refused");
-    check(p.error() == PeError::DirectoryOutOfFile,
-          "export: a zero-filled directory is not 'no exports'");
+    check_recorded(p, PeError::DirectoryOutOfFile, PeSeverity::Damaged,
+                   "export: a zero-filled directory is recorded");
+    check(p.loadable(),
+          "export: a zero-filled directory leaves the image loadable");
+    check(p.exports().empty(),
+          "export: a zero-filled directory is not 'no exports' by silence");
 }
 
 // One of the three tables pointing somewhere the file does not cover. The
@@ -1813,12 +1867,10 @@ void test_export_table_out_of_file() {
         e.*(w.field) = 0x9000;
         const PeImage p = build_export_image(e);
         char msg[128];
-        std::snprintf(msg, sizeof msg, "export: %s out of file is refused",
-                      w.what);
-        check(!p.ok(), msg);
         std::snprintf(msg, sizeof msg,
-                      "export: %s out of file reports a bad table", w.what);
-        check(p.error() == PeError::BadExportTable, msg);
+                      "export: %s out of file is recorded", w.what);
+        check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged, msg);
+        check(p.loadable(), msg);
     }
     check(true, "export: every table was checked separately");
 }
@@ -1842,9 +1894,9 @@ void test_export_count_larger_than_the_file() {
     e.declared_functions = 1000;
     const PeImage p = build_export_image(e);
 
-    check(!p.ok(), "export: a count past the end of the file is refused");
-    check(p.error() == PeError::BadExportTable,
-          "export: reports a bad table");
+    check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged,
+                   "export: a count past the end of the file is recorded");
+    check(p.loadable(), "export: the image is still loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("fit in a file") != std::string::npos,
               "export: the message says the file ran out");
@@ -1862,9 +1914,9 @@ void test_export_name_index_out_of_range() {
     e.names = {{"Alpha", 0}, {"Bad", 7}};
     const PeImage p = build_export_image(e);
 
-    check(!p.ok(), "export: an out-of-range name index is refused");
-    check(p.error() == PeError::BadExportTable,
-          "export: reports a bad table");
+    check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged,
+                   "export: an out-of-range name index is recorded");
+    check(p.loadable(), "export: the image is still loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("address-table entry 7") !=
                   std::string::npos,
@@ -1881,9 +1933,9 @@ void test_export_names_without_addresses() {
     e.names = {{"Alpha", 0}};
     const PeImage p = build_export_image(e);
 
-    check(!p.ok(), "export: names with no address table are refused");
-    check(p.error() == PeError::BadExportTable,
-          "export: reports a bad table");
+    check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged,
+                   "export: names with no address table are recorded");
+    check(p.loadable(), "export: the image is still loadable");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("no address table") != std::string::npos,
               "export: the message says why");
@@ -1899,9 +1951,8 @@ void test_export_count_is_capped() {
     e.declared_functions = 100000;
     const PeImage p = build_export_image(e);
 
-    check(!p.ok(), "export: an enormous address table is refused");
-    check(p.error() == PeError::BadExportTable,
-          "export: reports a bad table");
+    check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged,
+                   "export: an enormous address table is recorded");
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("65536") != std::string::npos,
               "export: the message names the cap");
@@ -1912,9 +1963,8 @@ void test_export_count_is_capped() {
     e2.names = {{"Alpha", 0}};
     e2.declared_names = 100000;
     const PeImage p2 = build_export_image(e2);
-    check(!p2.ok(), "export: an enormous name table is refused");
-    check(p2.error() == PeError::BadExportTable,
-          "export: reports a bad table for the name count too");
+    check_recorded(p2, PeError::BadExportTable, PeSeverity::Damaged,
+                   "export: an enormous name table is recorded");
 
     // The boundary itself: exactly the cap is walked, not refused. A cap
     // applied at the wrong comparison turns a file with 65536 exports into a
@@ -1937,11 +1987,12 @@ void test_export_count_is_capped() {
     e4.names = {{"Alpha", 0}};
     e4.declared_functions = 65537;
     const PeImage p4 = build_export_image(e4);
-    check(!p4.ok(), "export: 65537 is over the cap");
+    check_recorded(p4, PeError::BadExportTable, PeSeverity::Damaged,
+                   "export: 65537 is over the cap");
     if (!p4.error_detail().empty()) {
         check(p4.error_detail().find("this reader walks") !=
                   std::string::npos,
-              "export: 65537 is refused by the cap");
+              "export: 65537 is recorded by the cap");
     }
 }
 
@@ -1980,9 +2031,15 @@ void test_export_forwarder_unterminated() {
     e.forwarders = {{0, "KERNEL32.Sleep", true}};
     const PeImage p = build_export_image(e);
 
-    check(!p.ok(), "unterminated forwarder: refused");
-    check(p.error() == PeError::BadExportTable,
-          "unterminated forwarder: reports a bad table");
+    check_recorded(p, PeError::BadExportTable, PeSeverity::Damaged,
+                   "unterminated forwarder: recorded");
+    check(p.loadable(), "unterminated forwarder: the image is still loadable");
+    if (p.exports().size() == 1) {
+        check(p.exports()[0].is_forwarder,
+              "unterminated forwarder: still a forwarder by its address");
+        check(p.exports()[0].forwarder_dll.empty(),
+              "unterminated forwarder: with no target read");
+    }
     if (!p.error_detail().empty()) {
         check(p.error_detail().find("not a readable") != std::string::npos,
               "unterminated forwarder: the message says the string did not "
@@ -2063,7 +2120,8 @@ void test_export_truncated_file_fails_at_the_section_first() {
     e.truncate_to = kExpDirFile + kExpDirSize + 2 * 4;
     const PeImage p = build_export_image(e);
 
-    check(!p.ok(), "truncated file: refused");
+    check(!p.loadable(), "truncated file: the image is not loadable");
+    check(p.is_pe(), "truncated file: it is still a PE");
     check(p.error() == PeError::BadSectionTable,
           "truncated file: the section check fires before the export check");
     if (!p.error_detail().empty()) {
@@ -2625,6 +2683,44 @@ void test_truncated_buffer_everywhere() {
 
 } // namespace
 
+// The reader answers with a list of facts rather than a single error, and the
+// case for a list over an error is a file that carries more than one. A file
+// whose import directory and export directory both point outside it is one
+// file with two problems; a reader that reported only the first would send a
+// caller to fix it and meet the second on the next run. Both problems are
+// about directories rather than about the layout, so the file is still a PE
+// and still loadable, and the two facts are the whole report.
+void test_diagnostics_are_a_list() {
+    Spec s = base_spec();
+    s.import_rva = 0x8000;
+    s.import_size = 40;
+    s.export_rva = 0x9000;
+    s.export_size = 40;
+    const Built b = build(s);
+    const PeImage p = parse_image(b.bytes);
+
+    check(p.is_pe(), "two directories: still a PE");
+    check(p.loadable(),
+          "two directories: both problems are directory problems");
+    bool saw_import = false;
+    bool saw_export = false;
+    for (const PeDiagnostic& d : p.diagnostics()) {
+        if (d.code != PeError::DirectoryOutOfFile) {
+            continue;
+        }
+        if (d.where == 0x8000) {
+            saw_import = true;
+        }
+        if (d.where == 0x9000) {
+            saw_export = true;
+        }
+    }
+    check(saw_import, "two directories: the import fact is recorded");
+    check(saw_export, "two directories: the export fact is recorded");
+    check(p.diagnostics().size() >= 2,
+          "two directories: both facts are in the list at once");
+}
+
 int main() {
     test_pe32_executable();
     test_pe32plus_executable();
@@ -2674,6 +2770,7 @@ int main() {
     test_export_counts_are_independent();
     test_export_name_field_is_not_required();
     test_export_truncated_file_fails_at_the_section_first();
+    test_diagnostics_are_a_list();
     test_not_pe();
     test_bad_header_offset();
     test_truncated_coff_and_optional();

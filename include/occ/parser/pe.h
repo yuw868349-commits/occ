@@ -140,6 +140,61 @@ enum class PeError : std::uint8_t {
 
 [[nodiscard]] const char* pe_error_name(PeError e) noexcept;
 
+// How much a fact about a file matters, which is not the same as what kind of
+// fact it is.
+//
+// The reader does not fail on a malformed file. It parses what is there and
+// records what is not, and the severity is what tells a caller how far to
+// trust the result. The three levels are the three answers a caller can act
+// on, and there is no fourth because a caller that needs finer judgement can
+// read the code and the offset.
+//
+// The distinction that matters most is Damaged against Structural. A damaged
+// piece is a structure this image claims and cannot deliver -- an export
+// directory that runs off the end of the file -- and the image is still a
+// well-formed PE whose other parts are usable and whose layout can be
+// trusted. A structural problem is one about the layout itself -- a section
+// table that overruns, a SizeOfHeaders that cannot be true -- and an address
+// read from such an image may mean a different thing than an address read
+// from a healthy one, which is a claim no caller can work around.
+enum class PeSeverity : std::uint8_t {
+    // A fact worth recording that is not damage: a region that overlaps, a
+    // header size that leaves room for less than it claims. The image loads
+    // and means what it says.
+    Note,
+    // A structure the image claims and the file does not back. The image
+    // remains a PE and remains loadable; the affected directory or table is
+    // empty and this record says why. Distinguishing this from "the file has
+    // no such table" is the whole point: an empty export table and an export
+    // table that could not be read are two different claims about the file.
+    Damaged,
+    // A problem with the layout rather than with a structure in it. The
+    // reader keeps whatever it could parse, but `loadable()` is false,
+    // because an address this reader reports and an address the Windows
+    // loader would compute may differ, and no caller can repair that by
+    // reading more of the file.
+    Structural,
+};
+
+[[nodiscard]] const char* pe_severity_name(PeSeverity s) noexcept;
+
+// One fact the reader decided about a file, kept with enough of its context
+// to be read on its own.
+//
+// `where` is the RVA or file offset the fact is about, or zero when the fact
+// is not about a single location (a header field that is simply too small).
+// It is a location rather than a formatted string because a caller that wants
+// to point at it -- a report, a diff, a jump in a disassembler -- needs the
+// number, and a caller that wants a sentence can build one from `code` and
+// `detail`. `detail` carries the sentence the old failure path carried, so
+// nothing that used to be said about a file is lost by no longer refusing it.
+struct PeDiagnostic {
+    PeError code = PeError::None;
+    PeSeverity severity = PeSeverity::Note;
+    std::uint64_t where = 0;
+    std::string detail;
+};
+
 // A section header, as the file states it. The names are the section names
 // (.text, .rdata, ...) which are advisory: nothing in the format requires
 // them and a packer will rewrite them, so nothing here depends on one.
@@ -262,10 +317,50 @@ class PeImage {
 public:
     [[nodiscard]] static PeImage parse(ByteSpan bytes) noexcept;
 
-    [[nodiscard]] bool ok() const noexcept { return error_ == PeError::None; }
+    // Whether this is a PE at all. True once the identification layer -- the
+    // MZ stub, the `e_lfanew` offset, the PE signature and the fixed fields of
+    // the COFF header -- has held together. A file that fails this is not a
+    // PE, and nothing below it means anything; a file that passes it is a PE,
+    // whatever else the file got wrong, and every remaining problem is a
+    // diagnostic rather than a refusal.
+    [[nodiscard]] bool is_pe() const noexcept { return recognized_; }
+
+    // Whether the image's layout can be trusted: it is a PE and no recorded
+    // problem is one about the layout itself (PeSeverity::Structural). This is
+    // the question a loader asks before it maps anything, and it is the one
+    // judgement the reader makes on a caller's behalf -- because a caller
+    // cannot repair an untrusted layout by reading more of the file, and a
+    // caller *can* repair a damaged directory by treating it as empty, which
+    // is exactly what the reader already did for it.
+    [[nodiscard]] bool loadable() const noexcept;
+
+    // The same answer as `loadable()`, under the name the callers that
+    // predate it use. It is `loadable()` and not `is_pe()` on purpose: the
+    // callers that ask `ok()` are asking "can I act on this", and a file that
+    // is a PE but whose layout is untrustworthy is not one they can act on.
+    // The looser question -- "is this a PE", which still has an answer and a
+    // useful one -- is `is_pe()`, and a caller that wants the parts a damaged
+    // image did parse reads `diagnostics()` to see what was lost.
+    [[nodiscard]] bool ok() const noexcept { return loadable(); }
+
+    // The most severe fact recorded, and its sentence. Kept because the
+    // readers that predate the diagnostic list ask for "the error", and a
+    // single answer is still the right one for a caller that only wants to
+    // print why a file was not loadable.
     [[nodiscard]] PeError error() const noexcept { return error_; }
     [[nodiscard]] const std::string& error_detail() const noexcept {
         return detail_;
+    }
+
+    // Every fact the reader decided about the file, in the order it decided
+    // them. Empty for a file with nothing to report, which is the ordinary
+    // case for a file a compiler produced. A caller that wants to know what a
+    // malformed file was missing reads this and not `error()`, because the
+    // point of a diagnostic list over a single error is that a file can carry
+    // several problems at once and a reader that reported only the first
+    // would send a caller to fix one and be surprised by the next.
+    [[nodiscard]] const std::vector<PeDiagnostic>& diagnostics() const noexcept {
+        return diagnostics_;
     }
 
     [[nodiscard]] PeKind kind() const noexcept { return kind_; }
@@ -419,6 +514,29 @@ private:
 
     PeError error_ = PeError::NotPe;
     std::string detail_;
+
+    // True once the identification layer -- MZ, e_lfanew, PE signature, COFF
+    // fixed fields -- held together. Set at exactly one place in the parse,
+    // because "is this a PE" is one decision and a second place that could
+    // set it would be a second answer to it.
+    bool recognized_ = false;
+
+    // Every fact decided about the file, in order. A vector and not a single
+    // error because a malformed file usually has more than one thing wrong
+    // with it and a reader that stops at the first leaves the rest to be
+    // discovered one run at a time.
+    std::vector<PeDiagnostic> diagnostics_;
+
+    // Record a fact. `error_` and `detail_` are kept in step with the most
+    // severe diagnostic so the single-answer accessors stay meaningful
+    // without a caller having to walk the list.
+    void note(PeError code, PeSeverity severity, std::uint64_t where,
+              std::string detail) noexcept;
+
+    // The severity `error_`/`detail_` currently name. A later fact replaces
+    // them only when it is at least as severe, so "the error" stays the most
+    // serious thing known about the file rather than the most recent.
+    PeSeverity error_severity_ = PeSeverity::Note;
 
     PeKind kind_ = PeKind::None;
     PeMachine machine_ = PeMachine::Unknown;

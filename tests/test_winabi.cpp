@@ -1373,6 +1373,33 @@ void test_every_fixture_import_resolves() {
         "wcsrchr",              "wcsstr",
         "wcstombs",
     };
+    // The modern half of the same module. A guest built against a current
+    // toolchain imports these from `msvcrt.dll` too -- the name it names in
+    // its import table depends on the toolchain that built it, not on which
+    // library the function actually lives in -- and `add_msvcrt` has to merge
+    // the UCRT domain for them to resolve. Keeping the list apart from the
+    // classic one says which half a miss came from: the two halves are filled
+    // by two different domains, and a miss in this list and a miss in the one
+    // above are two different bugs. `ungetc` and `_strtoui64` lead it because
+    // they are the two a real guest hit first.
+    const char* msvcrt_modern[] = {
+        "ungetc",          "_strtoui64",    "_strtoi64",
+        "__acrt_iob_func", "_aligned_free", "_aligned_malloc",
+        "_aligned_realloc","_aligned_msize","_beginthreadex",
+        "_endthreadex",    "ctime_s",       "gmtime_s",
+        "localtime_s",     "fgetwc",        "fputwc",
+        "fscanf",          "fscanf_s",      "fwprintf",
+        "fwscanf",         "_getch",        "_kbhit",
+        "_putch",          "memcpy_s",      "memmove_s",
+        "printf",          "sprintf",       "sprintf_s",
+        "scanf",           "sscanf",        "sscanf_s",
+        "setlocale",       "strcat_s",      "strcpy_s",
+        "strncpy_s",       "strnlen_s",     "strdup",
+        "_strdup",         "strtof",        "vprintf",
+        "vsnprintf_s",     "vsprintf_s",    "wcrtomb",
+        "wcscat_s",        "_wsystem",      "wprintf",
+        "__stdio_common_vsnprintf",
+    };
     const char* user32[] = {
         "wsprintfA", "wsprintfW",
     };
@@ -1401,6 +1428,13 @@ void test_every_fixture_import_resolves() {
             std::fprintf(stderr, "  msvcrt miss: %s\n", name);
         }
         check(found.address != 0, "every msvcrt import resolves");
+    }
+    for (const char* name : msvcrt_modern) {
+        const ExportLookup found = registry.find_by_name("msvcrt.dll", name, 0);
+        if (found.address == 0) {
+            std::fprintf(stderr, "  msvcrt (modern) miss: %s\n", name);
+        }
+        check(found.address != 0, "every msvcrt modern import resolves");
     }
     for (const char* name : user32) {
         const ExportLookup found =

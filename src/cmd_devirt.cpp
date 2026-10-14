@@ -7,14 +7,17 @@
 // runtime dumps next to the image), control flow, and an assembly-like
 // listing.
 //
-// VMP 3 virtual instruction format (the bundled sample):
-//   dispatch:  mov rcx,[r12+rax*8]          @ 0x6b2a
-//   decrypt:   cmc;cmc; rol rcx,0xa; jmp rcx @ 0x8851
-//   handler = rol(word, 10).  The handler is a junk-wrapped micro-program
-//   on the virtual state: rbp = virtual stack pointer, rsi = bytecode
-//   cursor.  The trace records the virtual stack at every dispatch
-//   (st0/st1/st2) and the cursor, so a call is visible as the guest's own
-//   API address in the stack slots.
+// Each dispatch row carries the word the dispatcher read out of its
+// handler table. Two VM families write that word two ways and the trace
+// does not distinguish them, so the image decides (lift::resolve_handler):
+//   * a hand-rolled VM stores the handler's address directly;
+//   * VMP 3 stores it rotated left by ten and rotates it back before the
+//     jump -- `dispatch: mov rcx,[r12+rax*8]` at 0x6b2a, then
+//     `decrypt: cmc;cmc; rol rcx,0xa; jmp rcx` at 0x8851.
+// A handler is a junk-wrapped micro-program on the virtual state:
+// rbp = virtual stack pointer, rsi = bytecode cursor. The trace records
+// the virtual stack at every dispatch (st0/st1/st2) and the cursor, so a
+// call is visible as the guest's own API address in the stack slots.
 
 #include "occ/commands.h"
 #include "occ/devirt/lift.h"
@@ -37,12 +40,6 @@ namespace occ::devirt {
 
 namespace {
 
-constexpr std::uint64_t kMask = 0xFFFFFFFFFFFFFFFFULL;
-
-std::uint64_t rol10(std::uint64_t v) {
-    return ((v << 10) & kMask) | (v >> 54);
-}
-
 // ---------------------------------------------------------------- trace
 
 struct Row {
@@ -55,7 +52,12 @@ struct Row {
     std::uint64_t st0 = 0;   // virtual stack top
     std::uint64_t st1 = 0;
     std::uint64_t st2 = 0;
-    std::uint64_t word = 0;  // the encrypted virtual instruction word
+    std::uint64_t word = 0;  // the value the dispatcher read from the table
+    // The handler address `word` resolves to. It is computed once, against
+    // the image, right after the trace loads (see resolve_rows) so every
+    // later step reads the same answer instead of each re-deciding how the
+    // table encodes its entries.
+    std::uint64_t handler = 0;
 };
 
 std::uint64_t json_hex(std::string_view s) {
@@ -254,6 +256,15 @@ struct ImageMap {
         return nullptr;
     }
 
+    // Whether `va` names file-backed bytes. It is the probe `resolve_rows`
+    // hands to the handler resolver: an address with bytes behind it is
+    // the one the dispatcher jumped to.
+    bool code_at(std::uint64_t va) const {
+        std::uint64_t window_va = 0;
+        std::size_t available = 0;
+        return window(va, &window_va, &available) != nullptr;
+    }
+
     // The code reader the conformance check binds bytecode and image
     // inputs with: `width` bits from the image at `va`.
     static bool read(void* ctx, std::uint64_t va, unsigned width,
@@ -278,6 +289,19 @@ struct ImageMap {
         return true;
     }
 };
+
+// Fills in each row's handler address against the image, once, so every
+// later step reads one answer instead of each re-deciding how the table
+// encodes its entries. The two VM families the de-virtualizer serves
+// disagree here -- one stores the address, the other a rotated form -- and
+// the trace does not say which wrote it, so the image settles it through
+// lift::resolve_handler: the word that points at code is the address.
+void resolve_rows(const ImageMap& img, bool have_img, std::vector<Row>& rows) {
+    for (Row& r : rows) {
+        r.handler =
+            lift::resolve_handler(r.word, have_img && img.code_at(r.word));
+    }
+}
 
 // -------------------------------------------------------------- disasm
 
@@ -387,7 +411,7 @@ std::map<std::uint64_t, std::vector<Sem>>
 extract_handlers(const std::string& dump, const std::vector<Row>& rows) {
     std::map<std::uint64_t, std::vector<Sem>> handlers;
     for (const Row& r : rows) {
-        const std::uint64_t h = rol10(r.word);
+        const std::uint64_t h = r.handler;
         if (handlers.count(h)) {
             continue;
         }
@@ -593,6 +617,13 @@ int cmd_devirt(int argc, char** argv) {
         rows.resize(limit);
     }
 
+    // The handler table's encoding is settled here, once, against the
+    // image. Every step below reads the resolved `handler` off the row and
+    // none of them has to know which VM family wrote the trace.
+    ImageMap img;
+    const bool have_img = img.load(dump_path);
+    resolve_rows(img, have_img, rows);
+
     Report rep;
     rep.emit("trace: " + std::to_string(rows.size()) + " dispatches");
 
@@ -601,7 +632,7 @@ int cmd_devirt(int argc, char** argv) {
 
     std::map<std::uint64_t, std::vector<Row>> by_handler;
     for (const Row& r : rows) {
-        by_handler[rol10(r.word)].push_back(r);
+        by_handler[r.handler].push_back(r);
     }
 
     rep.emit("handler        count  semantics");
@@ -625,6 +656,26 @@ int cmd_devirt(int argc, char** argv) {
         rep.emit(std::string(b) + "  " + label.substr(0, 82));
     }
 
+    // The semantics are read from handler bytes, and the reader names the
+    // operations one VM family writes. When not one handler matched, the
+    // trace comes from a family whose register use the reader does not
+    // know: the handlers are still located and lifted below, but their
+    // operations are unnamed -- and a blank column reads as "no
+    // operations", which is a different and wrong report. So it is said.
+    bool any_named = false;
+    for (const auto& [h, s] : handlers) {
+        if (!s.empty()) {
+            any_named = true;
+            break;
+        }
+    }
+    if (!handlers.empty() && !any_named) {
+        rep.emit("");
+        rep.emit("no handler matched the operation names this build knows (the "
+                 "reader recognizes one VM family's register use); every "
+                 "handler below is located and lifted, none is named.");
+    }
+
     // The bytecode cursor's range.
     if (!rows.empty()) {
         std::uint64_t lo = rows[0].rsi, hi = rows[0].rsi;
@@ -645,7 +696,7 @@ int cmd_devirt(int argc, char** argv) {
     rep.emit("#    handler       word                  semantics");
     for (std::size_t i = 0; i < shown; ++i) {
         const Row& r = rows[i];
-        const auto sem = handlers.find(rol10(r.word));
+        const auto sem = handlers.find(r.handler);
         std::string label;
         if (sem != handlers.end()) {
             for (std::size_t j = 0; j < sem->second.size() && j < 3; ++j) {
@@ -658,7 +709,7 @@ int cmd_devirt(int argc, char** argv) {
         char b[64];
         std::snprintf(b, sizeof(b), "%-5llu0x%010llx  0x%016llx",
                       static_cast<unsigned long long>(r.seq),
-                      static_cast<unsigned long long>(rol10(r.word)),
+                      static_cast<unsigned long long>(r.handler),
                       static_cast<unsigned long long>(r.word));
         rep.emit(std::string(b) + "  " + (label.empty() ? "?" : label));
     }
@@ -696,7 +747,7 @@ int cmd_devirt(int argc, char** argv) {
     // Opcode histogram.
     std::map<std::string, std::size_t> counts;
     for (const Row& r : rows) {
-        const auto sem = handlers.find(rol10(r.word));
+        const auto sem = handlers.find(r.handler);
         if (sem != handlers.end() && !sem->second.empty()) {
             counts[sem->second[0].cls]++;
         } else {
@@ -761,8 +812,7 @@ int cmd_devirt(int argc, char** argv) {
     // previous row's values and compared with the next row's, field by
     // field.
     {
-        ImageMap img;
-        if (!img.load(dump_path)) {
+        if (!have_img) {
             rep.emit("");
             rep.emit("handler lifting: skipped (the dump does not parse as "
                      "a PE image)");
@@ -860,7 +910,7 @@ int cmd_devirt(int argc, char** argv) {
                 lr.st2 = r.st2;
                 lr.target = r.word;
                 lrows.push_back(lr);
-                which.push_back(index_of[rol10(r.word)]);
+                which.push_back(index_of[r.handler]);
             }
             const lift::Conformance conf = lift::check_trace(
                 model, lhandlers, lrows, which, ImageMap::read, &img);
@@ -905,14 +955,14 @@ int cmd_devirt(int argc, char** argv) {
         const std::size_t n = asm_limit ? asm_limit : rows.size();
         for (std::size_t i = 0; i < n; ++i) {
             const Row& r = rows[i];
-            const auto sem = handlers.find(rol10(r.word));
+            const auto sem = handlers.find(r.handler);
             const std::string label =
                 sem != handlers.end() ? asm_label(sem->second) : "?";
             char b[48];
             std::snprintf(b, sizeof(b), "%-5llu0x%010llx 0x%010llx",
                           static_cast<unsigned long long>(r.seq),
                           static_cast<unsigned long long>(r.rsi),
-                          static_cast<unsigned long long>(rol10(r.word)));
+                          static_cast<unsigned long long>(r.handler));
             rep.emit(std::string(b) + "  " + label +
                      std::string(22 - std::min<std::size_t>(22, label.size()), ' ') +
                      "  " + fmt_slots(r));

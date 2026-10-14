@@ -5900,7 +5900,16 @@ void add_shlwapi(ExportModule& module) {
 // wrapper so the module table keeps naming one function per module.
 void add_msvcrt(ExportModule& module) {
     module.name = "msvcrt.dll";
+    // The legacy CRT and the modern UCRT spellings name the same functions:
+    // a guest built against an old toolchain imports `msvcrt.dll!ungetc` and
+    // one built against a new one imports `ucrtbase.dll!ungetc`, and both
+    // must resolve. `api-ms-win-crt-*` merges the two lists for the same
+    // reason (see `modules.cpp`); `msvcrt.dll` has to merge them too, or the
+    // classic surface it carries is missing every function that only the
+    // modern list names -- which is exactly what made a real guest that
+    // imports `msvcrt.dll!ungetc` unbuildable.
     add_crt_exports(module.host_exports);
+    add_ucrt_extra(module.host_exports);
 }
 
 }  // namespace

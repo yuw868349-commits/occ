@@ -462,6 +462,66 @@ const char* pe_error_name(PeError e) noexcept {
     return "unknown";
 }
 
+const char* pe_severity_name(PeSeverity s) noexcept {
+    switch (s) {
+    case PeSeverity::Note:
+        return "note";
+    case PeSeverity::Damaged:
+        return "damaged";
+    case PeSeverity::Structural:
+        return "structural";
+    }
+    return "unknown";
+}
+
+bool PeImage::loadable() const noexcept {
+    if (!recognized_) {
+        return false;
+    }
+    for (const PeDiagnostic& d : diagnostics_) {
+        if (d.severity == PeSeverity::Structural) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void PeImage::note(PeError code, PeSeverity severity, std::uint64_t where,
+                   std::string detail) noexcept {
+    // The rank of a severity as an ordering, written out rather than relying
+    // on the enumerators' values so that adding a level cannot silently
+    // reorder the levels that already exist.
+    const auto rank = [](PeSeverity s) {
+        switch (s) {
+        case PeSeverity::Note:
+            return 0;
+        case PeSeverity::Damaged:
+            return 1;
+        case PeSeverity::Structural:
+            return 2;
+        }
+        return 0;
+    };
+    PeDiagnostic d;
+    d.code = code;
+    d.severity = severity;
+    d.where = where;
+    d.detail = detail;
+    // The single-answer accessors name the most severe fact, and among facts
+    // of equal severity the first one recorded. The comparison is strict so
+    // that a later fact of the same rank does not displace an earlier one: the
+    // first problem a file has is the one a caller wants to hear first, and a
+    // file whose optional header is short and whose section table therefore
+    // cannot be read should name the optional header, not the section table
+    // that failed as a consequence.
+    if (diagnostics_.empty() || rank(severity) > rank(error_severity_)) {
+        error_ = code;
+        detail_ = std::move(detail);
+        error_severity_ = severity;
+    }
+    diagnostics_.push_back(std::move(d));
+}
+
 bool PeSection::executable() const noexcept {
     return (characteristics & kScnMemExecute) != 0;
 }
@@ -501,17 +561,27 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     PeImage out;
     out.bytes_size_ = bytes.size();
 
-    // The failure path is used from several places below, and each one knows
-    // what it was reading. A local lambda keeps the error and its sentence
-    // together, because an error without its sentence is the thing this file
-    // exists to avoid.
-    const auto fail = [&out](PeError e, std::string detail) {
-        out.error_ = e;
-        out.detail_ = std::move(detail);
-        out.sections_.clear();
-        out.imports_.clear();
-        out.exports_.clear();
+    // The reader does not refuse a file for being malformed. It records what
+    // it found and answers with whatever it could parse -- `is_pe()` says
+    // whether the identification layer held, `loadable()` whether the layout
+    // can be trusted, and `diagnostics()` carries every fact either way.
+    //
+    // There is exactly one boundary left, and it is not a judgement call: it
+    // is whether there is a PE here to talk about at all. Before the COFF
+    // header's fixed fields are read there is nothing to describe, so a
+    // failure there ends the parse with `recognized_` false. After it, every
+    // problem is a diagnostic and the parse continues.
+    const auto identify_fail = [&out](PeError e, std::string detail) {
+        out.note(e, PeSeverity::Structural, 0, std::move(detail));
         return out;
+    };
+    const auto damaged = [&out](PeError e, std::uint64_t where,
+                                std::string detail) {
+        out.note(e, PeSeverity::Damaged, where, std::move(detail));
+    };
+    const auto structural = [&out](PeError e, std::uint64_t where,
+                                   std::string detail) {
+        out.note(e, PeSeverity::Structural, where, std::move(detail));
     };
 
     // --- the DOS header
@@ -521,13 +591,13 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     // answers send a reader to different places: one says "this is not a PE",
     // the other says "this is too short to tell".
     if (bytes.size() < kDosHeaderSize) {
-        return fail(PeError::TruncatedDosHeader,
+        return identify_fail(PeError::TruncatedDosHeader,
                     "the DOS header is " + decimal(kDosHeaderSize) +
                         " bytes and the file is " + decimal(bytes.size()));
     }
     if (!in_range(bytes, kOffDosMagic, 2) ||
         rd16(bytes, kOffDosMagic) != kDosMagic) {
-        return fail(PeError::NotPe,
+        return identify_fail(PeError::NotPe,
                     "the file does not begin with the MZ signature");
     }
 
@@ -540,21 +610,21 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     // odd offset is either corrupt or is a format this reader has no reason
     // to guess at. Either way the honest answer is to refuse.
     if (lfanew < kDosHeaderSize) {
-        return fail(PeError::BadHeaderOffset,
+        return identify_fail(PeError::BadHeaderOffset,
                     "e_lfanew is " + hex_value(lfanew) +
                         ", which is inside the DOS header");
     }
     if ((lfanew & 1u) != 0) {
-        return fail(PeError::BadHeaderOffset,
+        return identify_fail(PeError::BadHeaderOffset,
                     "e_lfanew is " + hex_value(lfanew) + ", which is odd");
     }
     if (!in_range(bytes, lfanew, kPeSignatureSize)) {
-        return fail(PeError::BadHeaderOffset,
+        return identify_fail(PeError::BadHeaderOffset,
                     "e_lfanew is " + hex_value(lfanew) +
                         " and the file is " + decimal(bytes.size()) + " bytes");
     }
     if (rd32(bytes, lfanew) != kPeSignature) {
-        return fail(PeError::NotPe,
+        return identify_fail(PeError::NotPe,
                     "there is no PE signature at e_lfanew (" +
                         hex_value(lfanew) + ")");
     }
@@ -562,7 +632,7 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     // --- the COFF header, which starts right after the signature
     const std::size_t coff = lfanew + kPeSignatureSize;
     if (!in_range(bytes, coff, kCoffHeaderSize)) {
-        return fail(PeError::TruncatedCoffHeader,
+        return identify_fail(PeError::TruncatedCoffHeader,
                     "the COFF header is at " + hex_value(coff) +
                         " and the file is " + decimal(bytes.size()) + " bytes");
     }
@@ -575,92 +645,99 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                                                         : PeKind::Executable;
     const std::uint16_t opt_size = rd16(bytes, coff + kOffCoffOptionalSize);
 
+    // The identification layer held: everything from here on is a diagnostic
+    // and never a refusal. This is the single place `recognized_` is set,
+    // because "is this a PE" is one decision and two places that could set it
+    // would be two answers to it. `error_` starts at None so a file with no
+    // diagnostics reports no error, which is the ordinary case.
+    out.recognized_ = true;
+    out.error_ = PeError::None;
+
     // --- the optional header
+    //
+    // A file with no optional header is a driver or a resource-only object: a
+    // real thing the reader can still describe, so its absence is not a
+    // problem and is not recorded. Everything else here is read as far as the
+    // file backs it. A header too short to hold the fields this reader reads
+    // leaves those fields at their defaults and records why, rather than
+    // refusing a file whose section table and directories may be entirely
+    // readable -- the section table's position does not depend on the optional
+    // header's contents, only on its declared length, which the COFF header
+    // carries regardless.
     const std::size_t opt = coff + kCoffHeaderSize;
     if (opt_size == 0) {
-        // A file with no optional header is a driver or a resource-only
-        // object. It is a real thing, and it is not a program this engine can
-        // run, but the reader can still describe it -- so the format is
-        // accepted and the fields that come from the optional header keep
-        // their defaults. Refusing here would make the reader unable to say
-        // anything at all about a valid file.
         out.plus_ = false;
         out.opt_size_ = 0;
+    } else if (!in_range(bytes, opt, opt_size)) {
+        structural(PeError::TruncatedOptionalHeader, opt,
+                   "the optional header is at " + hex_value(opt) +
+                       " for " + decimal(opt_size) + " bytes and the file is " +
+                       decimal(bytes.size()) + " bytes");
+    } else if (opt_size < kOffOptMagic + 2) {
+        // The magic comes before the length checks below and has to be there:
+        // which of the two layouts the header is depends on it, and the
+        // offsets everything else uses depend on that. A header too short to
+        // hold it is recorded and the fields that need it are left at their
+        // defaults.
+        structural(PeError::TruncatedOptionalHeader, opt,
+                   "SizeOfOptionalHeader is " + decimal(opt_size) +
+                       ", too short to hold the two-byte magic that says "
+                       "which layout this is");
     } else {
-        if (!in_range(bytes, opt, opt_size)) {
-            return fail(PeError::TruncatedOptionalHeader,
-                        "the optional header is at " + hex_value(opt) +
-                            " for " + decimal(opt_size) +
-                            " bytes and the file is " + decimal(bytes.size()) +
-                            " bytes");
-        }
-        // The magic comes before the length check below, and it has to be
-        // there: which of the two layouts the header is depends on it, and the
-        // offsets everything else uses depend on that. So the question is
-        // asked first -- and a header too short to hold the magic is reported
-        // as short. Reading it anyway yields zero, and zero is not a magic
-        // this reader does not recognise, it is the absence of one.
-        if (opt_size < kOffOptMagic + 2) {
-            return fail(PeError::TruncatedOptionalHeader,
-                        "SizeOfOptionalHeader is " + decimal(opt_size) +
-                            ", too short to hold the two-byte magic that says "
-                            "which layout this is");
-        }
         const std::size_t magic = rd16(bytes, opt + kOffOptMagic);
-        if (magic == kMagicPe32) {
-            out.plus_ = false;
-        } else if (magic == kMagicPe32Plus) {
-            out.plus_ = true;
+        if (magic != kMagicPe32 && magic != kMagicPe32Plus) {
+            structural(PeError::UnknownOptionalMagic, opt,
+                       "the optional header magic is " + hex_value(magic) +
+                           ", which is neither PE32 (" +
+                           hex_value(kMagicPe32) + ") nor PE32+ (" +
+                           hex_value(kMagicPe32Plus) + ")");
         } else {
-            return fail(PeError::UnknownOptionalMagic,
-                        "the optional header magic is " + hex_value(magic) +
-                            ", which is neither PE32 (" + hex_value(kMagicPe32) +
-                            ") nor PE32+ (" + hex_value(kMagicPe32Plus) + ")");
-        }
-        out.opt_size_ = opt_size;
+            out.plus_ = (magic == kMagicPe32Plus);
+            out.opt_size_ = opt_size;
 
-        // The fixed fields this reader reads -- entry point, image base, both
-        // alignments, subsystem, DLL characteristics -- end at offset 72 in
-        // both layouts. SizeOfOptionalHeader is the file's own statement of
-        // how long the header is, and reading past it does not fail: the
-        // bytes are in the file, they are just the section table's bytes.
-        // A subsystem of 0 read out of a section name is a wrong answer, and
-        // the reader cannot tell it from a right one, so the header is
-        // required to be long enough to hold what it claims to describe.
-        constexpr std::size_t kFixedFieldsEnd = 72;
-        if (opt_size < kFixedFieldsEnd) {
-            return fail(PeError::TruncatedOptionalHeader,
-                        "SizeOfOptionalHeader is " + decimal(opt_size) +
-                            ", too short to hold the fixed fields, which end "
-                            "at offset " +
-                            decimal(kFixedFieldsEnd));
-        }
+            // The fixed fields this reader reads -- entry point, image base,
+            // both alignments, subsystem, DLL characteristics -- end at offset
+            // 72 in both layouts. SizeOfOptionalHeader is the file's own
+            // statement of how long the header is, and reading past it does
+            // not fail: the bytes are in the file, they are just the section
+            // table's bytes. A subsystem of 0 read out of a section name is a
+            // wrong answer, and the reader cannot tell it from a right one, so
+            // a header too short is recorded and the fields are left default.
+            constexpr std::size_t kFixedFieldsEnd = 72;
+            if (opt_size < kFixedFieldsEnd) {
+                structural(PeError::TruncatedOptionalHeader, opt,
+                           "SizeOfOptionalHeader is " + decimal(opt_size) +
+                               ", too short to hold the fixed fields, which "
+                               "end at offset " +
+                               decimal(kFixedFieldsEnd));
+            } else {
+                // The entry point, image base and the two alignments are at
+                // different offsets in the two layouts, so they are read
+                // through a branch rather than through an offset table. The
+                // branch is on a value the file chose, once, above.
+                out.entry_ = rd32(bytes, opt + kOffOptEntry);
+                if (out.plus_) {
+                    out.base_ = rd64(bytes, opt + kOff64Base);
+                    out.section_align_ = rd32(bytes, opt + kOff64SectionAlign);
+                    out.file_align_ = rd32(bytes, opt + kOff64FileAlign);
+                    out.image_size_ = rd32(bytes, opt + kOff64ImageSize);
+                    out.headers_size_ = rd32(bytes, opt + kOff64HeadersSize);
+                } else {
+                    out.base_ = rd32(bytes, opt + kOff32Base);
+                    out.section_align_ = rd32(bytes, opt + kOff32SectionAlign);
+                    out.file_align_ = rd32(bytes, opt + kOff32FileAlign);
+                    out.image_size_ = rd32(bytes, opt + kOff32ImageSize);
+                    out.headers_size_ = rd32(bytes, opt + kOff32HeadersSize);
+                }
 
-        // The entry point, image base and the two alignments are at different
-        // offsets in the two layouts, so they are read through a branch
-        // rather than through an offset table. The branch is on a value the
-        // file chose, once, above.
-        out.entry_ = rd32(bytes, opt + kOffOptEntry);
-        if (out.plus_) {
-            out.base_ = rd64(bytes, opt + kOff64Base);
-            out.section_align_ = rd32(bytes, opt + kOff64SectionAlign);
-            out.file_align_ = rd32(bytes, opt + kOff64FileAlign);
-            out.image_size_ = rd32(bytes, opt + kOff64ImageSize);
-            out.headers_size_ = rd32(bytes, opt + kOff64HeadersSize);
-        } else {
-            out.base_ = rd32(bytes, opt + kOff32Base);
-            out.section_align_ = rd32(bytes, opt + kOff32SectionAlign);
-            out.file_align_ = rd32(bytes, opt + kOff32FileAlign);
-            out.image_size_ = rd32(bytes, opt + kOff32ImageSize);
-            out.headers_size_ = rd32(bytes, opt + kOff32HeadersSize);
+                out.subsystem_raw_ = rd16(bytes, opt + kOffOptSubsystem);
+                out.subsystem_ = subsystem_from(out.subsystem_raw_);
+                const std::uint16_t dllc = rd16(bytes, opt + kOffOptDllCharacteristics);
+                out.aslr_ = (dllc & kDllCharacteristicsDynamicBase) != 0;
+                out.nx_ = (dllc & kDllCharacteristicsNxCompat) != 0;
+                out.hev_ = (dllc & kDllCharacteristicsHighEntropyVa) != 0;
+            }
         }
-
-        out.subsystem_raw_ = rd16(bytes, opt + kOffOptSubsystem);
-        out.subsystem_ = subsystem_from(out.subsystem_raw_);
-        const std::uint16_t dllc = rd16(bytes, opt + kOffOptDllCharacteristics);
-        out.aslr_ = (dllc & kDllCharacteristicsDynamicBase) != 0;
-        out.nx_ = (dllc & kDllCharacteristicsNxCompat) != 0;
-        out.hev_ = (dllc & kDllCharacteristicsHighEntropyVa) != 0;
     }
 
     // --- the data directories
@@ -733,24 +810,31 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     // whose optional header is the expected size -- which is to say it would
     // work on the files that are already parsed correctly.
     const std::size_t table = opt + opt_size;
-    if (out.section_count_ == 0) {
-        return fail(PeError::NoSections,
-                    "the COFF header declares no sections");
-    }
     // The table's own extent, asked as a subtraction. section_count_ is a
-    // 16-bit value from the file and the product is the kind that can wrap
-    // if written as an addition.
+    // 16-bit value from the file and the product is the kind that can wrap if
+    // written as an addition.
     const std::size_t table_bytes =
         static_cast<std::size_t>(out.section_count_) * kSectionHeaderSize;
-    if (!in_range(bytes, table, table_bytes)) {
-        return fail(PeError::TruncatedSectionTable,
-                    "the section table is at " + hex_value(table) + " for " +
-                        decimal(table_bytes) + " bytes and the file is " +
-                        decimal(bytes.size()) + " bytes");
+    if (out.section_count_ == 0) {
+        structural(PeError::NoSections, table,
+                   "the COFF header declares no sections");
+    } else if (!in_range(bytes, table, table_bytes)) {
+        structural(PeError::TruncatedSectionTable, table,
+                   "the section table is at " + hex_value(table) + " for " +
+                       decimal(table_bytes) + " bytes and the file is " +
+                       decimal(bytes.size()) + " bytes");
     }
+    // The walk runs only when the table is readable. With no sections, or a
+    // table the file does not back, there is nothing to walk and the
+    // directories below resolve against an empty section set -- which is the
+    // correct answer for an image with no trustworthy sections, and is
+    // recorded above rather than left to look like an image that simply has
+    // none.
+    const bool table_ok =
+        out.section_count_ != 0 && in_range(bytes, table, table_bytes);
 
-    out.sections_.reserve(out.section_count_);
-    for (std::uint16_t i = 0; i < out.section_count_; ++i) {
+    if (table_ok) out.sections_.reserve(out.section_count_);
+    for (std::uint16_t i = 0; table_ok && i < out.section_count_; ++i) {
         const std::size_t at = table + static_cast<std::size_t>(i) * kSectionHeaderSize;
         PeSection s;
         for (std::size_t k = 0; k < 8; ++k) {
@@ -778,12 +862,20 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         if (s.raw_size != 0) {
             if (s.raw_offset > bytes.size() ||
                 bytes.size() - s.raw_offset < s.raw_size) {
-                return fail(PeError::BadSectionTable,
-                            "section " + decimal(i) + " (" + s.name +
-                                ") runs from " + hex_value(s.raw_offset) +
-                                " for " + hex_value(s.raw_size) +
-                                " bytes and the file is " +
-                                decimal(bytes.size()) + " bytes");
+                // A section whose raw extent leaves the file is recorded and
+                // skipped. Its header is a fact the file states, but the bytes
+                // it names are not there, so the section is left out of the
+                // parsed set rather than handed to a caller that would map or
+                // read it. Everything that did parse is kept.
+                structural(PeError::BadSectionTable,
+                           table + static_cast<std::size_t>(i) *
+                                       kSectionHeaderSize,
+                           "section " + decimal(i) + " (" + s.name +
+                               ") runs from " + hex_value(s.raw_offset) +
+                               " for " + hex_value(s.raw_size) +
+                               " bytes and the file is " +
+                               decimal(bytes.size()) + " bytes");
+                continue;
             }
         }
         out.sections_.push_back(s);
@@ -814,10 +906,20 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     // malformed whatever its sections say.
     if (out.headers_size_ != 0 &&
         out.headers_size_ > static_cast<std::uint64_t>(bytes.size())) {
-        return fail(PeError::BadHeaderSize,
-                    "SizeOfHeaders is " + hex_value(out.headers_size_) +
-                        ", which is more than the file's " +
-                        decimal(bytes.size()) + " bytes");
+        // Recorded and clamped. The value decides which of the two coordinate
+        // systems an RVA belongs to, so leaving it as the file states would
+        // reclassify every address in the image; clamping it to the file's
+        // length keeps the conversion bounded while the diagnostic keeps the
+        // number the file actually declared. A caller that needs to know the
+        // file said something impossible reads `loadable()`, which this makes
+        // false.
+        structural(PeError::BadHeaderSize, 0,
+                   "SizeOfHeaders is " + hex_value(out.headers_size_) +
+                       ", which is more than the file's " +
+                       decimal(bytes.size()) + " bytes");
+        out.headers_size_ = bytes.size() > 0xFFFFFFFFull
+                                ? 0xFFFFFFFFu
+                                : static_cast<std::uint32_t>(bytes.size());
     }
     // The headers also have to be at least as large as the headers this
     // reader just parsed out of them -- the DOS header, the COFF header, the
@@ -851,6 +953,13 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
     // report rather than an absence to infer. Wine resolves the RVA without
     // consulting Size as well.
     if (out.import_rva_ != 0) {
+        // A directory the file cannot back is recorded and this walk is
+        // skipped -- not the parse. Whatever went wrong is a fact about the
+        // import table alone, and the export table below is a separate
+        // question the file may still answer, so each failure exits this block
+        // through `import_done` and leaves the rest of the parse to run. Every
+        // exit names the RVA or offset it is about, so the diagnostic carries
+        // the location and not only a sentence.
         std::uint64_t dir_off = 0;
         bool zero_filled = false;
         if (!out.resolve_rva(out.import_rva_, dir_off, zero_filled) ||
@@ -860,10 +969,11 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             // that as "no imports" would turn a file that claims an import
             // table and has none into a file with no imports -- two claims
             // that differ and that a reader should not conflate.
-            return fail(PeError::DirectoryOutOfFile,
-                        "the import directory is at RVA " +
-                            hex_value(out.import_rva_) +
-                            ", which is not backed by the file");
+            damaged(PeError::DirectoryOutOfFile, out.import_rva_,
+                    "the import directory is at RVA " +
+                        hex_value(out.import_rva_) +
+                        ", which is not backed by the file");
+            goto import_done;
         }
         // dir_off is a file offset. Each name is an RVA and is resolved
         // separately, because the two coordinate systems are different and
@@ -875,10 +985,11 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         // because of something a function two hundred lines away happens to
         // guarantee today.
         if (dir_off > bytes.size()) {
-            return fail(PeError::DirectoryOutOfFile,
-                        "the import directory resolves to file offset " +
-                            hex_value(dir_off) + ", past the end of a file " +
-                            decimal(bytes.size()) + " bytes long");
+            damaged(PeError::DirectoryOutOfFile, dir_off,
+                    "the import directory resolves to file offset " +
+                        hex_value(dir_off) + ", past the end of a file " +
+                        decimal(bytes.size()) + " bytes long");
+            goto import_done;
         }
         const std::size_t room = bytes.size() - static_cast<std::size_t>(dir_off);
 
@@ -894,18 +1005,18 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         // non-zero and smaller than one descriptor is still a claim the
         // file cannot keep, and still a contradiction.
         if (out.import_size_ != 0 && out.import_size_ < kImportDescriptorSize) {
-            return fail(PeError::TruncatedImportTable,
-                        "the import directory declares " +
-                            decimal(out.import_size_) +
-                            " bytes, which cannot hold one " +
-                            decimal(kImportDescriptorSize) +
-                            "-byte descriptor");
+            damaged(PeError::TruncatedImportTable, out.import_rva_,
+                    "the import directory declares " +
+                        decimal(out.import_size_) +
+                        " bytes, which cannot hold one " +
+                        decimal(kImportDescriptorSize) + "-byte descriptor");
+            goto import_done;
         }
         const std::size_t declared = out.import_size_ / kImportDescriptorSize;
 
         // The cap is checked against the declared count, before the file's
         // room is considered. A directory claiming a hundred thousand
-        // descriptors is refused for claiming that whether or not the file
+        // descriptors is reported for claiming that whether or not the file
         // could hold them, and the diagnostic says so -- a reader told "only
         // N fit in the file" when the file claims ten times that is being
         // sent to look at the wrong problem.
@@ -914,11 +1025,12 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             // The cap is reported rather than applied: silently stopping at
             // the cap would produce exactly the same output as a table that
             // genuinely ended, and those two files are not alike.
-            return fail(PeError::TruncatedImportTable,
-                        "the import directory declares " + decimal(declared) +
-                            " descriptors, which is past the " +
-                            decimal(kMaxImportDescriptors) +
-                            " this reader will walk");
+            damaged(PeError::TruncatedImportTable, out.import_rva_,
+                    "the import directory declares " + decimal(declared) +
+                        " descriptors, which is past the " +
+                        decimal(kMaxImportDescriptors) +
+                        " this reader will walk");
+            goto import_done;
         }
 
         const std::size_t fitting = room / kImportDescriptorSize;
@@ -926,10 +1038,11 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             // The file ran out before the declaration did. That is a
             // different failure from the cap: the table is not too large to
             // read, it is broken, and the message has to say which.
-            return fail(PeError::TruncatedImportTable,
-                        "the import directory declares " + decimal(declared) +
-                            " descriptors but only " + decimal(fitting) +
-                            " fit in the file");
+            damaged(PeError::TruncatedImportTable, out.import_rva_,
+                    "the import directory declares " + decimal(declared) +
+                        " descriptors but only " + decimal(fitting) +
+                        " fit in the file");
+            goto import_done;
         }
         // Every declared descriptor was established to fit above, by division
         // rather than by an addition that could wrap. A zero declared size
@@ -961,6 +1074,7 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             }
         }
     }
+import_done:;
 
     // --- the export table
     //
@@ -989,16 +1103,18 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             // nothing" would turn a file that claims an export table and
             // cannot keep it into a DLL with no exports -- a claim a program
             // would act on.
-            return fail(PeError::DirectoryOutOfFile,
-                        "the export directory is at RVA " +
-                            hex_value(out.export_rva_) +
-                            ", which is not backed by the file");
+            damaged(PeError::DirectoryOutOfFile, out.export_rva_,
+                    "the export directory is at RVA " +
+                        hex_value(out.export_rva_) +
+                        ", which is not backed by the file");
+            goto export_done;
         }
         if (dir_off > bytes.size()) {
-            return fail(PeError::DirectoryOutOfFile,
-                        "the export directory resolves to file offset " +
-                            hex_value(dir_off) + ", past the end of a file " +
-                            decimal(bytes.size()) + " bytes long");
+            damaged(PeError::DirectoryOutOfFile, dir_off,
+                    "the export directory resolves to file offset " +
+                        hex_value(dir_off) + ", past the end of a file " +
+                        decimal(bytes.size()) + " bytes long");
+            goto export_done;
         }
         const std::size_t dir_at = static_cast<std::size_t>(dir_off);
 
@@ -1019,18 +1135,19 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         // the same reason and reaches the same conclusion one check later:
         // find_named_export refuses anything under sizeof(*exports).
         if (out.export_size_ < kExportDirectorySize) {
-            return fail(PeError::TruncatedExportDirectory,
-                        "the export directory declares " +
-                            decimal(out.export_size_) +
-                            " bytes, which cannot hold one " +
-                            decimal(kExportDirectorySize) +
-                            "-byte directory record");
+            damaged(PeError::TruncatedExportDirectory, out.export_rva_,
+                    "the export directory declares " +
+                        decimal(out.export_size_) +
+                        " bytes, which cannot hold one " +
+                        decimal(kExportDirectorySize) + "-byte directory record");
+            goto export_done;
         }
         if (!in_range(bytes, dir_at, kExportDirectorySize)) {
-            return fail(PeError::DirectoryOutOfFile,
-                        "the export directory at file offset " +
-                            hex_value(dir_off) + " is truncated by the end of "
-                            "a file " + decimal(bytes.size()) + " bytes long");
+            damaged(PeError::DirectoryOutOfFile, dir_off,
+                    "the export directory at file offset " +
+                        hex_value(dir_off) + " is truncated by the end of "
+                        "a file " + decimal(bytes.size()) + " bytes long");
+            goto export_done;
         }
 
         out.export_base_ = rd32(bytes, dir_at + kOffExportBase);
@@ -1064,19 +1181,21 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
         // symbols, which is a claim about the file. The diagnostic says what
         // the file claimed instead.
         if (num_functions > kMaxExportedSymbols) {
-            return fail(PeError::BadExportTable,
-                        "the export directory claims " +
-                            decimal(num_functions) +
-                            " addresses in its address table, which is past "
-                            "the " + decimal(kMaxExportedSymbols) +
-                            " this reader walks");
+            damaged(PeError::BadExportTable, out.export_rva_,
+                    "the export directory claims " +
+                        decimal(num_functions) +
+                        " addresses in its address table, which is past "
+                        "the " + decimal(kMaxExportedSymbols) +
+                        " this reader walks");
+            goto export_done;
         }
         if (num_names > kMaxExportedSymbols) {
-            return fail(PeError::BadExportTable,
-                        "the export directory claims " + decimal(num_names) +
-                            " names in its name pointer table, which is past "
-                            "the " + decimal(kMaxExportedSymbols) +
-                            " this reader walks");
+            damaged(PeError::BadExportTable, out.export_rva_,
+                    "the export directory claims " + decimal(num_names) +
+                        " names in its name pointer table, which is past "
+                        "the " + decimal(kMaxExportedSymbols) +
+                        " this reader walks");
+            goto export_done;
         }
 
         // A DLL that exports nothing declares zero for both counts and an RVA
@@ -1093,10 +1212,11 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             // alternative is a name with no address, which is a thing a
             // caller would have to detect.
             if (num_names != 0) {
-                return fail(PeError::BadExportTable,
-                            "the export directory names " + decimal(num_names) +
-                                " exports but declares no address table for "
-                                "them to point into");
+                damaged(PeError::BadExportTable, out.export_rva_,
+                        "the export directory names " + decimal(num_names) +
+                            " exports but declares no address table for "
+                            "them to point into");
+                goto export_done;
             }
         } else {
             // The address table. Resolved once, and every entry read through
@@ -1108,10 +1228,11 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
             if (!out.resolve_rva(functions_rva, functions_off,
                                  functions_zero) ||
                 functions_zero) {
-                return fail(PeError::BadExportTable,
-                            "the export address table is at RVA " +
-                                hex_value(functions_rva) +
-                                ", which is not backed by the file");
+                damaged(PeError::BadExportTable, functions_rva,
+                        "the export address table is at RVA " +
+                            hex_value(functions_rva) +
+                            ", which is not backed by the file");
+                goto export_done;
             }
             // The multiplication is by a constant width and a count already
             // bounded by the cap, so it cannot overflow a 64-bit size_t; the
@@ -1123,11 +1244,12 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                 bytes.size() - functions_at <
                     static_cast<std::size_t>(num_functions) *
                         kExportAddressWidth) {
-                return fail(PeError::BadExportTable,
-                            "the export address table declares " +
-                                decimal(num_functions) + " entries, which do "
-                                "not all fit in a file " +
-                                decimal(bytes.size()) + " bytes long");
+                damaged(PeError::BadExportTable, functions_rva,
+                        "the export address table declares " +
+                            decimal(num_functions) + " entries, which do "
+                            "not all fit in a file " +
+                            decimal(bytes.size()) + " bytes long");
+                goto export_done;
             }
 
             out.exports_.resize(num_functions);
@@ -1145,18 +1267,20 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                 bool ordinals_zero = false;
                 if (!out.resolve_rva(names_rva, names_off, names_zero) ||
                     names_zero) {
-                    return fail(PeError::BadExportTable,
-                                "the export name pointer table is at RVA " +
-                                    hex_value(names_rva) +
-                                    ", which is not backed by the file");
+                    damaged(PeError::BadExportTable, names_rva,
+                            "the export name pointer table is at RVA " +
+                                hex_value(names_rva) +
+                                ", which is not backed by the file");
+                    goto export_done;
                 }
                 if (!out.resolve_rva(ordinals_rva, ordinals_off,
                                      ordinals_zero) ||
                     ordinals_zero) {
-                    return fail(PeError::BadExportTable,
-                                "the export ordinal table is at RVA " +
-                                    hex_value(ordinals_rva) +
-                                    ", which is not backed by the file");
+                    damaged(PeError::BadExportTable, ordinals_rva,
+                            "the export ordinal table is at RVA " +
+                                hex_value(ordinals_rva) +
+                                ", which is not backed by the file");
+                    goto export_done;
                 }
                 const std::size_t names_at =
                     static_cast<std::size_t>(names_off);
@@ -1166,23 +1290,25 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                     bytes.size() - names_at <
                         static_cast<std::size_t>(num_names) *
                             kExportNamePointerWidth) {
-                    return fail(PeError::BadExportTable,
-                                "the export name pointer table declares " +
-                                    decimal(num_names) +
-                                    " entries, which do not all fit in a "
-                                    "file " + decimal(bytes.size()) +
-                                    " bytes long");
+                    damaged(PeError::BadExportTable, names_rva,
+                            "the export name pointer table declares " +
+                                decimal(num_names) +
+                                " entries, which do not all fit in a "
+                                "file " + decimal(bytes.size()) +
+                                " bytes long");
+                    goto export_done;
                 }
                 if (ordinals_at > bytes.size() ||
                     bytes.size() - ordinals_at <
                         static_cast<std::size_t>(num_names) *
                             kExportOrdinalWidth) {
-                    return fail(PeError::BadExportTable,
-                                "the export ordinal table declares " +
-                                    decimal(num_names) +
-                                    " entries, which do not all fit in a "
-                                    "file " + decimal(bytes.size()) +
-                                    " bytes long");
+                    damaged(PeError::BadExportTable, ordinals_rva,
+                            "the export ordinal table declares " +
+                                decimal(num_names) +
+                                " entries, which do not all fit in a "
+                                "file " + decimal(bytes.size()) +
+                                " bytes long");
+                    goto export_done;
                 }
 
                 for (std::size_t i = 0; i < num_names; ++i) {
@@ -1202,13 +1328,21 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                     // nothing, and a caller resolving that name would get
                     // whatever the vector happens to have at that position.
                     if (index >= num_functions) {
-                        return fail(PeError::BadExportTable,
-                                    "name " + decimal(i) + " of " +
-                                        decimal(num_names) +
-                                        " names address-table entry " +
-                                        decimal(index) +
-                                        ", and the address table has only " +
-                                        decimal(num_functions) + " entries");
+                        // Recorded and the name walk stops, exactly as an
+                        // unreadable name stops it: the names gathered before
+                        // this one are real and are kept. The export this name
+                        // would have attached to keeps its address and stays
+                        // unnamed, which is the state a name that never
+                        // resolved leaves it in.
+                        damaged(PeError::BadExportTable,
+                                ordinals_at + i * kExportOrdinalWidth,
+                                "name " + decimal(i) + " of " +
+                                    decimal(num_names) +
+                                    " names address-table entry " +
+                                    decimal(index) +
+                                    ", and the address table has only " +
+                                    decimal(num_functions) + " entries");
+                        break;
                     }
 
                     std::string name;
@@ -1267,13 +1401,17 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                 const std::uint64_t ordinal64 =
                     static_cast<std::uint64_t>(i) + out.export_base_;
                 if (ordinal64 > 0xFFFFFFFFull) {
-                    return fail(
-                        PeError::BadExportTable,
-                        "the export directory's base is " +
-                            decimal(out.export_base_) +
-                            ", which pushes the address table's ordinal to " +
-                            decimal(ordinal64) +
-                            ", past the 32 bits an ordinal is held in");
+                    // Recorded and the walk stops. The overflow is a property
+                    // of the base and not of one entry, so every entry from
+                    // here on carries it too; stopping keeps the entries whose
+                    // ordinals are representable rather than renaming them.
+                    damaged(PeError::BadExportTable, out.export_rva_,
+                            "the export directory's base is " +
+                                decimal(out.export_base_) +
+                                ", which pushes the address table's ordinal to " +
+                                decimal(ordinal64) +
+                                ", past the 32 bits an ordinal is held in");
+                    break;
                 }
                 e.rva = rva;
                 e.ordinal = static_cast<std::uint32_t>(ordinal64);
@@ -1312,17 +1450,23 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                 // and refuses one longer than any name.
                 std::string target;
                 if (!out.read_rva_string(bytes, rva, target)) {
-                    // A forwarder we cannot read is a claim the file does
-                    // not keep, and it is refused rather than recorded as a
-                    // forwarder to nothing. The export is left in place with
-                    // its address and its name, so a reader that only wanted
-                    // the names still has them; what is refused is the file,
-                    // because a DLL whose forwarder cannot be read is a DLL
-                    // whose import will fail later and less clearly.
-                    return fail(PeError::BadExportTable,
-                                "a forwarder for the export at RVA " +
-                                    hex_value(rva) + " is not a readable "
-                                    "string in the file");
+                    // Recorded and this export is left as an ordinary one: the
+                    // address and the name stay, the forwarder flag is
+                    // cleared, and the walk continues. The address and name
+                    // are facts the file stated; what is dropped is the claim
+                    // that the address names a forwarder string, because the
+                    // string is not there to keep it.
+                    // The address is inside the directory's extent, so this is
+                    // a forwarder by the rule that defines one; what is missing
+                    // is the string it should name. The flag stays set and the
+                    // forwarder fields stay empty, so a caller sees a forwarder
+                    // with no target and the diagnostic says why -- truer than
+                    // either calling it an ordinary export or dropping it.
+                    damaged(PeError::BadExportTable, rva,
+                            "a forwarder for the export at RVA " +
+                                hex_value(rva) + " is not a readable "
+                                "string in the file");
+                    continue;
                 }
 
                 // The split, at the last dot. `NTDLL.RtlAllocateHeap` and
@@ -1335,12 +1479,13 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                 if (dot == std::string::npos || dot == 0 ||
                     dot + 1 >= target.size()) {
                     // No dot at all, a leading dot, or a trailing one. Each
-                    // names a string the format does not define, and each is
-                    // a file making a claim this reader cannot keep.
-                    return fail(PeError::BadExportTable,
-                                "the forwarder \"" + target +
-                                    "\" is not of the form DLL.symbol or "
-                                    "DLL.#ordinal");
+                    // names a string the format does not define, so the export
+                    // is kept as an ordinary one and the fact is recorded.
+                    damaged(PeError::BadExportTable, rva,
+                            "the forwarder \"" + target +
+                                "\" is not of the form DLL.symbol or "
+                                "DLL.#ordinal");
+                    continue;
                 }
                 e.forwarder_dll = target.substr(0, dot);
                 const std::string symbol = target.substr(dot + 1);
@@ -1377,10 +1522,20 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                         ordinal = static_cast<std::uint32_t>(next);
                     }
                     if (!digits) {
-                        return fail(PeError::BadExportTable,
-                                    "the forwarder \"" + target +
-                                        "\" names an ordinal that is not a "
-                                        "number");
+                        // A target that did not parse keeps no half of itself:
+                        // the DLL part was read before the ordinal was, and
+                        // leaving it set would make a forwarder with no symbol
+                        // look like a by-name forwarder whose name is empty.
+                        // What is kept is the one fact the address carries --
+                        // that this export is a forwarder -- and the record of
+                        // why the target did not resolve.
+                        damaged(PeError::BadExportTable, rva,
+                                "the forwarder \"" + target +
+                                    "\" names an ordinal that is not a "
+                                    "number");
+                        e.forwarder_dll.clear();
+                        e.forwarder_by_ordinal = false;
+                        continue;
                     }
                     e.forwarder_by_ordinal = true;
                     // The ordinal is recorded as the file states it. Whether
@@ -1391,9 +1546,12 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                     // up and a base of zero would have to be stated by the
                     // target, which is a fact this file does not carry.
                     if (ordinal == 0) {
-                        return fail(PeError::BadExportTable,
-                                    "the forwarder \"" + target +
-                                        "\" names ordinal zero");
+                        damaged(PeError::BadExportTable, rva,
+                                "the forwarder \"" + target +
+                                    "\" names ordinal zero");
+                        e.forwarder_dll.clear();
+                        e.forwarder_by_ordinal = false;
+                        continue;
                     }
                     e.forwarder_ordinal = ordinal;
                 } else {
@@ -1424,8 +1582,8 @@ PeImage PeImage::parse(ByteSpan bytes) noexcept {
                 out.exports_.end());
         }
     }
+export_done:;
 
-    out.error_ = PeError::None;
     return out;
 }
 

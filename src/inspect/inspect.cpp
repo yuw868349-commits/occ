@@ -342,19 +342,43 @@ void write_section_characteristics(Json& json, std::uint32_t characteristics) {
 
 std::string inspect_pe_json(const parser::PeImage& image, ByteSpan bytes,
                             const InspectOptions& options) {
-    // The contract: a parse that failed produces no document, because the
-    // numbers a report would be built from are the ones the parse refused
-    // to produce. The caller reports the failure through the parse's own
-    // error, and answering an empty string here is how it learns there is
-    // nothing to report -- reading a half-filled header would otherwise
-    // turn a refusal into a report of zeroes.
-    if (!image.ok()) {
+    // The gate is `is_pe()`: a report is worth producing for any file that is
+    // a PE, including one whose layout the reader does not trust. A field the
+    // reader could not read is reported in `diagnostics` rather than by
+    // withholding the whole document, so a reader of the report sees both what
+    // the file says and which parts of it to doubt. Only a file that is not a
+    // PE at all has nothing to report, because none of the numbers below mean
+    // anything for it.
+    if (!image.is_pe()) {
         return std::string();
     }
     std::string out;
     out.reserve(64 * 1024);
     Json json(out);
     json.begin_object();
+
+    // -- what the reader could not read ------------------------------------
+    //
+    // Emitted first, before anything the file says, because it is the frame
+    // the rest of the report is read in: a caller that sees a zero and a
+    // `damaged` record knows the zero is an absence and not a fact. The list
+    // is always present, empty included, so its presence is not itself a
+    // signal.
+    json.key("diagnostics");
+    json.begin_array();
+    for (const parser::PeDiagnostic& d : image.diagnostics()) {
+        json.begin_object();
+        json.key("code");
+        json.value(parser::pe_error_name(d.code));
+        json.key("severity");
+        json.value(parser::pe_severity_name(d.severity));
+        json.key("where");
+        json.hex(d.where);
+        json.key("detail");
+        json.value(d.detail);
+        json.end_object();
+    }
+    json.end_array();
 
     const auto* file = static_cast<const std::uint8_t*>(bytes.data());
     const std::size_t file_size = bytes.size();

@@ -863,6 +863,48 @@ void test_branch_nesting_cap_is_reported() {
     }
 }
 
+// The dispatch word is the value the dispatcher read out of its handler
+// table, and the two VM families the de-virtualizer serves store that
+// value two ways. The trace does not carry which way, so the image
+// decides -- and these cases pin the one rule that does the deciding: the
+// word that points at code is the address, and only a word with nothing
+// behind it is rotated back.
+void test_handler_resolution() {
+    // A hand-rolled VM's table holds the address. When the image places
+    // the word, it is taken as read -- and that has to hold for any word,
+    // so the check does not lean on one lucky value.
+    const std::uint64_t placed[] = {
+        0x1400016d0ull,  // a handler in the sample's .text
+        0x1ull,
+        0xffffffffffffffffull,
+        0x4000000000000000ull,
+    };
+    for (const std::uint64_t a : placed) {
+        check(lift::resolve_handler(a, true) == a,
+              "a word the image places is the handler address");
+    }
+
+    // VMP 3's table holds the address rotated left by ten. Two facts pin
+    // the rotate: bit 0 comes back as bit 10, and the top bit wraps to the
+    // bottom instead of falling off the end -- the wrap is why the
+    // operation is a rotate and not a shift.
+    check(lift::resolve_handler(0x1ull, false) == 0x400ull,
+          "bit 0 rotates to bit 10");
+    check(lift::resolve_handler(0x8000000000000000ull, false) == 0x200ull,
+          "bit 63 wraps to bit 9 rather than off the end");
+    check(lift::resolve_handler(0x4000000000000000ull, false) == 0x100ull,
+          "bit 62 wraps to bit 8");
+
+    // The sample's own numbers. A dispatch word the image can place is
+    // used directly; its rotated form, which the image cannot place, is
+    // what the old code produced -- so a word with nothing behind it
+    // still reports exactly as it did before the two families were told
+    // apart.
+    check(lift::resolve_handler(0x1400016d0ull, false) == 0x500005b4000ull,
+          "the rotated form of a sample handler address");
+    check(lift::resolve_handler(0, false) == 0, "zero resolves to zero");
+}
+
 }  // namespace
 
 int main() {
@@ -892,6 +934,7 @@ int main() {
     run("unaligned_frame", test_unaligned_frame_conformance);
     run("resize_widen_back", test_resize_does_not_widen_back);
     run("nesting_cap", test_branch_nesting_cap_is_reported);
+    run("handler_resolution", test_handler_resolution);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

@@ -347,8 +347,30 @@ struct Row {
     std::uint64_t st0 = 0;
     std::uint64_t st1 = 0;
     std::uint64_t st2 = 0;
-    std::uint64_t target = 0;  // the encrypted word the dispatcher used
+    // What the dispatcher read out of its handler table for this step.
+    // Whether that value is the handler's own address or a rotated form of
+    // it is a property of the VM family, not of the trace -- see
+    // resolve_handler.
+    std::uint64_t target = 0;
 };
+
+// A dispatch row's `target` is the word the dispatcher read out of its
+// handler table, and two VM families produce that word two ways. A
+// hand-rolled VM stores the handler's address directly; VMP 3 stores it
+// rotated left by ten and rotates it back before jumping. The trace
+// records the word before that decision, so which family wrote it cannot
+// be read off the trace alone.
+//
+// `target_is_code` is the caller's answer to "does this value point at
+// file-backed bytes in the image under analysis". The address the
+// dispatcher jumped to is the one with code behind it, so a target that
+// already points at code is taken as the address, and only a target with
+// nothing behind it is rotated. A value the image cannot place at all
+// keeps the rotated form, which is what the de-virtualizer produced
+// before it could tell the two families apart -- so a word the image
+// cannot resolve still reports exactly as it did before.
+[[nodiscard]] std::uint64_t resolve_handler(std::uint64_t target,
+                                            bool target_is_code);
 
 struct Conformance {
     std::uint64_t checked = 0;    // predictions evaluated and equal
