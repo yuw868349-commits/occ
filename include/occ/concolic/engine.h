@@ -134,6 +134,8 @@ struct PathReport {
         std::uint64_t unsat = 0;        // calls proved unsatisfiable
         std::uint64_t limited = 0;      // calls answered "unproven" (budget)
         std::uint64_t conflicts = 0;    // CDCL conflicts across all calls
+        std::uint64_t unsat_prefix_hits = 0;  // unsat answered from the
+                                              // prefix cache, no solver call
     };
 
     Budget budget;
