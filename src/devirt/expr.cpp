@@ -431,6 +431,58 @@ std::string DAG::pretty(Id id) const {
     }
 }
 
+std::string DAG::pretty_bound(Id id, const Bindings& bound) const {
+    if (!valid(id)) {
+        return "?";
+    }
+    const Node& n = nodes_[id];
+    switch (n.op) {
+    case Op::Const: {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "0x%llx",
+                      static_cast<unsigned long long>(n.imm));
+        return buf;
+    }
+    case Op::Input: {
+        const auto ordinal = static_cast<unsigned>(n.imm);
+        if (!bound.has(ordinal)) {
+            // The run did not pin this one down. Its name is the honest
+            // answer: a zero in its place would read as a value.
+            return n.name;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "0x%llx",
+                      static_cast<unsigned long long>(
+                          bound.value(ordinal) & mask_of(n.width)));
+        return buf;
+    }
+    case Op::Resize: {
+        if (!valid(n.a)) {
+            return "?";
+        }
+        if (nodes_[n.a].width > n.width) {
+            return "(" + std::to_string(n.width) + ")" + pretty_bound(n.a, bound);
+        }
+        return pretty_bound(n.a, bound);
+    }
+    case Op::Select:
+        return pretty_bound(n.c, bound) + " ? " + pretty_bound(n.a, bound) +
+               " : " + pretty_bound(n.b, bound);
+    case Op::Not:
+        return "~" + pretty_bound(n.a, bound);
+    case Op::Neg:
+        return "-" + pretty_bound(n.a, bound);
+    default: {
+        const char* infix = op_infix(n.op);
+        if (infix != nullptr) {
+            return "(" + pretty_bound(n.a, bound) + infix +
+                   pretty_bound(n.b, bound) + ")";
+        }
+        return op_name(n.op);
+    }
+    }
+}
+
 std::uint64_t DAG::evaluate(Id id,
                             const std::vector<std::uint64_t>& inputs) const {
     if (!valid(id)) {

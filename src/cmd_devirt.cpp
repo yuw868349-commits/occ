@@ -1133,8 +1133,13 @@ int cmd_devirt(int argc, char** argv) {
                 which.push_back(index_of[r.handler]);
             }
             ByteSources sources{have_img ? &img : nullptr, &g_memory};
+            // The instantiation is asked of the check, not built beside it:
+            // the binding it prints is the one the check itself used, so the
+            // two cannot disagree about a row they both describe.
+            std::vector<lift::InstantiatedRow> instantiated;
             const lift::Conformance conf = lift::check_trace(
-                model, lhandlers, lrows, which, read_bytes, &sources);
+                model, lhandlers, lrows, which, read_bytes, &sources,
+                &instantiated);
             char b[224];
             std::snprintf(b, sizeof(b),
                           "  trace conformance: %llu checked, %llu mismatched, "
@@ -1160,6 +1165,66 @@ int cmd_devirt(int argc, char** argv) {
             }
             for (const std::string& f : conf.failures) {
                 rep.emit("  ! " + f);
+            }
+            // The stream again, with the run's own values in it. The
+            // symbolic listing above says what each handler is; this says
+            // what the engine did with it, which is the difference between
+            // `vst[i] ^= code[rax+2]` and `vst[3] ^= 0x5c` -- and it is the
+            // difference between a schema and a program.
+            if (!instantiated.empty()) {
+                // The program listing is the point of this section, so it
+                // gets a far wider cap than the schema above: a schema
+                // truncated is one entry missing, a program truncated is a
+                // tail nobody can read. What a trace longer than the cap
+                // still hides is said rather than silently dropped.
+                const std::size_t inst_shown =
+                    std::min<std::size_t>(400, instantiated.size());
+                std::size_t pinned = 0;
+                for (const lift::InstantiatedRow& ir : instantiated) {
+                    if (ir.inputs_bound == ir.inputs_total) {
+                        ++pinned;
+                    }
+                }
+                rep.emit("\ninstantiated stream (first " +
+                         std::to_string(inst_shown) +
+                         " of " + std::to_string(instantiated.size()) +
+                         "), every value the trace supplied substituted in:");
+                rep.emit("#    handler       effect");
+                for (std::size_t i = 0; i < inst_shown; ++i) {
+                    const lift::InstantiatedRow& ir = instantiated[i];
+                    std::string text;
+                    for (const std::string& w : ir.writes) {
+                        if (!text.empty()) {
+                            text += "; ";
+                        }
+                        text += w;
+                    }
+                    if (!ir.transfer.empty()) {
+                        if (!text.empty()) {
+                            text += "; ";
+                        }
+                        text += "-> " + ir.transfer;
+                    }
+                    char hb[80];
+                    std::snprintf(hb, sizeof(hb), "%-5llu0x%010llx  ",
+                                  static_cast<unsigned long long>(ir.seq),
+                                  static_cast<unsigned long long>(
+                                      ir.handler_va));
+                    rep.emit(std::string(hb) + text);
+                }
+                if (inst_shown < instantiated.size()) {
+                    rep.emit("  ... " +
+                             std::to_string(instantiated.size() - inst_shown) +
+                             " rows not shown");
+                }
+                char sb[128];
+                std::snprintf(sb, sizeof(sb),
+                              "  %llu of %llu rows pinned down completely "
+                              "by the trace",
+                              static_cast<unsigned long long>(pinned),
+                              static_cast<unsigned long long>(
+                                  instantiated.size()));
+                rep.emit(sb);
             }
         }
     }

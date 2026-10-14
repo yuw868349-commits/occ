@@ -75,6 +75,22 @@ struct Node {
     std::string name;
 };
 
+// What a run bound each input to, as a trace supplies it. `known` is the
+// part that matters: a value of zero and an input the trace never carried
+// are the same number, and only the flag tells them apart -- which is the
+// difference between a value the machine held and one nothing observed.
+struct Bindings {
+    std::vector<std::uint64_t> values;
+    std::vector<bool> known;
+
+    [[nodiscard]] bool has(unsigned ordinal) const noexcept {
+        return ordinal < known.size() && known[ordinal];
+    }
+    [[nodiscard]] std::uint64_t value(unsigned ordinal) const noexcept {
+        return ordinal < values.size() ? values[ordinal] : 0;
+    }
+};
+
 class DAG {
 public:
     DAG() = default;
@@ -133,6 +149,15 @@ public:
     // Pseudo-code form on one line: `rax + 4`, `st0 ^ 0xff`. Prefer this
     // for any user-facing output.
     [[nodiscard]] std::string pretty(Id id) const;
+
+    // The same pseudo-code with the inputs the trace pinned down replaced
+    // by the values they held. An input the trace did not bind keeps its
+    // name, so one string says both what the run fixed and what it left
+    // open. A value is printed at the input's own width, because a
+    // thirty-two-bit slot that held `0x41` did not hold
+    // `0x0000000000000041` -- the width is part of what was observed.
+    [[nodiscard]] std::string pretty_bound(Id id,
+                                           const Bindings& bound) const;
 
     // -- evaluation ----------------------------------------------------
     //

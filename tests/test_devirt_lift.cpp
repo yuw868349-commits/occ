@@ -1058,6 +1058,146 @@ void test_trace_memory_refuses_nothing_windows() {
     check(v == 0xdeadbeefull, "and the output is left untouched");
 }
 
+// ------------------------------------------------ instantiating a model
+
+void test_pretty_bound_replaces_what_the_run_pinned() {
+    // The rendering rule the report leans on: an input the run bound is
+    // the value the machine held, an input it did not is still its own
+    // name, and a value prints at the width of the slot it came out of.
+    expr::DAG dag;
+    const expr::Id a = dag.input("st0", 32);
+    const expr::Id b = dag.input("st1", 64);
+    const expr::Id sum = dag.add(a, b);
+
+    expr::Bindings bound;
+    bound.values = {0x41, 0x100000000ull};
+    bound.known = {true, false};
+
+    check(dag.pretty_bound(a, bound) == "0x41",
+          "a bound input prints as the value it held");
+    check(dag.pretty_bound(b, bound) == "st1",
+          "an input the trace never carried keeps its name");
+    const std::string both = dag.pretty_bound(sum, bound);
+    check(both.find("0x41") != std::string::npos &&
+              both.find("st1") != std::string::npos,
+          "and one expression says both at once");
+
+    // The mask is the input's own: a thirty-two-bit slot that held 0x41
+    // did not hold 0x0000000000000041.
+    expr::Bindings wide;
+    wide.values = {0x1ffffffffull, 0x1ffffffffull};
+    wide.known = {true, true};
+    check(dag.pretty_bound(a, wide) == "0xffffffff",
+          "a value is printed at the width of the input it came from");
+    check(dag.pretty_bound(b, wide) == "0x1ffffffff",
+          "and a sixty-four-bit input keeps all of its bits");
+
+    check(dag.pretty_bound(expr::kNoId, bound) == "?",
+          "an absent expression says so rather than answering");
+}
+
+void test_instantiated_row_shows_the_run() {
+    // The step the machine took, with the run's own numbers in it. The
+    // symbolic model says `vst[+8] = vst[+0] + vst[+8]`; this says the
+    // same thing about the row that ran, and the handler's `jmp rcx`
+    // makes the row is fully pinned only when the trace carried rcx.
+    lift::Model model;
+    const std::vector<lift::Handler> handlers = {
+        lift::summarize(model, kAdd.data(), kAdd.size(), kHandlerVa,
+                        kHandlerVa)};
+    std::vector<lift::Row> rows(2);
+    rows[0].seq = 1;
+    rows[0].rsi = 0x2000;
+    rows[0].rbp = 0x3000;
+    rows[0].st0 = 5;
+    rows[0].st1 = 7;
+    rows[0].st2 = 9;
+    rows[1].seq = 2;
+    rows[1].rsi = 0x2000;
+    rows[1].rbp = 0x3008;
+    rows[1].st0 = 12;
+    rows[1].st1 = 9;
+    rows[1].st2 = 0;
+    for (lift::Row& r : rows) {
+        r.gpr[1] = 0x4000;  // rcx, the register the handler jumps through
+        r.gpr_present |= std::uint32_t{1} << 1;
+    }
+    const std::vector<std::size_t> which{0};
+
+    std::vector<lift::InstantiatedRow> inst;
+    const lift::Conformance conf = lift::check_trace(
+        model, handlers, rows, which, nullptr, nullptr, &inst);
+    check(conf.checked >= 3, "the row is still checked");
+    check(inst.size() == 1, "and it is described once");
+    check(inst[0].seq == 1 && inst[0].handler_va == kHandlerVa,
+          "as the row that ran");
+    check(inst[0].inputs_bound == inst[0].inputs_total,
+          "the inputs its own effect reaches were all pinned by the trace");
+    check(!inst[0].writes.empty(), "the write is there");
+    if (!inst[0].writes.empty()) {
+        check(inst[0].writes[0] == "vst[8] = 0xc",
+              "at the slot it wrote, with the value the run produced");
+    }
+    check(inst[0].transfer == "0x4000",
+          "and the jump it made is the address it held, not a schema");
+
+    // The same row on a trace that never carried rcx: what the run pinned
+    // stays pinned, and what it did not is not invented. The row is then
+    // honestly reported as partly open.
+    std::vector<lift::Row> bare = rows;
+    for (lift::Row& r : bare) {
+        r.gpr_present &= ~(std::uint32_t{1} << 1);
+    }
+    std::vector<lift::InstantiatedRow> bare_inst;
+    const lift::Conformance bare_conf = lift::check_trace(
+        model, handlers, bare, which, nullptr, nullptr, &bare_inst);
+    check(bare_conf.mismatched == 0, "the bare row still checks out");
+    check(!bare_inst.empty(), "the bare row is described too");
+    if (!bare_inst.empty()) {
+        check(bare_inst[0].inputs_bound < bare_inst[0].inputs_total,
+              "a register the trace did not carry leaves the row open");
+        check(bare_inst[0].writes.size() == 1 &&
+                  bare_inst[0].writes[0] == "vst[8] = 0xc",
+              "while the part it did pin still reads as the run's value");
+        check(bare_inst[0].transfer == "rcx",
+              "and the open part keeps its name");
+    }
+}
+
+void test_instantiated_row_spans_the_last_dispatch() {
+    // A trace's last dispatch has no successor to compare against, and a
+    // report of the stream that stopped one row short would drop the
+    // engine's final step. The walk covers it; what it skips is the
+    // comparison, because there is nothing to compare with.
+    lift::Model model;
+    const std::vector<lift::Handler> handlers = {
+        lift::summarize(model, kAdd.data(), kAdd.size(), kHandlerVa,
+                        kHandlerVa)};
+    // Each row's cells are the ones the previous handler left. The add
+    // takes `[rbp+0] + [rbp+8]`, stores the sum at `[rbp+8]` and advances
+    // rbp by eight, so the next row's top cell is what this row wrote and
+    // the cell above it is what this row saw.
+    std::vector<lift::Row> rows(3);
+    const std::uint64_t tops[3] = {1, 3, 3};
+    const std::uint64_t second[3] = {2, 0, 0};
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        rows[i].seq = i + 1;
+        rows[i].rsi = 0x2000;
+        rows[i].rbp = 0x3000 + 8 * i;
+        rows[i].st0 = tops[i];
+        rows[i].st1 = second[i];
+        rows[i].st2 = 0;
+    }
+    const std::vector<std::size_t> which{0, 0, 0};
+
+    std::vector<lift::InstantiatedRow> inst;
+    const lift::Conformance conf = lift::check_trace(
+        model, handlers, rows, which, nullptr, nullptr, &inst);
+    check(inst.size() == 3, "every dispatch is described, the last included");
+    check(inst.back().seq == 3, "and the last one is the trace's last row");
+    check(conf.mismatched == 0, "with no comparison invented for it");
+}
+
 }  // namespace
 
 int main() {
@@ -1095,6 +1235,9 @@ int main() {
     run("trace_memory", test_trace_memory_serves_its_windows);
     run("trace_memory_overlap", test_trace_memory_later_record_wins);
     run("trace_memory_empty", test_trace_memory_refuses_nothing_windows);
+    run("pretty_bound", test_pretty_bound_replaces_what_the_run_pinned);
+    run("instantiated_row", test_instantiated_row_shows_the_run);
+    run("instantiated_last_row", test_instantiated_row_spans_the_last_dispatch);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

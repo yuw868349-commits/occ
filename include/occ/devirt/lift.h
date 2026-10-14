@@ -468,8 +468,13 @@ struct Layout {
 // the machine itself thinks it is using -- and everything else keeps its
 // address, because naming an address a slot would be a claim the model
 // cannot back.
+//
+// `bound` is the same substitution `render` takes: with it, an index a
+// trace pinned down prints as the number the machine used, so `vst[i]`
+// becomes `vst[3]`. Leave it null for the symbolic form.
 [[nodiscard]] std::string address_label(const Model& model, expr::Id addr,
-                                        unsigned width);
+                                        unsigned width,
+                                        const expr::Bindings* bound = nullptr);
 
 struct Conformance {
     std::uint64_t checked = 0;    // predictions evaluated and equal
@@ -566,14 +571,47 @@ struct TraceMemory {
                             std::uint64_t* out) const;
 };
 
+// One row's effect as the run saw it: the handler's model with every
+// input the trace pinned down replaced by the value it held. The symbolic
+// render says what a handler is -- `vst[i] ^ code[rax+2]`; this says what
+// it did to this machine at this step -- `vst[3] ^= 0x5c`. It is the same
+// model either way, so the two cannot drift.
+//
+// Only the check can produce one. The binding grows as the check walks the
+// trace -- a slot read is the value its handler was entered with, which is
+// the shadow's answer, which is itself built out of the rows before it --
+// so the instantiation is taken from the check rather than rebuilt beside
+// it, where a second implementation would be free to disagree with the
+// first about the very rows they both describe.
+struct InstantiatedRow {
+    std::uint64_t seq = 0;
+    std::uint64_t handler_va = 0;
+    // The handler's writes, in the order the model lists them.
+    std::vector<std::string> writes;
+    // Where control went, rendered the same way. Empty when the handler's
+    // model does not name a target -- a hand-back to a shared dispatcher
+    // is a transfer with nothing to name.
+    std::string transfer;
+    // How much of the row the trace pinned down: the inputs the row's own
+    // effects reach, and how many of those the trace bound. A row whose
+    // effects reach nothing is pinned vacuously -- there is nothing about
+    // it the run left open.
+    unsigned inputs_total = 0;
+    unsigned inputs_bound = 0;
+};
+
 [[nodiscard]] Conformance check_trace(
     Model& model, const std::vector<Handler>& handlers,
     const std::vector<Row>& rows,
     const std::vector<std::size_t>& handler_of_row, CodeReader code_bytes,
-    void* code_ctx);
+    void* code_ctx, std::vector<InstantiatedRow>* instantiated = nullptr);
 
 // The recovered expression for a slot write, rendered for a report.
-[[nodiscard]] std::string render(const Model& model, expr::Id id);
+// `bound` substitutes the values a trace gave the model's inputs, so a
+// report can show a step as the machine took it rather than as a schema;
+// null leaves every input symbolic.
+[[nodiscard]] std::string render(const Model& model, expr::Id id,
+                                 const expr::Bindings* bound = nullptr);
 
 // A one-line statement of what the handler does, taken from its model
 // rather than from its instruction text. The top of the value the handler

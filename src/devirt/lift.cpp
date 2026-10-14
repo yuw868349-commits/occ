@@ -3200,6 +3200,35 @@ struct TraceField {
     }
 };
 
+// One expression as a run saw it. A value the trace determined completely
+// prints as the number it was -- there is nothing left to say about it --
+// and one it left partly open keeps its shape with the values substituted,
+// so the open part stays visible instead of being folded into a claim the
+// run never made. Both the report's stream and the address labels read
+// through this, which is why a slot index the run fixed prints as
+// `vst[3]` rather than as the arithmetic that arrived there.
+[[nodiscard]] std::string bound_text(const Model& model, expr::Id id,
+                                     const expr::Bindings& bound) {
+    if (id == expr::kNoId) {
+        return "?";
+    }
+    for (const unsigned o : model.dag.inputs_of(id)) {
+        if (!bound.has(o)) {
+            return model.dag.pretty_bound(id, bound);
+        }
+    }
+    std::vector<std::uint64_t> values(model.inputs.size(), 0);
+    for (std::size_t k = 0; k < values.size() && k < bound.values.size();
+         ++k) {
+        values[k] = bound.values[k];
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%llx",
+                  static_cast<unsigned long long>(
+                      model.dag.evaluate(id, values)));
+    return buf;
+}
+
 }  // namespace
 
 std::uint64_t resolve_handler(std::uint64_t target, bool target_is_code) {
@@ -3293,7 +3322,8 @@ Layout infer_layout(const std::vector<HandlerBytes>& handlers) {
 Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
                         const std::vector<Row>& rows,
                         const std::vector<std::size_t>& handler_of_row,
-                        CodeReader code_bytes, void* code_ctx) {
+                        CodeReader code_bytes, void* code_ctx,
+                        std::vector<InstantiatedRow>* instantiated) {
     Conformance out;
     std::map<std::uint64_t, std::uint64_t> failures_by_handler;
     Shadow shadow;
@@ -3305,7 +3335,21 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
             shadow.adopt(stack, cells);
         }
     }
-    for (std::size_t i = 0; i + 1 < rows.size(); ++i) {
+    // One expression as the run saw it: a value the trace determined
+    // completely prints as the number it was, and one it left partly open
+    // keeps its shape with the values substituted in.
+    const auto instantiate = [&model](expr::Id id,
+                                      const expr::Bindings& b) {
+        return bound_text(model, id, b);
+    };
+
+    // The walk covers every row, including the last: a dispatch with no
+    // successor is still a dispatch the run took, and a report of the
+    // stream that stopped one short would be a report that dropped the
+    // engine's final step. What the row after it supplied -- the observed
+    // registers, the cells to compare against -- is what is absent, so
+    // those comparisons are the ones the walk skips.
+    for (std::size_t i = 0; i < rows.size(); ++i) {
         if (i >= handler_of_row.size()) {
             break;
         }
@@ -3316,7 +3360,13 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
         }
         const Handler& h = handlers[hi];
         const Row& prev = rows[i];
-        const Row& cur = rows[i + 1];
+        // Whether the trace says what happened after this row. The last
+        // row of a trace has nothing after it, and a caller may also leave
+        // the last row's own handler unnamed -- `handler_of_row` needs an
+        // entry for a row the walk descends into, and the row nothing
+        // descends into is not one.
+        const bool has_next = i + 1 < rows.size();
+        const Row& cur = has_next ? rows[i + 1] : prev;
 
         Binder b(model);
         const auto binding_of = [&]() {
@@ -3510,7 +3560,7 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
         if (!h.modeled) {
             ++out.unmodeled;
         }
-        {
+        if (has_next) {
             // The pointers are compared against the next row's value of
             // the register the convention assigns to each role, not
             // against fixed Row fields: under a permuted convention the
@@ -3523,7 +3573,7 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
             const bool want_known = tf.stack(cur, &want);
             record("rbp", known && want_known, v, want);
         }
-        {
+        if (has_next) {
             std::uint64_t v = 0;
             const bool known = eval(h.rsi_new, &v);
             std::uint64_t want = 0;
@@ -3534,8 +3584,7 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
         // handler ran next, and the model's jump target should name the
         // same one: this is the half of a handler's effect that says what
         // virtual instruction follows.
-        if (h.transfer == Handler::Transfer::Dispatch && i + 1 < rows.size() &&
-            i + 1 < handler_of_row.size()) {
+        if (has_next && h.transfer == Handler::Transfer::Dispatch) {
             const std::size_t next = handler_of_row[i + 1];
             if (next < handlers.size()) {
                 std::uint64_t v = 0;
@@ -3575,26 +3624,94 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
         // the shadow the model left behind -- then adopted from the
         // trace, so the comparison stays grounded on ground truth. The
         // window is the one the convention's stack register is read
-        // around, which is why the tracer records both.
-        std::uint64_t cur_stack = 0;
-        std::uint64_t prev_stack = 0;
-        const bool cur_ok = tf.stack(cur, &cur_stack);
-        const bool prev_ok = tf.stack(prev, &prev_stack);
-        const std::uint64_t base =
-            cur_ok ? (cur_stack & ~std::uint64_t{7}) : 0;
-        const std::vector<std::uint64_t> cells = tf.slot_cells(cur);
-        for (std::size_t k = 0; k < cells.size(); ++k) {
-            const std::uint64_t addr = base + 8 * static_cast<std::uint64_t>(k);
-            const std::int64_t disp =
-                prev_ok ? static_cast<std::int64_t>(addr) -
-                              static_cast<std::int64_t>(prev_stack)
-                        : 0;
-            std::uint64_t got = 0;
-            const bool known = shadow.read(addr, &got);
-            record("vst[" + std::to_string(disp) + "]", known, got, cells[k]);
+        // around, which is why the tracer records both. A row with no
+        // successor has no observation to compare against and none to
+        // adopt; the shadow still holds the state the row was entered
+        // with, which is what its instantiation is read from.
+        if (has_next) {
+            std::uint64_t cur_stack = 0;
+            std::uint64_t prev_stack = 0;
+            const bool cur_ok = tf.stack(cur, &cur_stack);
+            const bool prev_ok = tf.stack(prev, &prev_stack);
+            const std::uint64_t base =
+                cur_ok ? (cur_stack & ~std::uint64_t{7}) : 0;
+            const std::vector<std::uint64_t> cells = tf.slot_cells(cur);
+            for (std::size_t k = 0; k < cells.size(); ++k) {
+                const std::uint64_t addr =
+                    base + 8 * static_cast<std::uint64_t>(k);
+                const std::int64_t disp =
+                    prev_ok ? static_cast<std::int64_t>(addr) -
+                                  static_cast<std::int64_t>(prev_stack)
+                            : 0;
+                std::uint64_t got = 0;
+                const bool known = shadow.read(addr, &got);
+                record("vst[" + std::to_string(disp) + "]", known, got,
+                       cells[k]);
+            }
+            if (cur_ok && !cells.empty()) {
+                shadow.adopt(cur_stack, cells);
+            }
         }
-        if (cur_ok && !cells.empty()) {
-            shadow.adopt(cur_stack, cells);
+
+        // The row as the run saw it. The binding is complete here -- every
+        // input of the model has had its turn -- so what is rendered is
+        // the step the machine took, not the schema it took it from.
+        if (instantiated != nullptr) {
+            InstantiatedRow row;
+            row.seq = prev.seq;
+            row.handler_va = h.va;
+            expr::Bindings bound;
+            bound.values = b.values;
+            bound.known.assign(b.bound.size(), false);
+            // What the row's own effects reach. The machine registers
+            // every flag a handler might have read, and most handlers read
+            // none: counting those as unpinned would say every row is
+            // partly unknown for a reason that has nothing to do with the
+            // row. Only the inputs the effects actually name are the
+            // question "did the run pin this step down".
+            std::vector<unsigned> reached;
+            const auto reach = [&](expr::Id id) {
+                if (id == expr::kNoId) {
+                    return;
+                }
+                for (const unsigned o : model.dag.inputs_of(id)) {
+                    if (std::find(reached.begin(), reached.end(), o) ==
+                        reached.end()) {
+                        reached.push_back(o);
+                    }
+                }
+            };
+            for (const Handler::Write& wr : h.writes) {
+                reach(wr.value);
+                if (!wr.to_slot) {
+                    reach(wr.addr);
+                }
+            }
+            reach(h.target_expr);
+            row.inputs_total = static_cast<unsigned>(reached.size());
+            for (std::size_t k = 0; k < b.bound.size(); ++k) {
+                bound.known[k] = b.bound[k] != 0;
+            }
+            for (const unsigned o : reached) {
+                if (bound.has(o)) {
+                    ++row.inputs_bound;
+                }
+            }
+            for (const Handler::Write& wr : h.writes) {
+                const std::string value = instantiate(wr.value, bound);
+                if (wr.to_slot) {
+                    row.writes.push_back("vst[" + std::to_string(wr.disp) +
+                                         "] = " + value);
+                } else {
+                    row.writes.push_back(
+                        address_label(model, wr.addr, wr.width, &bound) +
+                        " = " + value);
+                }
+            }
+            if (h.target_expr != expr::kNoId) {
+                row.transfer = instantiate(h.target_expr, bound);
+            }
+            instantiated->push_back(std::move(row));
         }
     }
     out.worst_handlers.reserve(failures_by_handler.size());
@@ -3682,11 +3799,13 @@ bool TraceMemory::read(std::uint64_t va, unsigned width,
     return false;
 }
 
-std::string render(const Model& model, expr::Id id) {
+std::string render(const Model& model, expr::Id id,
+                   const expr::Bindings* bound) {
     if (id == expr::kNoId) {
         return "?";
     }
-    return model.dag.pretty(id);
+    return bound != nullptr ? model.dag.pretty_bound(id, *bound)
+                            : model.dag.pretty(id);
 }
 
 namespace {
@@ -3834,18 +3953,26 @@ std::string clipped(const std::string& text) {
 
 }  // namespace
 
-std::string address_label(const Model& model, expr::Id addr, unsigned width) {
+std::string address_label(const Model& model, expr::Id addr, unsigned width,
+                          const expr::Bindings* bound) {
+    // One rendering rule for the whole label: with a binding, an index the
+    // run fixed prints as the number it was, so the label says `vst[3]`
+    // and not the arithmetic that arrived there.
+    const auto text = [&](expr::Id id) {
+        return bound != nullptr ? bound_text(model, id, *bound)
+                                : model.dag.pretty(id);
+    };
     expr::Id index = indexed_by(model, addr, model.convention.regfile, false);
     if (index != expr::kNoId) {
-        return "vst[" + clipped(model.dag.pretty(index)) + "]";
+        return "vst[" + clipped(text(index)) + "]";
     }
     index = indexed_by(model, addr, model.convention.code, true);
     if (index != expr::kNoId) {
-        return "code[" + clipped(model.dag.pretty(index)) + "]";
+        return "code[" + clipped(text(index)) + "]";
     }
     char b[16];
     std::snprintf(b, sizeof(b), "mem%u[", width);
-    return std::string(b) + clipped(model.dag.pretty(addr)) + "]";
+    return std::string(b) + clipped(text(addr)) + "]";
 }
 
 }  // namespace occ::devirt::lift
