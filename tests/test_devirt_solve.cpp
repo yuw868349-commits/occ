@@ -39,6 +39,20 @@ void check(bool ok, const char* what) {
     }
 }
 
+// A goal from the text the command line would take. The tests write the
+// same language a caller does, so a change to the parser shows up here
+// rather than only in a hand-built tree.
+lift::GoalNode goal_of(const std::string& text) {
+    lift::GoalNode g;
+    std::string err;
+    if (!lift::parse_goal(text, &g, &err)) {
+        std::fprintf(stderr, "FAIL the test's own goal %s: %s\n",
+                     text.c_str(), err.c_str());
+        ++failures;
+    }
+    return g;
+}
+
 constexpr std::uint64_t kHandlerVa = 0x1000;
 
 // A run that recorded zero at every address. A reader rather than null so
@@ -104,7 +118,7 @@ void test_solve_reads_a_byte_out_of_the_unknown() {
 
     lift::SolveOptions opts;
     opts.unknown.push_back(lift::UnknownRegion{0x5000, 1});
-    opts.goals.push_back(lift::Goal{0, 0});
+    opts.goals.push_back(goal_of("vst[0] = 0"));
 
     const lift::SolveResult res = lift::solve(
         model, {h}, rows, which, zero_bytes, nullptr, opts);
@@ -137,7 +151,7 @@ void test_solve_reports_a_goal_no_input_can_meet() {
 
     lift::SolveOptions opts;
     opts.unknown.push_back(lift::UnknownRegion{0x5000, 1});
-    opts.goals.push_back(lift::Goal{0, 0});
+    opts.goals.push_back(goal_of("vst[0] = 0"));
 
     const lift::SolveResult res = lift::solve(
         model, {h}, rows, which, zero_bytes, nullptr, opts);
@@ -167,7 +181,7 @@ void test_solve_splits_a_goal_that_a_bitwise_or_joins() {
 
     lift::SolveOptions opts;
     opts.unknown.push_back(lift::UnknownRegion{0x5000, 2});
-    opts.goals.push_back(lift::Goal{0, 0});
+    opts.goals.push_back(goal_of("vst[0] = 0"));
 
     const lift::SolveResult res = lift::solve(
         model, {h}, rows, which, zero_bytes, nullptr, opts);
@@ -193,7 +207,7 @@ void test_solve_says_what_it_was_not_told() {
     const std::vector<std::size_t> which{0};
 
     lift::SolveOptions none;
-    none.goals.push_back(lift::Goal{0, 0});
+    none.goals.push_back(goal_of("vst[0] = 0"));
     const lift::SolveResult no_region = lift::solve(
         model, {h}, rows, which, zero_bytes, nullptr, none);
     check(!no_region.solved && !no_region.reason.empty(),
@@ -225,7 +239,7 @@ void test_solve_looks_through_a_narrow_goal() {
 
     lift::SolveOptions opts;
     opts.unknown.push_back(lift::UnknownRegion{0x5000, 1});
-    opts.goals.push_back(lift::Goal{0, 0});
+    opts.goals.push_back(goal_of("vst[0] = 0"));
 
     const lift::SolveResult res = lift::solve(
         model, {h}, rows, which, zero_bytes, nullptr, opts);
@@ -255,7 +269,7 @@ void test_solve_reads_the_goal_at_the_last_row_s_pointer() {
 
     lift::SolveOptions opts;
     opts.unknown.push_back(lift::UnknownRegion{0x5000, 1});
-    opts.goals.push_back(lift::Goal{0, 0});
+    opts.goals.push_back(goal_of("vst[0] = 0"));
     const lift::SolveResult res = lift::solve(
         model, {h}, rows, which, zero_bytes, nullptr, opts);
     check(!res.goal_addresses.empty(), "the goal's address is reported");
@@ -264,6 +278,137 @@ void test_solve_reads_the_goal_at_the_last_row_s_pointer() {
               "and it is the last row's pointer, not the one the model "
               "would have left behind");
     }
+}
+
+
+// The goal language: what a caller can write down.
+//
+// The parser is the only place a person's question enters this layer, so
+// it is tested on the things a person writes -- a comparison, a
+// conjunction, an index, a register -- and on the things they get wrong.
+// An error that says which offset and what was expected is worth more
+// than a refusal, and a rendering that re-parses to the same tree is what
+// keeps the report and the answer in one vocabulary.
+void test_goal_language_parses_what_a_caller_writes() {
+    const auto ok = [](const char* text) {
+        lift::GoalNode g;
+        std::string err;
+        const bool parsed = lift::parse_goal(text, &g, &err);
+        if (!parsed) {
+            std::fprintf(stderr, "  (rejected: %s -- %s)\n", text,
+                         err.c_str());
+        }
+        return parsed;
+    };
+    check(ok("vst[0] == 0"), "a slot compared with a number");
+    check(ok("vst[0] = 0"), "a single '=' is the same comparison");
+    check(ok("vst[1] <u 0x100"), "an unsigned bound");
+    check(ok("vst[1] <s 0"), "a signed one");
+    check(ok("vst[0] != 0xdeadbeef && mem64[0x1000] == 0x1122334455667788"),
+          "a conjunction over two places");
+    check(ok("code[rax] == 0x11"), "a bytecode byte against a constant");
+    check(ok("mem8[rsp + 4] == 0"), "a narrow access at a register");
+    check(ok("rax == 0 || rbx != 0"), "a disjunction over registers");
+    check(ok("(vst[0] + vst[1]) * 2 == vst[2]"),
+          "arithmetic with parentheses");
+    check(ok("vst[vst[1]] == 0"), "an index that is itself a slot");
+    check(ok("~vst[0] == 0xffffffff"), "a bitwise not");
+    check(ok("!(vst[0] == 0)"), "a negated condition");
+}
+
+void test_goal_language_refuses_what_it_cannot_read() {
+    lift::GoalNode g;
+    std::string err;
+    check(!lift::parse_goal("vst[0", &g, &err),
+          "an unclosed index is refused");
+    check(err.find("never closed") != std::string::npos,
+          "and the refusal says which brace");
+    err.clear();
+    check(!lift::parse_goal("0x10", &g, &err),
+          "a bare value asks no question");
+    check(err.find("condition") != std::string::npos,
+          "and the refusal says what a goal has to be");
+    err.clear();
+    check(!lift::parse_goal("mem7[0] == 0", &g, &err),
+          "a width that is not a machine width is refused");
+    err.clear();
+    check(!lift::parse_goal("vst[0] == 0 extra", &g, &err),
+          "trailing text is refused rather than ignored");
+    err.clear();
+    check(!lift::parse_goal("", &g, &err), "an empty goal is refused");
+}
+
+void test_goal_language_round_trips() {
+    // A rendering re-parses to the same tree. The report shows a goal in
+    // the machine's own vocabulary; if that text did not mean what the
+    // tree means, the report would be describing a different question.
+    const char* const texts[] = {
+        "vst[0] == 0",
+        "vst[1] <u 0x100 && mem64[0x1000] == 0xdeadbeef",
+        "rax == 0 || rbx != 0",
+        "(vst[0] + vst[1]) * 2 == vst[2]",
+        "mem8[rsp + 4] == 0",
+        "~(vst[0] & 0xff) == 0",
+    };
+    for (const char* text : texts) {
+        lift::GoalNode a;
+        std::string err;
+        if (!lift::parse_goal(text, &a, &err)) {
+            check(false, text);
+            continue;
+        }
+        const std::string shown = lift::render_goal(a);
+        lift::GoalNode b;
+        if (!lift::parse_goal(shown, &b, &err)) {
+            std::fprintf(stderr, "  (re-parse failed: %s -- %s)\n",
+                         shown.c_str(), err.c_str());
+            check(false, text);
+            continue;
+        }
+        check(lift::render_goal(b) == shown, text);
+    }
+}
+
+void test_goal_language_reads_memory_the_run_left() {
+    // A goal over a place rather than a slot: the handler stores a
+    // constant at [stack+0], and the question is asked of the memory the
+    // store landed in. The answer comes from the program's own write, so
+    // it rests on nothing the run failed to record.
+    lift::Model model;
+    const std::vector<lift::Handler> handlers = {
+        lift::summarize(model, kStoreConstant.data(), kStoreConstant.size(),
+                        kHandlerVa, kHandlerVa)};
+    std::vector<lift::Row> rows(1);
+    rows[0].seq = 1;
+    rows[0].rbp = 0x3000;
+    const std::vector<std::size_t> which{0};
+    lift::SolveOptions opts;
+    opts.unknown.push_back(lift::UnknownRegion{0x5000, 1});
+    opts.goals.push_back(goal_of("mem8[0x3000] == 0x11"));
+    const lift::SolveResult res =
+        lift::solve(model, handlers, rows, which, nullptr, nullptr, opts);
+    check(res.solved, "a goal over an address reads the store the handler "
+                      "made there");
+    check(res.goal_addresses.size() == 1 && res.goal_addresses[0] == 0x3000,
+          "and the address it read is the one the goal named");
+    check(res.goal_text.size() == 1 &&
+              res.goal_text[0] == "mem8[0x3000] == 0x11",
+          "and the goal is echoed back in the machine's own spelling");
+
+    // The same store, asked the other way: a value it did not write is a
+    // question with no answer, and that is reported rather than
+    // invented.
+    lift::Model other;
+    const std::vector<lift::Handler> other_handlers = {
+        lift::summarize(other, kStoreConstant.data(), kStoreConstant.size(),
+                        kHandlerVa, kHandlerVa)};
+    lift::SolveOptions no;
+    no.unknown.push_back(lift::UnknownRegion{0x5000, 1});
+    no.goals.push_back(goal_of("mem8[0x3000] == 0x22"));
+    const lift::SolveResult unsat =
+        lift::solve(other, other_handlers, rows, which, nullptr, nullptr, no);
+    check(!unsat.solved, "a value the store did not write is not reported as "
+                         "one it did");
 }
 
 }  // namespace
@@ -280,6 +425,10 @@ int main() {
     run("solve_narrow_goal", test_solve_looks_through_a_narrow_goal);
     run("solve_goal_base", test_solve_reads_the_goal_at_the_last_row_s_pointer);
     run("solve_says_what_it_was_not_told", test_solve_says_what_it_was_not_told);
+    run("goal_parses", test_goal_language_parses_what_a_caller_writes);
+    run("goal_refuses", test_goal_language_refuses_what_it_cannot_read);
+    run("goal_round_trip", test_goal_language_round_trips);
+    run("goal_memory", test_goal_language_reads_memory_the_run_left);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

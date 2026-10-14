@@ -378,11 +378,20 @@ struct ByteSources {
 bool read_bytes(void* ctx, std::uint64_t va, unsigned width,
                 std::uint64_t* out) {
     const auto* s = static_cast<const ByteSources*>(ctx);
-    if (s->img != nullptr &&
-        ImageMap::read(const_cast<ImageMap*>(s->img), va, width, out)) {
+    // The run's own record first.
+    //
+    // A table a program decrypts at start-up has one value in the file
+    // and another in memory, and it is the memory the program read. The
+    // trace is the only thing here that holds what was in memory at the
+    // time; the dump is what was on disk. Reading the file first answers
+    // every question about a self-decrypting table with the
+    // pre-decryption bytes -- not a wrong answer to a hard question, but
+    // a confident answer to a different one.
+    if (s->memory != nullptr && s->memory->read(va, width, out)) {
         return true;
     }
-    return s->memory != nullptr && s->memory->read(va, width, out);
+    return s->img != nullptr &&
+           ImageMap::read(const_cast<ImageMap*>(s->img), va, width, out);
 }
 
 
@@ -730,7 +739,18 @@ int cmd_devirt(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: occ devirt TRACE.jsonl DUMP.vmf [N] "
                      "[--asm [N]] [-o REPORT] "
-                     "[--unknown VA:SIZE] [--goal VST=HEX]\n");
+                     "[--unknown VA:SIZE] [--goal CONDITION] [--explore]\n"
+                     "  --unknown VA:SIZE   bytes the solve may choose\n"
+                     "  --goal CONDITION    what the finished program must "
+                     "satisfy; a condition over\n"
+                     "                      vst[i], code[i], mem64[a], "
+                     "mem8/16/32/64[a], the\n"
+                     "                      interpreter's registers, and the "
+                     "usual operators\n"
+                     "  --explore           recompute each dispatch's target "
+                     "from the model and\n"
+                     "                      enumerate where else it could "
+                     "have gone\n");
         return 2;
     }
     // The dispatcher calls this with argv+2, so argv[0] is the trace and
@@ -740,6 +760,7 @@ int cmd_devirt(int argc, char** argv) {
     std::size_t limit = 0;
     std::size_t asm_limit = 0;
     bool want_asm = false;
+    bool want_explore = false;
     std::string report_path;
     lift::SolveOptions solve_opts;
     bool want_solve = false;
@@ -750,6 +771,9 @@ int cmd_devirt(int argc, char** argv) {
             if (i + 1 < argc && std::isdigit(static_cast<unsigned char>(argv[i + 1][0]))) {
                 asm_limit = static_cast<std::size_t>(std::strtoull(argv[++i], nullptr, 10));
             }
+        } else if (a == "--explore") {
+            want_explore = true;
+            want_solve = true;
         } else if (a == "-o") {
             if (i + 1 < argc) {
                 report_path = argv[++i];
@@ -779,37 +803,21 @@ int cmd_devirt(int argc, char** argv) {
             solve_opts.unknown.push_back(region);
             want_solve = true;
         } else if (a == "--goal" && i + 1 < argc) {
-            // vst[DISP]=HEX: the displacement is the same number a slot
-            // write prints, measured from the convention's stack
-            // register.
             const std::string spec = argv[++i];
-            const std::size_t eq = spec.find('=');
-            if (eq == std::string::npos) {
-                std::fprintf(stderr,
-                             "devirt: --goal wants vst[DISP]=HEX (got %s)\n",
-                             spec.c_str());
+            lift::GoalNode goal;
+            std::string error;
+            if (!lift::parse_goal(spec, &goal, &error)) {
+                std::fprintf(stderr, "devirt: --goal %s\n  %s\n",
+                             spec.c_str(), error.c_str());
                 return 2;
             }
-            std::string slot = spec.substr(0, eq);
-            if (slot.rfind("vst[", 0) != 0 || slot.back() != ']') {
-                std::fprintf(stderr,
-                             "devirt: --goal names a slot as vst[DISP], "
-                             "which is how the report names one (got %s)\n",
-                             slot.c_str());
-                return 2;
-            }
-            slot = slot.substr(4, slot.size() - 5);
-            lift::Goal goal;
-            goal.disp = static_cast<std::int64_t>(
-                std::strtoll(slot.c_str(), nullptr, 0));
-            goal.value = static_cast<std::uint64_t>(
-                std::strtoull(spec.substr(eq + 1).c_str(), nullptr, 0));
-            solve_opts.goals.push_back(goal);
+            solve_opts.goals.push_back(std::move(goal));
             want_solve = true;
         } else if (std::isdigit(static_cast<unsigned char>(a[0]))) {
             limit = static_cast<std::size_t>(std::strtoull(a.c_str(), nullptr, 10));
         }
     }
+    solve_opts.explore = want_explore;
 
     load_api_map(dump_path);
 
@@ -914,6 +922,40 @@ int cmd_devirt(int argc, char** argv) {
             }
             index_of[h] = lhandlers.size();
             lhandlers.push_back(std::move(handler));
+        }
+    }
+
+    // The shared code every handler jumps to -- the dispatcher -- as a
+    // model of its own.
+    //
+    // The handlers stop at the boundary on purpose: the dispatcher is not
+    // any one handler's business, and folding it into each of them would
+    // give thirteen copies of the same code and thirteen chances to get
+    // it wrong. But it is the code that decides what runs next, and
+    // without a model of it the analysis can only report the sequence the
+    // trace happened to take. Summarized once, here, and replayed with
+    // the handlers, it turns "what ran" into "what the machine computed",
+    // which is a check where there was none and the only way a dispatch
+    // that depends on the input can be seen at all.
+    lift::Handler dispatcher;
+    bool have_dispatcher = false;
+    if (have_img && !boundary.empty()) {
+        const std::uint64_t entry = boundary.front();
+        std::uint64_t window_va = 0;
+        std::size_t avail = 0;
+        const std::uint8_t* p = img.window(entry, &window_va, &avail);
+        // The boundary list handed to the walk is empty: the dispatcher
+        // *is* the shared code, and it does not stop at itself. What
+        // stops it is its own indirect jump, which is where the next
+        // handler's address comes out.
+        if (p != nullptr && entry >= window_va && entry - window_va < avail) {
+            // `summarize` takes the section's own view -- the pointer the
+            // window returned and the address it starts at -- and finds
+            // the entry inside it. The offset that `HandlerBytes` wants
+            // is a different convention and is not applied here.
+            dispatcher = lift::summarize(model, p, avail, window_va, entry,
+                                         256);
+            have_dispatcher = true;
         }
     }
 
@@ -1291,7 +1333,7 @@ int cmd_devirt(int argc, char** argv) {
             if (want_solve) {
                 const lift::SolveResult sol = lift::solve(
                     model, lhandlers, lrows, which, read_bytes, &sources,
-                    solve_opts);
+                    solve_opts, have_dispatcher ? &dispatcher : nullptr);
                 rep.emit("\nsolve:");
                 for (std::size_t i = 0; i < solve_opts.unknown.size(); ++i) {
                     char ub[96];
@@ -1303,22 +1345,12 @@ int cmd_devirt(int argc, char** argv) {
                                       solve_opts.unknown[i].size));
                     rep.emit(ub);
                 }
-                for (std::size_t i = 0; i < solve_opts.goals.size(); ++i) {
-                    char gb[128];
-                    const char* at =
-                        i < sol.goal_addresses.size() ? "" : " (address "
-                        "unresolved)";
-                    std::snprintf(gb, sizeof(gb),
-                                  "  goal vst[%lld] = 0x%llx%s", 
-                                  static_cast<long long>(
-                                      solve_opts.goals[i].disp),
-                                  static_cast<unsigned long long>(
-                                      solve_opts.goals[i].value),
-                                  at);
-                    std::string line = gb;
-                    if (i < sol.goal_addresses.size()) {
+                for (std::size_t i = 0; i < sol.goal_text.size(); ++i) {
+                    std::string line = "  goal " + sol.goal_text[i];
+                    if (i < sol.goal_addresses.size() &&
+                        sol.goal_addresses[i] != 0) {
                         char ab[64];
-                        std::snprintf(ab, sizeof(ab), "  (read at 0x%llx)",
+                        std::snprintf(ab, sizeof(ab), "   (read at 0x%llx)",
                                       static_cast<unsigned long long>(
                                           sol.goal_addresses[i]));
                         line += ab;
@@ -1378,6 +1410,108 @@ int cmd_devirt(int argc, char** argv) {
                                   static_cast<unsigned long long>(
                                       sol.symbolic_stores));
                     rep.emit(wb);
+                }
+                // What the model says about control flow, against what the
+                // run did. Every dispatch's target is recomputed from the
+                // dispatcher's model; the ones that agree are a check on
+                // the model that nothing else in the analysis makes, and
+                // the ones that do not are either a defect or a branch.
+                if (have_dispatcher) {
+                    char db[224];
+                    std::snprintf(db, sizeof(db),
+                                  "  dispatch: the shared code at 0x%llx "
+                                  "was replayed over every row; %llu targets "
+                                  "resolved to a number, %llu depend on the "
+                                  "unknown",
+                                  static_cast<unsigned long long>(
+                                      dispatcher.va),
+                                  static_cast<unsigned long long>(
+                                      sol.targets_resolved),
+                                  static_cast<unsigned long long>(
+                                      sol.targets_symbolic));
+                    rep.emit(db);
+                    if (sol.targets_symbolic == 0 && sol.branches.empty() &&
+                        sol.targets_resolved != 0) {
+                        rep.emit("    and every one of them is the word the "
+                                 "run read, so the model's control flow and "
+                                 "the run's agree at all of them");
+                    }
+                    if (!dispatcher.modeled) {
+                        rep.emit("  ! the dispatcher's own model is not "
+                                 "claimed exact, and its targets are read "
+                                 "with that in mind");
+                    }
+                    {
+                        const char* ends = "nothing";
+                        switch (dispatcher.transfer) {
+                        case lift::Handler::Transfer::Dispatch:
+                            ends = "a dispatch";
+                            break;
+                        case lift::Handler::Transfer::Return:
+                            ends = "a return";
+                            break;
+                        case lift::Handler::Transfer::Call:
+                            ends = "a call out";
+                            break;
+                        default:
+                            break;
+                        }
+                        std::string line =
+                            std::string("    its model ends in ") + ends;
+                        if (dispatcher.target_expr != expr::kNoId) {
+                            line += ", on " +
+                                    lift::render(model,
+                                                 dispatcher.target_expr);
+                        } else {
+                            line += ", and names no target";
+                        }
+                        rep.emit(line);
+                        for (const std::string& n : dispatcher.notes) {
+                            rep.emit("    note: " + n);
+                        }
+                    }
+                } else if (want_solve) {
+                    rep.emit("  dispatch: not replayed; no shared code was "
+                             "modelled, so the handler sequence is the "
+                             "trace's and not the model's");
+                }
+                for (const lift::BranchPoint& bp : sol.branches) {
+                    char hb[192];
+                    std::snprintf(hb, sizeof(hb),
+                                  "  %s at seq %llu (handler 0x%llx): %s",
+                                  bp.symbolic ? "branch" : "divergence",
+                                  static_cast<unsigned long long>(bp.seq),
+                                  static_cast<unsigned long long>(
+                                      bp.handler_va),
+                                  bp.condition.c_str());
+                    rep.emit(hb);
+                    char ob[224];
+                    if (bp.symbolic) {
+                        std::snprintf(ob, sizeof(ob),
+                                      "    the run read 0x%llx there, which "
+                                      "is one successor and not the whole set",
+                                      static_cast<unsigned long long>(
+                                          bp.observed));
+                    } else {
+                        std::snprintf(ob, sizeof(ob),
+                                      "    the model made it 0x%llx and the "
+                                      "run read 0x%llx",
+                                      static_cast<unsigned long long>(
+                                          bp.computed),
+                                      static_cast<unsigned long long>(
+                                          bp.observed));
+                    }
+                    rep.emit(ob);
+                    for (const lift::BranchPoint::Edge& e : bp.edges) {
+                        char eb[128];
+                        std::snprintf(eb, sizeof(eb), "    -> 0x%llx  %s",
+                                      static_cast<unsigned long long>(
+                                          e.target),
+                                      e.reachable ? "reachable"
+                                                  : "ruled out by the path "
+                                                    "the run took");
+                        rep.emit(eb);
+                    }
                 }
                 for (const std::string& u : sol.unmet) {
                     rep.emit("  ! " + u);

@@ -332,6 +332,29 @@ void decode_shape(const std::uint8_t* bytes, std::size_t available,
         s.ok = true;
         return;
     }
+    case 0x63: {
+        // movsxd r64, r/m32: a signed thirty-two-bit load widened to the
+        // operand width.
+        //
+        // It is how a dispatcher reaches its own table. The entries are
+        // thirty-two-bit offsets relative to the table, and the sign is
+        // what lets one table serve the whole section -- an entry may
+        // point backwards -- so the load is signed and not zero-extended.
+        // A model that stopped here could not say where a dispatch went,
+        // and "where a dispatch went" is the one thing about control flow
+        // a model of this shape is otherwise able to say.
+        ++r.at;
+        const std::uint8_t modrm = r.u8();
+        s.op = Shape::Op::Movsx;
+        s.dst = reg_op(static_cast<std::uint8_t>(((modrm >> 3) & 7) |
+                                                 (px.rex_r ? 8 : 0)),
+                       op_width);
+        s.src = read_rm(r, modrm, px, 32, va, length);
+        s.has_dst = s.has_src = true;
+        s.width = op_width;
+        s.ok = true;
+        return;
+    }
     case 0x68:
     case 0x6A: {
         ++r.at;
@@ -942,6 +965,33 @@ void decode_shape(const std::uint8_t* bytes, std::size_t available,
     }
 }
 
+// Registers an input under the ordinal the DAG gave it.
+//
+// The DAG is the authority on an input's ordinal: it dedups by name and
+// width, so registering the same thing twice hands back the first one's
+// node. Appending to `inputs` in that case would put every later input
+// one slot past its own ordinal -- and every reader that indexes by
+// ordinal, which is the trace check and the replay both, would take the
+// wrong value from there on. It does not fail loudly; it answers every
+// question with the value of a different input, which is the shape of
+// the mistake this function exists to make impossible.
+//
+// A hole means the DAG holds an input this model did not make. It is
+// filled with a nameless one: nothing binds to it, so it is counted as
+// a value no run recorded rather than quietly standing in for whatever
+// shares its ordinal.
+void adopt_input(expr::DAG& dag, std::vector<Model::Input>& inputs,
+                 Model::Input in) {
+    const auto ordinal = static_cast<unsigned>(dag.node(in.id).imm);
+    if (ordinal < inputs.size()) {
+        return;
+    }
+    while (inputs.size() < ordinal) {
+        inputs.push_back(Model::Input{});
+    }
+    inputs.push_back(std::move(in));
+}
+
 // ------------------------------------------------------- model inputs
 
 }  // namespace
@@ -961,7 +1011,7 @@ expr::Id Model::input_slot(std::int64_t disp) {
     in.disp = disp;
     in.width = 64;
     in.id = dag.input(in.name, in.width);
-    inputs.push_back(in);
+    adopt_input(dag, inputs, in);
     return in.id;
 }
 
@@ -980,7 +1030,7 @@ expr::Id Model::input_code(std::int64_t disp, unsigned width) {
     in.disp = disp;
     in.width = width;
     in.id = dag.input(in.name, in.width);
-    inputs.push_back(in);
+    adopt_input(dag, inputs, in);
     return in.id;
 }
 
@@ -1000,7 +1050,7 @@ expr::Id Model::input_image(std::uint64_t va, unsigned width) {
     in.va = va;
     in.width = width;
     in.id = dag.input(in.name, in.width);
-    inputs.push_back(in);
+    adopt_input(dag, inputs, in);
     return in.id;
 }
 
@@ -1015,7 +1065,7 @@ expr::Id Model::input_reg(const std::string& reg) {
     in.name = reg;
     in.width = 64;
     in.id = dag.input(in.name, in.width);
-    inputs.push_back(in);
+    adopt_input(dag, inputs, in);
     return in.id;
 }
 
@@ -1035,7 +1085,7 @@ expr::Id Model::input_load(expr::Id addr, unsigned width) {
     // thinks in slots, so the model reads the way the machine does.
     in.name = address_label(*this, addr, width);
     in.id = dag.input(in.name, in.width);
-    inputs.push_back(in);
+    adopt_input(dag, inputs, in);
     return in.id;
 }
 
@@ -1047,7 +1097,7 @@ expr::Id Model::input_unknown(const std::string& hint) {
     std::snprintf(b, sizeof(b), "unk[%s]#%zu", hint.c_str(), inputs.size());
     in.name = b;
     in.id = dag.input(in.name, in.width);
-    inputs.push_back(in);
+    adopt_input(dag, inputs, in);
     return in.id;
 }
 
@@ -1856,6 +1906,14 @@ struct Runner {
         Handler::Transfer transfer = Handler::Transfer::Unknown;
         expr::Id target = expr::kNoId;
     };
+
+    // Every way out the walk found, in the order it found them. A fork
+    // whose arms leave differently -- a dispatcher's dispatch on one arm
+    // and a bail-out on the other -- records both here instead of
+    // reporting a contradiction: the arms are not disagreeing about the
+    // handler, they are the two answers to a question the walk could not
+    // reduce.
+    std::vector<Handler::Exit> exits;
 
     struct OperandRead {
         bool ok = false;
@@ -2886,14 +2944,37 @@ struct Runner {
                     mc.hazard("one arm of a branch could not be walked");
                     return Exit{};
                 }
-                if (taken_exit.transfer != fall_exit.transfer) {
-                    mc.hazard("the two arms of a branch end differently");
-                    return Exit{};
+                // The arms need not leave the same way, and when they do
+                // not that is the answer rather than a contradiction: a
+                // dispatcher is a dispatch on the arm that found a
+                // handler and a bail-out on the arm that did not, and a
+                // model that kept one arm and called the other a defect
+                // would be reporting its own limitation as the program's.
+                // Both are recorded with the branch that reaches them.
+                const bool same_way =
+                    taken_exit.transfer == fall_exit.transfer &&
+                    taken_exit.target == fall_exit.target;
+                if (!same_way) {
+                    const expr::Id cond_id = mc.id_of(cond);
+                    exits.push_back(Handler::Exit{
+                        taken_exit.transfer, taken_exit.target, cond_id, true});
+                    exits.push_back(Handler::Exit{
+                        fall_exit.transfer, fall_exit.target, cond_id, false});
                 }
                 merge_arm(taken_state, taken_writes, taken_stack, taken_host,
                           taken_exit, fall_exit, cond);
+                // Which way the handler hands control on: the dispatch,
+                // when there is one, because "what runs next" is the
+                // question a caller is asking. The target is the branch's
+                // own selected value rather than one arm's, so it answers
+                // for whichever arm the run takes.
+                const Handler::Transfer transfer =
+                    taken_exit.transfer == Handler::Transfer::Dispatch ||
+                            fall_exit.transfer == Handler::Transfer::Dispatch
+                        ? Handler::Transfer::Dispatch
+                        : fall_exit.transfer;
                 return Exit{
-                    true, fall_exit.transfer,
+                    true, transfer,
                     merge_target(cond, taken_exit.target, fall_exit.target)};
             }
             case Shape::Op::None:
@@ -2980,11 +3061,31 @@ Handler summarize(Model& model, const std::uint8_t* bytes,
     }
     const Runner::Exit exit =
         run.explore(va, std::vector<std::uint64_t>{}, 0);
-    if (exit.settled) {
-        h.transfer = exit.transfer;
-        h.target_expr = exit.target;
-    } else {
+    // A handler with one way out has one exit, and the exit the walk
+    // returned is it; a handler whose branches fork has one per arm, as
+    // the forks were merged.
+    if (run.exits.empty() && exit.settled) {
+        run.exits.push_back(
+            Handler::Exit{exit.transfer, exit.target, expr::kNoId, true});
+    }
+    h.exits = run.exits;
+    if (h.exits.empty()) {
         h.transfer = Handler::Transfer::Unknown;
+    } else {
+        const Handler::Exit* main = &h.exits.front();
+        for (const Handler::Exit& e : h.exits) {
+            if (e.transfer == Handler::Transfer::Dispatch) {
+                main = &e;
+                break;
+            }
+        }
+        h.transfer = main->transfer;
+        // The branch's own selected target when the walk settled on one,
+        // so a handler that dispatches two different ways reports the
+        // value the run's own branch produced rather than one arm's.
+        h.target_expr = exit.settled && exit.target != expr::kNoId
+                            ? exit.target
+                            : main->target;
     }
 
     h.modeled = !run.mc.incomplete;

@@ -1234,6 +1234,58 @@ void test_rendering_a_shared_graph_stops() {
           "and it says where it stopped");
 }
 
+
+void test_a_handler_that_leaves_two_ways_records_both() {
+    // A dispatcher's own shape: one arm hands control to the next
+    // handler, the other bails out. The two arms are not disagreeing
+    // about the handler -- they are the two answers to a branch the
+    // walk could not reduce -- and a model that kept one and called the
+    // other a contradiction would be reporting its own limitation as
+    // the program's. Both are kept, each with the branch that reaches
+    // it, and the model hands control on by the arm that dispatches.
+    //
+    //   movzx eax, byte [rdx]
+    //   cmp   eax, 0x11
+    //   je    bail
+    //   mov   eax, 1
+    //   jmp   rcx
+    // bail:
+    //   ret
+    const std::vector<std::uint8_t> two_ways = {
+        0x0F, 0xB6, 0x02,              // movzx eax, byte [rdx]
+        0x83, 0xF8, 0x11,              // cmp   eax, 0x11
+        0x74, 0x07,                    // je    +7
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov   eax, 1
+        0xFF, 0xE1,                    // jmp   rcx
+        0xC3,                          // ret
+    };
+    lift::Model model;
+    const lift::Handler h = lift::summarize(
+        model, two_ways.data(), two_ways.size(), kHandlerVa, kHandlerVa);
+    check(h.modeled, "the handler is modelled");
+    check(h.exits.size() == 2,
+          "both ways out are recorded, not just the one that ran");
+    bool have_dispatch = false;
+    bool have_return = false;
+    bool every_exit_has_a_branch = true;
+    for (const lift::Handler::Exit& e : h.exits) {
+        have_dispatch = have_dispatch ||
+                        e.transfer == lift::Handler::Transfer::Dispatch;
+        have_return =
+            have_return || e.transfer == lift::Handler::Transfer::Return;
+        every_exit_has_a_branch = every_exit_has_a_branch &&
+                                  e.condition != expr::kNoId;
+    }
+    check(have_dispatch, "one of them is the dispatch");
+    check(have_return, "and the other is the bail-out");
+    check(every_exit_has_a_branch,
+          "each carries the branch that reaches it");
+    check(h.transfer == lift::Handler::Transfer::Dispatch,
+          "the model hands control on by the arm that dispatches");
+    check(h.target_expr != expr::kNoId,
+          "and names the target it hands control to");
+}
+
 }  // namespace
 
 int main() {
@@ -1276,6 +1328,7 @@ int main() {
     run("instantiated_last_row", test_instantiated_row_spans_the_last_dispatch);
     run("evaluate_sharing", test_evaluate_survives_a_shared_graph);
     run("render_budget", test_rendering_a_shared_graph_stops);
+    run("two_ways_out", test_a_handler_that_leaves_two_ways_records_both);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

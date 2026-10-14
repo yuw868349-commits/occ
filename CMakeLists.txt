@@ -683,6 +683,7 @@ add_library(occ_core STATIC
     src/devirt/bitblast.cpp
     src/devirt/lift.cpp
     src/devirt/adapt.cpp
+    src/devirt/goal.cpp
     src/devirt/solve.cpp
     src/devirt/cert.cpp
     src/devirt/codegen.cpp

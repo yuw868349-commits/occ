@@ -107,6 +107,14 @@ private:
     return true;
 }
 
+// Whether an expression is a number, whichever way it was built. The
+// DAG's own `is_const` recognizes only a node that was born a constant;
+// this recognizes one that has become one, which is what a substituted
+// expression is whenever every input under it was bound.
+[[nodiscard]] bool is_ground(const expr::DAG& dag, expr::Id id) {
+    return dag.valid(id) && dag.inputs_of(id).empty();
+}
+
 // An expression with every input replaced by what the row bound it to.
 //
 // This is the whole of the replay: a handler's model is written over the
@@ -400,13 +408,217 @@ struct Support {
     return s;
 }
 
+// ---------------------------------------------------------------- goals
+
+// How deep a goal's tree may be read before the reader calls it a
+// runaway. The parser already caps its own descent; this is the second
+// gate, for a tree built by something other than the parser.
+constexpr unsigned kMaxGoalDepth = 256;
+
+// What a goal's leaves are resolved against: the state the replay ended
+// in. It is deliberately the same objects the replay itself used and not
+// a copy -- a goal reads the register file out of the very memory model
+// the program wrote, so "the state the last dispatch left behind" means
+// one thing in this file rather than two.
+struct GoalContext {
+    expr::DAG* dag = nullptr;
+    ReplayMemory* memory = nullptr;
+    std::uint64_t final_stack = 0;
+    unsigned regfile_width = 64;
+    std::uint64_t code_base = 0;
+    bool have_code = false;
+    const Row* last = nullptr;
+    std::size_t* unrecorded = nullptr;
+    // The first address the goal read, for the report: a caller that
+    // named a slot by displacement wants to see where the machine put it.
+    std::uint64_t address = 0;
+    bool have_address = false;
+    std::string error;
+};
+
+// `x != 0`, as a one-bit value. The machine's comparisons are its own
+// arithmetic; a logical connective is not an operation it has, so the
+// connectives are built out of the comparisons it does have.
+[[nodiscard]] expr::Id truth_of(expr::DAG& dag, expr::Id x) {
+    return dag.bit_not(dag.cmp_eq(x, dag.constant(0, dag.width(x))));
+}
+
+[[nodiscard]] expr::Id lower_goal(const GoalNode& n, GoalContext* ctx,
+                                  unsigned want, unsigned depth) {
+    if (depth > kMaxGoalDepth) {
+        ctx->error = "the goal nests too deeply to read";
+        return expr::kNoId;
+    }
+    expr::DAG& dag = *ctx->dag;
+    const auto lower = [&](const GoalNode& kid, unsigned w) {
+        return lower_goal(kid, ctx, w, depth + 1);
+    };
+    // A leaf that names a place has to name it by a number: the replay
+    // can only read memory it can point at, and an address built out of
+    // the unknown is a question about a place, not a question about what
+    // is in one. Saying which -- rather than reading address zero -- is
+    // the difference between a wrong answer and no answer.
+    const auto lower_address = [&](const GoalNode& index,
+                                   std::uint64_t* out) {
+        const expr::Id id = lower(index, 0);
+        if (id == expr::kNoId || !constant_value(dag, id, out)) {
+            ctx->error = "the address in '" + render_goal(index) +
+                         "' is not a number the replay can point at";
+            return false;
+        }
+        return true;
+    };
+    switch (n.kind) {
+    case GoalNode::Kind::Const:
+        return dag.constant(n.imm, want != 0 ? want : 64u);
+
+    case GoalNode::Kind::Register: {
+        const unsigned width = want != 0 ? want : 64u;
+        std::uint64_t v = 0;
+        if (ctx->last != nullptr && row_register(*ctx->last, n.name, &v)) {
+            return dag.constant(v, width);
+        }
+        // The trace did not carry it. Its name is kept and it is counted,
+        // the same rule the replay follows for a register it had to
+        // invent: a goal built on one is a candidate and not a fact.
+        if (ctx->unrecorded != nullptr) {
+            ++(*ctx->unrecorded);
+        }
+        return dag.input("unrecorded[" + n.name + "]", width);
+    }
+
+    case GoalNode::Kind::Regfile: {
+        std::uint64_t off = 0;
+        if (!lower_address(n.kids[0], &off)) {
+            return expr::kNoId;
+        }
+        const std::uint64_t addr =
+            ctx->final_stack + static_cast<std::uint64_t>(off);
+        if (!ctx->have_address) {
+            ctx->address = addr;
+            ctx->have_address = true;
+        }
+        return ctx->memory->read(addr, ctx->regfile_width);
+    }
+
+    case GoalNode::Kind::Code: {
+        std::uint64_t off = 0;
+        if (!lower_address(n.kids[0], &off)) {
+            return expr::kNoId;
+        }
+        if (!ctx->have_code) {
+            ctx->error = "code[...] needs the buffer's base, and the trace "
+                         "carried no register holding it";
+            return expr::kNoId;
+        }
+        return ctx->memory->read(ctx->code_base + off, 8);
+    }
+
+    case GoalNode::Kind::Memory: {
+        std::uint64_t addr = 0;
+        if (!lower_address(n.kids[0], &addr)) {
+            return expr::kNoId;
+        }
+        if (!ctx->have_address) {
+            ctx->address = addr;
+            ctx->have_address = true;
+        }
+        return ctx->memory->read(addr,
+                                 n.imm != 0 ? static_cast<unsigned>(n.imm)
+                                            : 64u);
+    }
+
+    case GoalNode::Kind::Not:
+        return dag.bit_not(lower(n.kids[0], want));
+    case GoalNode::Kind::Neg:
+        return dag.neg(lower(n.kids[0], want));
+    case GoalNode::Kind::LogNot: {
+        const expr::Id x = lower(n.kids[0], 0);
+        if (x == expr::kNoId) {
+            return expr::kNoId;
+        }
+        return dag.bit_not(truth_of(dag, x));
+    }
+
+    case GoalNode::Kind::LogAnd:
+    case GoalNode::Kind::LogOr: {
+        const expr::Id a = lower(n.kids[0], 0);
+        const expr::Id b = lower(n.kids[1], 0);
+        if (a == expr::kNoId || b == expr::kNoId) {
+            return expr::kNoId;
+        }
+        const expr::Id ta = truth_of(dag, a);
+        const expr::Id tb = truth_of(dag, b);
+        return n.kind == GoalNode::Kind::LogAnd ? dag.bit_and(ta, tb)
+                                                : dag.bit_or(ta, tb);
+    }
+
+    case GoalNode::Kind::Eq:
+    case GoalNode::Kind::Ne:
+    case GoalNode::Kind::Ult:
+    case GoalNode::Kind::Ule:
+    case GoalNode::Kind::Slt:
+    case GoalNode::Kind::Sle: {
+        expr::Id a = lower(n.kids[0], 0);
+        if (a == expr::kNoId) {
+            return expr::kNoId;
+        }
+        // Comparisons need their operands at one width, and the machine's
+        // own compare is what the widths have to be for the answer to
+        // mean the same thing the machine would have meant.
+        expr::Id b = lower(n.kids[1], dag.width(a));
+        if (b == expr::kNoId) {
+            return expr::kNoId;
+        }
+        const unsigned w = dag.width(a) > dag.width(b) ? dag.width(a)
+                                                       : dag.width(b);
+        a = dag.resize(a, w);
+        b = dag.resize(b, w);
+        switch (n.kind) {
+        case GoalNode::Kind::Eq:  return dag.cmp_eq(a, b);
+        case GoalNode::Kind::Ne:
+            return dag.bit_not(dag.cmp_eq(a, b));
+        case GoalNode::Kind::Ult: return dag.cmp_ult(a, b);
+        case GoalNode::Kind::Ule: return dag.bit_not(dag.cmp_ult(b, a));
+        case GoalNode::Kind::Slt: return dag.cmp_slt(a, b);
+        default:                  return dag.bit_not(dag.cmp_slt(b, a));
+        }
+    }
+
+    default: {
+        expr::Id a = lower(n.kids[0], 0);
+        if (a == expr::kNoId) {
+            return expr::kNoId;
+        }
+        expr::Id b = lower(n.kids[1], dag.width(a));
+        if (b == expr::kNoId) {
+            return expr::kNoId;
+        }
+        const unsigned w = dag.width(a) > dag.width(b) ? dag.width(a)
+                                                       : dag.width(b);
+        a = dag.resize(a, w);
+        b = dag.resize(b, w);
+        switch (n.kind) {
+        case GoalNode::Kind::Add: return dag.add(a, b);
+        case GoalNode::Kind::Sub: return dag.sub(a, b);
+        case GoalNode::Kind::Mul: return dag.mul(a, b);
+        case GoalNode::Kind::And: return dag.bit_and(a, b);
+        case GoalNode::Kind::Or:  return dag.bit_or(a, b);
+        case GoalNode::Kind::Xor: return dag.bit_xor(a, b);
+        case GoalNode::Kind::Shl: return dag.shl(a, b);
+        default:                  return dag.shr(a, b);
+        }
+    }
+    }
+}
+
 }  // namespace
 
 SolveResult solve(Model& model, const std::vector<Handler>& handlers,
                   const std::vector<Row>& rows,
                   const std::vector<std::size_t>& handler_of_row,
                   CodeReader code_bytes, void* code_ctx,
-                  const SolveOptions& options) {
+                  const SolveOptions& options, const Handler* dispatcher) {
     SolveResult out;
     if (rows.empty() || handler_of_row.empty()) {
         out.reason = "the trace has no dispatch to replay";
@@ -435,23 +647,13 @@ SolveResult solve(Model& model, const std::vector<Handler>& handlers,
     // that come before it.
     std::vector<expr::Id> binding(model.inputs.size(), expr::kNoId);
     std::uint64_t final_stack = 0;
-    const std::size_t rows_to_play = std::min(rows.size(),
-                                              handler_of_row.size());
-    for (std::size_t i = 0; i < rows_to_play; ++i) {
-        const std::size_t hi = handler_of_row[i];
-        if (hi >= handlers.size()) {
-            ++out.rows_skipped;
-            continue;
-        }
-        const Handler& h = handlers[hi];
-        const Row& prev = rows[i];
-        ++out.rows_played;
 
-        std::uint64_t stack = 0;
-        const bool have_stack = row_register(prev, stack_reg, &stack);
-        std::uint64_t cursor = 0;
-        const bool have_cursor = row_register(prev, cursor_reg, &cursor);
-
+    // What a handler's model is read with: the pointers the interpreter
+    // carried when the handler was entered, and the row its registers
+    // come from.
+    const auto bind_inputs = [&](const Row& row, std::uint64_t stack,
+                                 bool have_stack, std::uint64_t cursor,
+                                 bool have_cursor) {
         for (std::size_t k = 0; k < model.inputs.size(); ++k) {
             const Model::Input& in = model.inputs[k];
             expr::Id value = expr::kNoId;
@@ -475,7 +677,7 @@ SolveResult solve(Model& model, const std::vector<Handler>& handlers,
                 break;
             case Model::Input::Kind::Reg: {
                 std::uint64_t v = 0;
-                if (row_register(prev, in.name, &v)) {
+                if (row_register(row, in.name, &v)) {
                     value = dag.constant(v, in.width);
                 } else {
                     char name[48];
@@ -514,9 +716,12 @@ SolveResult solve(Model& model, const std::vector<Handler>& handlers,
             }
             binding[k] = value;
         }
+    };
 
-        // The handler's writes, in the order the model lists them: the
-        // order the bytes end up in.
+    // The writes a handler performs, in the order the model lists them:
+    // the order the bytes end up in.
+    const auto apply_writes = [&](const Handler& h, std::uint64_t stack,
+                                  bool have_stack) {
         for (const Handler::Write& wr : h.writes) {
             const unsigned bytes = wr.width / 8;
             if (bytes == 0 || bytes > 8) {
@@ -541,6 +746,51 @@ SolveResult solve(Model& model, const std::vector<Handler>& handlers,
             }
             memory.write(addr, dag.resize(value, wr.width), bytes);
         }
+    };
+
+    // The path the run took, as constraints on the unknown: one per
+    // dispatch whose target depended on it. The trace walked this path
+    // and only this one; remembering it as a condition is what makes
+    // "could the machine have gone elsewhere" a question with an answer,
+    // because the alternative has to be consistent with everything the
+    // run did reach.
+    std::vector<Constraint> path;
+    // The successors a dispatch could have taken, as the words the
+    // machine reads out of its own table. The table is program data and
+    // does not move with the input, so every word in it is a value some
+    // run would read -- and the ones this run read are the ones we have.
+    // Enumerating the table itself would need to know where it ends;
+    // enumerating what was seen does not, and every entry is one the
+    // machine really uses.
+    std::vector<std::uint64_t> candidates;
+    for (const Row& r : rows) {
+        if (r.target != 0) {
+            candidates.push_back(r.target);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                     candidates.end());
+
+    const std::size_t rows_to_play = std::min(rows.size(),
+                                              handler_of_row.size());
+    for (std::size_t i = 0; i < rows_to_play; ++i) {
+        const std::size_t hi = handler_of_row[i];
+        if (hi >= handlers.size()) {
+            ++out.rows_skipped;
+            continue;
+        }
+        const Handler& h = handlers[hi];
+        const Row& prev = rows[i];
+        ++out.rows_played;
+
+        std::uint64_t stack = 0;
+        const bool have_stack = row_register(prev, stack_reg, &stack);
+        std::uint64_t cursor = 0;
+        const bool have_cursor = row_register(prev, cursor_reg, &cursor);
+
+        bind_inputs(prev, stack, have_stack, cursor, have_cursor);
+        apply_writes(h, stack, have_stack);
 
         // The base the goals are read from: the value the stack register
         // carried at this row. It is the base every slot access of the run
@@ -561,27 +811,171 @@ SolveResult solve(Model& model, const std::vector<Handler>& handlers,
                 final_stack = where;
             }
         }
+
+        // Where this handler goes next.
+        //
+        // Until now the replay took the handler sequence from the trace
+        // and never asked the model what it thought; the dispatcher's own
+        // target is the one prediction about control flow the model can
+        // make, and it is the one a single trace cannot otherwise check.
+        // A target that comes out as a number is compared with the word
+        // the run read out of the same table -- agreement is a check on
+        // the model, disagreement is a defect in it -- and a target that
+        // leans on the unknown is a branch, which is the one thing a path
+        // followed by a run cannot enumerate.
+        const auto look_ahead = [&](const Handler& who) {
+            if (who.transfer != Handler::Transfer::Dispatch ||
+                who.target_expr == expr::kNoId) {
+                return;
+            }
+            const expr::Id target = substitute(dag, who.target_expr, binding);
+            if (target == expr::kNoId) {
+                return;
+            }
+            BranchPoint bp;
+            bp.seq = prev.seq;
+            bp.handler_va = who.va;
+            bp.condition = render(model, target);
+            bp.observed = prev.target;
+            std::uint64_t fixed = 0;
+            if (constant_value(dag, target, &fixed)) {
+                ++out.targets_resolved;
+                bp.computed = fixed;
+                bp.observed_matches_model = fixed == prev.target;
+                if (bp.observed_matches_model) {
+                    return;
+                }
+            } else {
+                ++out.targets_symbolic;
+                bp.symbolic = true;
+            }
+            if (options.explore && bp.symbolic) {
+                // Which of the machine's handlers this edge could lead to,
+                // asked as a question about the unknown: the alternative
+                // has to agree with every branch the run already took, or
+                // it is not an alternative on this path.
+                for (const std::uint64_t c : candidates) {
+                    sat::Solver probe;
+                    probe.set_limits(options.max_conflicts, options.max_seconds);
+                    bb::Encoder enc(dag, probe);
+                    for (const Constraint& p : path) {
+                        const expr::Id rhs =
+                            dag.constant(p.rhs, dag.width(p.lhs));
+                        const sat::Lit unit[1] = {
+                            enc.eq_bits(enc.bits(p.lhs), enc.bits(rhs))};
+                        probe.add_clause(unit);
+                    }
+                    const expr::Id want = dag.constant(c, dag.width(target));
+                    const sat::Lit unit[1] = {
+                        enc.eq_bits(enc.bits(target), enc.bits(want))};
+                    probe.add_clause(unit);
+                    BranchPoint::Edge edge;
+                    edge.target = c;
+                    edge.reachable =
+                        probe.solve() == sat::Solver::Status::Sat;
+                    bp.edges.push_back(edge);
+                }
+            }
+            out.branches.push_back(std::move(bp));
+        };
+        look_ahead(h);
+        if (dispatcher != nullptr) {
+            look_ahead(*dispatcher);
+        }
+
+        // The dispatcher is the engine's own code, and running it here is
+        // what turns a handler's jump into the next handler. Its model is
+        // the same kind of model the handlers have and is replayed the
+        // same way; what it adds is that the sequence of handlers stops
+        // being something read out of the trace and becomes something the
+        // model says.
+        if (dispatcher != nullptr && prev.target != 0) {
+            // The dispatcher has already run when the trace recorded this
+            // row -- the word it read is in the row -- so the constraint
+            // its edge puts on the unknown is "this is what it computed".
+            const expr::Id target =
+                substitute(dag, dispatcher->target_expr, binding);
+            if (target != expr::kNoId && !is_ground(dag, target)) {
+                path.push_back(Constraint{target, prev.target});
+            }
+        }
     }
 
     const unsigned goal_width =
         model.convention.regfile_width != 0 ? model.convention.regfile_width
                                             : 64u;
     std::vector<Constraint> constraints;
-    for (const Goal& g : options.goals) {
-        const std::uint64_t addr =
-            final_stack + static_cast<std::uint64_t>(g.disp);
-        out.goal_addresses.push_back(addr);
-        const expr::Id lhs = memory.read(addr, goal_width);
-        // The split is worth having at every width: a goal that says "this
-        // must be zero" is the one shape whose parts can be asked
-        // separately, and a machine whose result is accumulated from
-        // independent pieces hands the solver one small question per
-        // piece instead of one large question about all of them.
-        if (g.value == 0) {
-            split_zero(dag, lhs, &constraints, 0);
-        } else {
-            constraints.push_back(Constraint{lhs, g.value});
+    {
+        GoalContext ctx;
+        ctx.dag = &dag;
+        ctx.memory = &memory;
+        ctx.final_stack = final_stack;
+        ctx.regfile_width = goal_width;
+        ctx.last = rows_to_play != 0 ? &rows[rows_to_play - 1] : nullptr;
+        ctx.unrecorded = &out.unrecorded_variables;
+        // Where the bytecode buffer lives: the register the layout
+        // inference named, read off the last row. It is the same value a
+        // handler's own reads went through, and naming it here rather
+        // than in the caller keeps `code[i]` meaning one thing.
+        if (!model.convention.code.empty() && ctx.last != nullptr) {
+            ctx.have_code = row_register(*ctx.last, model.convention.code,
+                                         &ctx.code_base);
         }
+        for (const GoalNode& g : options.goals) {
+            out.goal_text.push_back(render_goal(g));
+            ctx.address = 0;
+            ctx.have_address = false;
+            const expr::Id root = lower_goal(g, &ctx, 0, 0);
+            out.goal_addresses.push_back(ctx.have_address ? ctx.address : 0);
+            if (root == expr::kNoId) {
+                out.unmet.push_back(ctx.error.empty()
+                                        ? "the goal could not be read"
+                                        : ctx.error);
+                continue;
+            }
+            // A condition that came out as a comparison is a constraint
+            // between the two things compared, and saying it that way --
+            // rather than as "this one-bit value is set" -- is what lets
+            // the split below see the shape of the question. `x == 0`
+            // where x is an `or` of independent pieces is a small
+            // question per piece; the same fact written as a comparison
+            // of a comparison is one large one.
+            const expr::Node n = dag.node(root);
+            if (n.op == expr::Op::CmpEQ) {
+                std::uint64_t c = 0;
+                if (constant_value(dag, n.b, &c)) {
+                    constraints.push_back(Constraint{n.a, c});
+                    continue;
+                }
+                if (constant_value(dag, n.a, &c)) {
+                    constraints.push_back(Constraint{n.b, c});
+                    continue;
+                }
+            }
+            constraints.push_back(Constraint{root, 1});
+        }
+    }
+    if (!out.unmet.empty()) {
+        out.reason = "a goal could not be read against the state the run "
+                     "left behind";
+        return out;
+    }
+
+    // The split is worth having at every width: a goal that says "this
+    // must be zero" is the one shape whose parts can be asked separately,
+    // and a machine whose result is accumulated from independent pieces
+    // hands the solver one small question per piece instead of one large
+    // question about all of them.
+    {
+        std::vector<Constraint> split;
+        for (const Constraint& c : constraints) {
+            if (c.rhs == 0) {
+                split_zero(dag, c.lhs, &split, 0);
+            } else {
+                split.push_back(c);
+            }
+        }
+        constraints = std::move(split);
     }
 
     // Which constraints the unknown has nothing to do with. One of those

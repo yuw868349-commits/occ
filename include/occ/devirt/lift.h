@@ -304,9 +304,36 @@ struct Handler {
         // A call out of the VM (the engine's call-out stub).
         Call,
     };
+
+    // One way control can leave the handler.
+    //
+    // A straight-line handler has exactly one. A handler that ends in a
+    // branch the walk could not reduce has one per arm, and they need not
+    // agree: a dispatcher's own shape is a dispatch on one arm and a
+    // bail-out on the other, and a model that kept only one of them would
+    // report the other as a contradiction rather than as the other arm.
+    // Each exit carries the branch that reaches it, so a caller can ask
+    // whether an arm is reachable at all instead of assuming the one the
+    // run took is the only one.
+    struct Exit {
+        Transfer transfer = Transfer::Unknown;
+        // For Dispatch: the expression the jump target was computed from.
+        expr::Id target = expr::kNoId;
+        // The branch this exit hangs off, when it is one arm of a fork.
+        // The exit is taken when `condition` holds, or when it does not,
+        // according to `when_set`. kNoId for a handler whose way out no
+        // branch decided.
+        expr::Id condition = expr::kNoId;
+        bool when_set = true;
+    };
+    std::vector<Exit> exits;
+
     Transfer transfer = Transfer::Unknown;
-    // For Dispatch: the expression the jump target was computed from
-    // (the decrypted bytecode word, in this engine), when it is known.
+    // For Dispatch: the expression the jump target was computed from.
+    // When the handler leaves by more than one exit this is the one that
+    // hands control on -- the dispatch, since "what runs next" is what
+    // the answer is for -- and its target is the branch's own selected
+    // value, not one arm's.
     expr::Id target_expr = expr::kNoId;
 
     // What the walk met and handled -- an instruction the decoder does

@@ -44,6 +44,7 @@
 #include <string>
 #include <vector>
 
+#include "occ/devirt/goal.h"
 #include "occ/devirt/lift.h"
 
 namespace occ::devirt::lift {
@@ -58,25 +59,13 @@ struct UnknownRegion {
     std::uint64_t size = 0;
 };
 
-// One thing the finished program must be true of. `disp` is a
-// displacement from the convention's stack register, which is the base
-// every slot access is measured from, and the same number a slot write
-// prints as `vst[disp]`; `value` is what must live there when the last
-// dispatch has run.
-//
-// A goal is a statement of the question. Where it comes from -- a
-// comparison in the code around the virtual machine, a branch the run
-// took, a value the caller read out of the trace -- is the caller's
-// business; what matters here is that it names the machine's own memory
-// and not a place in this implementation.
-struct Goal {
-    std::int64_t disp = 0;
-    std::uint64_t value = 0;
-};
-
 struct SolveOptions {
     std::vector<UnknownRegion> unknown;
-    std::vector<Goal> goals;
+    // The conditions the finished program must satisfy, in the language
+    // goal.h documents. They are read once the replay has finished, in
+    // the state the last dispatch left behind, and every one of them has
+    // to hold at the same time.
+    std::vector<GoalNode> goals;
     // The search budget. Zero means no cap, which is the honest setting
     // for a question whose answer is worth waiting for and the wrong one
     // for a wrapper script; a question that runs out is reported as
@@ -87,6 +76,49 @@ struct SolveOptions {
     // satisfied usually has one region of trouble, and the first few
     // constraints say which faster than a count does.
     std::size_t failures_shown = 4;
+    // Whether to work out what the control flow does beyond the path the
+    // trace took. Reading a trace answers "what ran"; the dispatches'
+    // own targets answer "what could have run", and for a machine whose
+    // next handler depends on the input the two are not the same
+    // question. Off by default because it costs a solver query per
+    // candidate per dispatch, which is worth it when the machine
+    // branches on its input and wasted when it cannot.
+    bool explore = false;
+};
+
+// One step where the model's next handler is not the one the run took,
+// or might not have been.
+//
+// The replay computes each handler's dispatch target the same way it
+// computes everything else -- symbolically, over the unknown bytes. What
+// it does with the answer is the point: a target that resolves to a
+// number is the machine's own decision, and comparing it with the
+// handler the trace saw is a check on the model that no other part of
+// the analysis makes. A target that depends on the unknown is a branch,
+// and the branches are what a single trace by construction cannot show.
+struct BranchPoint {
+    std::size_t seq = 0;               // the dispatch this came from
+    std::uint64_t handler_va = 0;      // the handler whose target it is
+    std::string condition;             // the target, rendered
+    bool symbolic = false;             // does it depend on the unknown
+    // What the trace saw next. For a symbolic target this is the path
+    // the run happened to take; it is one of the successors and never the
+    // whole set.
+    std::uint64_t observed = 0;
+    // What the model's own replay of the dispatcher computed for that
+    // step, when it resolved to a number.
+    std::uint64_t computed = 0;
+    bool observed_matches_model = false;
+    // The handlers a successor could be, and whether the unknown can
+    // reach that edge at all. A candidate the model rules out is as much
+    // an answer as one it allows: together they are the control flow
+    // graph at dispatch granularity, which is more than any one run can
+    // show.
+    struct Edge {
+        std::uint64_t target = 0;
+        bool reachable = false;
+    };
+    std::vector<Edge> edges;
 };
 
 struct SolveResult {
@@ -103,7 +135,24 @@ struct SolveResult {
     // The address each goal was read from, in the order the goals were
     // given. A caller that named a slot by displacement gets the address
     // the machine read, which is the only way to be sure the two agreed.
+    // A goal that read no memory leaves its entry at zero.
     std::vector<std::uint64_t> goal_addresses;
+
+    // The goals as the machine's own names render them, in the order they
+    // were given, so a report shows the question in the vocabulary of its
+    // answer.
+    std::vector<std::string> goal_text;
+
+    // Where the model's control flow was read off the run rather than
+    // checked against it: every dispatch whose target came out as a
+    // number gets compared with the handler the trace saw, and the ones
+    // that disagree -- and the ones that came out symbolic -- are here.
+    // Empty when every target resolved to the handler the run took.
+    std::vector<BranchPoint> branches;
+    // How many dispatches had a target the model could resolve to a
+    // number. The rest are the ones a single trace cannot vouch for.
+    std::size_t targets_resolved = 0;
+    std::size_t targets_symbolic = 0;
 
     // Constraints no assignment satisfies, rendered. A constraint that
     // reaches no variable at all is the interesting one: it says the
@@ -143,11 +192,21 @@ struct SolveResult {
 // why the model is taken by reference and why a caller runs the
 // conformance check first -- the check's answers describe the model as it
 // was, and the nodes added here are not part of them.
+//
+// `dispatcher` is the shared code every handler jumps to, summarized
+// under the same model, and it is what turns the replay's knowledge of
+// control flow from "what ran" into "what it computed". Pass null and the
+// replay follows the trace's own handler sequence without ever asking why
+// it was that sequence; pass it and each dispatch's target is recomputed
+// from the dispatcher's model and checked against the word the trace
+// recorded. The second is what a caller wants when the machine might
+// dispatch on its input.
 [[nodiscard]] SolveResult solve(Model& model,
                                 const std::vector<Handler>& handlers,
                                 const std::vector<Row>& rows,
                                 const std::vector<std::size_t>& handler_of_row,
                                 CodeReader code_bytes, void* code_ctx,
-                                const SolveOptions& options);
+                                const SolveOptions& options,
+                                const Handler* dispatcher = nullptr);
 
 }  // namespace occ::devirt::lift
