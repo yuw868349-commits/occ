@@ -92,14 +92,29 @@ struct InputDecl {
     std::uint32_t ordinal = 0;
 };
 
-// One assignment: `dst <- src`. `src` is a DAG expression over the
-// program's inputs; `dst` names a state variable (created implicitly on
-// first write if it was not declared). Assignments are not resized: the
-// expression's own width discipline applies, and the state stores the
-// value at that width.
+// One statement. `Assign` is the plain `dst <- src` form; `Load` reads a
+// cell through a computed address into `dst`; `Store` writes `value` to
+// the cell (of the `base` family) whose concrete address equals `addr`.
+//
+// Symbolic memory is modelled by *construction*, not by a new execution
+// semantics: `add_load` expands to a select chain over the known cells
+// of the family (`dst <- ite(addr==c0, c0, ite(addr==c1, c1, ...))`) and
+// `add_store` rewrites every candidate cell conditionally
+// (`c_i <- ite(addr==c_i_addr, value, c_i)`). The interpreter, the
+// taint engines and the path explorer then all work on ordinary
+// assignments over DAG expressions -- no array theory, no second
+// execution path, and the concrete run evaluates the same expressions
+// the symbolic layers reason about. The address set a load/store can
+// touch is the family's declared cell set; an address outside it reads
+// zero and writes nothing, which is the model's concretization policy
+// and is disclosed in the reports.
 struct Stmt {
-    std::string dst;
-    expr::Id src = expr::kNoId;
+    enum class Kind : std::uint8_t { Assign, Load, Store };
+    Kind kind = Kind::Assign;
+    std::string dst;         // Assign/Load: destination state
+    expr::Id src = expr::kNoId;   // Assign: source; Store: written value
+    expr::Id addr = expr::kNoId;  // Load/Store: computed address
+    std::string base;        // Store: cell family prefix (e.g. "mem")
 };
 
 // An outgoing edge: condition `cond` (1-bit; kNoId = unconditional) to
@@ -159,6 +174,33 @@ struct Program {
     // Declares a static memory cell: a state named after the address,
     // initially zero, written by statements like any other state.
     void declare_cell(const std::string& name, unsigned width);
+
+    // The current defining expression of state `name`: the last statement
+    // that wrote it, or its declared init (kNoId reads as zero). Used by
+    // the symbolic-memory builders below.
+    [[nodiscard]] expr::Id current_expr(const std::string& name) const;
+
+    // The cell family of `base`: every declared cell whose name starts
+    // with `base + "["` and whose embedded address parses as a plain
+    // unsigned constant. Cells are returned with their addresses, in
+    // address order.
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::string>>
+    cell_family(const std::string& base) const;
+
+    // `dst <- *(addr)` over the `base` family: expands to a select chain
+    // over every cell in the family (address order), each arm resized to
+    // `width`, ending in zero when no cell matches. The chain is a
+    // single DAG expression, so every layer treats it as an ordinary
+    // assignment source. Declares `dst` implicitly.
+    void add_load(std::uint32_t block, const std::string& dst,
+                  expr::Id addr, const std::string& base, unsigned width);
+
+    // `*(addr) <- value` over the `base` family: rewrites every cell in
+    // the family conditionally. Cells outside the family (or absent) are
+    // untouched. `value` is stored at the cell's own width (truncated or
+    // zero-extended as needed).
+    void add_store(std::uint32_t block, const std::string& base,
+                   expr::Id addr, expr::Id value);
 
     // -- queries ---------------------------------------------------------
 

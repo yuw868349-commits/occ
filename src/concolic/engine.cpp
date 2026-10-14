@@ -64,6 +64,77 @@ std::vector<bool> conc_referenced_inputs(const Program& prog,
     return referenced;
 }
 
+// A prefix tree over visited block sequences: the exploration's path
+// deduplication. Insertion is O(path length) and each shared prefix is
+// stored once, which beats a set-of-vectors both in memory and in
+// comparison cost on loop-heavy programs whose paths share long heads.
+struct PathTrie {
+    struct Node {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> children;
+        bool terminal = false;
+    };
+    std::vector<Node> nodes{1};  // node 0 is the root
+
+    // Inserts `path`; returns true when it was not present before.
+    bool insert(const std::vector<std::uint32_t>& path) {
+        std::uint32_t cur = 0;
+        for (const std::uint32_t b : path) {
+            // Take the child-list offset before growing `nodes`: the
+            // push_back can reallocate the node vector and invalidate
+            // any reference into it, so the insert re-reads the list by
+            // index after the growth.
+            auto& kids = nodes[cur].children;
+            auto it = std::lower_bound(
+                kids.begin(), kids.end(), b,
+                [](const std::pair<std::uint32_t, std::uint32_t>& e,
+                   std::uint32_t key) { return e.first < key; });
+            if (it != kids.end() && it->first == b) {
+                cur = it->second;
+            } else {
+                const std::size_t at =
+                    static_cast<std::size_t>(it - kids.begin());
+                const std::uint32_t n =
+                    static_cast<std::uint32_t>(nodes.size());
+                nodes.push_back(Node{});
+                nodes[cur].children.insert(
+                    nodes[cur].children.begin() +
+                        static_cast<std::ptrdiff_t>(at),
+                    std::make_pair(b, n));
+                cur = n;
+            }
+        }
+        if (nodes[cur].terminal) {
+            return false;
+        }
+        nodes[cur].terminal = true;
+        return true;
+    }
+};
+
+// An unsat constraint set makes every superset unsat, so a flip whose
+// constraint prefix was already proved unsatisfiable is answered without
+// a solver call. The check is a prefix scan over the recorded unsat sets
+// -- O(cached * cons) per flip, trivially cheap next to a CDCL call.
+bool conc_has_unsat_prefix(const std::vector<std::vector<expr::Id>>& unsat_cache,
+                           const std::vector<expr::Id>& cons) {
+    for (const std::vector<expr::Id>& u : unsat_cache) {
+        if (u.size() > cons.size()) {
+            continue;
+        }
+        bool prefix = true;
+        for (std::size_t i = 0; i < u.size(); ++i) {
+            if (u[i] != cons[i]) {
+                prefix = false;
+                break;
+            }
+        }
+        if (prefix) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Merges the solver's model into the parent inputs: inputs the constraint
 // set pins take the model's values, everything else keeps the value it
 // had on the run that produced this flip. An input the constraints never
@@ -105,21 +176,29 @@ PathReport concolic_explore(Program& prog,
     }
 
     std::set<std::vector<std::uint64_t>> seen_inputs;
-    std::set<std::vector<std::uint32_t>> seen_paths;
+    PathTrie seen_paths;
     std::set<JobKey> seen_jobs;
-    std::vector<FlipJob> worklist;
+    // Coverage-driven worklists: flips whose target edge is not yet
+    // covered sit in `hot`, everything else in `cold`. Popping hot
+    // first biases the search toward new edges without abandoning the
+    // depth-first discipline inside each queue (both are LIFO).
+    std::vector<FlipJob> hot_worklist;
+    std::vector<FlipJob> cold_worklist;
     std::set<std::uint32_t> covered_blocks;
     std::set<std::pair<std::uint32_t, std::uint32_t>> covered_edges;
+    // Every constraint set the solver proved unsatisfiable. A flip whose
+    // constraints extend one of these is answered from the cache.
+    std::vector<std::vector<expr::Id>> unsat_cache;
     std::size_t executed = 0;
 
     // Runs `inputs`, records the path if it is new, and pushes every
-    // flip candidate the path offers. The flip candidates are pushed in
-    // (decision, edge) order onto a stack, so the driver pops the
-    // deepest decision's last edge first -- a depth-first search over the
-    // decision tree.
+    // flip candidate the path offers. Flip candidates are pushed onto
+    // the hot queue when their target edge is uncovered, else the cold
+    // queue; both are LIFO, so the driver keeps a depth-first order
+    // while preferring edges that add coverage.
     const auto record_and_expand = [&](const std::vector<std::uint64_t>& inputs) {
         const RunResult rr = run(prog, inputs, budget.max_run_steps);
-        if (!seen_paths.insert(rr.blocks).second) {
+        if (!seen_paths.insert(rr.blocks)) {
             return;  // the same block sequence was already explored
         }
 
@@ -139,7 +218,14 @@ PathReport concolic_explore(Program& prog,
                 }
             }
             if (decision_index + 1 <= budget.max_depth) {
-                for (std::size_t k = 0; k < first_uncond; ++k) {
+                // Push flips in reverse edge order so the stack pops the
+                // first edge first: an unsat answer for an early edge is
+                // recorded before later edges of the same decision are
+                // solved, and their superset prefixes then hit the
+                // unsat-prefix cache. DFS completeness is unaffected --
+                // every flip is still pushed and popped exactly once.
+                for (std::size_t ki = first_uncond; ki > 0; --ki) {
+                    const std::size_t k = ki - 1;
                     if (d.edges[k].cond == expr::kNoId) {
                         continue;
                     }
@@ -162,9 +248,13 @@ PathReport concolic_explore(Program& prog,
                     }
                     const JobKey key{cons, d.block, static_cast<std::uint32_t>(k)};
                     if (seen_jobs.insert(key).second) {
-                        worklist.push_back(
-                            FlipJob{std::move(cons), inputs, d.block,
-                                    static_cast<std::uint32_t>(k)});
+                        FlipJob job{std::move(cons), inputs, d.block,
+                                    static_cast<std::uint32_t>(k)};
+                        const bool uncovered =
+                            !covered_edges.count(std::make_pair(
+                                d.block, static_cast<std::uint32_t>(k)));
+                        (uncovered ? hot_worklist : cold_worklist)
+                            .push_back(std::move(job));
                     }
                 }
             }
@@ -212,12 +302,32 @@ PathReport concolic_explore(Program& prog,
     seen_inputs.insert(initial_inputs);
     record_and_expand(initial_inputs);
 
-    while (!worklist.empty() && executed < budget.max_paths &&
+    while ((!hot_worklist.empty() || !cold_worklist.empty()) &&
+           executed < budget.max_paths &&
            out.solver.calls < budget.max_solver_calls) {
-        const FlipJob job = worklist.back();
-        worklist.pop_back();
+        FlipJob job;
+        if (!hot_worklist.empty()) {
+            job = hot_worklist.back();
+            hot_worklist.pop_back();
+        } else {
+            job = cold_worklist.back();
+            cold_worklist.pop_back();
+        }
         if (out.solver.calls >= budget.max_solver_calls) {
             break;
+        }
+        if (conc_has_unsat_prefix(unsat_cache, job.cons)) {
+            // A superset of a proved-unsat set is unsat: answered from
+            // the cache without a solver call.
+            ++out.solver.unsat_prefix_hits;
+            ++out.solver.unsat;
+            out.unsat_branches.push_back(
+                PathReport::UnsatBranch{job.block, job.edge, job.cons});
+            PathReport::Path p;
+            p.status = PathReport::Path::Status::UnsatNegation;
+            p.constraints = job.cons;
+            out.paths.push_back(std::move(p));
+            continue;
         }
         const bb::Model m = bb::solve_constraints(prog.dag, job.cons);
         ++out.solver.calls;
@@ -231,6 +341,8 @@ PathReport concolic_explore(Program& prog,
         }
         if (!m.sat) {
             ++out.solver.unsat;
+            // Record for prefix reuse: the whole set, exactly as asked.
+            unsat_cache.push_back(job.cons);
             out.unsat_branches.push_back(
                 PathReport::UnsatBranch{job.block, job.edge, job.cons});
             // A synthetic path entry so the status enum is the whole
