@@ -312,10 +312,21 @@ struct Handler {
 // The model's `convention` member selects which registers play the
 // stack and cursor roles; the default convention reproduces the
 // engine's own behavior.
+// `boundary` names the addresses where the handlers hand control back --
+// the shared entries a VM laid out this way jumps every handler to. Such
+// a VM keeps its dispatch in one place and lets every handler tail into
+// it, so without the boundary the walk models the dispatcher as part of
+// every handler -- and the dispatcher's own branches, one arm returning
+// and one dispatching by construction, end too differently to merge and
+// sink the walk. Reaching a boundary address is where the handler ends,
+// and what it ends with is the dispatch it then is. Empty (the default)
+// walks straight through, so a VM whose handlers are self-contained
+// behaves exactly as before.
 [[nodiscard]] Handler summarize(Model& model, const std::uint8_t* bytes,
                                 std::size_t available, std::uint64_t window_va,
                                 std::uint64_t va,
-                                std::size_t max_instructions = 96);
+                                std::size_t max_instructions = 96,
+                                const std::vector<std::uint64_t>& boundary = {});
 
 // ------------------------------------------------------------ conformance
 
@@ -440,5 +451,20 @@ using CodeReader = bool (*)(void* ctx, std::uint64_t va, unsigned width,
 
 // The recovered expression for a slot write, rendered for a report.
 [[nodiscard]] std::string render(const Model& model, expr::Id id);
+
+// A one-line statement of what the handler does, taken from its model
+// rather than from its instruction text. The top of the value the handler
+// wrote names the operation -- an `or` handler's cell is written with an
+// `Or` node, an `add` handler's with an `Add` -- and the transfer names
+// where it goes.
+//
+// Naming the effect from the model is what makes the label agree with the
+// model by construction, and it is the only way the label follows the
+// register assignment: the same handler reads `or DWORD PTR [rsp+rdx*4],
+// ecx` under one convention and `or QWORD PTR [rbp+0x8], rax` under
+// another, and a match on that text names one family's `or` and misses
+// the other's; the model says `or` either way.
+[[nodiscard]] std::string effect_label(const Model& model,
+                                       const Handler& handler);
 
 }  // namespace occ::devirt::lift

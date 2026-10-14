@@ -21,6 +21,7 @@
 
 #include "occ/commands.h"
 #include "occ/devirt/lift.h"
+#include "occ/inspect/disasm.h"
 #include "occ/parser/pe.h"
 
 #include <algorithm>
@@ -301,6 +302,67 @@ void resolve_rows(const ImageMap& img, bool have_img, std::vector<Row>& rows) {
         r.handler =
             lift::resolve_handler(r.word, have_img && img.code_at(r.word));
     }
+}
+
+// Learns where the handlers hand control back. A VM that keeps one
+// dispatcher lets every handler tail into it, and that shared entry is
+// not any handler's own entry -- which is how it is told apart from a
+// handler body. Each handler is linear-scanned to the instruction that
+// leaves it and the targets are tallied: a target more than one handler
+// jumps to is shared code, and the walk has to stop there rather than
+// model the dispatcher as part of the handler.
+//
+// The scan follows the straight path only. A conditional branch's
+// fall-through is still the handler, so the scan steps over it; only an
+// unconditional jump, a return or a call ends the scan, because those
+// are the instructions a handler leaves by. A shared entry that is a
+// handler's own entry is not a boundary: it is a dispatch target the
+// dispatcher computes, not a thing the handler tailed into.
+std::vector<std::uint64_t> learn_boundary(
+    const ImageMap& img, const std::vector<std::uint64_t>& handler_vas) {
+    std::map<std::uint64_t, std::size_t> refs;     // target -> owning handlers
+    std::map<std::uint64_t, std::uint64_t> owner;  // target -> last owner
+    for (const std::uint64_t h : handler_vas) {
+        std::uint64_t window_va = 0;
+        std::size_t available = 0;
+        const std::uint8_t* p = img.window(h, &window_va, &available);
+        if (p == nullptr) {
+            continue;
+        }
+        std::uint64_t at = h;
+        for (std::size_t i = 0; i < 64; ++i) {
+            if (at < window_va || at - window_va >= available) {
+                break;
+            }
+            lift::Insn insn;
+            if (!lift::decode_insn(p + (at - window_va),
+                                   available - (at - window_va), at, insn)) {
+                break;
+            }
+            if (insn.target != 0 && owner[insn.target] != h) {
+                owner[insn.target] = h;
+                ++refs[insn.target];
+            }
+            if (insn.kind == inspect::InsnKind::Jcc) {
+                at += insn.length;  // the fall-through is still the handler
+                continue;
+            }
+            if (insn.kind == inspect::InsnKind::Jmp ||
+                insn.kind == inspect::InsnKind::Ret ||
+                insn.kind == inspect::InsnKind::Call) {
+                break;
+            }
+            at += insn.length;
+        }
+    }
+    std::vector<std::uint64_t> out;
+    for (const auto& [target, n] : refs) {
+        if (n >= 2) {
+            out.push_back(target);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 // -------------------------------------------------------------- disasm
@@ -624,6 +686,21 @@ int cmd_devirt(int argc, char** argv) {
     const bool have_img = img.load(dump_path);
     resolve_rows(img, have_img, rows);
 
+    // The entries the handlers hand control back through, learned from the
+    // handlers themselves before they are lifted (see learn_boundary): the
+    // lift stops at them, so each handler is modelled up to its own
+    // boundary and not through the dispatcher it shares with the others.
+    std::vector<std::uint64_t> handler_vas;
+    for (const Row& r : rows) {
+        handler_vas.push_back(r.handler);
+    }
+    std::sort(handler_vas.begin(), handler_vas.end());
+    handler_vas.erase(std::unique(handler_vas.begin(), handler_vas.end()),
+                      handler_vas.end());
+    const std::vector<std::uint64_t> boundary =
+        have_img ? learn_boundary(img, handler_vas)
+                 : std::vector<std::uint64_t>{};
+
     Report rep;
     rep.emit("trace: " + std::to_string(rows.size()) + " dispatches");
 
@@ -635,46 +712,51 @@ int cmd_devirt(int argc, char** argv) {
         by_handler[r.handler].push_back(r);
     }
 
+    // Lift every handler before the tables print. The semantics column is
+    // the model's now, not a match on the instruction text, so the models
+    // have to exist first; the same ones are reported in full below.
+    lift::Model model;
+    std::vector<lift::Handler> lhandlers;
+    std::map<std::uint64_t, std::size_t> index_of;
+    if (have_img) {
+        for (const auto& [h, rs] : by_handler) {
+            (void)rs;
+            std::uint64_t window_va = 0;
+            std::size_t avail = 0;
+            const std::uint8_t* p = img.window(h, &window_va, &avail);
+            lift::Handler handler;
+            handler.va = h;
+            if (p != nullptr && avail != 0) {
+                // A handler is a chain of blocks scattered through the
+                // section, and the budget has to cover the whole chain --
+                // the sample's handlers run 70 to 150 instructions.
+                handler = lift::summarize(model, p, avail, window_va, h, 1024,
+                                          boundary);
+            } else {
+                handler.reason = "handler bytes are not file-backed";
+            }
+            index_of[h] = lhandlers.size();
+            lhandlers.push_back(std::move(handler));
+        }
+    }
+
     rep.emit("handler        count  semantics");
     rep.emit(std::string(96, '-'));
     for (const auto& [h, rs] : by_handler) {
-        const auto sem = handlers.find(h);
-        if (sem == handlers.end()) {
-            rep.emit("(none)");
-            continue;
-        }
         std::string label;
-        for (std::size_t i = 0; i < sem->second.size() && i < 2; ++i) {
-            if (!label.empty()) {
-                label += " ; ";
-            }
-            label += sem->second[i].cls + ":" + sem->second[i].op.substr(0, 38);
+        if (have_img) {
+            label = lift::effect_label(model, lhandlers[index_of[h]]);
         }
         char b[32];
         std::snprintf(b, sizeof(b), "0x%010llx  %6zu",
                       static_cast<unsigned long long>(h), rs.size());
-        rep.emit(std::string(b) + "  " + label.substr(0, 82));
+        rep.emit(std::string(b) + "  " + label);
     }
 
-    // The semantics are read from handler bytes, and the reader names the
-    // operations one VM family writes. When not one handler matched, the
-    // trace comes from a family whose register use the reader does not
-    // know: the handlers are still located and lifted below, but their
-    // operations are unnamed -- and a blank column reads as "no
-    // operations", which is a different and wrong report. So it is said.
-    bool any_named = false;
-    for (const auto& [h, s] : handlers) {
-        if (!s.empty()) {
-            any_named = true;
-            break;
-        }
-    }
-    if (!handlers.empty() && !any_named) {
-        rep.emit("");
-        rep.emit("no handler matched the operation names this build knows (the "
-                 "reader recognizes one VM family's register use); every "
-                 "handler below is located and lifted, none is named.");
-    }
+    // The column is the model's, so it names the operation whatever
+    // registers the VM chose: the label follows the convention the model
+    // was lifted under, and a family whose register use a match on the
+    // instruction text would miss is named all the same.
 
     // The bytecode cursor's range.
     if (!rows.empty()) {
@@ -696,15 +778,9 @@ int cmd_devirt(int argc, char** argv) {
     rep.emit("#    handler       word                  semantics");
     for (std::size_t i = 0; i < shown; ++i) {
         const Row& r = rows[i];
-        const auto sem = handlers.find(r.handler);
         std::string label;
-        if (sem != handlers.end()) {
-            for (std::size_t j = 0; j < sem->second.size() && j < 3; ++j) {
-                if (!label.empty()) {
-                    label += " ; ";
-                }
-                label += sem->second[j].cls;
-            }
+        if (have_img) {
+            label = lift::effect_label(model, lhandlers[index_of[r.handler]]);
         }
         char b[64];
         std::snprintf(b, sizeof(b), "%-5llu0x%010llx  0x%016llx",
@@ -747,9 +823,8 @@ int cmd_devirt(int argc, char** argv) {
     // Opcode histogram.
     std::map<std::string, std::size_t> counts;
     for (const Row& r : rows) {
-        const auto sem = handlers.find(r.handler);
-        if (sem != handlers.end() && !sem->second.empty()) {
-            counts[sem->second[0].cls]++;
+        if (have_img) {
+            counts[lift::effect_label(model, lhandlers[index_of[r.handler]])]++;
         } else {
             counts["(unknown)"]++;
         }
@@ -761,8 +836,12 @@ int cmd_devirt(int argc, char** argv) {
     std::sort(sorted.begin(), sorted.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
     for (const auto& [op, c] : sorted) {
-        rep.emit("  " + op + std::string(14 - op.size(), ' ') +
-                 std::to_string(c));
+        // The label is the model's now, and its length is not bounded the
+        // way the text-match labels were: `select -> dispatch` is longer
+        // than the old three-letter classes. The pad is a floor, so the
+        // subtraction stays in size_t.
+        const std::size_t pad = op.size() < 14 ? 14 - op.size() : 1;
+        rep.emit("  " + op + std::string(pad, ' ') + std::to_string(c));
     }
 
     // Control flow: the cursor advances by the virtual instruction length;
@@ -817,35 +896,25 @@ int cmd_devirt(int argc, char** argv) {
             rep.emit("handler lifting: skipped (the dump does not parse as "
                      "a PE image)");
         } else {
-            lift::Model model;
-            std::map<std::uint64_t, std::size_t> index_of;
-            std::vector<lift::Handler> lhandlers;
             std::size_t incomplete = 0;
-            for (const auto& [h, rs] : by_handler) {
-                (void)rs;
-                std::uint64_t window_va = 0;
-                std::size_t avail = 0;
-                const std::uint8_t* p = img.window(h, &window_va, &avail);
-                lift::Handler handler;
-                handler.va = h;
-                if (p != nullptr && avail != 0) {
-                    // A handler is a chain of blocks scattered through
-                    // the section, and the budget has to cover the whole
-                    // chain -- the sample's handlers run 70 to 150
-                    // instructions.
-                    handler = lift::summarize(model, p, avail, window_va, h,
-                                              1024);
-                } else {
-                    handler.reason = "handler bytes are not file-backed";
-                }
-                if (!handler.modeled) {
+            for (const lift::Handler& lh : lhandlers) {
+                if (!lh.modeled) {
                     ++incomplete;
                 }
-                index_of[h] = lhandlers.size();
-                lhandlers.push_back(std::move(handler));
             }
 
             rep.emit("");
+            if (!boundary.empty()) {
+                std::string b =
+                    "handler boundary (shared entries the walk stops at): ";
+                for (std::size_t i = 0; i < boundary.size(); ++i) {
+                    char buf[24];
+                    std::snprintf(buf, sizeof(buf), "%s0x%llx", i ? ", " : "",
+                                  static_cast<unsigned long long>(boundary[i]));
+                    b += buf;
+                }
+                rep.emit(b);
+            }
             rep.emit("handler lifting: " + std::to_string(lhandlers.size()) +
                      " handlers, " +
                      std::to_string(lhandlers.size() - incomplete) +
@@ -864,10 +933,17 @@ int cmd_devirt(int argc, char** argv) {
                     continue;
                 }
                 rep.emit(head + "fully modelled");
-                rep.emit(indent + "rbp' = " +
-                         brief(lift::render(model, lh.rbp_new)));
-                rep.emit(indent + "rsi' = " +
-                         brief(lift::render(model, lh.rsi_new)));
+                // The two virtual pointers, printed only when the handler
+                // moved them: "<stack>' = <stack>" is the model saying the
+                // handler left it alone, which the name already says.
+                const std::string rbp_s = brief(lift::render(model, lh.rbp_new));
+                if (rbp_s != model.convention.stack) {
+                    rep.emit(indent + "rbp' = " + rbp_s);
+                }
+                const std::string rsi_s = brief(lift::render(model, lh.rsi_new));
+                if (rsi_s != model.convention.cursor) {
+                    rep.emit(indent + "rsi' = " + rsi_s);
+                }
                 for (const lift::Handler::Write& w : lh.writes) {
                     if (w.to_slot) {
                         rep.emit(indent + "vst[" + std::to_string(w.disp) +
@@ -879,8 +955,13 @@ int cmd_devirt(int argc, char** argv) {
                     }
                 }
                 if (lh.transfer == lift::Handler::Transfer::Dispatch) {
+                    // A dispatch whose target the model could not compute --
+                    // the handler handed control back at a shared entry --
+                    // still names the transfer; only the target is unknown.
                     rep.emit(indent + "-> " +
-                             brief(lift::render(model, lh.target_expr)));
+                             (lh.target_expr == expr::kNoId
+                                  ? std::string("dispatch")
+                                  : brief(lift::render(model, lh.target_expr))));
                 } else if (lh.transfer == lift::Handler::Transfer::Call) {
                     rep.emit(indent + "-> call-out");
                 } else if (lh.transfer == lift::Handler::Transfer::Return) {

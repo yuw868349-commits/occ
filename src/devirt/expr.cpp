@@ -404,6 +404,12 @@ std::string DAG::pretty(Id id) const {
     case Op::Input:
         return n.name;
     case Op::Resize: {
+        // `a` may be absent when a model leans on a value the walk could
+        // not name; a resize of nothing is nothing, and saying so is
+        // better than reading past the node table for a width.
+        if (!valid(n.a)) {
+            return "?";
+        }
         if (nodes_[n.a].width > n.width) {
             return "(" + std::to_string(n.width) + ")" + pretty(n.a);
         }

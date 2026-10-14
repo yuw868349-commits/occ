@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using namespace occ::devirt;
@@ -905,6 +906,53 @@ void test_handler_resolution() {
     check(lift::resolve_handler(0, false) == 0, "zero resolves to zero");
 }
 
+// A VM that keeps one dispatcher lets every handler tail into it. Walking
+// that shared code as if it were the handler's is what sinks the walk, so
+// the boundary is where the handler ends -- and these cases pin that: the
+// same bytes model differently once an address inside them is named as a
+// shared entry, and the way they differ is that the walk stopped there.
+void test_shared_boundary_ends_the_walk() {
+    // Two moves of the virtual stack pointer, then a jump: the shape a
+    // handler has when the dispatcher is code it shares with the others.
+    const std::vector<std::uint8_t> body = {
+        0x48, 0x83, 0xC5, 0x08,  // add rbp, 0x8
+        0x48, 0x83, 0xC5, 0x08,  // add rbp, 0x8
+        0xFF, 0xE1,              // jmp rcx
+    };
+    lift::Model walked;
+    const lift::Handler whole = lift::summarize(
+        walked, body.data(), body.size(), kHandlerVa, kHandlerVa);
+    check(whole.modeled, "a straight handler walks to its dispatch");
+
+    // The same bytes with the second move named a shared entry: the walk
+    // stops there, so the pointer moved once and the hand-back is the
+    // dispatch the boundary is.
+    lift::Model cut;
+    const std::vector<std::uint64_t> boundary{kHandlerVa + 4};
+    const lift::Handler part = lift::summarize(
+        cut, body.data(), body.size(), kHandlerVa, kHandlerVa, 96, boundary);
+    check(part.modeled, "a handler stopped at a boundary is still modelled");
+    check(part.transfer == lift::Handler::Transfer::Dispatch,
+          "and the hand-back is the dispatch it is");
+    check(lift::render(cut, part.rbp_new) != lift::render(walked, whole.rbp_new),
+          "the boundary is where the handler ended, not past it");
+}
+
+// The semantics label is the model's, not a match on the instruction
+// text. That is what makes it follow the convention instead of one
+// family's register use -- the same handler reads differently under two
+// conventions, and only the model names both.
+void test_effect_label_names_the_operation() {
+    lift::Model model;
+    const lift::Handler h =
+        lift::summarize(model, kAdd.data(), kAdd.size(), kHandlerVa, kHandlerVa);
+    const std::string label = lift::effect_label(model, h);
+    check(label.rfind("add", 0) == 0,
+          "the label names the operation the model performed");
+    check(label.find("dispatch") != std::string::npos,
+          "and it says where the handler went");
+}
+
 }  // namespace
 
 int main() {
@@ -935,6 +983,8 @@ int main() {
     run("resize_widen_back", test_resize_does_not_widen_back);
     run("nesting_cap", test_branch_nesting_cap_is_reported);
     run("handler_resolution", test_handler_resolution);
+    run("shared_boundary", test_shared_boundary_ends_the_walk);
+    run("effect_label", test_effect_label_names_the_operation);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

@@ -1842,6 +1842,10 @@ struct Runner {
     // a branch forks into, not per path: a diamond cannot be walked for
     // free, and a budget that did not count the arms would not bound the
     // work.
+    // Where the handlers hand control back (see summarize). The walk
+    // stops at the first of these it reaches; null when the caller gave
+    // none, so a self-contained handler walks exactly as before.
+    const std::vector<std::uint64_t>* boundary = nullptr;
     std::size_t steps = 0;
     std::size_t step_budget = 0;
     // A handler whose branches nest deeper than this is not followed
@@ -2277,6 +2281,20 @@ struct Runner {
     Exit explore(std::uint64_t va, std::vector<std::uint64_t> visited,
                  unsigned depth) {
         for (;;) {
+            // The handlers of a VM that keeps one dispatcher all tail
+            // into it; reaching that entry is where this handler ends.
+            // Stopping here is what keeps the dispatcher's own branches
+            // -- one arm returning, one dispatching by construction --
+            // out of the handler's model, and the transfer it ends with
+            // is the dispatch the hand-back is.
+            if (boundary != nullptr) {
+                for (const std::uint64_t b : *boundary) {
+                    if (b == va) {
+                        return Exit{true, Handler::Transfer::Dispatch,
+                                    expr::kNoId};
+                    }
+                }
+            }
             if (steps >= step_budget) {
                 mc.hazard("instruction budget exhausted");
                 return Exit{};
@@ -2941,7 +2959,8 @@ bool decode_insn(const std::uint8_t* bytes, std::size_t available,
 
 Handler summarize(Model& model, const std::uint8_t* bytes,
                   std::size_t available, std::uint64_t window_va,
-                  std::uint64_t va, std::size_t max_instructions) {
+                  std::uint64_t va, std::size_t max_instructions,
+                  const std::vector<std::uint64_t>& boundary) {
     Handler h;
     h.va = va;
     Runner run;
@@ -2950,6 +2969,7 @@ Handler summarize(Model& model, const std::uint8_t* bytes,
     run.available = available;
     run.base_va = va;
     run.window_va = window_va;
+    run.boundary = &boundary;
     // The budget covers the handler and every arm a branch forks into: a
     // diamond cannot be walked for free. A straight-line handler still
     // gets several times its own length.
@@ -3493,6 +3513,78 @@ std::string render(const Model& model, expr::Id id) {
         return "?";
     }
     return model.dag.pretty(id);
+}
+
+namespace {
+
+// The name of the operation a handler performs, from the top of the value
+// it wrote. A resize only changes the width, so it is stepped through:
+// the operation under it is the one that names the effect.
+const char* effect_op_name(expr::Op op) {
+    switch (op) {
+        case expr::Op::Add: return "add";
+        case expr::Op::Sub: return "sub";
+        case expr::Op::Mul: return "imul";
+        case expr::Op::And: return "and";
+        case expr::Op::Or: return "or";
+        case expr::Op::Xor: return "xor";
+        case expr::Op::Shl: return "shl";
+        case expr::Op::Shr: return "shr";
+        case expr::Op::Sar: return "sar";
+        case expr::Op::Not: return "not";
+        case expr::Op::Neg: return "neg";
+        case expr::Op::Select: return "select";
+        case expr::Op::CmpEQ: return "eq";
+        case expr::Op::CmpULT: return "lt";
+        case expr::Op::CmpSLT: return "slt";
+        case expr::Op::Const:
+        case expr::Op::Input:
+        case expr::Op::Resize:
+            break;
+    }
+    return "mov";
+}
+
+const char* transfer_name(Handler::Transfer t) {
+    switch (t) {
+        case Handler::Transfer::Dispatch: return "dispatch";
+        case Handler::Transfer::Return: return "return";
+        case Handler::Transfer::Call: return "call";
+        case Handler::Transfer::Unknown: break;
+    }
+    return "";
+}
+
+}  // namespace
+
+std::string effect_label(const Model& model, const Handler& handler) {
+    std::string label;
+    // A handler is one virtual instruction, so it has one effect. The
+    // first cell it wrote is the one that names it: the later writes are
+    // the rest of the same slot's bytes, or the pointer's own move.
+    if (!handler.writes.empty()) {
+        expr::Id id = handler.writes.front().value;
+        while (model.dag.valid(id)) {
+            const expr::Op op = model.dag.node(id).op;
+            if (op != expr::Op::Resize) {
+                label = effect_op_name(op);
+                break;
+            }
+            id = model.dag.node(id).a;
+        }
+        if (label.empty()) {
+            label = "mov";
+        }
+    }
+    // Where it goes, when the handler itself decided that.
+    const char* const t = transfer_name(handler.transfer);
+    if (*t != '\0') {
+        if (!label.empty()) {
+            label += " -> ";
+        }
+        label += t;
+    }
+    return label.empty() ? std::string("?") : label;
 }
 
 }  // namespace occ::devirt::lift
