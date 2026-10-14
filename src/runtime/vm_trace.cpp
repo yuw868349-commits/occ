@@ -130,10 +130,9 @@ bool g_resolved = false;
 
 // The image base the trace armed against, and its mapped size. The tracer
 // needs both to tell a register that names guest memory from one that
-// names the image: the image is in the dump already, so a window over it
-// would be carried twice, and only the pages above it are the engine's own.
+// names this runtime's own mappings: the guest's mappings sit at and
+// above the image, and everything below it belongs to the host.
 std::uint64_t g_image_base = 0;
-std::uint64_t g_image_size = 0;
 
 // The virtual clock's epoch (real tick at the first dispatch) and the
 // clean dispatch rate the clock pretends. A thousand dispatches a
@@ -281,9 +280,17 @@ void parse_guest_ranges() noexcept {
                 ++sp;
             }
             const bool readable = sp + 1 < eol && sp[1] == 'r';
+            // The image's own mapping is guest memory like any other.
+            // Leaving it out would be a bet that the file view and the
+            // runtime view agree -- true for code the program never
+            // touches, false for a table it builds at start-up: the S box
+            // of one engine is `0xff` on disk and a permutation in memory,
+            // and the dispatcher that reads it from the file dispatches
+            // every row to the same handler. The windows dedup by start,
+            // so an image-resident register costs one record for the
+            // window it names, not one per dispatch.
             if (readable && hi > lo && lo >= g_image_base &&
-                lo < g_image_base + kGuestCeiling &&
-                hi > g_image_base + g_image_size) {
+                lo < g_image_base + kGuestCeiling) {
                 g_guest_ranges[g_guest_range_count].lo = lo;
                 g_guest_ranges[g_guest_range_count].hi = hi;
                 ++g_guest_range_count;
@@ -497,7 +504,6 @@ void arm_trap(std::uint64_t image_base) noexcept {
         if (pe_at != 0 && std::memcmp(img + pe_at, "PE\0\0", 4) == 0) {
             const std::uint32_t image_size =
                 *reinterpret_cast<const std::uint32_t*>(img + pe_at + 0x50);
-            g_image_size = image_size;
             for (std::uint64_t off = 0;
                  off + 8 < image_size && g_dispatch_count < kMaxCandidates;
                  ++off) {

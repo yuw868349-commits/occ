@@ -940,7 +940,58 @@ int cmd_devirt(int argc, char** argv) {
     lift::Handler dispatcher;
     bool have_dispatcher = false;
     if (have_img && !boundary.empty()) {
-        const std::uint64_t entry = boundary.front();
+        std::uint64_t entry = boundary.front();
+        // The boundary is where the handlers hand control back. The
+        // dispatch itself may live a jump or two further along -- a key
+        // roll, a bounds check, whatever the engine shares -- and the
+        // model has to start where the trace's own registers mean what
+        // the model's inputs say they mean. A state the trace never
+        // carried would make every input a guess: an engine whose shared
+        // tail rolls a key before re-entering the dispatch reads the
+        // trace's key *after* that roll, so a model entered at the tail
+        // would roll it a second time and index its own table with the
+        // wrong byte. Following the chain of unconditional jumps lands on
+        // the loop head the trace's sampling point sits inside, where
+        // the recorded registers are the model's own inputs.
+        std::vector<std::uint64_t> visited{entry};
+        for (int hop = 0; hop < 8; ++hop) {
+            std::uint64_t window_va = 0;
+            std::size_t avail = 0;
+            const std::uint8_t* p = img.window(entry, &window_va, &avail);
+            if (p == nullptr || entry < window_va ||
+                entry - window_va >= avail) {
+                break;
+            }
+            // Walk the block from the entry to its terminator. Only an
+            // unconditional direct jump moves the entry: a conditional
+            // or an indirect one leaves the state the trace carried
+            // behind a branch, and a call or a return leaves it in
+            // someone else's frame.
+            std::uint64_t pc = entry;
+            std::uint64_t next = 0;
+            while (pc - window_va < avail) {
+                lift::Insn in;
+                if (!lift::decode_insn(p + (pc - window_va),
+                                       avail - (pc - window_va), pc, in)) {
+                    break;
+                }
+                if (in.kind == inspect::InsnKind::Jmp && in.target != 0) {
+                    next = in.target;
+                    break;
+                }
+                if (in.kind != inspect::InsnKind::Other) {
+                    break;
+                }
+                pc += in.length;
+            }
+            if (next == 0 || next == entry ||
+                std::find(visited.begin(), visited.end(), next) !=
+                    visited.end()) {
+                break;
+            }
+            entry = next;
+            visited.push_back(entry);
+        }
         std::uint64_t window_va = 0;
         std::size_t avail = 0;
         const std::uint8_t* p = img.window(entry, &window_va, &avail);
