@@ -1198,6 +1198,42 @@ void test_instantiated_row_spans_the_last_dispatch() {
     check(conf.mismatched == 0, "with no comparison invented for it");
 }
 
+// ------------------------------------------- sharing, in the graph itself
+
+void test_evaluate_survives_a_shared_graph() {
+    // The graph is hash-consed, so a node reached twice is one node. A
+    // walk that does not remember where it has been visits that node
+    // twice, and twice again: doubling a value onto itself twenty times
+    // is a graph of twenty nodes and a tree of a million. The test is a
+    // correctness test that happens to fail as a hang.
+    expr::DAG dag;
+    const expr::Id seed = dag.input("x", 64);
+    expr::Id doubler = seed;
+    for (unsigned i = 0; i < 20; ++i) {
+        doubler = dag.add(doubler, doubler);
+    }
+    std::vector<std::uint64_t> inputs(1, 3);
+    check(dag.evaluate(doubler, inputs) == (3ull << 20),
+          "a value doubled onto itself twenty times is that value times 2^20");
+}
+
+void test_rendering_a_shared_graph_stops() {
+    // Printing expands sharing into text, so a graph can render to a
+    // string exponentially larger than itself. A line that trails off is
+    // worth more than a report that never arrives.
+    expr::DAG dag;
+    const expr::Id seed = dag.input("x", 64);
+    expr::Id chain = seed;
+    for (unsigned i = 0; i < 20; ++i) {
+        chain = dag.add(chain, chain);
+    }
+    const std::string text = dag.pretty(chain);
+    check(text.size() < 64 * 1024,
+          "a rendering of a shared graph is bounded, not exponential");
+    check(text.find("...") != std::string::npos,
+          "and it says where it stopped");
+}
+
 }  // namespace
 
 int main() {
@@ -1238,6 +1274,8 @@ int main() {
     run("pretty_bound", test_pretty_bound_replaces_what_the_run_pinned);
     run("instantiated_row", test_instantiated_row_shows_the_run);
     run("instantiated_last_row", test_instantiated_row_spans_the_last_dispatch);
+    run("evaluate_sharing", test_evaluate_survives_a_shared_graph);
+    run("render_budget", test_rendering_a_shared_graph_stops);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

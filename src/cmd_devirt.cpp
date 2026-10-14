@@ -21,6 +21,7 @@
 
 #include "occ/commands.h"
 #include "occ/devirt/lift.h"
+#include "occ/devirt/solve.h"
 #include "occ/inspect/disasm.h"
 #include "occ/parser/pe.h"
 
@@ -728,7 +729,8 @@ int cmd_devirt(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: occ devirt TRACE.jsonl DUMP.vmf [N] "
-                     "[--asm [N]] [-o REPORT]\n");
+                     "[--asm [N]] [-o REPORT] "
+                     "[--unknown VA:SIZE] [--goal VST=HEX]\n");
         return 2;
     }
     // The dispatcher calls this with argv+2, so argv[0] is the trace and
@@ -739,6 +741,8 @@ int cmd_devirt(int argc, char** argv) {
     std::size_t asm_limit = 0;
     bool want_asm = false;
     std::string report_path;
+    lift::SolveOptions solve_opts;
+    bool want_solve = false;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--asm") {
@@ -750,6 +754,58 @@ int cmd_devirt(int argc, char** argv) {
             if (i + 1 < argc) {
                 report_path = argv[++i];
             }
+        } else if (a == "--unknown" && i + 1 < argc) {
+            // VA:SIZE, both hexadecimal or decimal.
+            const std::string spec = argv[++i];
+            const std::size_t colon = spec.find(':');
+            if (colon == std::string::npos) {
+                std::fprintf(stderr,
+                             "devirt: --unknown wants VA:SIZE (got %s)\n",
+                             spec.c_str());
+                return 2;
+            }
+            const auto parse = [](const std::string& s) {
+                return static_cast<std::uint64_t>(
+                    std::strtoull(s.c_str(), nullptr, 0));
+            };
+            lift::UnknownRegion region;
+            region.va = parse(spec.substr(0, colon));
+            region.size = parse(spec.substr(colon + 1));
+            if (region.size == 0) {
+                std::fprintf(stderr,
+                             "devirt: --unknown needs a non-empty region\n");
+                return 2;
+            }
+            solve_opts.unknown.push_back(region);
+            want_solve = true;
+        } else if (a == "--goal" && i + 1 < argc) {
+            // vst[DISP]=HEX: the displacement is the same number a slot
+            // write prints, measured from the convention's stack
+            // register.
+            const std::string spec = argv[++i];
+            const std::size_t eq = spec.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr,
+                             "devirt: --goal wants vst[DISP]=HEX (got %s)\n",
+                             spec.c_str());
+                return 2;
+            }
+            std::string slot = spec.substr(0, eq);
+            if (slot.rfind("vst[", 0) != 0 || slot.back() != ']') {
+                std::fprintf(stderr,
+                             "devirt: --goal names a slot as vst[DISP], "
+                             "which is how the report names one (got %s)\n",
+                             slot.c_str());
+                return 2;
+            }
+            slot = slot.substr(4, slot.size() - 5);
+            lift::Goal goal;
+            goal.disp = static_cast<std::int64_t>(
+                std::strtoll(slot.c_str(), nullptr, 0));
+            goal.value = static_cast<std::uint64_t>(
+                std::strtoull(spec.substr(eq + 1).c_str(), nullptr, 0));
+            solve_opts.goals.push_back(goal);
+            want_solve = true;
         } else if (std::isdigit(static_cast<unsigned char>(a[0]))) {
             limit = static_cast<std::size_t>(std::strtoull(a.c_str(), nullptr, 10));
         }
@@ -1225,6 +1281,134 @@ int cmd_devirt(int argc, char** argv) {
                               static_cast<unsigned long long>(
                                   instantiated.size()));
                 rep.emit(sb);
+            }
+
+            // The question the caller asked, answered by replaying the
+            // models the check just agreed with. It runs after the check
+            // on purpose: the replay adds input nodes to the model's
+            // expression DAG, and the check's answers describe the model
+            // as it was.
+            if (want_solve) {
+                const lift::SolveResult sol = lift::solve(
+                    model, lhandlers, lrows, which, read_bytes, &sources,
+                    solve_opts);
+                rep.emit("\nsolve:");
+                for (std::size_t i = 0; i < solve_opts.unknown.size(); ++i) {
+                    char ub[96];
+                    std::snprintf(ub, sizeof(ub),
+                                  "  unknown[%zu]  0x%llx + %llu bytes", i,
+                                  static_cast<unsigned long long>(
+                                      solve_opts.unknown[i].va),
+                                  static_cast<unsigned long long>(
+                                      solve_opts.unknown[i].size));
+                    rep.emit(ub);
+                }
+                for (std::size_t i = 0; i < solve_opts.goals.size(); ++i) {
+                    char gb[128];
+                    const char* at =
+                        i < sol.goal_addresses.size() ? "" : " (address "
+                        "unresolved)";
+                    std::snprintf(gb, sizeof(gb),
+                                  "  goal vst[%lld] = 0x%llx%s", 
+                                  static_cast<long long>(
+                                      solve_opts.goals[i].disp),
+                                  static_cast<unsigned long long>(
+                                      solve_opts.goals[i].value),
+                                  at);
+                    std::string line = gb;
+                    if (i < sol.goal_addresses.size()) {
+                        char ab[64];
+                        std::snprintf(ab, sizeof(ab), "  (read at 0x%llx)",
+                                      static_cast<unsigned long long>(
+                                          sol.goal_addresses[i]));
+                        line += ab;
+                    }
+                    rep.emit(line);
+                }
+                {
+                    char rb[192];
+                    std::snprintf(rb, sizeof(rb),
+                                  "  %llu of %llu rows replayed, %llu "
+                                  "skipped; the goals reach %llu of the "
+                                  "regions' bytes",
+                                  static_cast<unsigned long long>(
+                                      sol.rows_played),
+                                  static_cast<unsigned long long>(
+                                      lrows.size()),
+                                  static_cast<unsigned long long>(
+                                      sol.rows_skipped),
+                                  static_cast<unsigned long long>(
+                                      sol.variables));
+                    rep.emit(rb);
+                }
+                if (sol.clauses != 0) {
+                    char cb[192];
+                    std::snprintf(cb, sizeof(cb),
+                                  "  %llu clauses over %llu variables, "
+                                  "%llu conflicts, %llu decisions",
+                                  static_cast<unsigned long long>(
+                                      sol.clauses),
+                                  static_cast<unsigned long long>(
+                                      sol.variables),
+                                  static_cast<unsigned long long>(
+                                      sol.conflicts),
+                                  static_cast<unsigned long long>(
+                                      sol.decisions));
+                    rep.emit(cb);
+                }
+                if (sol.unrecorded_variables != 0) {
+                    char nb[192];
+                    std::snprintf(nb, sizeof(nb),
+                                  "  %llu values the model needed that no "
+                                  "run recorded%s",
+                                  static_cast<unsigned long long>(
+                                      sol.unrecorded_variables),
+                                  sol.unrecorded_used
+                                      ? ", and the answer depends on some "
+                                        "of them"
+                                      : "; the answer depends on none");
+                    rep.emit(nb);
+                }
+                if (sol.symbolic_stores != 0) {
+                    char wb[160];
+                    std::snprintf(wb, sizeof(wb),
+                                  "  %llu stores whose address no run "
+                                  "fixed: which cells they covered is not "
+                                  "known from here",
+                                  static_cast<unsigned long long>(
+                                      sol.symbolic_stores));
+                    rep.emit(wb);
+                }
+                for (const std::string& u : sol.unmet) {
+                    rep.emit("  ! " + u);
+                }
+                if (sol.solved) {
+                    for (std::size_t i = 0; i < sol.region_bytes.size();
+                         ++i) {
+                        const std::vector<std::uint8_t>& bytes =
+                            sol.region_bytes[i];
+                        std::string hex;
+                        std::string text;
+                        for (const std::uint8_t byte : bytes) {
+                            char hb[4];
+                            std::snprintf(hb, sizeof(hb), "%02x", byte);
+                            hex += hb;
+                            text += (byte >= 0x20 && byte < 0x7f)
+                                        ? static_cast<char>(byte)
+                                        : '.';
+                        }
+                        rep.emit("  answer[" + std::to_string(i) + "] 0x" +
+                                 hex + "  \"" + text + "\"");
+                    }
+                    rep.emit("  solved: the bytes above satisfy every "
+                             "goal, checked by evaluating the expressions "
+                             "the search was built from");
+                    rep.emit("  a candidate, not a proof: run the program "
+                             "with it, because the replay follows the "
+                             "traced path and the traced input's length");
+                } else {
+                    rep.emit("  not solved: " + sol.reason);
+                }
             }
         }
     }

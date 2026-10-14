@@ -3148,36 +3148,7 @@ struct TraceField {
     // is what separates a register the trace recorded from one it did not.
     static bool pick(const Row& r, const std::string& name,
                      std::uint64_t* out) {
-        if (name == "rbp") {
-            *out = r.rbp;
-            return true;
-        }
-        if (name == "rsi") {
-            *out = r.rsi;
-            return true;
-        }
-        if (name == "rdi") {
-            *out = r.rdi;
-            return true;
-        }
-        if (name == "rsp") {
-            *out = r.rsp;
-            return true;
-        }
-        if (name == "r12") {
-            *out = r.r12;
-            return true;
-        }
-        for (std::size_t i = 0; i < 16; ++i) {
-            if (name == kRowGprNames[i]) {
-                if ((r.gpr_present & (std::uint32_t{1} << i)) == 0) {
-                    return false;
-                }
-                *out = r.gpr[i];
-                return true;
-            }
-        }
-        return false;
+        return row_register(r, name, out);
     }
 
     // The cells the trace read around the convention's stack register.
@@ -3317,6 +3288,39 @@ Layout infer_layout(const std::vector<HandlerBytes>& handlers) {
         }
     }
     return best;
+}
+
+bool row_register(const Row& r, const std::string& name, std::uint64_t* out) {
+    if (name == "rbp") {
+        *out = r.rbp;
+        return true;
+    }
+    if (name == "rsi") {
+        *out = r.rsi;
+        return true;
+    }
+    if (name == "rdi") {
+        *out = r.rdi;
+        return true;
+    }
+    if (name == "rsp") {
+        *out = r.rsp;
+        return true;
+    }
+    if (name == "r12") {
+        *out = r.r12;
+        return true;
+    }
+    for (std::size_t i = 0; i < 16; ++i) {
+        if (name == kRowGprNames[i]) {
+            if ((r.gpr_present & (std::uint32_t{1} << i)) == 0) {
+                return false;
+            }
+            *out = r.gpr[i];
+            return true;
+        }
+    }
+    return false;
 }
 
 Conformance check_trace(Model& model, const std::vector<Handler>& handlers,

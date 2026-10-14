@@ -171,6 +171,21 @@ public:
     [[nodiscard]] std::vector<unsigned> inputs_of(Id id) const;
 
 private:
+    // The two halves of `evaluate`: the recursive walk, and the memo that
+    // keeps a shared node from being walked twice.
+    [[nodiscard]] std::uint64_t evaluate_memo(
+        Id id, const std::vector<std::uint64_t>& inputs,
+        std::vector<std::uint64_t>& memo, std::vector<char>& done) const;
+    [[nodiscard]] std::uint64_t evaluate_raw(
+        Id id, const std::vector<std::uint64_t>& inputs,
+        std::vector<std::uint64_t>& memo, std::vector<char>& done) const;
+    // The one walk both renderings are: the pseudo-code form, with the
+    // inputs either named or replaced by the values a trace bound, and a
+    // budget that stops it. A graph shared by two parents would otherwise
+    // be printed twice, and twice again, and a printer that can hang on
+    // the program it describes is not one a report can use.
+    void render_into(Id id, const Bindings* bound, std::size_t* budget,
+                     std::string* out) const;
     [[nodiscard]] Id intern(Node n);
     [[nodiscard]] Id simplify(Node n);
 

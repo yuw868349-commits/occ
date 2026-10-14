@@ -463,6 +463,14 @@ struct Layout {
 // indexed an array of elements, which is a stack machine's whole code.
 [[nodiscard]] Layout infer_layout(const std::vector<HandlerBytes>& handlers);
 
+// The value a row carries for a named register, for the names a row can
+// carry: the five the tracer has always sampled (rsi/rbp/rdi/rsp/r12) and
+// every entry of the general table the presence mask marks. False means
+// the trace did not carry that register -- which is not the same as
+// carrying zero, and every reader of a Row has to tell the two apart.
+[[nodiscard]] bool row_register(const Row& r, const std::string& name,
+                                std::uint64_t* out);
+
 // The report's name for an address a model computed. An access into the
 // convention's register file reads as `vst[index]` -- the index is what
 // the machine itself thinks it is using -- and everything else keeps its

@@ -683,6 +683,7 @@ add_library(occ_core STATIC
     src/devirt/bitblast.cpp
     src/devirt/lift.cpp
     src/devirt/adapt.cpp
+    src/devirt/solve.cpp
     src/devirt/cert.cpp
     src/devirt/codegen.cpp
     src/devirt/semlib.cpp
@@ -694,11 +695,9 @@ add_library(occ_core STATIC
     src/packer/pe_view.cpp
     src/packer/pipeline.cpp
     src/packer/smc.cpp
-    src/packer/esp_law.cpp
     src/concolic/engine.cpp
     src/concolic/program.cpp
-    src/concolic/bitflow.cpp
-                            src/concolic/taint.cpp
+    src/concolic/taint.cpp
     src/dbi/dbi.cpp
     src/emu/emu.cpp
     src/hostile/hostile.cpp

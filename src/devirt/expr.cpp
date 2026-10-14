@@ -389,102 +389,150 @@ std::string DAG::dump(Id id) const {
     }
 }
 
-std::string DAG::pretty(Id id) const {
-    if (!valid(id)) {
-        return "?";
+namespace {
+
+// How much of a graph a single rendering will expand, in nodes. A
+// hash-consed graph can be exponentially smaller than its own tree
+// expansion -- that sharing is why the graph exists -- so a printer with
+// no budget is a printer that can hang on the program it was asked to
+// describe. A line that trails off is worth more than a report that
+// never arrives.
+constexpr std::size_t kRenderBudget = 4096;
+
+}  // namespace
+
+void DAG::render_into(Id id, const Bindings* bound, std::size_t* budget,
+                      std::string* out) const {
+    if (bound != nullptr && !valid(id)) {
+        *out += "?";
+        return;
     }
+    if (!valid(id)) {
+        *out += "?";
+        return;
+    }
+    if (*budget == 0) {
+        *out += "...";
+        return;
+    }
+    --*budget;
     const Node& n = nodes_[id];
     switch (n.op) {
     case Op::Const: {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "0x%llx",
                       static_cast<unsigned long long>(n.imm));
-        return buf;
+        *out += buf;
+        return;
     }
-    case Op::Input:
-        return n.name;
+    case Op::Input: {
+        if (bound == nullptr) {
+            *out += n.name;
+            return;
+        }
+        const auto ordinal = static_cast<unsigned>(n.imm);
+        if (!bound->has(ordinal)) {
+            // The run did not pin this one down. Its name is the honest
+            // answer: a zero in its place would read as a value.
+            *out += n.name;
+            return;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "0x%llx",
+                      static_cast<unsigned long long>(bound->value(ordinal) &
+                                                     mask_of(n.width)));
+        *out += buf;
+        return;
+    }
     case Op::Resize: {
         // `a` may be absent when a model leans on a value the walk could
         // not name; a resize of nothing is nothing, and saying so is
         // better than reading past the node table for a width.
         if (!valid(n.a)) {
-            return "?";
+            *out += "?";
+            return;
         }
         if (nodes_[n.a].width > n.width) {
-            return "(" + std::to_string(n.width) + ")" + pretty(n.a);
+            *out += "(" + std::to_string(n.width) + ")";
         }
-        return pretty(n.a);
+        render_into(n.a, bound, budget, out);
+        return;
     }
     case Op::Select:
-        return pretty(n.c) + " ? " + pretty(n.a) + " : " + pretty(n.b);
+        render_into(n.c, bound, budget, out);
+        *out += " ? ";
+        render_into(n.a, bound, budget, out);
+        *out += " : ";
+        render_into(n.b, bound, budget, out);
+        return;
     case Op::Not:
-        return "~" + pretty(n.a);
+        *out += "~";
+        render_into(n.a, bound, budget, out);
+        return;
     case Op::Neg:
-        return "-" + pretty(n.a);
+        *out += "-";
+        render_into(n.a, bound, budget, out);
+        return;
     default: {
         const char* infix = op_infix(n.op);
         if (infix != nullptr) {
-            return "(" + pretty(n.a) + infix + pretty(n.b) + ")";
+            *out += "(";
+            render_into(n.a, bound, budget, out);
+            *out += infix;
+            render_into(n.b, bound, budget, out);
+            *out += ")";
+            return;
         }
-        return op_name(n.op);
+        *out += op_name(n.op);
+        return;
     }
     }
 }
 
+std::string DAG::pretty(Id id) const {
+    std::string out;
+    std::size_t budget = kRenderBudget;
+    render_into(id, nullptr, &budget, &out);
+    return out;
+}
+
 std::string DAG::pretty_bound(Id id, const Bindings& bound) const {
-    if (!valid(id)) {
-        return "?";
-    }
-    const Node& n = nodes_[id];
-    switch (n.op) {
-    case Op::Const: {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "0x%llx",
-                      static_cast<unsigned long long>(n.imm));
-        return buf;
-    }
-    case Op::Input: {
-        const auto ordinal = static_cast<unsigned>(n.imm);
-        if (!bound.has(ordinal)) {
-            // The run did not pin this one down. Its name is the honest
-            // answer: a zero in its place would read as a value.
-            return n.name;
-        }
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "0x%llx",
-                      static_cast<unsigned long long>(
-                          bound.value(ordinal) & mask_of(n.width)));
-        return buf;
-    }
-    case Op::Resize: {
-        if (!valid(n.a)) {
-            return "?";
-        }
-        if (nodes_[n.a].width > n.width) {
-            return "(" + std::to_string(n.width) + ")" + pretty_bound(n.a, bound);
-        }
-        return pretty_bound(n.a, bound);
-    }
-    case Op::Select:
-        return pretty_bound(n.c, bound) + " ? " + pretty_bound(n.a, bound) +
-               " : " + pretty_bound(n.b, bound);
-    case Op::Not:
-        return "~" + pretty_bound(n.a, bound);
-    case Op::Neg:
-        return "-" + pretty_bound(n.a, bound);
-    default: {
-        const char* infix = op_infix(n.op);
-        if (infix != nullptr) {
-            return "(" + pretty_bound(n.a, bound) + infix +
-                   pretty_bound(n.b, bound) + ")";
-        }
-        return op_name(n.op);
-    }
-    }
+    std::string out;
+    std::size_t budget = kRenderBudget;
+    render_into(id, &bound, &budget, &out);
+    return out;
 }
 
 std::uint64_t DAG::evaluate(Id id,
                             const std::vector<std::uint64_t>& inputs) const {
+    // The memo is per call: it is keyed by the node, and the inputs are
+    // the caller's. Without it a node reached twice is evaluated twice,
+    // and sharing is the whole point of a hash-consed graph -- a chain
+    // that reuses its own values would cost exponential time for a
+    // result that is a linear function of the graph.
+    std::vector<std::uint64_t> memo(nodes_.size(), 0);
+    std::vector<char> done(nodes_.size(), 0);
+    return evaluate_memo(id, inputs, memo, done);
+}
+
+std::uint64_t DAG::evaluate_memo(
+    Id id, const std::vector<std::uint64_t>& inputs,
+    std::vector<std::uint64_t>& memo, std::vector<char>& done) const {
+    if (!valid(id)) {
+        return 0;
+    }
+    if (done[id] != 0) {
+        return memo[id];
+    }
+    const std::uint64_t value = evaluate_raw(id, inputs, memo, done);
+    done[id] = 1;
+    memo[id] = value;
+    return value;
+}
+
+std::uint64_t DAG::evaluate_raw(
+    Id id, const std::vector<std::uint64_t>& inputs,
+    std::vector<std::uint64_t>& memo, std::vector<char>& done) const {
     if (!valid(id)) {
         return 0;
     }
@@ -496,34 +544,34 @@ std::uint64_t DAG::evaluate(Id id,
     case Op::Input:
         return n.imm < inputs.size() ? inputs[n.imm] & m : 0;
     case Op::Add:
-        return (evaluate(n.a, inputs) + evaluate(n.b, inputs)) & m;
+        return (evaluate_memo(n.a, inputs, memo, done) + evaluate_memo(n.b, inputs, memo, done)) & m;
     case Op::Sub:
-        return (evaluate(n.a, inputs) - evaluate(n.b, inputs)) & m;
+        return (evaluate_memo(n.a, inputs, memo, done) - evaluate_memo(n.b, inputs, memo, done)) & m;
     case Op::Mul:
-        return (evaluate(n.a, inputs) * evaluate(n.b, inputs)) & m;
+        return (evaluate_memo(n.a, inputs, memo, done) * evaluate_memo(n.b, inputs, memo, done)) & m;
     case Op::And:
-        return evaluate(n.a, inputs) & evaluate(n.b, inputs);
+        return evaluate_memo(n.a, inputs, memo, done) & evaluate_memo(n.b, inputs, memo, done);
     case Op::Or:
-        return evaluate(n.a, inputs) | evaluate(n.b, inputs);
+        return evaluate_memo(n.a, inputs, memo, done) | evaluate_memo(n.b, inputs, memo, done);
     case Op::Xor:
-        return evaluate(n.a, inputs) ^ evaluate(n.b, inputs);
+        return evaluate_memo(n.a, inputs, memo, done) ^ evaluate_memo(n.b, inputs, memo, done);
     case Op::Shl: {
-        const std::uint64_t s = evaluate(n.b, inputs);
+        const std::uint64_t s = evaluate_memo(n.b, inputs, memo, done);
         if (s >= n.width) {
             return 0;
         }
-        return (evaluate(n.a, inputs) << s) & m;
+        return (evaluate_memo(n.a, inputs, memo, done) << s) & m;
     }
     case Op::Shr: {
-        const std::uint64_t s = evaluate(n.b, inputs);
+        const std::uint64_t s = evaluate_memo(n.b, inputs, memo, done);
         if (s >= n.width) {
             return 0;
         }
-        return (evaluate(n.a, inputs) & m) >> s;
+        return (evaluate_memo(n.a, inputs, memo, done) & m) >> s;
     }
     case Op::Sar: {
-        const std::uint64_t s = evaluate(n.b, inputs);
-        const std::uint64_t v = evaluate(n.a, inputs) & m;
+        const std::uint64_t s = evaluate_memo(n.b, inputs, memo, done);
+        const std::uint64_t v = evaluate_memo(n.a, inputs, memo, done) & m;
         const bool neg = (v >> (n.width - 1)) & 1;
         // A shift at or past the width fills with the sign bit -- the
         // same answer the folder gives (`cb >= w` there), which is what
@@ -539,21 +587,21 @@ std::uint64_t DAG::evaluate(Id id,
         return (v >> s) | fill;
     }
     case Op::Not:
-        return ~evaluate(n.a, inputs) & m;
+        return ~evaluate_memo(n.a, inputs, memo, done) & m;
     case Op::Neg:
-        return (~evaluate(n.a, inputs) + 1) & m;
+        return (~evaluate_memo(n.a, inputs, memo, done) + 1) & m;
     case Op::Resize:
-        return evaluate(n.a, inputs) & m;
+        return evaluate_memo(n.a, inputs, memo, done) & m;
     case Op::Select:
-        return evaluate(n.c, inputs) != 0 ? evaluate(n.a, inputs) & m
-                                          : evaluate(n.b, inputs) & m;
+        return evaluate_memo(n.c, inputs, memo, done) != 0 ? evaluate_memo(n.a, inputs, memo, done) & m
+                                          : evaluate_memo(n.b, inputs, memo, done) & m;
     case Op::CmpEQ:
-        return evaluate(n.a, inputs) == evaluate(n.b, inputs) ? 1 : 0;
+        return evaluate_memo(n.a, inputs, memo, done) == evaluate_memo(n.b, inputs, memo, done) ? 1 : 0;
     case Op::CmpULT:
-        return evaluate(n.a, inputs) < evaluate(n.b, inputs) ? 1 : 0;
+        return evaluate_memo(n.a, inputs, memo, done) < evaluate_memo(n.b, inputs, memo, done) ? 1 : 0;
     case Op::CmpSLT: {
-        const std::uint64_t v = evaluate(n.a, inputs);
-        const std::uint64_t u = evaluate(n.b, inputs);
+        const std::uint64_t v = evaluate_memo(n.a, inputs, memo, done);
+        const std::uint64_t u = evaluate_memo(n.b, inputs, memo, done);
         // Mixed widths compare as the narrower operand zero-extended, so
         // the sign bit lives at the wider operand's top -- the same place
         // `slt_bits` reads it. Reading it at the left operand's width
