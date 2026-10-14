@@ -53,6 +53,16 @@ struct Row {
     std::uint64_t st0 = 0;   // virtual stack top
     std::uint64_t st1 = 0;
     std::uint64_t st2 = 0;
+    // The rsp window and every general register, as the trace carries
+    // them: both are what lets a prediction about an indexed access be
+    // checked rather than counted unverifiable. The presence flags say
+    // which of them this trace actually named -- an absent field and a
+    // field that held zero are the same number, and only the flag tells
+    // the checker which it is looking at.
+    std::array<std::uint64_t, 8> rt{};
+    bool rt_present = false;
+    std::array<std::uint64_t, 16> gpr{};
+    std::uint32_t gpr_present = 0;
     std::uint64_t word = 0;  // the value the dispatcher read from the table
     // The handler address `word` resolves to. It is computed once, against
     // the image, right after the trace loads (see resolve_rows) so every
@@ -123,6 +133,13 @@ void json_fields(std::string_view line,
     }
 }
 
+// The bytes the trace carried for pages the image dump does not hold: the
+// buffer the engine decrypted its bytecode into, the register file its
+// handlers index. A trace from a runtime built before the tracer carried
+// them has none, and every prediction that needed one stays unverifiable --
+// which is the honest reading of a trace that does not have the bytes.
+lift::TraceMemory g_memory;
+
 bool load_trace(const std::string& path, std::vector<Row>& rows) {
     std::ifstream in(path);
     if (!in) {
@@ -136,6 +153,24 @@ bool load_trace(const std::string& path, std::vector<Row>& rows) {
         }
         std::map<std::string, std::string> f;
         json_fields(line, f);
+        if (f["kind"] == "memory") {
+            // The bytes the tracer carried for a page no file holds. The
+            // record is the window's address, its length and its bytes as
+            // one hexadecimal string, which is the shape that keeps a
+            // sixteen-kilobyte window a single line.
+            std::vector<std::uint8_t> bytes;
+            const std::string& hex = f["bytes"];
+            if (hex.size() % 2 == 0) {
+                bytes.reserve(hex.size() / 2);
+                for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
+                    const auto pair = hex.substr(i, 2);
+                    bytes.push_back(static_cast<std::uint8_t>(
+                        std::strtoul(pair.c_str(), nullptr, 16) & 0xffu));
+                }
+            }
+            g_memory.add(json_hex(f["va"]), std::move(bytes));
+            continue;
+        }
         if (f["kind"] != "dispatch") {
             continue;
         }
@@ -153,6 +188,43 @@ bool load_trace(const std::string& path, std::vector<Row>& rows) {
         r.st0 = json_hex(f["st0"]);
         r.st1 = json_hex(f["st1"]);
         r.st2 = json_hex(f["st2"]);
+        // The rsp window and the general registers, by the names the
+        // trace writes them under. A trace from before the tracer carried
+        // them has none, and the presence flags are what record that: a
+        // field left zero by absence and a field that really held zero are
+        // the same number, so the row says which of them the trace named
+        // and a model that leans on an absent one stays unverifiable
+        // rather than being bound to a number the trace never recorded.
+        for (std::size_t i = 0; i < r.rt.size(); ++i) {
+            char key[8];
+            std::snprintf(key, sizeof(key), "rt%zu", i);
+            const auto it = f.find(key);
+            if (it != f.end()) {
+                r.rt[i] = json_hex(it->second);
+                r.rt_present = true;
+            }
+        }
+        // The five registers the trace has always carried name the same
+        // ones the extension does, so they seed the table first: a trace
+        // from before the extension keeps working and binds exactly what
+        // it used to, and a model that leans on any of the others stays
+        // unverifiable rather than being bound to a number this trace
+        // never recorded.
+        r.gpr[4] = r.rsp;
+        r.gpr[5] = r.rbp;
+        r.gpr[6] = r.rsi;
+        r.gpr[7] = r.rdi;
+        r.gpr[12] = r.r12;
+        r.gpr_present = (std::uint32_t{1} << 4) | (std::uint32_t{1} << 5) |
+                        (std::uint32_t{1} << 6) | (std::uint32_t{1} << 7) |
+                        (std::uint32_t{1} << 12);
+        for (std::size_t i = 0; i < r.gpr.size(); ++i) {
+            const auto it = f.find(lift::kRowGprNames[i]);
+            if (it != f.end()) {
+                r.gpr[i] = json_hex(it->second);
+                r.gpr_present |= std::uint32_t{1} << i;
+            }
+        }
         rows.push_back(r);
     }
     return !rows.empty();
@@ -291,12 +363,28 @@ struct ImageMap {
     }
 };
 
-// Fills in each row's handler address against the image, once, so every
-// later step reads one answer instead of each re-deciding how the table
-// encodes its entries. The two VM families the de-virtualizer serves
-// disagree here -- one stores the address, the other a rotated form -- and
-// the trace does not say which wrote it, so the image settles it through
-// lift::resolve_handler: the word that points at code is the address.
+// The bytes behind an address, from whichever of the two sources holds
+// them. The image dump answers for the image; the trace's own memory
+// records answer for the pages the engine allocated while it ran. Which
+// source holds an address is the address itself, so there is no order to
+// prefer and no overlap to arbitrate: a read the image cannot place is
+// asked of the trace, and one neither holds is a read nothing recorded.
+struct ByteSources {
+    const ImageMap* img = nullptr;
+    const lift::TraceMemory* memory = nullptr;
+};
+
+bool read_bytes(void* ctx, std::uint64_t va, unsigned width,
+                std::uint64_t* out) {
+    const auto* s = static_cast<const ByteSources*>(ctx);
+    if (s->img != nullptr &&
+        ImageMap::read(const_cast<ImageMap*>(s->img), va, width, out)) {
+        return true;
+    }
+    return s->memory != nullptr && s->memory->read(va, width, out);
+}
+
+
 void resolve_rows(const ImageMap& img, bool have_img, std::vector<Row>& rows) {
     for (Row& r : rows) {
         r.handler =
@@ -743,6 +831,14 @@ int cmd_devirt(int argc, char** argv) {
         model.convention.regfile = layout.regfile;
         model.convention.regfile_width = layout.regfile_width;
         model.convention.code = layout.code;
+        // A register machine's slots hang off its file's base, so that is
+        // the register the checker has to read its window around -- and
+        // naming it as the stack is what makes the model's slots and the
+        // trace's observed cells the same place. A stack machine has no
+        // file and keeps the default.
+        if (!layout.regfile.empty()) {
+            model.convention.stack = layout.regfile;
+        }
 
         for (const auto& [h, rs] : by_handler) {
             (void)rs;
@@ -1028,12 +1124,17 @@ int cmd_devirt(int argc, char** argv) {
                 lr.st0 = r.st0;
                 lr.st1 = r.st1;
                 lr.st2 = r.st2;
+                lr.rt = r.rt;
+                lr.rt_present = r.rt_present;
+                lr.gpr = r.gpr;
+                lr.gpr_present = r.gpr_present;
                 lr.target = r.word;
                 lrows.push_back(lr);
                 which.push_back(index_of[r.handler]);
             }
+            ByteSources sources{have_img ? &img : nullptr, &g_memory};
             const lift::Conformance conf = lift::check_trace(
-                model, lhandlers, lrows, which, ImageMap::read, &img);
+                model, lhandlers, lrows, which, read_bytes, &sources);
             char b[224];
             std::snprintf(b, sizeof(b),
                           "  trace conformance: %llu checked, %llu mismatched, "

@@ -3113,16 +3113,14 @@ struct Shadow {
     // anywhere, so nothing about the stack's bytes is known from here on.
     void clear() { bytes.clear(); }
 
-    // The three cells the tracer read at a dispatch: the aligned cells
-    // containing the pointer, not the pointer's own byte range.
-    // The three cells the tracer read at a dispatch: the aligned cells
-    // containing the pointer, not the pointer's own byte range. `stack`
-    // is the value the convention's stack register held at this row --
-    // the register the trace's own cells were read around.
-    void adopt(const Row& r, std::uint64_t stack) {
+    // The cells the tracer read at a dispatch: the aligned cells
+    // containing the pointer, not the pointer's own byte range. Which
+    // cells those are is the caller's answer -- the tracer records two
+    // windows, one around rbp and one around rsp, because which of them
+    // is the virtual stack is a question about the model.
+    void adopt(std::uint64_t stack, const std::vector<std::uint64_t>& cells) {
         const std::uint64_t base = stack & ~std::uint64_t{7};
-        const std::uint64_t cells[3] = {r.st0, r.st1, r.st2};
-        for (int k = 0; k < 3; ++k) {
+        for (std::size_t k = 0; k < cells.size(); ++k) {
             write(base + 8 * static_cast<std::uint64_t>(k), cells[k]);
         }
     }
@@ -3131,9 +3129,10 @@ struct Shadow {
 // Which Row field carries the value of a convention register. The trace
 // samples five physical registers by name (rsi/rbp/rdi/rsp/r12); a
 // convention whose stack or cursor names one of them reads that field.
-// A convention that names anything else has no field at all -- the
-// register was not sampled -- and the role is reported unbound rather
-// than guessed.
+// A convention that names anything else reads the general table, and only
+// where the trace says it carried that register -- a zero in a field the
+// trace never wrote is not a value the machine held, and binding it would
+// be a fabricated prediction rather than an unverifiable one.
 struct TraceField {
     const Convention& conv;
     [[nodiscard]] bool stack(const Row& r, std::uint64_t* out) const {
@@ -3142,6 +3141,11 @@ struct TraceField {
     [[nodiscard]] bool cursor(const Row& r, std::uint64_t* out) const {
         return pick(r, conv.cursor, out);
     }
+    // The value a named register held at this row. The five registers the
+    // tracer has always carried are read from their own fields -- a Row
+    // built before the extension has them and nowhere else -- and every
+    // other register comes from the table, where the row's presence mask
+    // is what separates a register the trace recorded from one it did not.
     static bool pick(const Row& r, const std::string& name,
                      std::uint64_t* out) {
         if (name == "rbp") {
@@ -3164,7 +3168,35 @@ struct TraceField {
             *out = r.r12;
             return true;
         }
+        for (std::size_t i = 0; i < 16; ++i) {
+            if (name == kRowGprNames[i]) {
+                if ((r.gpr_present & (std::uint32_t{1} << i)) == 0) {
+                    return false;
+                }
+                *out = r.gpr[i];
+                return true;
+            }
+        }
         return false;
+    }
+
+    // The cells the trace read around the convention's stack register.
+    // The tracer records two windows -- around rbp and around rsp -- since
+    // which of them is the virtual stack is the model's question to
+    // answer and not the tracer's. A convention that names rsp reads that
+    // window when the trace carried it; anything else is a trace built to
+    // describe the convention, and its cells are the three the trace
+    // carries. A window the trace did not read yields no cells at all,
+    // which leaves the shadow unseeded there instead of seeded with a zero
+    // the machine never wrote.
+    [[nodiscard]] std::vector<std::uint64_t> slot_cells(const Row& r) const {
+        if (conv.stack == "rsp") {
+            if (!r.rt_present) {
+                return {};
+            }
+            return std::vector<std::uint64_t>(r.rt.begin(), r.rt.end());
+        }
+        return std::vector<std::uint64_t>{r.st0, r.st1, r.st2};
     }
 };
 
@@ -3267,9 +3299,10 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
     Shadow shadow;
     const TraceField tf{model.convention};
     if (!rows.empty()) {
+        const std::vector<std::uint64_t> cells = tf.slot_cells(rows[0]);
         std::uint64_t stack = 0;
-        if (tf.stack(rows[0], &stack)) {
-            shadow.adopt(rows[0], stack);
+        if (!cells.empty() && tf.stack(rows[0], &stack)) {
+            shadow.adopt(stack, cells);
         }
     }
     for (std::size_t i = 0; i + 1 < rows.size(); ++i) {
@@ -3355,22 +3388,17 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
             const Model::Input& in = model.inputs[k];
             const auto ord = static_cast<unsigned>(k);
             switch (in.kind) {
-            case Model::Input::Kind::Reg:
-                // The registers the tracer records are the ones the
-                // models hang off: the two pointers, the engine's stack
-                // base, and the host stack pointer.
-                if (in.name == "rbp") {
-                    b.bind(ord, prev.rbp);
-                } else if (in.name == "rsi") {
-                    b.bind(ord, prev.rsi);
-                } else if (in.name == "rdi") {
-                    b.bind(ord, prev.rdi);
-                } else if (in.name == "rsp") {
-                    b.bind(ord, prev.rsp);
-                } else if (in.name == "r12") {
-                    b.bind(ord, prev.r12);
+            case Model::Input::Kind::Reg: {
+                // Every general register the trace carries, by name: a
+                // model that names a bytecode buffer in r8 or a file index
+                // in r11 is bound from the same place the two pointers
+                // always were.
+                std::uint64_t v = 0;
+                if (TraceField::pick(prev, in.name, &v)) {
+                    b.bind(ord, v);
                 }
                 break;
+            }
             case Model::Input::Kind::Slot: {
                 // A slot read is the memory the handler was entered
                 // with: whatever the shadow knows before this handler's
@@ -3460,6 +3488,10 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
                 return;
             }
             ++out.mismatched;
+            std::fprintf(stderr, "[mismatch] %s model=0x%llx trace=0x%llx\n",
+                         what.c_str(),
+                         static_cast<unsigned long long>(got),
+                         static_cast<unsigned long long>(observed));
             ++failures_by_handler[h.va];
             if (out.failures.size() < 8) {
                 char buf[192];
@@ -3542,16 +3574,16 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
         // The cells the tracer observed at the next dispatch, against
         // the shadow the model left behind -- then adopted from the
         // trace, so the comparison stays grounded on ground truth. The
-        // base and the displacement are read from the Row fields the
-        // convention's stack register samples.
+        // window is the one the convention's stack register is read
+        // around, which is why the tracer records both.
         std::uint64_t cur_stack = 0;
         std::uint64_t prev_stack = 0;
         const bool cur_ok = tf.stack(cur, &cur_stack);
         const bool prev_ok = tf.stack(prev, &prev_stack);
         const std::uint64_t base =
             cur_ok ? (cur_stack & ~std::uint64_t{7}) : 0;
-        const std::uint64_t observed[3] = {cur.st0, cur.st1, cur.st2};
-        for (int k = 0; k < 3; ++k) {
+        const std::vector<std::uint64_t> cells = tf.slot_cells(cur);
+        for (std::size_t k = 0; k < cells.size(); ++k) {
             const std::uint64_t addr = base + 8 * static_cast<std::uint64_t>(k);
             const std::int64_t disp =
                 prev_ok ? static_cast<std::int64_t>(addr) -
@@ -3559,10 +3591,10 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
                         : 0;
             std::uint64_t got = 0;
             const bool known = shadow.read(addr, &got);
-            record("vst[" + std::to_string(disp) + "]", known, got, observed[k]);
+            record("vst[" + std::to_string(disp) + "]", known, got, cells[k]);
         }
-        if (cur_ok) {
-            shadow.adopt(cur, cur_stack);
+        if (cur_ok && !cells.empty()) {
+            shadow.adopt(cur_stack, cells);
         }
     }
     out.worst_handlers.reserve(failures_by_handler.size());
@@ -3578,6 +3610,76 @@ Conformance check_trace(Model& model, const std::vector<Handler>& handlers,
                   return a.va < b.va;
               });
     return out;
+}
+
+void TraceMemory::add(std::uint64_t va, std::vector<std::uint8_t> bytes) {
+    if (bytes.empty()) {
+        return;
+    }
+    // A trace the tracer wrote holds each window once, so the windows do
+    // not overlap. Two that do are a hand-built reader's doing, and the
+    // record fed second is the later read of those bytes: it wins wherever
+    // it covers, so an earlier window is cut back to the parts of itself
+    // this record does not reach rather than dropped whole or left to
+    // shadow the newer bytes.
+    const std::uint64_t from = va;
+    const std::uint64_t to = va + bytes.size();
+    std::vector<Window> kept;
+    kept.reserve(windows.size() + 2);
+    for (Window& w : windows) {
+        const std::uint64_t wfrom = w.va;
+        const std::uint64_t wto = w.va + w.bytes.size();
+        if (wto <= from || wfrom >= to) {
+            kept.push_back(std::move(w));
+            continue;
+        }
+        if (wfrom < from) {
+            kept.push_back(Window{
+                wfrom, std::vector<std::uint8_t>(
+                           w.bytes.begin(),
+                           w.bytes.begin() + static_cast<std::ptrdiff_t>(
+                                                  from - wfrom))});
+        }
+        if (wto > to) {
+            kept.push_back(Window{
+                to, std::vector<std::uint8_t>(
+                        w.bytes.begin() + static_cast<std::ptrdiff_t>(to - wfrom),
+                        w.bytes.end())});
+        }
+    }
+    kept.push_back(Window{va, std::move(bytes)});
+    std::sort(kept.begin(), kept.end(),
+              [](const Window& a, const Window& b) { return a.va < b.va; });
+    windows = std::move(kept);
+}
+
+bool TraceMemory::read(std::uint64_t va, unsigned width,
+                       std::uint64_t* out) const {
+    if (va == 0 || width == 0 || width % 8 != 0) {
+        return false;
+    }
+    const std::size_t n = width / 8;
+    if (n > 8) {
+        return false;
+    }
+    for (const Window& w : windows) {
+        // The windows are sorted, so the first one that starts above the
+        // read ends the search: no later window can cover it either.
+        if (va < w.va) {
+            break;
+        }
+        if (va - w.va > w.bytes.size() || n > w.bytes.size() - (va - w.va)) {
+            continue;
+        }
+        std::uint64_t v = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            v |= static_cast<std::uint64_t>(w.bytes[va - w.va + i])
+                 << (8 * i);
+        }
+        *out = v;
+        return true;
+    }
+    return false;
 }
 
 std::string render(const Model& model, expr::Id id) {

@@ -990,6 +990,74 @@ void test_infer_layout_leaves_a_stack_machine_alone() {
     check(layout.code.empty(), "and no bytecode buffer");
 }
 
+// ---------------------------------------------------- the trace's own bytes
+
+void test_trace_memory_serves_its_windows() {
+    // The bytes a trace carried for pages no file holds. The reader has to
+    // answer a read a window contains and refuse one it does not: half an
+    // answer would be a value no run produced, which is the one thing a
+    // conformance check must never do.
+    lift::TraceMemory mem;
+    std::vector<std::uint8_t> first(16);
+    for (std::size_t i = 0; i < first.size(); ++i) {
+        first[i] = static_cast<std::uint8_t>(0x10 + i);
+    }
+    mem.add(0x1000, first);
+    std::vector<std::uint8_t> second(8, 0xaa);
+    mem.add(0x2000, second);
+
+    check(mem.windows.size() == 2, "both windows are held");
+    check(mem.windows[0].va == 0x1000 && mem.windows[1].va == 0x2000,
+          "the windows are kept in address order");
+
+    std::uint64_t v = 0;
+    check(mem.read(0x1000, 64, &v) && v == 0x1716151413121110ull,
+          "a window answers a read at its first byte, little endian");
+    check(mem.read(0x1004, 32, &v) && v == 0x17161514ull,
+          "a read inside a window answers");
+    check(mem.read(0x1008, 64, &v) && v == 0x1f1e1d1c1b1a1918ull,
+          "a read ending on the window's last byte answers");
+    check(mem.read(0x2000, 64, &v) && v == 0xaaaaaaaaaaaaaaaaull,
+          "the second window answers too");
+
+    check(!mem.read(0x100c, 64, &v),
+          "a read that runs past the window is refused, not truncated");
+    check(!mem.read(0xff8, 16, &v), "a read that starts below a window is refused");
+    check(!mem.read(0x1800, 8, &v), "a read in the gap between windows is refused");
+    check(!mem.read(0x2000, 72, &v), "a read past the last window is refused");
+    check(!mem.read(0, 8, &v), "a null address is no address");
+    check(!mem.read(0x1000, 0, &v), "a zero width is refused");
+    check(!mem.read(0x1000, 12, &v), "a width that is not whole bytes is refused");
+    check(!mem.read(0x1000, 72, &v), "a width past a register is refused");
+}
+
+void test_trace_memory_later_record_wins() {
+    // Two records that overlap are a hand-built reader's doing, and the one
+    // fed second is the later read of those bytes: it wins where it covers
+    // rather than being dropped for the collision.
+    lift::TraceMemory mem;
+    mem.add(0x1000, std::vector<std::uint8_t>(8, 0x11));
+    mem.add(0x1004, std::vector<std::uint8_t>(8, 0x22));
+
+    std::uint64_t v = 0;
+    check(mem.read(0x1004, 32, &v) && v == 0x22222222ull,
+          "the later record's bytes are the ones served");
+    check(mem.read(0x1000, 32, &v) && v == 0x11111111ull,
+          "the bytes only the earlier record covers keep their value");
+    check(!mem.read(0x1000, 64, &v),
+          "a read across the seam is refused: no single window holds it");
+}
+
+void test_trace_memory_refuses_nothing_windows() {
+    // A trace from a runtime built before the tracer carried pages has no
+    // windows at all, and the reader must say so rather than answer with a
+    // zero: an unverifiable prediction is honest, a fabricated byte is not.
+    lift::TraceMemory mem;
+    std::uint64_t v = 0xdeadbeefull;
+    check(!mem.read(0x1000, 8, &v), "an empty trace carries no bytes");
+    check(v == 0xdeadbeefull, "and the output is left untouched");
+}
+
 }  // namespace
 
 int main() {
@@ -1024,6 +1092,9 @@ int main() {
     run("effect_label", test_effect_label_names_the_operation);
     run("infer_layout", test_infer_layout_reads_the_handlers);
     run("infer_layout_stack", test_infer_layout_leaves_a_stack_machine_alone);
+    run("trace_memory", test_trace_memory_serves_its_windows);
+    run("trace_memory_overlap", test_trace_memory_later_record_wins);
+    run("trace_memory_empty", test_trace_memory_refuses_nothing_windows);
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

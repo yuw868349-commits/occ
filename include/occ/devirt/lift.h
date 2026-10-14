@@ -75,6 +75,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -122,6 +123,14 @@ struct Convention {
     bool operator==(const Convention&) const = default;
 };
 inline const Convention kDefaultConvention{};
+
+// The general registers a Row carries, in the x86-64 encoding order. A
+// model names a register by its own name, and this is the order the trace
+// writes them in, so the two have to stay in step.
+inline constexpr const char* kRowGprNames[16] = {
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
+};
 
 // One decoded instruction with its operands in structured form. The
 // mnemonic and the operand kinds come from the inspector's decoder; the
@@ -371,6 +380,25 @@ struct Row {
     std::uint64_t st0 = 0;
     std::uint64_t st1 = 0;
     std::uint64_t st2 = 0;
+    // The same window around rsp. The tracer records both because which
+    // of them is the virtual stack is a question about the model, not
+    // about the machine, and a convention whose stack register is rsp
+    // reads its slots from here. `rt_present` says whether the trace
+    // carried the window at all: a trace written before the tracer read
+    // it has the fields but nothing behind them, and a slot the trace did
+    // not read must stay unverifiable rather than be seeded from zero.
+    std::array<std::uint64_t, 8> rt{};
+    bool rt_present = false;
+    // Every general register, in kRowGprNames order. A model can lean on
+    // any -- a bytecode buffer held in r8, a register file indexed by
+    // r11 -- and a prediction about one can only be checked if the trace
+    // carries it. `gpr_present` says which of them it does, bit i for
+    // `gpr[i]`: the same table holds zeros for registers an older trace
+    // never sampled, and a zero that stands for "not recorded" is
+    // indistinguishable from a register that really held zero, so the
+    // lookup answers only for the ones the trace names.
+    std::array<std::uint64_t, 16> gpr{};
+    std::uint32_t gpr_present = 0;
     // What the dispatcher read out of its handler table for this step.
     // Whether that value is the handler's own address or a rotated form of
     // it is a property of the VM family, not of the trace -- see
@@ -500,8 +528,43 @@ struct Conformance {
 // `code_bytes` supplies bytes of the image at a virtual address, which is
 // what binds the bytecode and rip-relative inputs; leave it null and
 // those predictions are counted unverifiable rather than checked.
+//
+// An engine need not keep its bytecode in the image. A packer that
+// decrypts its program into a buffer it allocated at run time leaves
+// those bytes in no file at all, and the only place they exist is the
+// trace the runtime wrote while the engine read them. `TraceMemory` is
+// the reader for exactly those bytes, and a caller that holds one passes
+// it through `code_bytes` alongside the image -- the two answer for
+// different address ranges, so which one holds an address is the address
+// itself and not a choice the checker makes.
 using CodeReader = bool (*)(void* ctx, std::uint64_t va, unsigned width,
                             std::uint64_t* out);
+
+// The bytes the trace itself carried.
+//
+// The image dump holds the image. A page the engine allocated while it ran
+// -- the buffer it decrypted its bytecode into, the register file its
+// handlers index -- is in no file, so the trace is the only source of its
+// bytes. The tracer writes one window per address it saw a register name;
+// this is the reader that serves them, and it exists so that a prediction
+// about a bytecode operand is checked against the bytes the engine really
+// read rather than counted unverifiable.
+//
+// A window is held whole and answered whole: a read that a window does
+// not contain end to end is a read the trace never carried, and half an
+// answer would be a value no run produced.
+struct TraceMemory {
+    struct Window {
+        std::uint64_t va = 0;
+        std::vector<std::uint8_t> bytes;
+    };
+    // Sorted by `va`, and disjoint for every trace the tracer writes.
+    std::vector<Window> windows;
+
+    void add(std::uint64_t va, std::vector<std::uint8_t> bytes);
+    [[nodiscard]] bool read(std::uint64_t va, unsigned width,
+                            std::uint64_t* out) const;
+};
 
 [[nodiscard]] Conformance check_trace(
     Model& model, const std::vector<Handler>& handlers,

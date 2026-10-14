@@ -75,11 +75,48 @@ const std::vector<std::uint8_t> kByteR12 = {
 
 constexpr std::uint64_t kHandlerVa = 0x1000;
 
+// Seeds the general-register table the tracer extension added from the
+// five named fields, so a hand-built row is as coherent as one the
+// tracer wrote: a model that leans on any register -- rcx for the
+// dispatcher's read-ahead target, r8 for a bytecode buffer -- reads the
+// same table a real trace fills, and a row that predates the extension
+// keeps binding exactly the five it always did. Each seed marks the
+// register present, because a row that carries a value and a row that
+// left the field zero are the same number and only the mask tells them
+// apart.
+void mirror(lift::Row& r) {
+    for (std::size_t i = 0; i < r.gpr.size(); ++i) {
+        const std::string name = lift::kRowGprNames[i];
+        std::uint64_t v = 0;
+        bool carried = true;
+        if (name == "rsi") {
+            v = r.rsi;
+        } else if (name == "rbp") {
+            v = r.rbp;
+        } else if (name == "rdi") {
+            v = r.rdi;
+        } else if (name == "rsp") {
+            v = r.rsp;
+        } else if (name == "r12") {
+            v = r.r12;
+        } else {
+            carried = false;
+        }
+        if (carried) {
+            r.gpr[i] = v;
+            r.gpr_present |= std::uint32_t{1} << i;
+        }
+    }
+}
+
 // A row with all six sampled fields set. st0/st1/st2 default to zero;
-// the tests that use them overwrite the fields afterwards.
+// the tests that use them overwrite the fields afterwards. `rcx` is the
+// dispatcher's read-ahead target -- the word it read for the step this
+// dispatch hands off to -- which is what a handler's `jmp rcx` lands on.
 lift::Row row(std::uint64_t seq, std::uint64_t rsi, std::uint64_t rbp,
               std::uint64_t rdi, std::uint64_t rsp, std::uint64_t r12,
-              std::uint64_t st0, std::uint64_t st1, std::uint64_t st2) {
+              std::uint64_t st0, std::uint64_t st1, std::uint64_t st2,
+              std::uint64_t rcx = 0) {
     lift::Row r;
     r.seq = seq;
     r.rsi = rsi;
@@ -90,6 +127,9 @@ lift::Row row(std::uint64_t seq, std::uint64_t rsi, std::uint64_t rbp,
     r.st0 = st0;
     r.st1 = st1;
     r.st2 = st2;
+    r.gpr[1] = rcx;
+    r.gpr_present |= std::uint32_t{1} << 1;
+    mirror(r);
     return r;
 }
 
@@ -228,15 +268,36 @@ void test_lift_permuted_convention() {
           "the cursor role advances on r12");
 
     // A trace built around the permuted stack register (rdi) conforms to
-    // the model: the cells are around rdi, the cursor is in r12.
+    // the model: the cells are around rdi, the cursor is in r12. The
+    // dispatcher reads the word for the step it hands off to before it
+    // jumps, so rcx at a dispatch is the next handler's address -- with
+    // the general-register table carried by the trace, the model's
+    // `jmp rcx` target is a checked prediction rather than an unknown.
     std::vector<lift::Row> rows;
-    rows.push_back(row(1, 0x5000, 0x4000, 0x3000, 0x7000, 0x2000, 5, 7, 9));
+    rows.push_back(row(1, 0x5000, 0x4000, 0x3000, 0x7000, 0x2000, 5, 7, 9,
+                       kHandlerVa));
     rows.push_back(row(2, 0x5000, 0x4000, 0x3008, 0x7000, 0x2000, 12, 9, 0));
     const std::vector<std::size_t> which = {0, 0};
     const lift::Conformance c =
         lift::check_trace(m, {h}, rows, which, nullptr, nullptr);
     check(c.mismatched == 0, "the permuted-convention trace conforms");
-    check(c.checked >= 3, "the cells and pointers are checked");
+    check(c.checked >= 4, "the cells, the pointers and the target are checked");
+
+    // The same trace with rcx marked absent -- the shape a trace from
+    // before the tracer carried the general table has -- must leave the
+    // target prediction unverifiable rather than bind it to the zero the
+    // field holds. A fabricated value would either invent agreement or
+    // invent a mismatch, and both are worse than saying nothing.
+    std::vector<lift::Row> bare = rows;
+    for (lift::Row& r : bare) {
+        r.gpr_present &= ~(std::uint32_t{1} << 1);
+        r.gpr[1] = 0;
+    }
+    const lift::Conformance b =
+        lift::check_trace(m, {h}, bare, which, nullptr, nullptr);
+    check(b.mismatched == 0, "an uncarried register invents no mismatch");
+    check(b.unverifiable > c.unverifiable,
+          "and its prediction is reported unverifiable, not bound to zero");
 }
 
 // ------------------------------------------------------- the static lift

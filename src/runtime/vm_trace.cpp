@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -54,6 +55,29 @@ constexpr DispatchIdiom kIdioms[] = {
 // The ring buffer's depth: the tail the trace can show around a crash.
 constexpr std::size_t kRingDepth = 512;
 
+// The general registers, in the x86-64 encoding order, and their names.
+// The trace carries all of them under their own names: a model can lean on
+// any -- a bytecode buffer held in r8, a register file indexed by r11 --
+// and a prediction that leans on one can only be checked if the trace has
+// it. The names are the trace's, the order is the array's, and the two
+// have to stay in step.
+constexpr int kGprOrder[16] = {
+    REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+    REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15,
+};
+constexpr const char* kGprNames[16] = {
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
+};
+
+// One value as the trace writes it: hex without a prefix, because every
+// field of the line is one and the quotes carry the rest.
+std::string hex_of(std::uint64_t v) {
+    char b[24];
+    std::snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v));
+    return b;
+}
+
 struct DispatchRecord {
     std::uint64_t t;      // CLOCK_MONOTONIC ns
     std::uint64_t rip;    // dispatch address
@@ -70,6 +94,15 @@ struct DispatchRecord {
     std::uint64_t st0;
     std::uint64_t st1;
     std::uint64_t st2;
+    // The same window around rsp. An engine that keeps its register file
+    // at a register other than rbp has its cells read here too; which of
+    // the two windows is the file is decided afterwards, by the model,
+    // because the tracer's job is to record what the machine held and not
+    // to decide what the machine meant.
+    std::uint64_t rt[8];
+    // Every general register, under its own name, so the checker can bind
+    // any the model names.
+    std::uint64_t gpr[16];
 };
 
 // The trace's switch and output, read once.
@@ -95,8 +128,12 @@ DispatchSite g_sites[kMaxCandidates];
 std::size_t g_dispatch_count = 0;
 bool g_resolved = false;
 
-// The image base the trace armed against.
+// The image base the trace armed against, and its mapped size. The tracer
+// needs both to tell a register that names guest memory from one that
+// names the image: the image is in the dump already, so a window over it
+// would be carried twice, and only the pages above it are the engine's own.
 std::uint64_t g_image_base = 0;
+std::uint64_t g_image_size = 0;
 
 // The virtual clock's epoch (real tick at the first dispatch) and the
 // clean dispatch rate the clock pretends. A thousand dispatches a
@@ -130,6 +167,246 @@ std::size_t g_ring_pos = 0;
 
 // How many dispatches were recorded.
 std::uint64_t g_recorded = 0;
+
+// What the trace carries beyond the dispatch rows.
+//
+// The image dump carries the image. A page the engine allocated at run
+// time -- the buffer it decrypted its bytecode into, the register file
+// its handlers index -- is in no file, and the only source of its bytes
+// is the run itself. The tracer therefore carries those pages: at a
+// dispatch it reads the window around every register that names guest
+// memory and writes the ones it has not written yet. The de-virtualizer
+// then holds the bytes behind an address a handler read, so a prediction
+// about a bytecode operand is checked instead of counted unverifiable.
+//
+// A window is written once, when a register first names it, and not once
+// per dispatch: these are the engine's own bytes, they do not change from
+// step to step, and a trace that repeated sixteen kilobytes three hundred
+// times would be a file whose payload is noise. A window the engine moves
+// into later -- a buffer it reallocates, a stack that grows -- is written
+// when a register first names that one.
+constexpr std::uint64_t kSnapshotWindow = 0x4000;  // 16 KiB per window
+constexpr std::size_t kMaxSnapshots = 512;
+std::uint64_t g_snapshot_windows[kMaxSnapshots];
+std::size_t g_snapshot_count = 0;
+bool g_snapshot_full_reported = false;
+
+// The guest's own mappings, from /proc/self/maps. A window may only be
+// read where the guest mapped it: a register can name an address the
+// engine never touched -- a length that happens to look like a pointer, a
+// register the packer left holding a constant -- and reading past the end
+// of a mapping faults inside the signal handler the trace runs in, which
+// is the one context where a fault cannot be delivered. The map answers
+// "may this page be read", and it is read with the raw syscalls a handler
+// is allowed to make.
+constexpr std::size_t kMaxGuestRanges = 128;
+struct GuestRange {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+};
+GuestRange g_guest_ranges[kMaxGuestRanges];
+std::size_t g_guest_range_count = 0;
+bool g_guest_ranges_ready = false;
+constexpr std::size_t kMapsBuffer = 1 << 17;
+char g_maps_buffer[kMapsBuffer];
+
+// The highest address above the image a guest mapping may start at. The
+// guest's own mappings sit at and above the image -- the image itself, the
+// heap the engine allocated, its stack -- while this runtime's own
+// mappings (the libc it is linked against, its heap, its thread stacks)
+// are elsewhere in the address space. A gigabyte above the image is far
+// past any heap a packed program allocates and far below where the host's
+// own libraries land.
+constexpr std::uint64_t kGuestCeiling = 0x40000000;
+
+// One hexadecimal field of a maps line, stopping at the first byte that is
+// not a hex digit. True when at least one digit was read.
+[[nodiscard]] bool parse_hex_field(const char* p, const char* end,
+                                   std::uint64_t* out) noexcept {
+    std::uint64_t v = 0;
+    std::size_t digits = 0;
+    while (p < end) {
+        const unsigned c = static_cast<unsigned>(*p);
+        unsigned nibble = 0;
+        if (c >= '0' && c <= '9') {
+            nibble = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            nibble = c - 'a' + 10u;
+        } else if (c >= 'A' && c <= 'F') {
+            nibble = c - 'A' + 10u;
+        } else {
+            break;
+        }
+        v = (v << 4) | nibble;
+        ++p;
+        ++digits;
+    }
+    *out = v;
+    return digits != 0;
+}
+
+void parse_guest_ranges() noexcept {
+    g_guest_ranges_ready = true;
+    const long fd = ::syscall(SYS_openat, AT_FDCWD, "/proc/self/maps",
+                              O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    const long n = ::syscall(SYS_read, fd, g_maps_buffer, kMapsBuffer - 1);
+    ::syscall(SYS_close, fd);
+    if (n <= 0) {
+        return;
+    }
+    g_maps_buffer[n] = '\0';
+    const char* const base = g_maps_buffer;
+    const char* const stop = base + n;
+    for (const char* line = base; line < stop && g_guest_range_count < kMaxGuestRanges;) {
+        const char* eol = line;
+        while (eol < stop && *eol != '\n') {
+            ++eol;
+        }
+        const char* dash = line;
+        while (dash < eol && *dash != '-') {
+            ++dash;
+        }
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+        if (dash < eol && parse_hex_field(line, dash, &lo) &&
+            parse_hex_field(dash + 1, eol, &hi)) {
+            // The permission field follows the two addresses. Only a
+            // readable mapping may be read; a guard page reports `---p`
+            // and faulting on it would take the process down.
+            const char* sp = dash;
+            while (sp < eol && *sp != ' ') {
+                ++sp;
+            }
+            const bool readable = sp + 1 < eol && sp[1] == 'r';
+            if (readable && hi > lo && lo >= g_image_base &&
+                lo < g_image_base + kGuestCeiling &&
+                hi > g_image_base + g_image_size) {
+                g_guest_ranges[g_guest_range_count].lo = lo;
+                g_guest_ranges[g_guest_range_count].hi = hi;
+                ++g_guest_range_count;
+            }
+        }
+        line = eol + 1;
+        if (eol == stop) {
+            break;
+        }
+    }
+}
+
+// The window worth reading around a register value: the sixteen-kilobyte
+// span that holds it, clamped to the mapping it lies in, so that a value
+// near the end of a mapping yields a shorter window rather than a read
+// past the end. False when the value names no guest mapping at all.
+[[nodiscard]] bool guest_window(std::uint64_t value, std::uint64_t* lo,
+                                std::uint64_t* hi) noexcept {
+    if (value == 0) {
+        return false;
+    }
+    for (std::size_t i = 0; i < g_guest_range_count; ++i) {
+        const GuestRange& r = g_guest_ranges[i];
+        if (value < r.lo || value >= r.hi) {
+            continue;
+        }
+        const std::uint64_t start = value & ~(kSnapshotWindow - 1);
+        const std::uint64_t from = start < r.lo ? r.lo : start;
+        const std::uint64_t to =
+            r.hi < start + kSnapshotWindow ? r.hi : start + kSnapshotWindow;
+        if (to <= from) {
+            return false;
+        }
+        *lo = from;
+        *hi = to;
+        return true;
+    }
+    return false;
+}
+
+// The trace's switch and output, opened on first use.
+void ensure_sink() noexcept {
+    if (g_file == nullptr && !g_to_stderr && !g_path.empty()) {
+        g_file = std::fopen(g_path.c_str(), "w");
+        if (g_file == nullptr) {
+            std::fprintf(stderr, "occ vm: cannot open %s; tracing to stderr\n",
+                         g_path.c_str());
+            g_to_stderr = true;
+        }
+    }
+}
+
+void emit_line(const std::string& line) noexcept {
+    if (g_to_stderr) {
+        std::fputs(line.c_str(), stderr);
+    } else if (g_file != nullptr) {
+        std::fwrite(line.data(), 1, line.size(), g_file);
+        std::fflush(g_file);
+    }
+}
+
+// The window, as a `memory` record: the address it starts at, its length,
+// and its bytes. The row that follows the record is the dispatch whose
+// registers named it, so a reader that streams the trace has the bytes in
+// hand before it reads the row that indexes them.
+void emit_memory(std::uint64_t seq, std::uint64_t va,
+                 std::uint64_t size) noexcept {
+    static constexpr char kHex[] = "0123456789abcdef";
+    const auto* p = reinterpret_cast<const std::uint8_t*>(va);
+    std::string line;
+    line.reserve(static_cast<std::size_t>(size) * 2 + 96);
+    line += "{\"kind\":\"memory\",\"seq\":";
+    line += std::to_string(seq);
+    line += ",\"va\":\"0x" + hex_of(va);
+    line += "\",\"size\":\"" + std::to_string(size);
+    line += "\",\"bytes\":\"";
+    for (std::uint64_t i = 0; i < size; ++i) {
+        line.push_back(kHex[p[i] >> 4]);
+        line.push_back(kHex[p[i] & 0x0fu]);
+    }
+    line += "\"}\n";
+    emit_line(line);
+}
+
+// Writes the window around every register that names guest memory the
+// trace has not carried yet. Called before the dispatch row is written,
+// so the bytes precede the row that reads them.
+void snapshot_windows(std::uint64_t seq, const std::uint64_t gpr[16]) noexcept {
+    if (!g_guest_ranges_ready) {
+        parse_guest_ranges();
+    }
+    if (g_guest_range_count == 0) {
+        return;
+    }
+    for (std::size_t i = 0; i < 16; ++i) {
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+        if (!guest_window(gpr[i], &lo, &hi)) {
+            continue;
+        }
+        bool known = false;
+        for (std::size_t k = 0; k < g_snapshot_count; ++k) {
+            if (g_snapshot_windows[k] == lo) {
+                known = true;
+                break;
+            }
+        }
+        if (known) {
+            continue;
+        }
+        if (g_snapshot_count == kMaxSnapshots) {
+            if (!g_snapshot_full_reported) {
+                g_snapshot_full_reported = true;
+                std::fprintf(stderr,
+                             "occ vm: the trace's memory windows are full; "
+                             "pages the guest reaches later are not carried\n");
+            }
+            continue;
+        }
+        g_snapshot_windows[g_snapshot_count++] = lo;
+        emit_memory(seq, lo, hi - lo);
+    }
+}
 
 [[nodiscard]] bool read_once_enabled() noexcept {
     const char* value = ::getenv("OCC_VM_TRACE");
@@ -220,6 +497,7 @@ void arm_trap(std::uint64_t image_base) noexcept {
         if (pe_at != 0 && std::memcmp(img + pe_at, "PE\0\0", 4) == 0) {
             const std::uint32_t image_size =
                 *reinterpret_cast<const std::uint32_t*>(img + pe_at + 0x50);
+            g_image_size = image_size;
             for (std::uint64_t off = 0;
                  off + 8 < image_size && g_dispatch_count < kMaxCandidates;
                  ++off) {
@@ -364,6 +642,24 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
             rec.st1 = stack[1];
             rec.st2 = stack[2];
         }
+        // The same window around rsp, and every general register. An
+        // engine that indexes a file of its own needs both read, and
+        // recording them is what lets the de-virtualizer check a
+        // prediction about an indexed access instead of counting it
+        // unverifiable.
+        for (std::size_t i = 0; i < 8; ++i) {
+            rec.rt[i] = 0;
+        }
+        if (rec.rsp >= 0x10000 && rec.rsp < 0x7ffffffff000ull) {
+            const auto* file = reinterpret_cast<const std::uint64_t*>(
+                rec.rsp & ~7ull);
+            for (std::size_t i = 0; i < 8; ++i) {
+                rec.rt[i] = file[i];
+            }
+        }
+        for (std::size_t i = 0; i < 16; ++i) {
+            rec.gpr[i] = static_cast<std::uint64_t>(g[kGprOrder[i]]);
+        }
 
         // The handler pointer is in the table the guest indexes: this
         // process maps the guest, so the read is a plain load from the
@@ -401,41 +697,44 @@ bool service_fetch(::ucontext_t* uc, std::uint64_t rip) noexcept {
                                   1000000ull;
         }
 
-        if (g_file == nullptr && !g_to_stderr && !g_path.empty()) {
-            g_file = std::fopen(g_path.c_str(), "w");
-            if (g_file == nullptr) {
-                std::fprintf(stderr,
-                             "occ vm: cannot open %s; tracing to stderr\n",
-                             g_path.c_str());
-                g_to_stderr = true;
-            }
+        // The pages this dispatch's registers name come first, so a reader
+        // that walks the trace in order holds the bytes before the row that
+        // indexes them.
+        ensure_sink();
+        snapshot_windows(g_recorded, rec.gpr);
+        // The line is built rather than formatted in one call: the record
+        // carries a variable tail now -- eight cells and sixteen registers
+        // -- and a format string with that many arguments is a place for
+        // the arguments to drift out of step with the text.
+        std::string line;
+        line.reserve(1024);
+        line += "{\"kind\":\"dispatch\",\"seq\":";
+        line += std::to_string(g_recorded);
+        line += ",\"va\":\"0x" + hex_of(rec.rip);
+        line += "\",\"index\":\"0x" + hex_of(rec.index);
+        line += "\",\"base\":\"0x" + hex_of(rec.base);
+        line += "\",\"target\":\"0x" + hex_of(rec.target);
+        line += "\",\"rsi\":\"0x" + hex_of(rec.rsi);
+        line += "\",\"rdi\":\"0x" + hex_of(rec.rdi);
+        line += "\",\"rsp\":\"0x" + hex_of(rec.rsp);
+        line += "\",\"rbp\":\"0x" + hex_of(rec.rbp);
+        line += "\",\"st0\":\"0x" + hex_of(rec.st0);
+        line += "\",\"st1\":\"0x" + hex_of(rec.st1);
+        line += "\",\"st2\":\"0x" + hex_of(rec.st2);
+        line += "\"";
+        char b[48];
+        for (std::size_t i = 0; i < 8; ++i) {
+            std::snprintf(b, sizeof(b), ",\"rt%zu\":\"0x%llx\"", i,
+                          static_cast<unsigned long long>(rec.rt[i]));
+            line += b;
         }
-        char line[400];
-        const int n = std::snprintf(
-            line, sizeof(line),
-            "{\"kind\":\"dispatch\",\"seq\":%llu,\"va\":\"0x%llx\","
-            "\"index\":\"0x%llx\",\"base\":\"0x%llx\",\"target\":\"0x%llx\","
-            "\"rsi\":\"0x%llx\",\"rdi\":\"0x%llx\",\"rsp\":\"0x%llx\","
-            "\"rbp\":\"0x%llx\",\"st0\":\"0x%llx\",\"st1\":\"0x%llx\","
-            "\"st2\":\"0x%llx\"}\n",
-            static_cast<unsigned long long>(g_recorded),
-            static_cast<unsigned long long>(rec.rip),
-            static_cast<unsigned long long>(rec.index),
-            static_cast<unsigned long long>(rec.base),
-            static_cast<unsigned long long>(rec.target),
-            static_cast<unsigned long long>(rec.rsi),
-            static_cast<unsigned long long>(rec.rdi),
-            static_cast<unsigned long long>(rec.rsp),
-            static_cast<unsigned long long>(rec.rbp),
-            static_cast<unsigned long long>(rec.st0),
-            static_cast<unsigned long long>(rec.st1),
-            static_cast<unsigned long long>(rec.st2));
-        if (g_to_stderr) {
-            std::fprintf(stderr, "%s", line);
-        } else if (g_file != nullptr) {
-            std::fwrite(line, 1, static_cast<std::size_t>(n), g_file);
-            std::fflush(g_file);
+        for (std::size_t i = 0; i < 16; ++i) {
+            std::snprintf(b, sizeof(b), ",\"%s\":\"0x%llx\"", kGprNames[i],
+                          static_cast<unsigned long long>(rec.gpr[i]));
+            line += b;
         }
+        line += "}\n";
+        emit_line(line);
     }
 
     // Whatever the fetch was, the instruction must now run: the page's
