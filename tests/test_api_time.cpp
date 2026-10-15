@@ -366,7 +366,7 @@ void test_registration() {
         }
     }
     check(addressed, "time: every entry has a name and an address");
-    check(list.size() == 20, "time: the domain contributes twenty names");
+    check(list.size() == 21, "time: the domain contributes twenty-one names");
 }
 
 }  // namespace

@@ -1133,6 +1133,56 @@ extern "C" __attribute__((ms_abi)) std::uint64_t k32ad2_SetThreadAffinityMask(
     return previous;
 }
 
+// The process's affinity, which is the same call as the thread's with the
+// process as the target. Linux's `sched_setaffinity` takes a thread id and
+// the main thread *is* the process, so the same two syscalls serve both --
+// which is the shape Windows has as well, where a process's affinity is the
+// main thread's until other threads are created.
+extern "C" __attribute__((ms_abi)) std::int32_t k32ad2_SetProcessAffinityMask(
+    std::uint64_t process, std::uint64_t mask) noexcept {
+    // The pseudo handle is what a program passes for its own process, and
+    // the process id is the other spelling of the same thing. Anything else
+    // names a process this runtime has no handle to.
+    constexpr std::uint64_t kCurrentProcess = 0xFFFFFFFFFFFFFFFFULL;
+    if (process != kCurrentProcess &&
+        process != static_cast<std::uint64_t>(::getpid())) {
+        set_last_error(kErrorInvalidHandle);
+        return 0;
+    }
+    if (mask == 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        set_last_error(kErrorInvalidFunction);
+        return 0;
+    }
+    std::uint64_t previous = 0;
+    if (!mask_from_cpu_set(allowed, previous)) {
+        set_last_error(kErrorNotSupported);
+        return 0;
+    }
+    if ((mask & ~previous) != 0) {
+        set_last_error(kErrorInvalidParameter);
+        return 0;
+    }
+    cpu_set_t wanted;
+    CPU_ZERO(&wanted);
+    for (std::uint32_t cpu = 0; cpu < 64; ++cpu) {
+        if ((mask & (std::uint64_t{1} << cpu)) != 0) {
+            CPU_SET(static_cast<int>(cpu), &wanted);
+        }
+    }
+    if (::sched_setaffinity(0, sizeof(wanted), &wanted) != 0) {
+        set_last_error(kErrorAccessDenied);
+        return 0;
+    }
+    set_last_error(kErrorSuccess);
+    return 1;
+}
+
 // The thread's CPU consumption as a cycle-time stand-in. Linux exposes no
 // per-thread cycle counter; the thread's CPU time in 100ns units is the
 // honest value a caller can compare and act on. Only the calling thread can
@@ -2218,6 +2268,8 @@ void add_kernel32_antidebug2(ExportList& out) {
       reinterpret_cast<void*>(&k32ad2_SetProcessDEPPolicy));
     // The process and processor queries.
     e("GetProcessTimes", reinterpret_cast<void*>(&k32ad2_GetProcessTimes));
+    e("SetProcessAffinityMask",
+      reinterpret_cast<void*>(&k32ad2_SetProcessAffinityMask));
     e("SetThreadAffinityMask",
       reinterpret_cast<void*>(&k32ad2_SetThreadAffinityMask));
     e("QueryThreadCycleTime",

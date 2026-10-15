@@ -590,6 +590,8 @@ add_library(occ_core STATIC
     src/runtime/ntdll.cpp
     src/runtime/objects.cpp
     src/runtime/pe_process.cpp
+    src/runtime/module_table.cpp
+    src/runtime/dll_runtime.cpp
     src/runtime/seh.cpp
     src/runtime/winabi.cpp
     src/runtime/guest_thread.cpp
@@ -723,6 +725,7 @@ add_executable(occ
     src/cmd_attach.cpp
     src/cmd_stop.cpp
     src/cmd_inspect.cpp
+    src/cmd_dll.cpp
     src/cmd_devirt.cpp
 )
 

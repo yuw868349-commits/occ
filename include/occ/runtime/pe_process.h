@@ -85,6 +85,16 @@ struct ProcessOptions {
     std::uint64_t stack_reserve = 1024 * 1024;
     std::uint64_t stack_commit = 4 * 1024;
 
+    // Whether the image is a library rather than a program.
+    //
+    // A DLL is not started: a program's entry point is jumped to and a
+    // library's entry point is *called* with a reason. The two are different
+    // shapes of run, and the loading path is the only part they share --
+    // which is why this is a flag on the build and not a second builder. A
+    // false here with a DLL is refused before anything is mapped, because
+    // the alternative is a process with an image nothing will call.
+    bool loading_library = false;
+
     // A directory to resolve the image's own name against, for a program
     // that asks for its current directory during startup. Empty means the
     // host's current directory, which is what a caller who did not think
@@ -308,5 +318,114 @@ struct RunOutcome {
 };
 
 [[nodiscard]] RunOutcome run_pe_process(PeProcess& process) noexcept;
+
+// ------------------------------------------------------------ guest calls
+//
+// The other shape a call into guest code takes: one that returns.
+//
+// `run_pe_process` jumps to an entry point and never comes back through the
+// ordinary path -- a program leaves by `ExitProcess` or by faulting -- so its
+// return leg is a long jump from the terminate path. A `DllMain` returns. So
+// does an export a caller asked for. This is the machinery for those: the
+// same state, the same fault boundary and the same segment base, with a
+// `call` that comes back and an answer that travels with it.
+
+// The arguments of one call, as the guest's convention lays them out.
+//
+// **The convention is positional.** The first four arguments go in
+// registers, one register per *position*: position 1 in `rcx` or `xmm0`,
+// position 2 in `rdx` or `xmm1`, and so on, with the register chosen by the
+// argument's type and not by how many arguments of that type came before
+// it. `f(int, double)` therefore puts the integer in `rcx` and the double in
+// `xmm1`, and a caller that counted the two sequences apart -- as this
+// runtime's first cut did -- puts the double in `xmm0` and the integer on
+// the stack, which is a call with both arguments wrong.
+//
+// A slot is one position, carrying both the class and the value, because
+// that is what the layout needs. A fifth argument travels on the stack,
+// which this call does not place: `cmd_dll` refuses one rather than making a
+// call with an argument missing, and the refusal says why.
+struct GuestCallArgs {
+    struct Slot {
+        bool floating = false;
+        double as_float = 0;
+        std::uint64_t as_integer = 0;
+    };
+    struct Slot slots[4];
+    std::size_t count = 0;
+    // Whether the answer comes back in a vector register. The guest
+    // convention has two places an answer can be, chosen by the function's
+    // declared return type, and a file carries no type information: the
+    // export table names an address and nothing about its signature. So the
+    // caller says, and the answer is read from the register the type names.
+    //
+    // The bit pattern is what travels either way, so a `double` answer is
+    // the same eight bytes a caller reading it as an integer would see.
+    bool floating_result = false;
+};
+
+struct GuestCallOutcome {
+    // True when the call returned. False when it faulted or ended the
+    // process, which the fault fields then describe.
+    bool ok = false;
+    bool faulted = false;
+    std::uint64_t result = 0;
+    std::uint64_t fault_address = 0;
+    int signal = 0;
+    std::string detail;
+};
+
+// A sequence of calls into one process.
+//
+// The state the thunks read is built once and reused, and that is the point
+// rather than an optimization. Building it runs the modules' TLS
+// process-attach callbacks and installs their per-thread blocks; assembling
+// it before every call would run every module's initializer again for every
+// call, which is a module initialized four times by four `call`s. One session
+// is one process's worth of setup, and the calls made through it share it.
+//
+// An incomplete type: what a session holds is the state, the fault
+// bookkeeping and the host's segment base, and none of that belongs in a
+// header a caller reads to learn what a call is.
+class GuestCallSession;
+
+// The session's deleter. A function rather than `std::default_delete`,
+// because the session's body is private to the layer that calls into a
+// guest: a caller holding the pointer has no definition to delete through,
+// and rightly so -- what it holds is not the caller's business.
+struct GuestCallSessionDeleter {
+    void operator()(GuestCallSession* session) const noexcept;
+};
+
+using GuestCallSessionPtr = std::unique_ptr<GuestCallSession,
+                                            GuestCallSessionDeleter>;
+
+[[nodiscard]] GuestCallSessionPtr make_guest_call_session(PeProcess& process);
+
+// Whether the session's state was assembled, and why it was not.
+//
+// Two functions rather than a member on an incomplete type: what a session
+// holds stays private to the layer that knows how to call into a guest, and
+// a caller only ever needs to know whether it can call.
+[[nodiscard]] bool guest_call_session_ready(
+    const GuestCallSession& session) noexcept;
+[[nodiscard]] const std::string& guest_call_session_error(
+    const GuestCallSession& session) noexcept;
+
+// Calls `entry` -- a guest address the caller holds, from an export table or
+// an entry point field -- and returns its answer.
+//
+// The call is made under the session's state, fault boundary and segment
+// base, so a thunk the callee reaches sees the process it was built for. The
+// stack is the host thread's own, which is what a loader calling `DllMain` on
+// the thread that asked for the load gives the callee on Windows as well.
+//
+// A call the guest never returns from -- because it faulted, or because it
+// called `ExitProcess` -- leaves the session usable for the calls after it:
+// the fault boundary and the segment base are restored either way, and what
+// the guest did to its own state is what the guest did.
+[[nodiscard]] GuestCallOutcome call_guest_entry(
+    PeProcess& process, GuestCallSession& session, std::uint64_t entry,
+    const GuestCallArgs& args) noexcept;
 
 } // namespace occ::runtime

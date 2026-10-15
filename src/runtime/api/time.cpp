@@ -407,6 +407,40 @@ extern "C" __attribute__((ms_abi)) void k32t_GetSystemTimePreciseAsFileTime(
     k32t_GetSystemTimeAsFileTime(out);
 }
 
+// The clock's adjustment parameters.
+//
+// Windows keeps a clock that is periodically nudged rather than stepped, and
+// this call reports how: the size of each adjustment, how often one is
+// applied, and whether the adjustments are switched off. A program that
+// reads it is asking how accurate the clock can be, and the honest answer
+// for this runtime is that the host's clock *is* the clock -- it is not
+// being nudged, and every reading is as good as the last.
+//
+// The three values are the ones a host with adjustment disabled reports:
+// the nominal tick of a system whose clock the kernel owns, expressed in the
+// hundred-nanosecond unit the API uses, and the flag that says no
+// adjustment is being applied.
+extern "C" __attribute__((ms_abi)) std::int32_t k32t_GetSystemTimeAdjustment(
+    std::uint32_t* adjustment, std::uint32_t* increment,
+    std::int32_t* disabled) noexcept {
+    // 15.625 ms, the tick Windows has used since its clock became a counter
+    // the kernel owns rather than the timer interrupt's period.
+    constexpr std::uint32_t kNominalTick100ns = 156250;
+    if (adjustment != nullptr) {
+        *adjustment = kNominalTick100ns;
+    }
+    if (increment != nullptr) {
+        *increment = kNominalTick100ns;
+    }
+    if (disabled != nullptr) {
+        // True, and not as an evasion: there is no adjustment being applied
+        // to this clock, and a program that asked whether there is one is
+        // owed the answer rather than a plausible-looking false.
+        *disabled = 1;
+    }
+    return 1;
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t k32t_SetSystemTime(
     const std::uint8_t* in) noexcept {
     (void)in;
@@ -739,6 +773,8 @@ void add_time_kernel32(ExportList& out) {
       reinterpret_cast<void*>(&k32t_GetDynamicTimeZoneInformation));
     e("GetLocalTime", reinterpret_cast<void*>(&k32t_GetLocalTime));
     e("GetSystemTime", reinterpret_cast<void*>(&k32t_GetSystemTime));
+    e("GetSystemTimeAdjustment",
+      reinterpret_cast<void*>(&k32t_GetSystemTimeAdjustment)),
     e("GetSystemTimeAsFileTime",
       reinterpret_cast<void*>(&k32t_GetSystemTimeAsFileTime));
     e("GetSystemTimePreciseAsFileTime",

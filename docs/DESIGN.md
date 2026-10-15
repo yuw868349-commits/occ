@@ -53,7 +53,7 @@ The split is therefore not "simulated versus native" but "environment versus mac
 | `parser` | Format detection and parsing: PE, ELF |
 | `engine` | Format engines that drive a run |
 | `runner` | The run and debug drivers |
-| `runtime` | The guest runtime: loader, ntdll, SEH, TLS, API simulations, guest threads, memwatch, debugger, VM tracing, 32-bit interpreter |
+| `runtime` | The guest runtime: loader, module ledger and library lifecycle, ntdll, SEH, TLS, API simulations, guest threads, memwatch, debugger, VM tracing, 32-bit interpreter |
 | `syscall` | Kernel ABI: syscall numbers, capabilities, errno |
 | `isolation` | seccomp and container |
 | `observer` | The event stream: probes, watchpoints, registry, RSP, transport, sessions |
@@ -153,7 +153,20 @@ The top of the stack for actually executing something.
 
 ## Runtime
 
-See [RUNTIME.md](RUNTIME.md). In brief, it owns the guest environment: address space ledger, mapper, loader, TLS, TEB/PEB, SEH, the Windows ABI bridge, the guest heap and stdio, the export registry, API set resolution, synthetic guest module images, guest threads, write watching, VM dispatch tracing, image dump and minidump, IAT reconstruction, the 32-bit interpreter, containment, kernel objects, the guest debugger, the API hook, and 70 API simulation files covering 6351 registered exports.
+See [RUNTIME.md](RUNTIME.md). In brief, it owns the guest environment: address space ledger, mapper, loader, TLS, TEB/PEB, SEH, the Windows ABI bridge, the guest heap and stdio, the export registry, API set resolution, synthetic guest module images, the module ledger and the library lifecycle, guest threads, write watching, VM dispatch tracing, image dump and minidump, IAT reconstruction, the 32-bit interpreter, containment, kernel objects, the guest debugger, the API hook, and 70 API simulation files covering 6353 registered exports.
+
+**Two shapes of guest, one runtime.** A program is *jumped to*: its entry
+point takes no arguments, never returns through the ordinary path, and its
+exit is `ExitProcess` or a fault. A library is *called*: its entry point
+takes a reason and returns, and an export takes arguments and returns an
+answer. Everything under the two is the same -- the address space, the
+loader, the TEB and PEB, the state the thunks read, the fault boundary, the
+segment base -- and the layer that names the difference is `pe_process.h`:
+`run_pe_process` is the first shape, `call_guest_entry` the second, and both
+run over the one `build_guest_state` and the one `FaultGuard`. That is why
+`occ dll` exists as a mode of the same runtime rather than as a second
+runtime: a library needs a process built around it, and this is the code
+that builds processes.
 
 ---
 

@@ -26,7 +26,7 @@ The consequence of that last one is worth stating plainly, because it is the thi
 
 **PE parsing and mapping.** Its own parser for headers, sections, imports, exports, TLS, exceptions, resources, and delay imports, and its own loader that maps the image, applies the full relocation type set, rebuilds the import address table, and runs TLS initializers the way a Windows loader would, because guests notice when loading is done differently.
 
-**A Windows runtime on a Linux thread.** Guest TLS, TEB and PEB with the real x64 layouts, SEH dispatch and stack unwinding, a ntdll subset, API set resolution, and 6351 registered exports across 57 modules: kernel32, the UCRT and the classic C runtime across eleven MSVC versions, a large `Rtl*` surface, GDI, USER32, Winsock, crypt32, advapi32 including the whole registry family, rpcrt4, dbghelp, and the rest. Each one is a deliberate re-implementation with real semantics, not a stub that returns zero.
+**A Windows runtime on a Linux thread.** Guest TLS, TEB and PEB with the real x64 layouts, SEH dispatch and stack unwinding, a ntdll subset, API set resolution, and 6353 registered exports across 57 modules: kernel32, the UCRT and the classic C runtime across eleven MSVC versions, a large `Rtl*` surface, GDI, USER32, Winsock, crypt32, advapi32 including the whole registry family, rpcrt4, dbghelp, and the rest. Each one is a deliberate re-implementation with real semantics, not a stub that returns zero.
 
 **Guest threads.** Real threads, each with its own TEB and stack, with `SYS_arch_prctl` setting GS base so guest code can reach its TEB the way it was compiled to.
 
@@ -59,11 +59,24 @@ occ devirt <trace> <dump> [N] [--asm [N]] [-o <report>]
                               [--unknown <va>:<size>] [--goal <condition>]
                               [--explore]
                               offline VM de-virtualization report
+occ dll <file> <mode> [options]
+                              load a library and drive its lifecycle:
+                              attach, call an export, or read calls from
+                              stdin
 occ run32 <image>             run a 32-bit PE image on the in-process
                               interpreter
 occ mdmp <file>               summarize a minidump
 occ doctor                    report what this host can and cannot do
 ```
+
+`occ dll` loads a library rather than starting a program: the entry points
+of the library and of every dependency it needs run in the order a loader
+runs them, dependencies first, and then one of three things happens --
+nothing (`attach`, which is the mode to watch a module's load-time
+behaviour in), a call to one export (`call`), or a prompt (`serve`). The
+arguments are typed on the command line (`i32:5`, `str:hello`, `f64:1.5`)
+because a file carries no signature, and the library's own directory is
+searched for its dependencies before anywhere else.
 
 The debugger: `b` and `hb` arm breakpoints, software and hardware. `del` and `hbd` disarm. `breaks` lists both. `r` runs, `s` steps, `regs` shows the register file, `x` examines memory, `mdmp` writes a minidump of the stopped guest, `q` quits.
 

@@ -2,7 +2,7 @@
 
 What this runtime answers, what it does not, and how the API surface is organized. All figures come from the source: `src/runtime/api/`, `src/runtime/winabi.cpp`, `src/runtime/apiset.cpp`, `src/runtime/exports.cpp`.
 
-Totals: **57 module entries**, **6351 registered exports**, **364 API set entries**, across **70 files** and roughly 95,000 lines.
+Totals: **57 module entries**, **6353 registered exports**, **364 API set entries**, across **70 files** and roughly 95,000 lines.
 
 ---
 
@@ -13,6 +13,7 @@ Totals: **57 module entries**, **6351 registered exports**, **364 API set entrie
 - [Coverage by DLL](#coverage-by-dll)
 - [API set resolution](#api-set-resolution)
 - [The forwarder gap](#the-forwarder-gap)
+- [Loading a library](#loading-a-library)
 - [What is deliberately not answered](#what-is-deliberately-not-answered)
 - [Guest-visible objects](#guest-visible-objects)
 - [Consistency rules](#consistency-rules)
@@ -155,6 +156,39 @@ Module constructor locations in `winabi.cpp`: `add_kernel32` (5644), `add_module
 Matching lowercases the query and strips the `.dll` suffix, then binary searches. Both sides are normalized, so `API-MS-WIN-CORE-X.DLL` and `api-ms-win-core-x` are the same query. The `ext-ms-win-` prefix travels the same path, so third-party extension contracts resolve too.
 
 The table order is a hard constraint. Any edit requires a re-sort, and a mis-sorted table fails silently, because binary search on an unsorted array returns whatever it finds first.
+
+## Loading a library
+
+`LoadLibrary` answers from three places, in this order, and the order is the
+one the platform uses:
+
+1. the API modules this runtime implements -- a real image is synthesised
+   for each, so the handle is the base of something the guest can walk;
+2. the modules already loaded into this process, by folded base name;
+3. a file, searched in the directories the caller named, then loaded with
+   its dependencies.
+
+`GetProcAddress` answers a name, an ordinal, or a forwarder. A forwarder --
+an export whose RVA lands inside the export directory -- is resolved when it
+is asked for rather than when the module is loaded, because a forwarder may
+name a module the image does not import and Windows resolves the string at
+`GetProcAddress` time: a forwarder to a missing module is a failed call, not
+a failed load.
+
+`FreeLibrary` moves a reference count. A module whose count reaches zero is
+detached, unmapped and forgotten. The image the process was built around,
+and every API image, are pinned: there is nothing to unload, which is the
+same answer the platform gives for the running module.
+
+A dependency that cannot be resolved fails the load, and the failure names
+the module that wanted it and the symbol it wanted -- `helper.dll wants
+libgcc_s_seh-1.dll!__emutls_get_address`, which is the only form of that
+message a person can act on. Nothing is mapped on a failed load: the images
+the load had placed are unmapped and forgotten before the failure is
+returned.
+
+The library runtime's design -- the two-pass load, the entry-point order,
+the call convention -- is in `docs/RUNTIME.md`, under "Loading a library".
 
 ## The forwarder gap
 

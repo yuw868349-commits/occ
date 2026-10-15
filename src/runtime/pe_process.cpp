@@ -15,6 +15,8 @@
 // Windows.
 
 #include "occ/runtime/pe_process.h"
+
+#include "occ/runtime/module_table.h"
 #include "occ/runtime/api_hook.h"
 
 #include <algorithm>
@@ -421,7 +423,7 @@ std::unique_ptr<PeProcess> PeProcess::build(const parser::PeImage& image,
     // loader would map it, write its relocations, fill its IAT, and then
     // there is nothing to jump to, and the address space is now full of a
     // half-built process.
-    if (image.is_dll()) {
+    if (image.is_dll() && !options.loading_library) {
         return bail(ProcessError::NotAnExecutable,
                     "the image is a DLL; a DLL is loaded into a process "
                     "rather than started as one");
@@ -2102,27 +2104,30 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
 
 }  // namespace
 
-// Start the process and run it to completion.
+namespace {
+
+// ------------------------------------------------------------------ shared
 //
-// The state the thunks serve is built here, from the options the caller
-// built the process with, so that the PEB's command line, `GetCommandLineA`
-// and `__getmainargs` are three views of the one string rather than three
-// strings that agree by luck. The exit codes and the fault reports come back
-// through the terminate path and the handler above; the caller sees a
-// `RunOutcome` and none of the plumbing.
-[[nodiscard]] RunOutcome run_pe_process(PeProcess& process) noexcept {
-    RunOutcome outcome;
+// The two pieces `run_pe_process` and `call_guest_entry` both need: the
+// state the thunks serve, and the boundary a call into guest code is made
+// under.
+//
+// Shared rather than written twice, because the two callers differ in one
+// thing -- what they call and what they do with the answer -- and agree in
+// everything else. A second copy of the state assembly would be a second
+// place where the PEB's command line and `GetCommandLineA` are made to
+// agree, and two copies of an agreement drift.
+
+// Builds the state every thunk reads: the command line and its parsed form,
+// the image's own exports, the argv and environment tables in guest memory,
+// the TLS of the modules that declare it, and the terminate path.
+//
+// The state is the caller's, so that the caller can read the fault fields
+// after the guest is done with it.
+[[nodiscard]] std::string build_guest_state(PeProcess& process,
+                                            winabi::GuestState& state) {
     const ProcessImage& image = process.image();
-    if (!image.ok) {
-        outcome.detail =
-            std::string(process_error_name(image.error)) + ": " + image.detail;
-        return outcome;
-    }
     const ProcessOptions& options = process.options();
-
-    // --- the state the thunks serve --------------------------------------
-
-    winabi::GuestState state;
     state.space = &process.space();
     state.mapper = &process.mapper();
     state.teb = image.teb;
@@ -2211,9 +2216,8 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
             AddressSpace::round_up(floor, AddressSpace::kGranularity),
             data_bytes, PageProtection::ReadWrite, RegionKind::Private);
         if (!guest_data.ok()) {
-            outcome.detail = "the guest data region could not be placed: " +
-                             std::string(status_name(guest_data.status));
-            return outcome;
+            return "the guest data region could not be placed: " +
+                   std::string(status_name(guest_data.status));
         }
 
         std::uint64_t cursor = guest_data.value;
@@ -2319,36 +2323,339 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // faults at the first `__declspec(thread)` access and the fault path
     // says where.
     static_cast<void>(winabi::register_module_tls(state, image.module.base));
+    // The loaded modules that are not the image: a disk DLL with a TLS
+    // directory needs its index written and its template copied the same
+    // way the image's does, and it needs them in the same registry, because
+    // a module's slot number is what its own compiled code reads back. The
+    // table is asked rather than a list being carried, so a module loaded
+    // after this point is picked up by the next call without anyone
+    // remembering to add it.
+    if (module_table::Table* table = module_table::current();
+        table != nullptr) {
+        for (module_table::Entry* module : table->disk_modules()) {
+            if (module->base != 0 && module->has_tls) {
+                static_cast<void>(
+                    winabi::register_module_tls(state, module->base));
+            }
+        }
+    }
     static_cast<void>(winabi::install_thread_tls(state));
 
     g_run_frame.state = &state;
+    return std::string();
+}
+
+// The boundary a call into guest code is made under: the alternate stack,
+// the signal handlers, and the host's own segment base.
+//
+// The three belong together because they are installed for the same reason
+// and restored at the same moment. The guest is native code -- its null
+// dereference is a real SIGSEGV and its illegal instruction a real SIGILL --
+// so the handlers are what turn those signals into this runtime's exception
+// path; the alternate stack is what lets the handler run when the guest
+// faulted on its own stack; and the segment base is what the guest reads its
+// TEB through, which the host must not keep after the guest is done with it.
+struct FaultGuard {
+    std::unique_ptr<std::uint8_t[]> alt_storage;
+    ::stack_t previous_alt{};
+    static constexpr std::size_t kSignalCount = 5;
+    struct ::sigaction previous[kSignalCount]{};
+    // The host's segment base, kept so that the thread -- which continues
+    // with the host's own TLS conventions after the guest is done -- finds
+    // the base it left behind.
+    std::uint64_t host_gs_base = 0;
+    bool armed = false;
+
+    FaultGuard() = default;
+    FaultGuard(const FaultGuard&) = delete;
+    FaultGuard& operator=(const FaultGuard&) = delete;
+
+    ~FaultGuard() {
+        if (armed) {
+            disarm();
+        }
+    }
+
+    void arm() {
+        constexpr int kFaultSignals[] = {SIGSEGV, SIGILL, SIGFPE, SIGBUS,
+                                         SIGTRAP};
+        ::syscall(SYS_arch_prctl, kArchGetGs, &host_gs_base);
+
+        // An alternate stack for the handler. A fault on the guest's own
+        // stack -- a stack overflow in the callee -- has nowhere to run a
+        // handler on the stack it faulted on, and the alternate stack is the
+        // only reason the fault can be reported rather than silently fatal.
+        constexpr std::size_t kAltStackBytes = 64 * 1024;
+        alt_storage.reset(new std::uint8_t[kAltStackBytes]);
+        ::stack_t alt_stack{};
+        alt_stack.ss_sp = alt_storage.get();
+        alt_stack.ss_size = kAltStackBytes;
+        ::sigaltstack(&alt_stack, &previous_alt);
+
+        struct ::sigaction action {};
+        action.sa_sigaction = &guest_fault_handler;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        ::sigemptyset(&action.sa_mask);
+        for (std::size_t i = 0; i < kSignalCount; ++i) {
+            ::sigaction(kFaultSignals[i], &action, &previous[i]);
+        }
+        armed = true;
+    }
+
+    void disarm() {
+        constexpr int kFaultSignals[] = {SIGSEGV, SIGILL, SIGFPE, SIGBUS,
+                                         SIGTRAP};
+        ::syscall(SYS_arch_prctl, kArchSetGs, host_gs_base);
+        for (std::size_t i = 0; i < kSignalCount; ++i) {
+            ::sigaction(kFaultSignals[i], &previous[i], nullptr);
+        }
+        ::sigaltstack(&previous_alt, nullptr);
+        armed = false;
+    }
+};
+
+}  // namespace
+
+// Start the process and run it to completion.
+//
+// The state the thunks serve is built here, from the options the caller
+// built the process with, so that the PEB's command line, `GetCommandLineA`
+// and `__getmainargs` are three views of the one string rather than three
+// strings that agree by luck. The exit codes and the fault reports come back
+// through the terminate path and the handler above; the caller sees a
+// `RunOutcome` and none of the plumbing.
+// ----------------------------------------------------------------- calls
+
+// The session's body. A class rather than a struct in the header because
+// what it holds -- the guest state, the fault bookkeeping, the host's
+// segment base -- is machinery, not interface.
+//
+// The state is the piece that must be built once: assembling it registers
+// every module's TLS and runs the process-attach callbacks, and a session
+// that rebuilt it per call would run every module's initializer once per
+// call. The fault boundary and the segment base are per-call, because
+// between calls the host has to run with its own handlers and its own base.
+class GuestCallSession {
+public:
+    explicit GuestCallSession(PeProcess& process) noexcept {
+        error_ = build_guest_state(process, state_);
+        prepared_ = error_.empty();
+        if (prepared_) {
+            winabi::set_guest_state(&state_);
+        }
+    }
+
+    ~GuestCallSession() {
+        if (prepared_) {
+            winabi::set_guest_state(nullptr);
+            g_run_frame = RunFrame{};
+        }
+    }
+
+    GuestCallSession(const GuestCallSession&) = delete;
+    GuestCallSession& operator=(const GuestCallSession&) = delete;
+
+    winabi::GuestState& state() noexcept { return state_; }
+    [[nodiscard]] bool prepared() const noexcept { return prepared_; }
+    [[nodiscard]] const std::string& error() const noexcept { return error_; }
+
+private:
+    winabi::GuestState state_;
+    std::string error_;
+    bool prepared_ = false;
+};
+
+void GuestCallSessionDeleter::operator()(GuestCallSession* session) const
+    noexcept {
+    delete session;
+}
+
+GuestCallSessionPtr make_guest_call_session(PeProcess& process) {
+    return GuestCallSessionPtr(new GuestCallSession(process));
+}
+
+bool guest_call_session_ready(const GuestCallSession& session) noexcept {
+    return session.prepared();
+}
+
+const std::string& guest_call_session_error(
+    const GuestCallSession& session) noexcept {
+    return session.error();
+}
+
+// Calls a guest function with the arguments in the slots the caller filled.
+//
+// One signature per combination of classes, because that is what the
+// convention is: with four register positions and two classes there are
+// sixteen shapes of call, and a single signature would put every argument of
+// the classes it did not declare in the wrong place. The dispatch is a
+// switch over the shape rather than a chain of counted arguments for the
+// same reason the slots carry a class each: a call whose layout is computed
+// rather than declared is one where a mistake in the computation is a call
+// with the right values in the wrong registers.
+//
+// The shapes past four slots are not here. A fifth argument travels on the
+// stack -- at the caller's `rsp+0x20`, past the shadow space -- and placing
+// one means building a frame this function does not build. A caller with a
+// fifth argument is told so by its own layer rather than handed a call with
+// an argument missing.
+[[nodiscard]] std::uint64_t invoke_guest_function(std::uint64_t entry,
+                                                  const GuestCallArgs& args) {
+    // The shape's bit i is "position i is floating-point".
+    const auto bit = [&](std::size_t i) -> std::uint32_t {
+        return (i < args.count && args.slots[i].floating) ? 1u : 0u;
+    };
+    const std::uint32_t shape = bit(0) | (bit(1) << 1) | (bit(2) << 2) |
+                                (bit(3) << 3);
+    // Each shape names its slots explicitly -- `F(k)` is position k as a
+    // floating-point value and `I(k)` is the same position as an integer --
+    // rather than naming bare values and relying on the reader to check
+    // that the k-th floating value really is the k-th position. It is not:
+    // with the two classes interleaved, the third floating-point argument
+    // can be at the fourth position, and a table of bare names is exactly
+    // where that mistake hides.
+#define F(k) args.slots[k].as_float
+#define I(k) args.slots[k].as_integer
+#define OCC_GUEST_SHAPE(RT, m0, m1, m2, m3, v0, v1, v2, v3)                   \
+    case (m0) | ((m1) << 1) | ((m2) << 2) | ((m3) << 3): {                    \
+        using Fn = RT(__attribute__((ms_abi)) *)(                             \
+            decltype(v0), decltype(v1), decltype(v2), decltype(v3));          \
+        const RT answer = reinterpret_cast<Fn>(entry)(v0, v1, v2, v3);        \
+        std::uint64_t bits = 0;                                               \
+        static_assert(sizeof(answer) == sizeof(bits));                        \
+        std::memcpy(&bits, &answer, sizeof(bits));                            \
+        return bits;                                                          \
+    }
+    if (args.floating_result) {
+        switch (shape) {
+            OCC_GUEST_SHAPE(double, 0, 0, 0, 0, I(0), I(1), I(2), I(3))
+            OCC_GUEST_SHAPE(double, 1, 0, 0, 0, F(0), I(1), I(2), I(3))
+            OCC_GUEST_SHAPE(double, 0, 1, 0, 0, I(0), F(1), I(2), I(3))
+            OCC_GUEST_SHAPE(double, 1, 1, 0, 0, F(0), F(1), I(2), I(3))
+            OCC_GUEST_SHAPE(double, 0, 0, 1, 0, I(0), I(1), F(2), I(3))
+            OCC_GUEST_SHAPE(double, 1, 0, 1, 0, F(0), I(1), F(2), I(3))
+            OCC_GUEST_SHAPE(double, 0, 1, 1, 0, I(0), F(1), F(2), I(3))
+            OCC_GUEST_SHAPE(double, 1, 1, 1, 0, F(0), F(1), F(2), I(3))
+            OCC_GUEST_SHAPE(double, 0, 0, 0, 1, I(0), I(1), I(2), F(3))
+            OCC_GUEST_SHAPE(double, 1, 0, 0, 1, F(0), I(1), I(2), F(3))
+            OCC_GUEST_SHAPE(double, 0, 1, 0, 1, I(0), F(1), I(2), F(3))
+            OCC_GUEST_SHAPE(double, 1, 1, 0, 1, F(0), F(1), I(2), F(3))
+            OCC_GUEST_SHAPE(double, 0, 0, 1, 1, I(0), I(1), F(2), F(3))
+            OCC_GUEST_SHAPE(double, 1, 0, 1, 1, F(0), I(1), F(2), F(3))
+            OCC_GUEST_SHAPE(double, 0, 1, 1, 1, I(0), F(1), F(2), F(3))
+            OCC_GUEST_SHAPE(double, 1, 1, 1, 1, F(0), F(1), F(2), F(3))
+        }
+        return 0;
+    }
+    switch (shape) {
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 0, 0, 0, I(0), I(1), I(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 0, 0, 0, F(0), I(1), I(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 1, 0, 0, I(0), F(1), I(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 1, 0, 0, F(0), F(1), I(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 0, 1, 0, I(0), I(1), F(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 0, 1, 0, F(0), I(1), F(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 1, 1, 0, I(0), F(1), F(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 1, 1, 0, F(0), F(1), F(2), I(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 0, 0, 1, I(0), I(1), I(2), F(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 0, 0, 1, F(0), I(1), I(2), F(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 1, 0, 1, I(0), F(1), I(2), F(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 1, 0, 1, F(0), F(1), I(2), F(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 0, 1, 1, I(0), I(1), F(2), F(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 0, 1, 1, F(0), I(1), F(2), F(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 0, 1, 1, 1, I(0), F(1), F(2), F(3))
+        OCC_GUEST_SHAPE(std::uint64_t, 1, 1, 1, 1, F(0), F(1), F(2), F(3))
+    }
+#undef OCC_GUEST_SHAPE
+#undef F
+#undef I
+    return 0;
+}
+
+// Calls one guest function and comes back.
+//
+// What is shared with the run is everything that makes the call legal: the
+// state the thunks read, the fault boundary, the segment base, and the
+// terminate path. What differs is the return leg. The run never sees one --
+// its guest leaves through `ExitProcess` or through a fault -- so its return
+// leg is a `siglongjmp` from the terminate path. A function that returns
+// returns through the `call` instruction, which is why this needs no jump
+// buffer of its own for the ordinary case and needs one for the other: a
+// guest that calls `ExitProcess` in the middle of a `DllMain` is a guest
+// that ended the process, and the terminate path catches it either way.
+[[nodiscard]] GuestCallOutcome call_guest_entry(
+    PeProcess& process, GuestCallSession& session, std::uint64_t entry,
+    const GuestCallArgs& args) noexcept {
+    GuestCallOutcome outcome;
+    if (!session.prepared()) {
+        outcome.detail = session.error();
+        return outcome;
+    }
+    if (entry == 0) {
+        outcome.detail = "the function address is zero";
+        return outcome;
+    }
+    static_cast<void>(process);  // the session already holds the process's state
+
+    FaultGuard faults;
+    faults.arm();
+
+    // The stack the guest runs on is this thread's, which is the host's.
+    // That is deliberate: a `DllMain` is called by the loader on the thread
+    // that asked for the load, and on Windows that thread's stack is
+    // whatever the loader left it -- a host stack, from the guest's point of
+    // view.
+    if (::sigsetjmp(g_host_return, 1) == 0) {
+        ::syscall(SYS_arch_prctl, kArchSetGs, session.state().teb);
+        outcome.result = invoke_guest_function(entry, args);
+        outcome.ok = true;
+    } else {
+        // The terminate path, reached because the guest ended the process
+        // rather than returning. `ExitProcess`, `TerminateProcess`, `exit`
+        // and `abort` all end there, and a call that never returned is not a
+        // call that succeeded -- the answer is reported as the ending it was.
+        outcome.ok = false;
+        if (session.state().faulted) {
+            outcome.faulted = true;
+            outcome.fault_address = session.state().fault_address;
+            outcome.signal = session.state().fault_signal;
+            outcome.detail = "the guest faulted (signal " +
+                             std::to_string(session.state().fault_signal) +
+                             ") at 0x" +
+                             std::to_string(static_cast<unsigned long long>(
+                                 session.state().fault_address));
+        } else {
+            outcome.detail =
+                "the guest ended the process during the call (exit code " +
+                std::to_string(g_guest_exit_code) + ")";
+        }
+    }
+
+    faults.disarm();
+    return outcome;
+}
+
+[[nodiscard]] RunOutcome run_pe_process(PeProcess& process) noexcept {
+    RunOutcome outcome;
+    const ProcessImage& image = process.image();
+    if (!image.ok) {
+        outcome.detail =
+            std::string(process_error_name(image.error)) + ": " + image.detail;
+        return outcome;
+    }
+
+    // --- the state the thunks serve --------------------------------------
+
+    winabi::GuestState state;
+    if (std::string state_error = build_guest_state(process, state);
+        !state_error.empty()) {
+        outcome.detail = state_error;
+        return outcome;
+    }
 
     // --- the fault plumbing ----------------------------------------------
 
-    // An alternate stack for the handler. A fault on the guest's own stack
-    // -- the stack overflow above -- has nowhere to run a handler on the
-    // stack it faulted on, and the alternate stack is the only reason the
-    // fault can be reported rather than silently fatal.
-    constexpr std::size_t kAltStackBytes = 64 * 1024;
-    const std::unique_ptr<std::uint8_t[]> alt_storage(
-        new std::uint8_t[kAltStackBytes]);
-    ::stack_t alt_stack{};
-    alt_stack.ss_sp = alt_storage.get();
-    alt_stack.ss_size = kAltStackBytes;
-    ::stack_t previous_alt{};
-    ::sigaltstack(&alt_stack, &previous_alt);
-
-    constexpr int kFaultSignals[] = {SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGTRAP};
-    constexpr std::size_t kFaultSignalCount =
-        sizeof(kFaultSignals) / sizeof(kFaultSignals[0]);
-    struct ::sigaction action {};
-    action.sa_sigaction = &guest_fault_handler;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    ::sigemptyset(&action.sa_mask);
-    struct ::sigaction previous[kFaultSignalCount] = {};
-    for (std::size_t i = 0; i < kFaultSignalCount; ++i) {
-        ::sigaction(kFaultSignals[i], &action, &previous[i]);
-    }
+    FaultGuard faults;
+    faults.arm();
 
     // The watch, if the run asked for one, goes on here -- after the
     // handlers that will service it are installed, before the guest runs.
@@ -2370,11 +2677,6 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
     // which the first dump exposed as a module with no name.
     g_dump_module = process.options().image_path.c_str();
 
-    // The host's GS base, kept so the process that continues after this run
-    // -- the same thread, with its own TLS conventions -- finds the segment
-    // base it left behind.
-    std::uint64_t host_gs_base = 0;
-    ::syscall(SYS_arch_prctl, kArchGetGs, &host_gs_base);
 
     // --- the run ---------------------------------------------------------
     //
@@ -2422,11 +2724,7 @@ void guest_fault_handler(int sig, ::siginfo_t* info, void* context_void) noexcep
 
     // --- home again -------------------------------------------------------
 
-    ::syscall(SYS_arch_prctl, kArchSetGs, host_gs_base);
-    for (std::size_t i = 0; i < kFaultSignalCount; ++i) {
-        ::sigaction(kFaultSignals[i], &previous[i], nullptr);
-    }
-    ::sigaltstack(&previous_alt, nullptr);
+    faults.disarm();
     winabi::install_terminate_path(nullptr);
     winabi::set_guest_state(nullptr);
     g_run_frame = RunFrame{};

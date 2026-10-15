@@ -211,3 +211,31 @@ occ_add_test(occ_test_concolic_bitflow test_concolic_bitflow.cpp)
 occ_add_test(occ_test_concolic_memory test_concolic_memory.cpp)
 occ_add_test(occ_test_concolic_strategy test_concolic_strategy.cpp)
 occ_add_test(occ_test_doctor test_doctor.cpp)
+
+# The DLL runtime's test loads a real library, so the library has to exist.
+#
+# Built with the mingw cross compiler when one is installed, because what the
+# test is about is loading a library the Windows toolchain produced -- built
+# from the same headers and exporting the same symbols a person's own DLL
+# would. A build without the cross compiler still builds and runs the test;
+# the test reports that it has nothing to load and passes, and the definition
+# below is what tells it so.
+find_program(OCC_MINGW_CC x86_64-w64-mingw32-gcc)
+if(OCC_MINGW_CC)
+    set(OCC_DLL_TEST_LIBRARY ${CMAKE_CURRENT_BINARY_DIR}/dll_test_helper.dll)
+    add_custom_command(
+        OUTPUT ${OCC_DLL_TEST_LIBRARY}
+        COMMAND ${OCC_MINGW_CC} -shared -O1 -o ${OCC_DLL_TEST_LIBRARY}
+                ${CMAKE_CURRENT_SOURCE_DIR}/dll_test_helper.c
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/dll_test_helper.c
+        COMMENT "building the DLL runtime's test library")
+    add_custom_target(occ_dll_test_helper ALL DEPENDS ${OCC_DLL_TEST_LIBRARY})
+endif()
+
+occ_add_test(occ_test_dll_runtime test_dll_runtime.cpp)
+if(OCC_MINGW_CC)
+    add_dependencies(occ_test_dll_runtime occ_dll_test_helper)
+    target_compile_definitions(
+        occ_test_dll_runtime
+        PRIVATE OCC_TEST_DLL_PATH="${OCC_DLL_TEST_LIBRARY}")
+endif()

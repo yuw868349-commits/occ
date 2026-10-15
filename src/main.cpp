@@ -50,6 +50,11 @@ void print_usage(const char* argv0) {
         "                     dispatch trace and a decrypted image dump;\n"
         "                     'occ devirt' with no arguments prints the "
         "detail\n"
+        "  dll <file> <mode> [options]\n"
+        "                     load a library and drive its lifecycle: "
+        "attach,\n"
+        "                     call an export, or read calls from stdin;\n"
+        "                     'occ dll' with no mode prints the detail\n"
         "  run32 <image>      run a 32-bit PE image on the in-process\n"
         "                     interpreter\n"
         "  dbg <image> [--script <file>] [--break <rva>]... [args...]\n"
@@ -110,6 +115,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "devirt") {
         return occ::cmd_devirt(argc - 2, argv + 2);
+    }
+    if (cmd == "dll") {
+        return occ::cmd_dll(argc - 2, argv + 2);
     }
     if (cmd == "run32") {
         if (argc < 3) {

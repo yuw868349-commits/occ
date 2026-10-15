@@ -28,12 +28,13 @@ What is not finished is named below, and most of it is small.
 **PE loading.** Header validation, section mapping, the full relocation type set including HIGHADJ with its two-slot consumption, IAT resolution ordered after relocation, TLS directory handling with VA/RVA disambiguation, deterministic base placement, two-pass relocation with rollback.
 
 **Windows ABI.** The `ms_abi` bridge for all guest-facing thunks, hand-built `SysvVaList` for variadics, struct returns through the hidden return pointer, path translation between host and `Z:` drive form, command line construction.
+**Loading libraries.** A module ledger where a loaded file is a module rather than a shape, a two-pass load that makes a dependency cycle a property of the graph rather than a failure of the load, dependencies loaded recursively from a search path with the library's own directory first, entry points run in post-order -- a dependency's before its dependent's -- and a detach in the reverse. `LoadLibrary`, `GetProcAddress` (by name, by ordinal and through forwarders) and `FreeLibrary` with a real reference count. `occ dll` drives the lifecycle: `attach` to watch a module's load-time behaviour, `call` to invoke an export with typed arguments, `serve` to do it interactively. The call itself places arguments by the x64 convention's positional rule and reads the answer from the register the declared type names, which a file does not carry and the caller therefore supplies.
 
 **The guest environment.** TEB and PEB with the real Windows x64 layouts, a clean `NtGlobalFlag` and heap flags, guest threads with their own TEB and stack, TLS slots, a guest heap and stdio table.
 
 **Exception handling.** UNWIND_INFO parsing, cycle detection on chained entries, bounded stack walks, the C-specific handler with correct search and unwind phases, `RtlUnwindEx` with signal mask restoration.
 
-**The API surface.** 6351 registered exports across 57 module entries and 70 files. kernel32, the UCRT and classic C runtime across eleven MSVC versions, a large `Rtl*` subset, GDI, USER32, Winsock, crypt32, advapi32 including the full registry family, rpcrt4, dbghelp, and the rest.
+**The API surface.** 6353 registered exports across 57 module entries and 70 files. kernel32, the UCRT and classic C runtime across eleven MSVC versions, a large `Rtl*` subset, GDI, USER32, Winsock, crypt32, advapi32 including the full registry family, rpcrt4, dbghelp, and the rest.
 
 **Anti-detection.** Consistent answers across `NtQueryInformationProcess`, `CheckRemoteDebugerPresent`, and `IsWow64Process`. A single monotonic clock model so no two time APIs disagree. A curated fingerprint table across eight namespaces.
 

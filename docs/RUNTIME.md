@@ -597,7 +597,7 @@ Handle base is `kHandleBase = 0x200000`, chosen above the file-handle range. `kI
 
 ## API simulation layer
 
-`runtime/api/` holds 70 files, about 95,000 lines. Total registered exports: 6351.
+`runtime/api/` holds 70 files, about 95,000 lines. Total registered exports: 6353.
 
 ### Registration path
 
@@ -641,6 +641,8 @@ Module constructor locations: `add_kernel32` (winabi.cpp:5644), `add_module_psap
 | File | Lines | Coverage |
 |---|---|---|
 | `crt_families.cpp` | 9773 | The family surfaces the apiset split parcels out: the math family in all three widths plus the SSE2 spellings, the string and ctype families narrow and wide, the filesystem family (stat in four layouts, the find family over the kernel32 walks, the directory and path spellings), the environment, process, heap, locale, conio, convert and time families, the low-level descriptor family over the confined open, and the family table the forwarder modules are built from |
+| `module_table.cpp` | The process's module ledger: the load (two passes, so a dependency cycle is a shape of the graph rather than a failure), the entry-point order, the export index, and the reference counts a `FreeLibrary` moves |
+| `dll_runtime.cpp` | The library lifecycle: the process built around a DLL, the load, the entry points in post-order, and the call path |
 | `crt.cpp` | 827 | Classic C runtime, 176 exports. Process and exit, memory, narrow strings, wide strings, mem functions, stdio, conversion, math, time, integer division, sort/search, random, environment, locale, thread-local locks, argv accessors. Shared by all 11 msvcr*/msvcrt* modules, with the module name as the only parameter |
 | `ucrt_extra.cpp` | 4258 | Modern UCRT, 176 exports. `_s` safe series, wide stdio, printf/scanf variadic families, the `__stdio_common_*` formatting core, locale-aware `_l` suffixes, locale objects, path splitting, threads, aligned allocation, error handling, console |
 | `ntdll_rtl_str.cpp` | 5669 | 130 `Rtl*` exports. ANSI/Unicode interconversion, string construction and concatenation, compare/find, case, memory operations, code page conversion core, UTF-16 normalization, numeric conversion, IP address text, IDN, SID strings, environment variable expansion, GUID, messages, function tables, context, the `IMemoryStream` family, atomics |
@@ -725,6 +727,84 @@ OverlappedLayout  40 bytes
 `required_capacity` and `fits` are the safety preconditions for wide-to-narrow conversion: compute the bytes needed, then check the destination buffer can hold them. Never write past `nBufferSize`.
 
 Error constants run from `kErrorSuccess=0` to `kErrorBusy=170`, plus `kInvalidHandleValue` and `kInvalidHandle`. HRESULT constants run from `kSOk` to `kEDataError`.
+
+### Loading a library
+
+`occ dll` loads a library and drives its lifecycle, and three files are the
+whole of it.
+
+**`module_table.cpp` is the ledger.** One entry per module -- the image the
+process was built around, the images `guest_module.cpp` synthesises for the
+API modules, and every file loaded from disk -- carrying the base, the size,
+the entry point, the reference count, the export index and the dependencies.
+It is the first place in this runtime where a module is a thing rather than
+a shape: before it, `LoadLibrary` answered "module not found" for anything
+that was not an API module this runtime implements, and `FreeLibrary`
+refused every handle but the image's own.
+
+**The load is two passes, and that is what makes the order independent of
+the dependency graph's shape.** The first pass walks the graph in post-order
+and maps every node with the loader's resolver *unset* -- which maps,
+relocates and records the import table without resolving it, because the
+loader writes the IAT only when there is a resolver to ask. The second pass
+walks the same order and resolves, writing each recorded import into its
+slot. The alternative -- resolving during the load, which is what the
+loader's resolver callback invites -- cannot survive a cycle: A importing B
+and B importing A makes A's load call B's load call A's load, and the second
+visit finds a module with no base because the first has not returned. It is
+also what the platform's own loader does, by the same means: it maps before
+it snapshots.
+
+**`dll_runtime.cpp` is the lifecycle.** The process is built around the
+library itself -- an address space, a PEB with a loader list, a TEB with a
+TLS array, a stack -- and the only difference from `occ run` is that the
+entry point is *called* with a reason rather than jumped to. The order is
+post-order: a module's dependencies' entry points run before its own, which
+is what makes a dependency's exported data valid by the time its dependent's
+`DllMain` reads it. The detach runs in the reverse order.
+
+**The entry points are called through `call_guest_entry`, and the call is
+where the convention lives.** `run_pe_process` never needs a return leg --
+a program leaves by `ExitProcess` or by faulting -- so this is the other
+shape: a `call` that comes back. Its arguments are positional, which is the
+whole of the x64 convention's argument rule and the one thing about it that
+is easy to get wrong: the first four arguments go in registers, one register
+per *position*, and the register is chosen by the argument's type rather
+than by how many arguments of that type came before it. `f(int, double)`
+puts the integer in `rcx` and the double in `xmm1`; a caller that counted
+the two classes apart puts the double in `xmm0` and the integer on the
+stack, which is a call with both arguments wrong. The dispatch is therefore
+a switch over the sixteen shapes four positions and two classes produce,
+one signature each, and the same switch appears twice because the answer can
+come back in `rax` or in `xmm0` depending on the function's declared return
+type -- which a file does not carry, so the caller says.
+
+**The state is assembled once per process, not once per call.** Building it
+registers every module's TLS and runs the process-attach callbacks, so a
+session that rebuilt it per call would run every module's initializer once
+per call. One `GuestCallSession` is one process's worth of setup, and the
+calls made through it share it.
+
+**A dependency that is a third-party runtime is an API-coverage question
+rather than a loading question.** The loader walks a real dependency chain
+correctly -- loading `helper.dll` from the mingw toolchain pulls in
+`libgcc_s_seh-1.dll`, and that pulls in `libwinpthread-1.dll`, with each
+module's imports resolved against the one below it -- and the chain then
+stops at the first API this runtime does not implement, with the failure
+naming the module and the symbol: `libwinpthread-1.dll wants
+msvcrt.dll!_setjmp`. That is the honest boundary: what the runtime loads is
+every DLL whose imports the API surface answers, which is the library and
+its dependencies as long as those dependencies are the Windows system DLLs
+rather than a compiler's own runtime.
+
+**What it does not do.** A fifth argument travels on the stack, past the
+shadow space, and this call does not place it: `occ dll` refuses a call with
+one rather than making a call with an argument missing. `DllMain` is called
+for `DLL_PROCESS_ATTACH` and `DLL_PROCESS_DETACH`; the thread reasons exist
+in the same machinery and no path here produces them, because this runtime
+does not start guest threads. A forwarder resolves at `GetProcAddress` time
+rather than at load time, which is what the platform does: a forwarder to a
+module that is not loaded is a failed call, not a failed load.
 
 ### The apiset forwarder surface
 
