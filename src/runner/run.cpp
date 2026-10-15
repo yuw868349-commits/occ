@@ -703,7 +703,11 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         // session asks it for descriptors and gets none from an empty
         // layer, which costs one vector allocation and saves the session
         // from having to know why a layer might be empty.
-        sc.probes = &placer;
+        //
+        // The layer rather than the placer: the session holds a Uprobes
+        // pointer, which is what keeps `observer` from depending on
+        // `probe` -- see SessionConfig::probes.
+        sc.probes = &placer.layer();
 
         const obs::SessionResult sr = obs::observe(sc, events);
         out.stops = sr.stops;

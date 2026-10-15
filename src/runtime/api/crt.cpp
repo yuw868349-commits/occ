@@ -570,9 +570,14 @@ extern "C" __attribute__((ms_abi)) void cr_ucrt_exit_no_atexit(
 
 extern "C" __attribute__((ms_abi)) void cr_ucrt_terminate(void) noexcept {
     // The C++ runtime's last resort: called when no exception handler
-    // accepted a throw. It aborts, and a runtime that returned here would
-    // leave the caller continuing past a point the standard says is
-    // unreachable.
+    // accepted a throw. A handler `set_terminate` installed runs first,
+    // and the call ends the process the way the abort path does; a
+    // runtime that returned here would leave the caller continuing past
+    // a point the standard says is unreachable.
+    if (crt_terminate_handler() != nullptr) {
+        reinterpret_cast<GuestPvfv>(
+            reinterpret_cast<std::uint64_t>(crt_terminate_handler()))();
+    }
     k32_ExitProcess(3);  // the code the C++ runtime's abort uses
     __builtin_unreachable();
 }

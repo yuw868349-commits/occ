@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -1746,6 +1747,143 @@ EspLawResult analyze(const std::uint8_t* bytes, std::size_t size,
     }
     result.writes = result.smc.size();
     return result;
+}
+
+// ------------------------------------------------------------ offline unpack
+
+namespace {
+
+// Reads a whole file into a buffer. On failure the error names the
+// failure; the buffer is left empty and the caller refuses to run.
+bool conc_read_file(const std::string& path, std::vector<std::uint8_t>* out,
+                    std::string* error) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        *error = "cannot open " + path;
+        return false;
+    }
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        *error = "cannot seek " + path;
+        return false;
+    }
+    const long end = std::ftell(f);
+    if (end < 0) {
+        std::fclose(f);
+        *error = "cannot size " + path;
+        return false;
+    }
+    std::fseek(f, 0, SEEK_SET);
+    out->assign(static_cast<std::size_t>(end), 0);
+    const std::size_t got = std::fread(out->data(), 1, out->size(), f);
+    std::fclose(f);
+    if (got != out->size()) {
+        *error = "short read from " + path;
+        return false;
+    }
+    return true;
+}
+
+// The verdict prefix that means "the identifier found a packer". The two
+// packed forms differ only in the confidence they carry, and both are
+// actionable: a medium-confidence call is a reason to run the loop and
+// let the loop decide, because the loop either finds the balanced
+// transfer or reports why it could not. The unpacked forms -- "unpacked"
+// and "unpacked (low-confidence signals only)" -- are not.
+[[nodiscard]] bool conc_verdict_is_packed(const std::string& verdict) {
+    return verdict.rfind("packed", 0) == 0;
+}
+
+// Renders an address in lowercase hex, unprefixed, the way every other
+// report in this module does. An RVA printed in decimal would read as a
+// different number to anyone holding the file in a disassembler.
+[[nodiscard]] std::string conc_hex(std::uint64_t v) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%llx", static_cast<unsigned long long>(v));
+    return std::string(b);
+}
+
+}  // namespace
+
+OfflineUnpack offline_unpack(const std::uint8_t* bytes,
+                             std::size_t size) noexcept {
+    OfflineUnpack out;
+    out.analysis = packer::identify(bytes, size);
+
+    if (!out.analysis.valid) {
+        out.skip_reason = "identification failed: " + out.analysis.error;
+        return out;
+    }
+    if (!conc_verdict_is_packed(out.analysis.verdict)) {
+        // No wrapper to run. Say so, and say what the verdict was, so a
+        // reader can see the decision rather than infer it from a
+        // missing section.
+        out.skip_reason = "not run: identify verdict is \"" +
+                          out.analysis.verdict + "\"";
+        return out;
+    }
+
+    out.ran = true;
+    out.law = analyze(bytes, size);
+    return out;
+}
+
+OfflineUnpack offline_unpack_file(const std::string& path) noexcept {
+    OfflineUnpack out;
+    std::vector<std::uint8_t> bytes;
+    std::string error;
+    if (!conc_read_file(path, &bytes, &error)) {
+        out.analysis.valid = false;
+        out.analysis.error = error;
+        out.skip_reason = "identification failed: " + error;
+        return out;
+    }
+    return offline_unpack(bytes.data(), bytes.size());
+}
+
+std::string offline_report_text(const OfflineUnpack& result) noexcept {
+    std::string out = "== packer offline unpack ==\n";
+    out += packer::report_text(result.analysis);
+
+    if (!result.ran) {
+        out += "\n== esp-law ==\n";
+        out += "loop: " +
+               (result.skip_reason.empty() ? "not run (no reason given)"
+                                           : result.skip_reason) +
+               "\n";
+        return out;
+    }
+
+    out += "\n== esp-law ==\n";
+    const EspLawResult& law = result.law;
+    if (!law.error.empty()) {
+        out += "loop: could not start: " + law.error + "\n";
+        return out;
+    }
+    if (law.ok) {
+        out += "loop: OEP at rva 0x" + conc_hex(law.oep_rva) + "\n";
+    } else {
+        out += "loop: no OEP found\n";
+    }
+    out += "reason: " + law.reason + "\n";
+    out += "steps: " + std::to_string(law.steps) + " (cap " +
+           std::to_string(law.max_steps) + ")\n";
+    out += "writes: " + std::to_string(law.writes) + "\n";
+    if (!law.api_calls.empty()) {
+        out += "api calls stubbed: " + std::to_string(law.api_calls.size()) +
+               "\n";
+        for (std::size_t i = 0; i < law.api_calls.size() && i < 8; ++i) {
+            const ApiCall& c = law.api_calls[i];
+            out += "  at rva 0x" + conc_hex(c.at_rva) + " -> 0x" +
+                   conc_hex(c.target) + " (" + c.note + ")\n";
+        }
+        if (law.api_calls.size() > 8) {
+            out += "  ...\n";
+        }
+    }
+    out += "decrypted image: " + std::to_string(law.image.size()) +
+           " bytes\n";
+    return out;
 }
 
 }  // namespace occ::packer::esp_law

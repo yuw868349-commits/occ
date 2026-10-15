@@ -234,6 +234,103 @@ int main() {
               "esp_law: api-stub wrapper decrypted the section");
     }
 
+    // --- the offline composition: identify gates the loop ----------------
+    // The gate is a refusal to guess. An image the identifier calls
+    // packed gets the loop; an image it calls unpacked is reported with
+    // the loop's absence stated, not silently skipped; an image it cannot
+    // parse is reported with the parse error and no loop.
+    {
+        const occ::packer::esp_law::OfflineUnpack u =
+            occ::packer::esp_law::offline_unpack(pe.data(), pe.size());
+        check(u.analysis.valid, "offline: identification ran");
+        check(u.ran, "offline: shell PE is packed, so the loop ran");
+        check(u.skip_reason.empty(), "offline: no skip reason when it ran");
+        check(u.law.ok, "offline: loop found the OEP");
+        check(u.law.oep_rva == 0x1000, "offline: same OEP as the raw loop");
+        const std::string text =
+            occ::packer::esp_law::offline_report_text(u);
+        check(text.find("== packer identify ==") != std::string::npos,
+              "offline: text opens with the identification");
+        check(text.find("== esp-law ==") != std::string::npos,
+              "offline: text carries the loop section");
+        check(text.find("OEP at rva 0x1000") != std::string::npos,
+              "offline: text names the OEP");
+        check(text.find("loop: OEP at rva") != std::string::npos,
+              "offline: text says the loop succeeded");
+    }
+
+    // --- the gate refuses to run the loop on an unpacked image -----------
+    {
+        // A plain PE: ordinary section names, ordinary entropy, ordinary
+        // imports. identify must call it unpacked, and the composition
+        // must not run the loop on it -- a step cap reported as a finding
+        // would be a lie about an image that has no wrapper.
+        std::vector<std::uint8_t> plain(0x600, 0);
+        plain[0] = 'M';
+        plain[1] = 'Z';
+        put32(plain, 0x3C, 0x40);
+        plain[0x40] = 'P';
+        plain[0x41] = 'E';
+        put16(plain, 0x44, 0x8664);
+        put16(plain, 0x46, 1);
+        put16(plain, 0x54, 0xF0);
+        put16(plain, 0x56, 0x22);
+        put16(plain, 0x58, 0x20B);
+        put32(plain, 0x68, 0x1000);   // entry rva
+        put32(plain, 0x78, 0x1000);
+        put32(plain, 0x7C, 0x200);
+        put32(plain, 0x90, 0x2000);
+        put32(plain, 0x94, 0x200);
+        std::memcpy(&plain[0x148], ".text", 6);
+        put32(plain, 0x150, 0x400);
+        put32(plain, 0x154, 0x1000);
+        put32(plain, 0x158, 0x200);
+        put32(plain, 0x15C, 0x200);
+        put32(plain, 0x160, 0x60000020u);
+        // Ordinary code: a short prologue repeated, low entropy, no
+        // packer idiom at the entry.
+        static const std::uint8_t kCode[] = {0x48, 0x89, 0x5C, 0x24, 0x08,
+                                             0x57, 0x48, 0x83, 0xEC, 0x20,
+                                             0x90, 0xC3};
+        for (std::size_t i = 0; i < 0x200; ++i) {
+            plain[0x200 + i] = kCode[i % sizeof(kCode)];
+        }
+
+        const occ::packer::esp_law::OfflineUnpack u =
+            occ::packer::esp_law::offline_unpack(plain.data(), plain.size());
+        check(u.analysis.valid, "offline unpacked: identification ran");
+        check(!u.ran, "offline unpacked: loop did not run");
+        check(!u.skip_reason.empty(),
+              "offline unpacked: skip reason is stated");
+        check(u.skip_reason.find("not run") != std::string::npos,
+              "offline unpacked: reason says it was not run");
+        const std::string text =
+            occ::packer::esp_law::offline_report_text(u);
+        check(text.find("not run") != std::string::npos,
+              "offline unpacked: text states the loop did not run");
+    }
+
+    // --- the gate refuses to run the loop on an unparsable image ---------
+    {
+        const occ::packer::esp_law::OfflineUnpack u =
+            occ::packer::esp_law::offline_unpack(pe.data(), 0x100);
+        check(!u.analysis.valid, "offline truncated: identification failed");
+        check(!u.ran, "offline truncated: loop did not run");
+        check(u.skip_reason.find("identification failed") != std::string::npos,
+              "offline truncated: reason names the identification failure");
+    }
+
+    // --- the file form: a path that cannot be read is a report ----------
+    {
+        const occ::packer::esp_law::OfflineUnpack u =
+            occ::packer::esp_law::offline_unpack_file(
+                "/nonexistent/definitely/not/here.exe");
+        check(!u.analysis.valid, "offline file: missing file is invalid");
+        check(!u.analysis.error.empty(),
+              "offline file: error names the failure");
+        check(!u.ran, "offline file: loop did not run");
+    }
+
     std::fprintf(stdout, "%d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

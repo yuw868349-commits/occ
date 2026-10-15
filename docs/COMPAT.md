@@ -2,7 +2,7 @@
 
 What this runtime answers, what it does not, and how the API surface is organized. All figures come from the source: `src/runtime/api/`, `src/runtime/winabi.cpp`, `src/runtime/apiset.cpp`, `src/runtime/exports.cpp`.
 
-Totals: **60 module entries**, **2733 registered exports**, **364 API set entries**, across **69 files** and roughly 85,000 lines.
+Totals: **57 module entries**, **6351 registered exports**, **364 API set entries**, across **70 files** and roughly 95,000 lines.
 
 ---
 
@@ -52,7 +52,7 @@ Forwarder detection: a target RVA inside the export directory range is a forward
 | Core | `KERNEL32.dll`, `KERNELBASE.dll`, `ntdll.dll`, `SHLWAPI.dll` |
 | C runtime | `msvcrt.dll`, `UCRTBASE.dll`, `MSVCR70/71/80/90/100/110/120/120_APP/MSVCRTD.dll`, `MSVCIRT.dll`, `MSVCRT20.dll`, `MSVCRT40.dll` |
 | C++ runtime | `MSVCP140.dll`, `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` |
-| Contract modules | 18 `api-ms-win-crt-*.dll`, all `l1-1-0`: runtime, stdio, string, stdlib, math, ctype, locale, time, convert, heap, environment, filesystem, process, conio, utility, multibyte, private |
+| Contract modules | the 15 `api-ms-win-crt-*.dll` modules Windows ships, all `l1-1-0`: runtime, stdio, string, math, locale, time, convert, heap, environment, filesystem, process, conio, utility, multibyte, private. The `-stdlib` and `-ctype` names the older table carried are not modules Windows builds, and a guest that imports one is refused the way the loader refuses any module it cannot find |
 | UI | `USER32.dll`, `GDI32.dll` |
 | Security | `ADVAPI32.dll`, `CRYPT32.dll`, `BCRYPT.dll`, `bcryptprimitives.dll`, `SECUR32.dll`, `SSPICLI.dll` |
 | Network | `WS2_32.dll`, `WININET.dll`, `URLMON.dll`, `IPHLPAPI.dll` |
@@ -91,10 +91,10 @@ Module constructor locations in `winabi.cpp`: `add_kernel32` (5644), `add_module
 | File | Exports | Covers |
 |---|---|---|
 | `crt.cpp` | 176 | Classic C runtime. Process and exit, memory, narrow and wide strings, mem functions, stdio, conversion, math, time, integer division, sort/search, random, environment, locale, thread-local locks, argv accessors. Shared by all 11 msvcr*/msvcrt* modules with the module name as the only parameter |
-| `ucrt_extra.cpp` | 176 | Modern UCRT. `_s` safe series, wide stdio, printf/scanf variadic families, the `__stdio_common_*` formatting core, locale-aware `_l` suffixes, locale objects, path splitting, threads, aligned allocation, error handling, console |
+| `ucrt_extra.cpp` | 169 | Modern UCRT. `_s` safe series, wide stdio, printf/scanf variadic families, the `__stdio_common_*` formatting core, locale-aware `_l` suffixes, locale objects, path splitting, threads, aligned allocation, error handling, console |
 | `msvcp140.cpp` | mangled | Allocation operators, six stream objects as data exports, insertion operator overloads, manipulators, ostream/istream members, the full `streambuf` vtable, `ios_base` state, member template versions |
 | `vcruntime.cpp` | 38 | EH (`__CxxFrameHandler3/4`, `__CxxThrowException`), `__vcrt_*` initialization, standard library support, entropy, overwrite-string memory |
-| `modules.cpp` | tables | The 18 `api-ms-win-crt-*` forwarder stub name tables and the MSVCR* alias tables |
+| `modules.cpp` | tables | The 15 `api-ms-win-crt-*` forwarder stub name tables and the MSVCR* alias tables |
 
 ### ntdll
 
@@ -171,8 +171,6 @@ A guest calling one of these through an `api-ms-win-crt-*` contract module gets 
 **Not every API.** The surface is large and grows one test at a time. Guests leaning on undocumented behavior or deep driver assumptions can still find a hole.
 
 **MachO is detected but not parsed.** The parser recognizes the magic and stops.
-
-**`esp_law.cpp` is not built.** It is not in the `occ_core` source list, so the ESP-law unpacker is dead code with a test as its only consumer.
 
 ## Guest-visible objects
 

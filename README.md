@@ -26,7 +26,7 @@ The consequence of that last one is worth stating plainly, because it is the thi
 
 **PE parsing and mapping.** Its own parser for headers, sections, imports, exports, TLS, exceptions, resources, and delay imports, and its own loader that maps the image, applies the full relocation type set, rebuilds the import address table, and runs TLS initializers the way a Windows loader would, because guests notice when loading is done differently.
 
-**A Windows runtime on a Linux thread.** Guest TLS, TEB and PEB with the real x64 layouts, SEH dispatch and stack unwinding, a ntdll subset, API set resolution, and 2733 registered exports across 60 modules: kernel32, the UCRT and the classic C runtime across eleven MSVC versions, a large `Rtl*` surface, GDI, USER32, Winsock, crypt32, advapi32 including the whole registry family, rpcrt4, dbghelp, and the rest. Each one is a deliberate re-implementation with real semantics, not a stub that returns zero.
+**A Windows runtime on a Linux thread.** Guest TLS, TEB and PEB with the real x64 layouts, SEH dispatch and stack unwinding, a ntdll subset, API set resolution, and 6351 registered exports across 57 modules: kernel32, the UCRT and the classic C runtime across eleven MSVC versions, a large `Rtl*` surface, GDI, USER32, Winsock, crypt32, advapi32 including the whole registry family, rpcrt4, dbghelp, and the rest. Each one is a deliberate re-implementation with real semantics, not a stub that returns zero.
 
 **Guest threads.** Real threads, each with its own TEB and stack, with `SYS_arch_prctl` setting GS base so guest code can reach its TEB the way it was compiled to.
 
@@ -43,15 +43,26 @@ The consequence of that last one is worth stating plainly, because it is the thi
 ## Commands
 
 ```
-occ check <path>        detect the format, print the routing decision
-occ run <path>          run under isolation, start the observer
-occ dbg <path>          interactive debugger
-occ attach <session>    reconnect to a running session
-occ stop <session>      tear a session down
-occ inspect <path>      static report: headers, sections, imports, exports,
-                        tls, exceptions, resources, strings
-occ devirt <trace> <dump>   offline VM de-virtualization report
-occ doctor              report what this host can and cannot do
+occ check <path> [--json]     detect the format, print the routing decision
+occ run [options] <path> [args...]
+                              run under isolation, start the observer;
+                              'occ run' with no target prints the option list
+occ dbg <path> [--script <file>] [--break <rva>]... [args...]
+                              interactive debugger
+occ attach <session-id|pid>   reconnect to a running session
+occ stop <session-id|pid>     tear a session down
+occ inspect <path> [--no-strings] [--disasm <rva>[:<count>[:<bytes>]]]
+                              [--limit <n>]
+                              static report: headers, sections, imports,
+                              exports, tls, exceptions, resources, strings
+occ devirt <trace> <dump> [N] [--asm [N]] [-o <report>]
+                              [--unknown <va>:<size>] [--goal <condition>]
+                              [--explore]
+                              offline VM de-virtualization report
+occ run32 <image>             run a 32-bit PE image on the in-process
+                              interpreter
+occ mdmp <file>               summarize a minidump
+occ doctor                    report what this host can and cannot do
 ```
 
 The debugger: `b` and `hb` arm breakpoints, software and hardware. `del` and `hbd` disarm. `breaks` lists both. `r` runs, `s` steps, `regs` shows the register file, `x` examines memory, `mdmp` writes a minidump of the stopped guest, `q` quits.
@@ -81,8 +92,6 @@ The loader and the common API surface are solid. Real guests this has run: a sev
 What is honest about the limits:
 
 - Not every Windows API is simulated. The surface grows one test at a time.
-- The API set forwarder table names about fifty CRT functions that are not registered. A guest calling one through a contract module gets a failed `GetProcAddress`, which is safe but is a gap.
-- `esp_law.cpp` is in the tree and not in the build. It is dead code.
 - `packer`, `dbi`, and `emu` are libraries with tests and no command. They are not features you can invoke.
 - MachO is detected and not parsed.
 - Coverage instrumentation does not exist in the build.

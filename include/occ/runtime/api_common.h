@@ -218,6 +218,27 @@ struct OverlappedLayout {
     static constexpr std::size_t kBytes = 40;
 };
 
+// WIN32_FIND_DATAW, 592 bytes: the attributes, three FILETIMEs, the two
+// size halves, the two reserved words, then the long and short names (260
+// and 14 wide characters). Two domains fill or read it -- the kernel32
+// directory walk that produces it and the CRT find family that converts
+// it -- so the offsets live here rather than in either one.
+struct Win32FindDataLayout {
+    static constexpr std::size_t kAttributes = 0;
+    static constexpr std::size_t kCreation = 4;
+    static constexpr std::size_t kLastAccess = 12;
+    static constexpr std::size_t kLastWrite = 20;
+    static constexpr std::size_t kSizeHigh = 28;
+    static constexpr std::size_t kSizeLow = 32;
+    static constexpr std::size_t kReserved0 = 36;
+    static constexpr std::size_t kReserved1 = 40;
+    static constexpr std::size_t kName = 44;
+    static constexpr std::size_t kNameChars = 260;
+    static constexpr std::size_t kShortName = 564;
+    static constexpr std::size_t kShortNameChars = 14;
+    static constexpr std::size_t kBytes = 592;
+};
+
 // ------------------------------------------------------------ small writers
 //
 // Structure fields are read and written through these, so that one

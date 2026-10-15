@@ -17,7 +17,7 @@ What exists, what is unfinished, and what is next. Every claim here is checked a
 
 ## Where the project stands
 
-The runtime runs Windows PE images natively, in-process, on Linux, with a Windows environment built around them. The loader, the ABI bridge, SEH, TLS, and a broad API surface are complete enough that 86 tests cover them and real samples run.
+The runtime runs Windows PE images natively, in-process, on Linux, with a Windows environment built around them. The loader, the ABI bridge, SEH, TLS, and a broad API surface are complete enough that 89 tests cover them and real samples run.
 
 The de-virtualization path works end to end: trace, lift, bit-blast, solve, and certify, with a goal language expressive enough to ask arbitrary questions of a recovered VM.
 
@@ -33,11 +33,11 @@ What is not finished is named below, and most of it is small.
 
 **Exception handling.** UNWIND_INFO parsing, cycle detection on chained entries, bounded stack walks, the C-specific handler with correct search and unwind phases, `RtlUnwindEx` with signal mask restoration.
 
-**The API surface.** 2733 registered exports across 60 module entries and 69 files. kernel32, the UCRT and classic C runtime across eleven MSVC versions, a large `Rtl*` subset, GDI, USER32, Winsock, crypt32, advapi32 including the full registry family, rpcrt4, dbghelp, and the rest.
+**The API surface.** 6351 registered exports across 57 module entries and 70 files. kernel32, the UCRT and classic C runtime across eleven MSVC versions, a large `Rtl*` subset, GDI, USER32, Winsock, crypt32, advapi32 including the full registry family, rpcrt4, dbghelp, and the rest.
 
 **Anti-detection.** Consistent answers across `NtQueryInformationProcess`, `CheckRemoteDebugerPresent`, and `IsWow64Process`. A single monotonic clock model so no two time APIs disagree. A curated fingerprint table across eight namespaces.
 
-**Observation.** 18 event kinds, JSON bodies built where the fact is observed, sessions that survive process replacement, and a GDB-compatible RSP stub that a stock debugger can attach to.
+**Observation.** 17 event kinds, JSON bodies built where the fact is observed, sessions that survive process replacement, and a GDB-compatible RSP stub that a stock debugger can attach to.
 
 **De-virtualization.** Lift with symbolic x86-64 promotion, shared boundary recognition, automatic layout inference, multi-exit handlers, conformance checking. A hash-consed expression DAG with memoized evaluation. Bit-blasting to CNF and a CDCL solver. A general replay solver. A goal language covering the register file, the bytecode stream, guest memory, registers, arithmetic, comparison, and logic.
 
@@ -47,15 +47,13 @@ What is not finished is named below, and most of it is small.
 
 ## Unfinished, in the tree
 
-These are files that exist and do not participate in the build. They are not features.
+These are capabilities that exist in `occ_core` and have no command in front of them. They are not features you can invoke.
 
-**`src/packer/esp_law.cpp`.** Not in the `occ_core` source list. `grep -c esp_law CMakeLists.txt` returns zero. Its test is the only consumer. The ESP-law unpacker is dead code.
-
-**`packer`, `dbi`, and `emu` have no CLI entry points.** `main.cpp` does not reference them. They are libraries with tests. `identify.cpp`, `smc.cpp`, `pipeline.cpp`, `pe_view.cpp`, `dbi.cpp`, and `emu.cpp` are all built into `occ_core`, so they are reachable from code, but no command exposes them.
+**`packer`, `dbi`, and `emu` have no CLI entry points.** `main.cpp` does not reference them. They are libraries with tests. `identify.cpp`, `smc.cpp`, `pipeline.cpp`, `pe_view.cpp`, `esp_law.cpp`, `dbi.cpp`, and `emu.cpp` are all built into `occ_core`, so they are reachable from code, but no command exposes them. `esp_law.cpp` in particular is complete and tested -- identify, the ESP-law loop, and their composition all work -- and waits on the same surface.
 
 ## Known gaps
 
-**The apiset forwarder table is larger than the implementation.** `kCrtForwarders[]` in `modules.cpp` lists roughly 50 names with no corresponding registration in `crt.cpp` or `ucrt_extra.cpp`: `_strrev`, `strtok_s`, `_fullpath`, `_getcwd`, `_chdir`, `_mkdir`, `_access`, `_spawnv`, the `_mbs*` family, `_findfirst`, `_stat`, `_chmod`, `_execv`, and others. A guest calling one of these through an `api-ms-win-crt-*` contract module gets a failed `GetProcAddress`. The failure is safe, but it is a gap.
+**The CRT family surface is narrower than the real one where the hard parts live.** The 15 `api-ms-win-crt-*` modules carry exactly what their real counterparts export as far as this runtime implements it -- environment, filesystem, heap, process, conio and utility are complete, and runtime, stdio, string, time and convert are within a handful of names. The residuals are the families whose remainder is machinery rather than spelling: private is missing the 1177 names that are the C++ exception machinery, the demangler and the `_o_` detour spellings the real private module carries; multibyte is missing the 199 multi-byte string functions, whose code pages this single-byte runtime does not configure; math is missing the 168 names that are the complex-arithmetic family and the vendor's internal float classification helpers; convert, locale, string, stdio and time are missing 45, 3, 23, 9 and 4 names respectively. A guest calling one of the missing names through a contract module gets a failed `GetProcAddress`, the same refusal the real loader gives.
 
 **MachO is detected, not parsed.** The parser recognizes the magic and stops. `Format::MachO` exists in the enum and nothing fills it.
 
@@ -73,9 +71,6 @@ In order of how much they unblock:
 
 **Wire `packer` into a command.** The identify, SMC, and pipeline code is written and tested. It needs a CLI surface, which is a thin layer over what exists.
 
-**Close the forwarder gap.** Register the missing CRT names, or trim `kCrtForwarders[]` to what is implemented. Either is correct; the current state, where the table claims more than the code delivers, is not.
-
-**Decide `esp_law.cpp`.** Build it or delete it. A file that is not compiled and not deleted costs a reader time to discover that it is neither.
 
 **Give `dbi` and `emu` a surface, or state that they are internal.** Both are complete enough to be useful. Neither is reachable from the CLI.
 

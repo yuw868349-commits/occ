@@ -212,7 +212,6 @@ The module does not execute exceptions and does not poke memory it does not own.
 ## What is not defended
 
 - **The container is not a security boundary against a determined guest.** It is containment against accident and against samples that escape a directory. A guest that finds a host vulnerability has already won, because it is running in-process with the host's privileges.
-- **`esp_law.cpp` is not built.** Not a security gap, but a feature that does not exist despite the file's presence.
 - **MachO is detected, not parsed.**
 - **The API surface is not complete.** A guest calling an unimplemented export gets a failed `GetProcAddress`, which is a different observable than a working call. A sample that checks for specific APIs can tell.
 - **`OCC_PLAIN_SPAWN=1` removes the container entirely.** It exists for guests that need the host, and it is exactly as safe as running the guest on the host directly.

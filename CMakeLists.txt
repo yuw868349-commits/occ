@@ -639,6 +639,7 @@ add_library(occ_core STATIC
     src/runtime/api/secur32.cpp
     src/runtime/api/ole32.cpp
     src/runtime/api/crt.cpp
+    src/runtime/api/crt_families.cpp
     src/runtime/api/kernel32_sync.cpp
     src/runtime/api/kernel32_proc.cpp
     src/runtime/api/kernel32_str.cpp
@@ -696,9 +697,11 @@ add_library(occ_core STATIC
     src/packer/pe_view.cpp
     src/packer/pipeline.cpp
     src/packer/smc.cpp
+    src/packer/esp_law.cpp
     src/concolic/engine.cpp
     src/concolic/program.cpp
     src/concolic/taint.cpp
+    src/concolic/bitflow.cpp
     src/dbi/dbi.cpp
     src/emu/emu.cpp
     src/hostile/hostile.cpp

@@ -26,9 +26,9 @@
 #include "occ/observer/event.h"
 #include "occ/observer/ptrace.h"
 #include "occ/observer/rsp.h"
+#include "occ/observer/uprobe.h"
 #include "occ/observer/watchpoint.h"
 #include "occ/observer/wx.h"
-#include "occ/probe/placer.h"
 
 namespace occ::obs {
 
@@ -115,10 +115,20 @@ struct SessionConfig {
     // starts -- the probe has to be in place before the tracee reaches the
     // function -- and the session is handed the layer to poll.
     //
+    // The layer rather than the placer that owns it, and the difference is
+    // the dependency direction. `probe/placer.h` includes this module's
+    // event and uprobe headers, because placing a probe reports an event
+    // and holds a Uprobes; a session that held the placer would close that
+    // into a cycle two headers wide, one that compiles or refuses to
+    // depending on the order the two are reached in. The session needs
+    // three things from the layer -- its descriptors, its drain, its
+    // subscription state -- and all three are the layer's own, so the
+    // pointer names the layer and the cycle does not exist.
+    //
     // Null means no function-level observation. The syscall trace is
     // unaffected either way, which is the point of keeping the two
     // independent.
-    ProbePlacer* probes = nullptr;
+    Uprobes* probes = nullptr;
 
     // Whether to hold the target at its first stop until a debugger
     // arrives.

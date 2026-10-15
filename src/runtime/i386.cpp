@@ -184,7 +184,8 @@ struct ModRm {
 // difference between a decoder and a pile of branches.
 [[nodiscard]] ModRm decode_modrm(Machine& m, Memory& /*mem*/,
                                  const std::uint8_t* code,
-                                 std::size_t& i) noexcept {
+                                 std::size_t& i,
+                                 std::uint32_t segment_base) noexcept {
     const std::uint8_t byte = code[i++];
     ModRm r;
     r.mod = byte >> 6;
@@ -258,7 +259,10 @@ struct ModRm {
     }
     default: break;
     }
-    r.address = effective;
+    // The segment base rides on the effective address: the only base the
+    // prefix table serves is fs, whose base is the TEB, and a guest's
+    // fs-prefixed operand names TEB-relative state.
+    r.address = effective + segment_base;
     return r;
 }
 
@@ -365,9 +369,6 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
     // The image: headers, then each section at its virtual address. A
     // 16-byte scratch stack at 0x7fff0000 -- the loader would place a real
     // one; the interpreter places a page-range and points esp at its top.
-    // TODO: TLS, the PEB/TEB pair, and the loader's other promises land
-    // with the first guest that asks for them; the first guest this file
-    // runs reads its imports and calls, which is the spine.
     Memory mem;
     // The offsets below are read straight out of the file, and the file is
     // the guest's: every offset has to be proven against `bytes` before the
@@ -472,20 +473,41 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
     }
     m.regs[Machine::kEsp] = kStackTop - 4;
 
-    // The TEB, at the address Windows puts the first thread's on, and the
-    // fields the CRT reads through fs: Self at 0x18, the client id at
-    // 0x20, the TLS pointer array at 0x2C, and the PEB at 0x30. The PEB
-    // itself is a page with nothing in it yet -- a guest that reads
-    // deeper than the process id names what it needs, and the loader
-    // grows the answer then.
+    // The TEB, at the address Windows puts the first thread's on, with
+    // the fields a 32-bit guest reads through fs: the self pointer at
+    // 0x18, the client id at 0x20, the TLS pointer array at 0x2C, the PEB
+    // at 0x30, the last error at 0x34, the stack bounds at 0x04 and 0x08,
+    // and the sixty-four TLS slots at 0xE10. The slots and the error live
+    // in the zero-filled page, which is the value they start at.
     static constexpr std::uint32_t kTeb = 0x7FFDE000;
     static constexpr std::uint32_t kPeb = 0x7FFDF000;
+    mem.write32(kTeb + 0x04, kStackTop);                  // StackBase
+    mem.write32(kTeb + 0x08, kStackTop - 16 * kPageSize);  // StackLimit
     mem.write32(kTeb + 0x18, kTeb);
     mem.write32(kTeb + 0x20, 1);  // client id: process
     mem.write32(kTeb + 0x24, 1);  // client id: thread
-    mem.write32(kTeb + 0x2C, 0);  // thread local storage: none yet
+    mem.write32(kTeb + 0x2C, 0);  // TLS pointer array: the TLS directory fills it
     mem.write32(kTeb + 0x30, kPeb);
+    mem.write32(kTeb + 0x34, 0);  // LastErrorValue
     m.fs_base = kTeb;
+
+    // The PEB, with the fields a 32-bit guest reads, at the offsets the
+    // win32 layout states -- wine's `winternl.h` carries the offsets in
+    // comments beside each field, and these are those. The version is the
+    // one the runtime's surface is modelled on, which is what the 64-bit
+    // side answers `RtlGetVersion` with, and the subsystem comes from the
+    // image's own header below.
+    static constexpr std::uint32_t kProcessHeap = 0x7FFC0000;
+    static_cast<void>(mem.page(kProcessHeap));  // the heap's own page
+    mem.write8(kPeb + 0x02, 0);   // BeingDebugged: no
+    mem.write32(kPeb + 0x08, image_base);
+    mem.write32(kPeb + 0x18, kProcessHeap);
+    mem.write32(kPeb + 0x64, 1);  // NumberOfProcessors: the one this run has
+    mem.write32(kPeb + 0x68, 0);  // NtGlobalFlag: no flags
+    mem.write32(kPeb + 0xA4, 10);       // OSMajorVersion
+    mem.write32(kPeb + 0xA8, 0);        // OSMinorVersion
+    mem.write32(kPeb + 0xAC, 19045);    // OSBuildNumber
+    mem.write32(kPeb + 0xB0, 2);        // OSPlatformId: VER_PLATFORM_WIN32_NT
 
     // The import table resolves to magic addresses -- one per (dll, name),
     // issued from a counter in the 0x70000000 range, which is a range the
@@ -583,6 +605,94 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         }
     }
 
+    // The TLS directory, which is data directory 9. A 32-bit image's
+    // entries are all four-byte virtual addresses: the raw-data bounds,
+    // the address the slot index is stored at, the callback array, and
+    // the zero-fill count. The loader's promise is threefold -- a slot
+    // index written where the image's `AddressOfIndex` names, a
+    // per-thread block that starts as the raw data and grows by the
+    // zero-fill, and a pointer array in the TEB that names the block --
+    // and the three land here, because a `__declspec(thread)` guest that
+    // reads its own variable through the array reads what this built.
+    std::vector<std::uint32_t> tls_callbacks;
+    {
+        const std::uint32_t pe_at = [&] {
+            std::uint32_t v = 0;
+            std::memcpy(&v, image_bytes + 0x3C, 4);
+            return v;
+        }();
+        const std::uint32_t tls_rva = mem.read32(image_base + pe_at + 24 + 96 + 9 * 8);
+        if (tls_rva != 0) {
+            const std::uint32_t raw_start =
+                mem.read32(image_base + tls_rva + 0);
+            const std::uint32_t raw_end = mem.read32(image_base + tls_rva + 4);
+            const std::uint32_t index_addr =
+                mem.read32(image_base + tls_rva + 8);
+            const std::uint32_t callbacks =
+                mem.read32(image_base + tls_rva + 12);
+            const std::uint32_t zero_fill =
+                mem.read32(image_base + tls_rva + 16);
+            // The slot index is this image's position in the pointer
+            // array. One image runs here, so the index is zero -- the
+            // first slot -- and the answer the image stores is the one
+            // its own reads go through.
+            constexpr std::uint32_t kTlsSlot = 0;
+            if (index_addr != 0) {
+                // The directory's fields are virtual addresses on a
+                // 32-bit image, which is what makes them different from
+                // the import table's RVAs: the writes and reads below go
+                // to the addresses themselves.
+                mem.write32(index_addr, kTlsSlot);
+            }
+            // The block: the raw data copied, the zero-fill grown, both
+            // on a page of its own below the loader areas. The pointer
+            // array sits on the same page, before the block, wide enough
+            // for the slots this loader mints.
+            static constexpr std::uint32_t kTlsPage = 0x7FFB0000;
+            static constexpr std::uint32_t kTlsArraySlots = 64;
+            static constexpr std::uint32_t kTlsArrayBytes =
+                kTlsArraySlots * 4;
+            const std::uint32_t raw_bytes =
+                raw_end > raw_start ? raw_end - raw_start : 0;
+            const std::uint32_t block =
+                kTlsPage + kTlsArrayBytes;
+            for (std::uint32_t i = 0; i < raw_bytes; ++i) {
+                mem.write8(block + i, mem.read8(raw_start + i));
+            }
+            for (std::uint32_t i = raw_bytes;
+                 i < raw_bytes + zero_fill; ++i) {
+                mem.write8(block + i, 0);
+            }
+            mem.write32(kTlsPage + kTlsSlot * 4, block);
+            mem.write32(kTeb + 0x2C, kTlsPage);
+            if (trace) {
+                std::fprintf(stderr,
+                             "occ i386: tls block 0x%08x raw %u zero %u "
+                             "index at 0x%08x\n",
+                             block, raw_bytes, zero_fill, index_addr);
+            }
+            // The callback array is a null-terminated run of virtual
+            // addresses, each run with the process-attach reason once
+            // the run loop can call them.
+            if (callbacks != 0) {
+                for (;;) {
+                    const std::uint32_t cb =
+                        mem.read32(callbacks +
+                                   static_cast<std::uint32_t>(
+                                       tls_callbacks.size()) *
+                                       4);
+                    if (cb == 0) {
+                        break;
+                    }
+                    tls_callbacks.push_back(cb);
+                    if (tls_callbacks.size() == 64) {
+                        break;  // a bounded array, as the loader's is
+                    }
+                }
+            }
+        }
+    }
+
     // The interpreter loop. The code bytes are fetched from guest memory
     // into a local copy each step: the fetch is where a self-modifying
     // guest is served, and the copy is what bounds a faulting decode.
@@ -610,6 +720,11 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             }
             machine.regs[Machine::kEsp] -= 4;
             memory.write32(machine.regs[Machine::kEsp], kNestReturn);
+            // The caller's own instruction pointer is what the nested
+            // run returns to, which is why the save is here and not at
+            // the return: a save at the return would read the sentinel
+            // the run is ending on.
+            machine.nest_saved_eip = machine.eip;
             machine.eip = func;
         }
         if (trace && func != 0) {
@@ -643,7 +758,6 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         bool rep = false;
         std::uint32_t segment_base = 0;  // fs lands here, per instruction
         (void)rep;
-        (void)segment_base;
         // Prefixes, before any opcode. The fetch buffer is the bound: a
         // stream of prefixes that fills it is an instruction this
         // interpreter cannot decode, and the alternative is reading past
@@ -760,7 +874,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             const std::uint8_t kind = op >> 3;
             const unsigned wide = (form & 1) != 0 ? opsz : 1u;
             const bool to_rm = (form & 2) == 0;
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             std::uint32_t a, b;
             if (to_rm) {
                 a = rm_read(m, mem, r, wide);
@@ -838,19 +952,19 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             break;
         }
         case 0x88: case 0x89: {  // mov rm, r8 / mov rm, r32
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             rm_write(m, mem, r, reg_read(m, r.reg, (op == 0x89) ? opsz : 1u), (op == 0x89) ? opsz : 1u);
             machine.eip = machine.eip + static_cast<std::uint32_t>(i);
             break;
         }
         case 0x8A: case 0x8B: {  // mov r, rm
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             reg_write(m, r.reg, rm_read(m, mem, r, (op == 0x8B) ? opsz : 1u), (op == 0x8B) ? opsz : 1u);
             machine.eip = machine.eip + static_cast<std::uint32_t>(i);
             break;
         }
         case 0x8D: {  // lea r, m
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             if (r.is_register) {
                 if (loop_fault != nullptr) {
                     *loop_fault = "lea with a register operand";
@@ -862,7 +976,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             break;
         }
         case 0xC7: {  // mov rm, imm
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             std::uint32_t imm = 0;
             std::memcpy(&imm, c + i, opsz);
             i += opsz;
@@ -871,7 +985,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             break;
         }
         case 0x84: case 0x85: {  // test
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             const unsigned tw = (op == 0x85) ? opsz : 1u;
             logic_flags(m, rm_read(m, mem, r, tw) & reg_read(m, r.reg, tw),
                         tw);
@@ -879,7 +993,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             break;
         }
         case 0x80: case 0x81: case 0x83: {  // group1 rm, imm
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             const std::uint8_t sub = r.reg;
             // 80 is the byte form; 83 is imm8 sign-extended to the
             // operand size; 81 is the immediate at the operand size --
@@ -1046,6 +1160,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         case 0xA1: {  // mov eax, moffs
             std::uint32_t addr = 0;
             std::memcpy(&addr, c + i, 4);
+            addr += segment_base;
             if (opsz == 2) {
                 std::uint16_t half = 0;
                 memory.read(addr, &half, 2);
@@ -1064,6 +1179,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         case 0xA0: {  // mov al, moffs8
             std::uint32_t addr = 0;
             std::memcpy(&addr, c + i, 4);
+            addr += segment_base;
             reg_write(m, 0, memory.read8(addr), 1);
             machine.eip = rip_after + 4;
             break;
@@ -1071,6 +1187,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         case 0xA2: {  // mov moffs8, al
             std::uint32_t addr = 0;
             std::memcpy(&addr, c + i, 4);
+            addr += segment_base;
             memory.write8(addr,
                           static_cast<std::uint8_t>(reg_read(m, 0, 1)));
             machine.eip = rip_after + 4;
@@ -1079,6 +1196,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         case 0xA3: {  // mov moffs, eax
             std::uint32_t addr = 0;
             std::memcpy(&addr, c + i, 4);
+            addr += segment_base;
             if (opsz == 2) {
                 const std::uint16_t half =
                     static_cast<std::uint16_t>(
@@ -1091,7 +1209,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             break;
         }
         case 0xFF: {  // group5: the indirect call and jump
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             const std::uint8_t sub = r.reg;
             const std::uint32_t target = rm_read(m, mem, r, 4);
             if (sub == 2) {  // call rm32
@@ -1207,7 +1325,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         case 0xC0: case 0xC1: case 0xD0: case 0xD1:
         case 0xD2: case 0xD3: {  // group2: shifts
             const unsigned wide = (op & 1) != 0 ? opsz : 1u;
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             std::uint32_t count = 0;
             if (op == 0xC0 || op == 0xC1) {
                 count = c[i];
@@ -1274,7 +1392,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             break;
         }
         case 0xF6: {  // group3, byte: test/not/neg/mul/imul/div/idiv
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             const std::uint32_t a = rm_read(m, mem, r, 1);
             switch (r.reg) {
             case 0: case 1: {  // test rm8, imm8
@@ -1374,7 +1492,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
                 }
                 return false;
             }
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             const std::uint32_t a = rm_read(m, mem, r, 4);
             std::uint32_t v = a;
             switch (r.reg) {
@@ -1475,7 +1593,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
             break;
         }
         case 0x69: case 0x6B: {  // imul r, rm, imm
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             const unsigned wide = opsz;
             const std::uint32_t src = rm_read(m, mem, r, wide);
             std::uint32_t imm = 0;
@@ -1510,7 +1628,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         case 0x0F: {  // two-byte opcodes the subset carries
             const std::uint8_t op2 = c[i++];
             if (op2 == 0xAF) {  // imul r, rm
-                const ModRm r = decode_modrm(m, mem, c, i);
+                const ModRm r = decode_modrm(m, mem, c, i, segment_base);
                 const unsigned wide = opsz;
                 const std::int64_t p =
                     static_cast<std::int64_t>(static_cast<std::int32_t>(
@@ -1532,7 +1650,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
                 machine.eip = machine.eip + static_cast<std::uint32_t>(i);
             } else if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE ||
                        op2 == 0xBF) {  // movzx / movsx
-                const ModRm r = decode_modrm(m, mem, c, i);
+                const ModRm r = decode_modrm(m, mem, c, i, segment_base);
                 // The source width is the opcode's own choice: B6/BE
                 // read a byte, B7/BF a word -- the 66 prefix narrows the
                 // destination, never widens the source. Reading a dword
@@ -1556,7 +1674,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
                 machine.eip = machine.eip + static_cast<std::uint32_t>(i);
             } else if (op2 == 0xB0 || op2 == 0xB1) {  // cmpxchg rm, r
                 const unsigned wide = (op2 & 1) != 0 ? opsz : 1u;
-                const ModRm r = decode_modrm(m, mem, c, i);
+                const ModRm r = decode_modrm(m, mem, c, i, segment_base);
                 const std::uint32_t dst = rm_read(m, mem, r, wide);
                 const std::uint32_t src = reg_read(m, r.reg, wide);
                 const std::uint32_t acc = reg_read(m, Machine::kEax, wide);
@@ -1569,7 +1687,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
                 machine.eip = machine.eip + static_cast<std::uint32_t>(i);
             } else if (op2 == 0xC0 || op2 == 0xC1) {  // xadd rm, r
                 const unsigned wide = (op2 & 1) != 0 ? opsz : 1u;
-                const ModRm r = decode_modrm(m, mem, c, i);
+                const ModRm r = decode_modrm(m, mem, c, i, segment_base);
                 const std::uint32_t dst = rm_read(m, mem, r, wide);
                 const std::uint32_t src = reg_read(m, r.reg, wide);
                 add_flags(m, dst, src, dst + src, wide);
@@ -1621,7 +1739,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
                 }
                 machine.eip = taken ? next + static_cast<std::uint32_t>(rel) : next;
             } else if ((op2 & 0xF0) == 0x90) {  // setcc rm8
-                const ModRm r = decode_modrm(m, mem, c, i);
+                const ModRm r = decode_modrm(m, mem, c, i, segment_base);
                 const std::uint8_t cc = op2 & 0xF;
                 const bool zf = (machine.eflags & Machine::kZF) != 0;
                 const bool cf = (machine.eflags & Machine::kCF) != 0;
@@ -1667,7 +1785,7 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         }
         case 0x86: case 0x87: {  // xchg rm, r
             const unsigned wide = (op & 1) != 0 ? opsz : 1u;
-            const ModRm r = decode_modrm(m, mem, c, i);
+            const ModRm r = decode_modrm(m, mem, c, i, segment_base);
             const std::uint32_t a = rm_read(m, mem, r, wide);
             const std::uint32_t b = reg_read(m, r.reg, wide);
             rm_write(m, mem, r, b, wide);
@@ -1765,6 +1883,22 @@ bool run(const std::uint8_t* image_bytes, std::size_t bytes,
         return (*fn)(machine, memory, func, a1, a2, budget, loop_fault);
     };
     s_exec_ctx = &exec_fn;
+    // The TLS callbacks, which the loader runs before the entry: each
+    // gets the image base, the DLL_PROCESS_ATTACH reason, and a null
+    // context, cdecl. A callback that faults names itself the way an
+    // entry fault does -- the load has not delivered a running guest, so
+    // a callback failure is the run's failure.
+    for (const std::uint32_t callback : tls_callbacks) {
+        std::string callback_fault;
+        if (!call_guest(m, mem, callback, image_base,
+                        1 /* DLL_PROCESS_ATTACH */, step_budget,
+                        &callback_fault)) {
+            if (fault_detail != nullptr) {
+                *fault_detail = "tls callback failed: " + callback_fault;
+            }
+            return 0;
+        }
+    }
     return exec_fn(m, mem, 0, 0, 0, step_budget, fault_detail);
 }
 

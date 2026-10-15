@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "occ/runtime/address_space.h"
+#include "occ/runtime/containment.h"
 #include "occ/runtime/dos_path.h"
 #include "occ/runtime/api.h"
 #include "occ/runtime/mapper.h"
@@ -1341,32 +1342,6 @@ std::unordered_map<const void*, FileMode> g_file_modes;
     return it == g_file_modes.end() || it->second.text;
 }
 
-void note_file_mode(const void* stream, const char* mode) noexcept {
-    bool text = true;
-    bool named = false;
-    if (mode != nullptr) {
-        for (const char* m = mode; *m != '\0'; ++m) {
-            if (*m == 'b') {
-                text = false;
-                named = true;
-                break;
-            }
-            if (*m == 't') {
-                text = true;
-                named = true;
-                break;
-            }
-        }
-    }
-    if (!named) {
-        // The `_fmode` default answers when the mode names neither
-        // spelling; O_BINARY is the one value that flips it.
-        text = g_fmode != 0x8000;
-    }
-    const std::lock_guard<std::mutex> lock(g_file_mode_mutex);
-    g_file_modes[stream] = FileMode{text};
-}
-
 void forget_file_mode(const void* stream) noexcept {
     const std::lock_guard<std::mutex> lock(g_file_mode_mutex);
     g_file_modes.erase(stream);
@@ -1608,6 +1583,33 @@ constexpr int kGuestSigIgnore = 1; // SIG_IGN
 constexpr int kGuestSigAbrt = 22;  // SIGABRT on Windows
 
 }  // namespace
+
+void note_file_mode(const void* stream, const char* mode) noexcept {
+    bool text = true;
+    bool named = false;
+    if (mode != nullptr) {
+        for (const char* m = mode; *m != '\0'; ++m) {
+            if (*m == 'b') {
+                text = false;
+                named = true;
+                break;
+            }
+            if (*m == 't') {
+                text = true;
+                named = true;
+                break;
+            }
+        }
+    }
+    if (!named) {
+        // The `_fmode` default answers when the mode names neither
+        // spelling; O_BINARY is the one value that flips it.
+        text = g_fmode != 0x8000;
+    }
+    const std::lock_guard<std::mutex> lock(g_file_mode_mutex);
+    g_file_modes[stream] = FileMode{text};
+}
+
 
 // The data exports. Their addresses are the whole of the answer; the
 // variables live for the process and their values are whatever the guest's
@@ -3591,6 +3593,62 @@ extern "C" __attribute__((ms_abi)) std::uint64_t cr_signal(
     return previous;
 }
 
+// The raise, which dispatches through the same handler table `signal`
+// fills. A handler is a guest function the call reaches natively; the
+// default action for the signal whose default ends the process is the
+// abort path the C runtime's own abort takes.
+extern "C" __attribute__((ms_abi)) std::int32_t cr_raise(
+    std::int32_t sig) noexcept {
+    if (sig < 0 || static_cast<std::size_t>(sig) >= 32) {
+        errno = EINVAL;
+        return -1;
+    }
+    const std::uint64_t handler = g_signal_handlers[sig];
+    if (handler == 0 || handler == 1) {
+        // SIG_DFL and SIG_IGN. The one signal whose default is a visible
+        // end takes it; the rest have nothing to do.
+        if (sig == 22) {  // SIGABRT
+            k32_ExitProcess(3);
+            __builtin_unreachable();
+        }
+        return 0;
+    }
+    using GuestSigFn = void (__attribute__((ms_abi))*)(std::int32_t);
+    reinterpret_cast<GuestSigFn>(handler)(sig);
+    return 0;
+}
+
+// The whole-stream sweeps, which walk the streams the open path recorded.
+// They live beside the mode registry because the registry is the one list
+// of streams this runtime has.
+extern "C" __attribute__((ms_abi)) std::int32_t cr_flush_all() noexcept {
+    const std::lock_guard<std::mutex> lock(g_file_mode_mutex);
+    std::int32_t flushed = 0;
+    for (const auto& [stream, mode] : g_file_modes) {
+        if (::fflush(static_cast<std::FILE*>(const_cast<void*>(stream))) == 0) {
+            ++flushed;
+        }
+    }
+    return flushed;
+}
+
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fclose_all() noexcept {
+    const std::lock_guard<std::mutex> lock(g_file_mode_mutex);
+    std::int32_t closed = 0;
+    for (const auto& [stream, mode] : g_file_modes) {
+        // The three standards are not the caller's to close, which is
+        // what the real sweep skips them for.
+        if (stream == stdin || stream == stdout || stream == stderr) {
+            continue;
+        }
+        if (::fclose(static_cast<std::FILE*>(const_cast<void*>(stream))) == 0) {
+            ++closed;
+        }
+    }
+    g_file_modes.clear();
+    return closed;
+}
+
 extern "C" __attribute__((ms_abi)) std::int32_t* cr__errno() noexcept {
     return &errno;
 }
@@ -5059,7 +5117,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr__read(
     if (buffer == nullptr || fd < 0) {
         return -1;
     }
-    if (fd > 2) {
+    // Beyond the three standards, a descriptor is read only when the CRT
+    // issued it: the issued set is the low-level family's ledger, and a
+    // number it does not name is whatever the host process happens to
+    // hold at that number.
+    if (fd > 2 && !crt_fd_is_valid(fd)) {
         errno = EBADF;
         return -1;
     }
@@ -5170,7 +5232,11 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_rename(
     if (from == nullptr || to == nullptr) {
         return -1;
     }
-    return ::rename(from_dos_path(from).c_str(), from_dos_path(to).c_str());
+    // The confined rename: a destination that resolves out of the root is
+    // not a destination the guest can name, which is the property every
+    // other file operation here preserves.
+    return contained_rename(from_dos_path(from).c_str(),
+                            from_dos_path(to).c_str());
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t cr_remove(
@@ -5178,7 +5244,7 @@ extern "C" __attribute__((ms_abi)) std::int32_t cr_remove(
     if (path == nullptr) {
         return -1;
     }
-    return ::remove(from_dos_path(path).c_str());
+    return contained_unlink(from_dos_path(path).c_str());
 }
 
 extern "C" __attribute__((ms_abi)) void* cr_tmpfile() noexcept {
@@ -5959,9 +6025,7 @@ void register_host_modules(ExportRegistry& registry) {
         {"api-ms-win-crt-runtime-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-stdio-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-string-l1-1-0.dll", &add_module_api_ms_win_crt},
-        {"api-ms-win-crt-stdlib-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-math-l1-1-0.dll", &add_module_api_ms_win_crt},
-        {"api-ms-win-crt-ctype-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-locale-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-time-l1-1-0.dll", &add_module_api_ms_win_crt},
         {"api-ms-win-crt-convert-l1-1-0.dll", &add_module_api_ms_win_crt},

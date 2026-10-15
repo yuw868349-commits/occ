@@ -24,7 +24,7 @@ The design rule that shapes the whole module: **an event is a fact, encoded wher
 
 `observer/event.h`
 
-Eighteen kinds. The gaps in the numbering are deliberate: `Section` is separate from `Mapping`, and `ProbeAttached` is separate from `ProbeHit`, and both separations exist because merging them would lose information a consumer cannot recover.
+Seventeen kinds. The separations in the list are deliberate: `Section` is separate from `Mapping`, and `ProbeAttached` is separate from `ProbeHit`, and both exist because merging them would lose information a consumer cannot recover.
 
 ```
 SessionStart, SessionEnd,
@@ -61,7 +61,7 @@ class Event {
 };
 ```
 
-An event holds its already-encoded JSON body. The body is built where the fact is observed, which keeps the encoder free of state beyond the output sink and keeps a struct per event kind from being needed for eighteen kinds that keep growing.
+An event holds its already-encoded JSON body. The body is built where the fact is observed, which keeps the encoder free of state beyond the output sink and keeps a struct per event kind from being needed for the seventeen kinds that exist, or for the eighteenth when one is added.
 
 The overload set is the quoting safety. `add(key, std::string_view)` quotes and escapes; `add(key, uint64_t)` does not. A caller cannot accidentally emit an unquoted string, and the `const char*` overload exists specifically so a bare pointer does not convert to `bool` and turn a name into a truth value. The hazard is closed at the type rather than at each call site.
 

@@ -170,7 +170,9 @@ SessionRun drive_session(int pid, ProbePlacer* placer) {
     sc.pid = pid;
     sc.trace_syscalls = false;
     sc.follow_forks = false;
-    sc.probes = placer;
+    // The layer, not the placer: the session holds a Uprobes pointer so
+    // that observer does not depend on probe. See SessionConfig::probes.
+    sc.probes = placer != nullptr ? &placer->layer() : nullptr;
 
     Writer events;
     events.attach(-1);

@@ -54,24 +54,25 @@ namespace {
 
 // ---------------------------------------------------------------- layouts
 
-// WIN32_FIND_DATAW: the attributes, three FILETIMEs, the two size halves,
-// the two reserved words, then the long and short names. The long name is
-// 260 wide characters and the short one 14, which puts the structure at 592
-// bytes. The offsets are stated because the structure is the guest's and a
-// compiler's padding is not.
-constexpr std::size_t kFindAttributes = 0;
-constexpr std::size_t kFindCreation = 4;
-constexpr std::size_t kFindLastAccess = 12;
-constexpr std::size_t kFindLastWrite = 20;
-constexpr std::size_t kFindSizeHigh = 28;
-constexpr std::size_t kFindSizeLow = 32;
-[[maybe_unused]] constexpr std::size_t kFindReserved0 = 36;
-[[maybe_unused]] constexpr std::size_t kFindReserved1 = 40;
-constexpr std::size_t kFindName = 44;
-constexpr std::size_t kFindNameChars = 260;
-constexpr std::size_t kFindShortName = 564;
-constexpr std::size_t kFindShortNameChars = 14;
-constexpr std::size_t kFindBytes = 592;
+// WIN32_FIND_DATAW's offsets are shared with the CRT find family, which
+// converts the structure this walk fills; the layout lives in
+// `api_common.h` for that reason, and the names below are the local
+// spellings of it.
+constexpr std::size_t kFindAttributes =
+    Win32FindDataLayout::kAttributes;
+constexpr std::size_t kFindCreation = Win32FindDataLayout::kCreation;
+constexpr std::size_t kFindLastAccess =
+    Win32FindDataLayout::kLastAccess;
+constexpr std::size_t kFindLastWrite = Win32FindDataLayout::kLastWrite;
+constexpr std::size_t kFindSizeHigh = Win32FindDataLayout::kSizeHigh;
+constexpr std::size_t kFindSizeLow = Win32FindDataLayout::kSizeLow;
+constexpr std::size_t kFindName = Win32FindDataLayout::kName;
+constexpr std::size_t kFindNameChars = Win32FindDataLayout::kNameChars;
+constexpr std::size_t kFindShortName =
+    Win32FindDataLayout::kShortName;
+constexpr std::size_t kFindShortNameChars =
+    Win32FindDataLayout::kShortNameChars;
+constexpr std::size_t kFindBytes = Win32FindDataLayout::kBytes;
 
 // BY_HANDLE_FILE_INFORMATION, which is what `GetFileInformationByHandle`
 // fills: the same attributes and times, then the volume serial, the size in

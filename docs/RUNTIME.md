@@ -597,7 +597,7 @@ Handle base is `kHandleBase = 0x200000`, chosen above the file-handle range. `kI
 
 ## API simulation layer
 
-`runtime/api/` holds 69 files, about 85,000 lines. Total registered exports: 2733.
+`runtime/api/` holds 70 files, about 95,000 lines. Total registered exports: 6351.
 
 ### Registration path
 
@@ -624,9 +624,10 @@ SHELL32.dll         CRYPT32.dll         BCRYPT.dll          bcryptprimitives.dll
 winmm.dll           MSCOREE.dll         WS2_32.dll          WININET.dll
 URLMON.dll          IPHLPAPI.dll        OLE32.dll           UCRTBASE.dll
 VCRUNTIME140.dll    VCRUNTIME140_1.dll  MSVCP140.dll
-18 api-ms-win-crt-*.dll modules (runtime / stdio / string / stdlib / math /
-  ctype / locale / time / convert / heap / environment / filesystem /
-  process / conio / utility / multibyte / private, all l1-1-0)
+the 15 api-ms-win-crt-*.dll modules Windows ships (runtime / stdio /
+  string / math / locale / time / convert / heap / environment /
+  filesystem / process / conio / utility / multibyte / private, all
+  l1-1-0; the -stdlib and -ctype names are not modules Windows builds)
 MSVCR70/71/80/90/100/110/120/120_APP/MSVCRTD.dll
 MSVCIRT.dll        MSVCRT20.dll        MSVCRT40.dll
 ```
@@ -639,6 +640,7 @@ Module constructor locations: `add_kernel32` (winabi.cpp:5644), `add_module_psap
 
 | File | Lines | Coverage |
 |---|---|---|
+| `crt_families.cpp` | 9773 | The family surfaces the apiset split parcels out: the math family in all three widths plus the SSE2 spellings, the string and ctype families narrow and wide, the filesystem family (stat in four layouts, the find family over the kernel32 walks, the directory and path spellings), the environment, process, heap, locale, conio, convert and time families, the low-level descriptor family over the confined open, and the family table the forwarder modules are built from |
 | `crt.cpp` | 827 | Classic C runtime, 176 exports. Process and exit, memory, narrow strings, wide strings, mem functions, stdio, conversion, math, time, integer division, sort/search, random, environment, locale, thread-local locks, argv accessors. Shared by all 11 msvcr*/msvcrt* modules, with the module name as the only parameter |
 | `ucrt_extra.cpp` | 4258 | Modern UCRT, 176 exports. `_s` safe series, wide stdio, printf/scanf variadic families, the `__stdio_common_*` formatting core, locale-aware `_l` suffixes, locale objects, path splitting, threads, aligned allocation, error handling, console |
 | `ntdll_rtl_str.cpp` | 5669 | 130 `Rtl*` exports. ANSI/Unicode interconversion, string construction and concatenation, compare/find, case, memory operations, code page conversion core, UTF-16 normalization, numeric conversion, IP address text, IDN, SID strings, environment variable expansion, GUID, messages, function tables, context, the `IMemoryStream` family, atomics |
@@ -703,7 +705,7 @@ Module constructor locations: `add_kernel32` (winabi.cpp:5644), `add_module_psap
 | `proc_ext.cpp` | 168 | 3 exports. `WinExec`, `GetTempFileNameA` |
 | `ldr_ext.cpp` | 208 | 4 exports. `LdrLoadDll`, `LdrGetProcedureAddress`, `NtGetContextThread`, `NtSetContextThread` |
 | `ntdll_nt.cpp` | 137 | 4 exports. `Nt/Zw QueryInformationThread`, `Nt/Zw SetInformationThread` |
-| `modules.cpp` | 330 | The 18 `api-ms-win-crt-*` forwarder stub name tables and the MSVCR* alias tables |
+| `modules.cpp` | tables | The 15 `api-ms-win-crt-*` forwarder stub name tables and the MSVCR* alias tables |
 | `api_common.cpp` | 133 | ANSI/wide-string capacity computation and narrowing, fixed-width guest memory access primitives |
 
 ### The api_common contract
@@ -724,13 +726,37 @@ OverlappedLayout  40 bytes
 
 Error constants run from `kErrorSuccess=0` to `kErrorBusy=170`, plus `kInvalidHandleValue` and `kInvalidHandle`. HRESULT constants run from `kSOk` to `kEDataError`.
 
-### The apiset forwarder gap
+### The apiset forwarder surface
 
-`modules.cpp`'s `kCrtForwarders[]` is an 18-entry static table listing the name set each contract module genuinely forwards. The implementation loads the complete `add_crt_exports` and `add_ucrt_extra` export faces into a temporary `ExportList full`, then filters that down to the subset each module should hold.
+`modules.cpp`'s `kCrtForwarders[]` states the name set each of the 15
+`api-ms-win-crt-*` contract modules carries, and the table lives in
+`api.h` so the tests can iterate it. The implementation loads the
+complete export face -- `add_crt_exports`, `add_ucrt_extra`, and the
+family domain `add_crt_families` -- into a temporary `ExportList full`,
+then filters that down to the subset each module should hold.
 
-**A name in the table with no counterpart in the full face is silently skipped.** Roughly 50 names appear in the table with no corresponding registration in `crt.cpp`/`ucrt_extra.cpp`, including `_strrev`, `strtok_s`, `_fullpath`, `_getcwd`, `_chdir`, `_mkdir`, `_access`, `_spawnv`, `_getche`, `_cgets`, `_cprintf`, `_cputs`, `_cscanf`, `_rotl`, `_rotr`, `_byteswap_*`, `_mbslen`, `_mbschr`, `_mbsrchr`, `_mbsstr`, `_mbsdup`, `_mbccpy`, `_mbclen`, `_ismbblead`, `_ismbbtrail`, `_wgetenv`, `_wputenv`, `_dupenv_s`, `_searchenv`, `_wsearchenv`, `_findfirst`, `_findnext`, `_stat`, `_fstat`, `_chsize`, `_chmod`, `_rmdir`, `_remove`, `_unlink`, `_execv`, `_execve`, `_spawnve`, `_wspawnv`, `_getmbcp`, `_setmbcp`, `_isctype`, `_tolower`, `_toupper`, `isblank`, `isleadbyte`, `btowc`, `wctob`, `_wcstombs_s`, `_mbstowcs_s`.
+**Every name in the table resolves, to the implementation the base face
+holds.** `tests/test_crt_forwarders.cpp` walks the table and asserts it
+per name: the registry resolves it through the contract module, the
+address is the one the full face answers, and the module carries exactly
+the set and nothing more. The two module names the older table carried
+that Windows does not ship (`-stdlib`, `-ctype`) are gone, and the
+classic names that are header inlines on the UCRT (`printf`, `time`,
+`mktime`, and the rest) are absent from every family, which is the
+answer the real modules give.
 
-That is a real "table larger than implementation" gap in the code.
+**The families whose remainder is machinery rather than spelling are
+narrower than their real counterparts.** Six families -- environment,
+filesystem, heap, process, conio and utility -- are complete. The
+residuals: private is missing the 1177 names that are the C++ exception
+machinery, the demangler and the `_o_` detour spellings; multibyte is
+missing the 199 multi-byte string functions, whose code pages this
+single-byte runtime does not configure; math is missing the 168 names
+that are the complex-arithmetic family and the vendor's internal float
+helpers; convert, string, stdio, runtime, locale and time are missing
+45, 23, 9, 8, 3 and 4 names. A guest calling one of the missing names
+through a contract module gets a failed `GetProcAddress`, the same
+refusal the real loader gives.
 
 ### The msvcp140 tradeoff
 

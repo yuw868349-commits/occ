@@ -83,4 +83,44 @@ struct EspLawResult {
                                    std::size_t size,
                                    std::size_t max_steps = 250000) noexcept;
 
+// ------------------------------------------------------------ offline unpack
+
+// The offline half of the unpack pipeline: what the image is, and what
+// its wrapper's own loop leaves behind.
+struct OfflineUnpack {
+    packer::Report analysis;  // what the image is, from its file bytes
+    bool ran = false;         // whether the ESP-law loop ran
+    std::string skip_reason;  // non-empty exactly when `ran` is false
+    EspLawResult law;         // the loop's outcome; valid only when `ran`
+    std::string text;         // the merged human-readable report
+};
+
+// Composes the two offline analyses in the order an unpacker asks them:
+// identify first, so the report opens with what the image is and with
+// what confidence, then the ESP-law loop, gated on that answer.
+//
+// The gate is a refusal to guess, not a fast path. An image the
+// identifier calls unpacked has no wrapper to run, and running the loop
+// anyway would report a step cap as a finding rather than as the
+// absence of a wrapper; so the loop runs only when the identifier's
+// verdict is "packed", at either confidence. An image identified as
+// unpacked is reported as such with the loop's absence stated plainly,
+// and an image the identifier could not parse is reported with its
+// parse error and no loop. Nothing here upgrades a low-confidence
+// signal into a verdict, which is the same rule identify follows.
+[[nodiscard]] OfflineUnpack offline_unpack(const std::uint8_t* bytes,
+                                           std::size_t size) noexcept;
+
+// Reads a file and runs `offline_unpack` over it. A file that cannot be
+// read produces a report whose `analysis.valid` is false and whose error
+// says which failure it was.
+[[nodiscard]] OfflineUnpack offline_unpack_file(
+    const std::string& path) noexcept;
+
+// Renders an OfflineUnpack as human-readable text: the identification
+// report, the gate decision with its reason, and -- when the loop ran --
+// its outcome, the OEP, and the step and write counts.
+[[nodiscard]] std::string offline_report_text(
+    const OfflineUnpack& result) noexcept;
+
 }  // namespace occ::packer::esp_law

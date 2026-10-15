@@ -712,6 +712,28 @@ extern "C" __attribute__((ms_abi)) void cr_exit( std::int32_t code) noexcept;
 extern "C" __attribute__((ms_abi)) void cr__amsg_exit( std::int32_t code) noexcept;
 extern "C" __attribute__((ms_abi)) void cr_abort() noexcept;
 extern "C" __attribute__((ms_abi)) std::uint64_t cr_signal( std::int32_t sig, std::uint64_t handler) noexcept;
+// The raise, which dispatches through the handler table `signal` fills.
+extern "C" __attribute__((ms_abi)) std::int32_t cr_raise(
+    std::int32_t sig) noexcept;
+
+// The whole-stream sweeps the `_flushall` and `_fcloseall` spellings run,
+// over the streams the open path recorded.
+extern "C" __attribute__((ms_abi)) std::int32_t cr_flush_all() noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t cr_fclose_all() noexcept;
+
+// The stream-mode record the reopen spellings keep current; it lives with
+// the mode registry in `winabi.cpp`.
+void note_file_mode(const void* stream, const char* mode) noexcept;
+
+// The low-level descriptor ledger the CRT family owns and the classic
+// read consults: a descriptor beyond the three standards is read only
+// when the family issued it.
+[[nodiscard]] bool crt_fd_is_valid(std::int32_t fd) noexcept;
+
+// The terminate handler `set_terminate` records, which `terminate` runs
+// before its own last resort.
+[[nodiscard]] void* crt_terminate_handler() noexcept;
+
 extern "C" __attribute__((ms_abi)) std::int32_t* cr__errno() noexcept;
 extern "C" __attribute__((ms_abi)) void* cr___iob_func() noexcept;
 extern "C" __attribute__((ms_abi)) void cr__lock( std::int32_t index) noexcept;

@@ -1402,7 +1402,7 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
     // is this one and not the layer's size.
     if (config.probes != nullptr) {
         out.probes_watched =
-            static_cast<std::uint64_t>(config.probes->layer().fds().size());
+            static_cast<std::uint64_t>(config.probes->fds().size());
     }
 
     // ---------------------------------------------------------- wx setup
@@ -1594,7 +1594,7 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
         if (config.probes == nullptr) {
             return;
         }
-        Uprobes& layer = config.probes->layer();
+        Uprobes& layer = *config.probes;
         if (layer.size() == 0) {
             return;
         }
@@ -1941,7 +1941,7 @@ SessionResult observe(const SessionConfig& config, Writer& events) noexcept {
         // enough that a target making hundreds of calls a second does not
         // cost the observer a wakeup per call.
         if (config.probes != nullptr) {
-            const std::vector<int> probe_fds = config.probes->layer().fds();
+            const std::vector<int> probe_fds = config.probes->fds();
             if (!probe_fds.empty()) {
                 std::vector<sys::PollFd> pfds(probe_fds.size());
                 for (std::size_t i = 0; i < probe_fds.size(); ++i) {

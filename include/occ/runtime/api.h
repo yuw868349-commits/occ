@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <initializer_list>
 #include <cstdint>
 #include <vector>
 
@@ -721,6 +722,25 @@ void add_crt(ExportList& out, const char* module);
 // of them calls the same functions and a per-module copy would let the
 // copies disagree about what the runtime provides.
 void add_crt_exports(ExportList& out);
+
+// The family-domain exports, which the `api-ms-win-crt-*` forwarder
+// modules build from. The classic and modern lists carry the names a
+// program imports; this one carries the names the family split parcels
+// out, which is the same surface read the way the apiset loader reads it.
+void add_crt_families(ExportList& out);
+
+// The `api-ms-win-crt-*` family table: the module name and the names it
+// carries, each of which resolves through the registry. The table lives
+// here rather than in `modules.cpp` because the tests iterate it -- the
+// contract "every name in every set resolves" is only checkable from
+// outside the file that states the sets.
+struct ForwardSet {
+    const char* module;
+    std::initializer_list<const char*> names;
+};
+
+// The table, terminated by a null module name.
+extern const ForwardSet kCrtForwarders[];
 
 // The modules built from domains, named once each.
 void add_module_ntdll(ExportModule& module);

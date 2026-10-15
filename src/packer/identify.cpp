@@ -115,13 +115,25 @@ struct SectionNameEntry {
 };
 
 constexpr SectionNameEntry kSectionTable[] = {
-    {"UPX0", "UPX", kNameWeightHigh, false,
-     "UPX renames the original sections to UPX0/UPX1/UPX2; documented in "
-     "UPX's own source and present on any UPX-packed binary."},
-    {"UPX1", "UPX", kNameWeightHigh, false,
+    {".upx0", "UPX", kNameWeightHigh, false,
+     "UPX renames the original sections to .upx0/.upx1/.upx2; the dotted "
+     "form is what UPX's own writer emits, and it is present on any "
+     "UPX-packed binary."},
+    {".upx1", "UPX", kNameWeightHigh, false,
      "the compressed payload section of UPX's two-section layout"},
-    {"UPX2", "UPX", kNameWeightHigh, false,
+    {".upx2", "UPX", kNameWeightHigh, false,
      "third section of larger UPX-packed binaries"},
+    // The undotted spellings survive from tools that strip the leading
+    // dot when renaming or reporting a section. They earn the same
+    // weight: the section is UPX's own either way, and a matcher that
+    // accepted one spelling and refused the other would be asserting a
+    // difference the format does not make.
+    {"UPX0", "UPX", kNameWeightHigh, false,
+     "undotted spelling of .upx0, as seen after a rename tool"},
+    {"UPX1", "UPX", kNameWeightHigh, false,
+     "undotted spelling of .upx1"},
+    {"UPX2", "UPX", kNameWeightHigh, false,
+     "undotted spelling of .upx2"},
     {".themida", "Themida", kNameWeightHigh, false,
      "Themida's .themida section is its own; WinLicense uses the same "
      "installer family."},

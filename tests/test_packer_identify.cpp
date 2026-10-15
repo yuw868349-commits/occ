@@ -426,6 +426,62 @@ void test_upx_shape() {
     }
 }
 
+// The dotted spelling: what UPX's own writer emits. Every other packer
+// family in the table is listed by the name it actually writes, and UPX
+// was the outlier -- a table entry of "UPX0" with no leading dot missed
+// every real UPX binary, whose sections are named .upx0/.upx1/.upx2.
+// This test is the regression guard for that: the same shape as
+// test_upx_shape, spelled the way the packer spells it.
+void test_upx_dotted_shape() {
+    std::vector<std::uint8_t> payload(0x800);
+    fill_random(payload);
+    std::vector<std::uint8_t> stub = {
+        0x60,                 // pushad
+        0xE9, 0x00, 0, 0, 0,  // jmp rel32
+    };
+    std::vector<ImportDll> imps;
+    imps.push_back(ImportDll{"KERNEL32.dll",
+                             {"LoadLibraryA", "GetProcAddress"}});
+    const std::vector<std::uint8_t> file =
+        PeBuilder()
+            .section(".upx1", payload, 0x4000, kSecExecRead)
+            .section(".upx0", std::vector<std::uint8_t>(), 0x4000,
+                     kSecExecWriteRead)
+            .imports(imps)
+            .entry(stub)
+            .build();
+
+    const Report r = occ::packer::identify(file.data(), file.size());
+    check(r.valid, "upx dotted: image parsed");
+    check(r.sections.size() == 3, "upx dotted: three sections reported");
+    check(has_section(r, ".upx0") && has_section(r, ".upx1"),
+          "upx dotted: both sections present");
+    check(!r.candidates.empty() && r.candidates[0].name == "UPX",
+          "upx dotted: first candidate is UPX");
+    check(r.candidates[0].confidence >= 0.60,
+          "upx dotted: confidence clears the high line");
+    check(!r.candidates[0].low_confidence,
+          "upx dotted: candidate not marked low-confidence");
+    check(has_evidence(r.candidates[0], Evidence::Kind::SectionName),
+          "upx dotted: section-name evidence present");
+    check(has_evidence(r.candidates[0], Evidence::Kind::HighEntropy),
+          "upx dotted: high-entropy evidence present");
+    check(has_evidence(r.candidates[0], Evidence::Kind::SizeDisparity),
+          "upx dotted: size-disparity evidence present");
+    check(r.verdict.find("packed") != std::string::npos,
+          "upx dotted: verdict says packed");
+    // Both spellings must land on the same candidate, not two: a binary
+    // carrying .upx0 and .upx1 is one UPX image, and the scorer that
+    // split them would halve the evidence for it.
+    std::size_t upx_candidates = 0;
+    for (const Candidate& c : r.candidates) {
+        if (c.name == "UPX") {
+            ++upx_candidates;
+        }
+    }
+    check(upx_candidates == 1, "upx dotted: one UPX candidate, not two");
+}
+
 void test_generic_packer() {
     std::vector<std::uint8_t> payload(0x800);
     fill_random(payload);
@@ -557,6 +613,7 @@ int main() {
         fn();
     };
     run("upx_shape", test_upx_shape);
+    run("upx_dotted_shape", test_upx_dotted_shape);
     run("generic_packer", test_generic_packer);
     run("clean_pe", test_clean_pe);
     run("name_entropy_contradiction", test_name_entropy_contradiction);

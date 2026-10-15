@@ -2,7 +2,7 @@
 
 This document describes the architecture: what each module owns, why the boundaries fall where they do, and what the invariants are. Facts here come from the source, not from any earlier revision of this document.
 
-Repository shape: 21 module directories, 163 source files, 83 headers, roughly 180,000 lines of product code, 90 test files adding another 60,000.
+Repository shape: 20 module directories, 163 source files, 83 headers, roughly 180,000 lines of product code, 90 test files adding another 60,000.
 
 ---
 
@@ -73,11 +73,15 @@ The split is therefore not "simulated versus native" but "environment versus mac
 
 ## Dependency direction
 
-Strictly downward. `util` depends on nothing. `parser`, `syscall`, `util` are leaves. `runtime` depends on `parser`, `syscall`, `util`. `engine` depends on `parser`, `runtime`, `isolation`. `runner` depends on `engine`, `runtime`, `observer`. `devirt` depends on `parser`, `runtime`, `util` and nothing above it.
+Mostly downward, with three exceptions that are load-bearing:
 
-`observer` is deliberately outside that chain: it is an observation layer, not a driver, so both `runner` and `engine` can subscribe to it without depending on each other.
+- `util` depends on `syscall` for the errno constants, so `syscall` and `util` are not both leaves -- `syscall` is, and `util` sits on it.
+- `runtime` depends on `observer`, which is the opposite of the direction the name suggests. The runtime emits events; the observer owns the sink they go to.
+- `probe` depends on `observer` and `engine`. It is not a leaf, and it once was very nearly not a module at all: `observer/session.h` held a `ProbePlacer*` while `probe/placer.h` held a `Uprobes` by value and an event `Writer`, which is a cycle two headers wide that compiled only because the include guards happened to break it in the order the two were reached. `SessionConfig` now names the layer (`Uprobes*`) instead of the placer that owns it -- the session needs three things from the layer and all three are the layer's own -- so the edge is one-way and the accident is gone.
 
-The build enforces the bottom four layers as the `occ_core` static library, with `-fno-exceptions -fno-rtti` applied privately to that target only.
+The rest holds: `parser` sits on `util`; `isolation` on `syscall` and `util`; `engine` on `parser`, `isolation`, `observer`, `runner`, `util`; `runner` on almost everything above it. `devirt` depends on `inspect` (for the disassembler) and nothing else outside itself; `concolic` and `deobf` depend on `devirt`'s expression DAG. `packer` depends on `runtime` for the dump and IAT rebuild; `emu` depends on `dbi`.
+
+The build enforces the bottom layers as the `occ_core` static library, with `-fno-exceptions -fno-rtti` applied privately to that target only.
 
 ---
 
@@ -99,35 +103,37 @@ This is what lets the same parser serve three different callers with different r
 
 ### Structures
 
-`DosHeader` (mz_header_off_=0, e_lfanew_=0x3C), `CoffFileHeader` 20 bytes, `OptionalHeader` with `dll_characteristics`/`subsystem`, `DataDirectory`, `PeSection`, `PeImport`, `PeExport`, `PeTls`, `PeFunctionEntry`, `PeResource`, `PeDebug`, `PeClr`, `PeLoadConfig`, `PeDelayImport`, `PeTls64`.
+`PeImage` is the whole reader: one class, `parse(ByteSpan)`, and a set of accessors. The enums around it are `PeMachine`, `PeKind{None, Executable, Dll}`, `PeSubsystem`, `PeError`, `PeSeverity`; the structs are `PeDiagnostic`, `PeSection`, `PeExport`.
 
-`PeResource` supports the classic three-level tree with id, string, and id-or-string entry variants. `PeDelayImport` is the delay-load table, which the loader does not yet consume but the parser does.
+`PeSection` keeps the raw eight-byte name alongside the string, because a name that used all eight bytes is a real case and truncating it would make two sections look alike. `mapped_size()` falls back to the raw size when `VirtualSize` is zero -- the legal linker-emitted form meaning "as much as the file holds" -- because treating it as empty makes the section's whole address range unaddressable.
 
-`SIGNATURE_BYTES = 4`; an empty optional header means NT64. `class ResourceTree` is a convenience wrapper.
+`PeExport` records the ordinal as the outside world sees it: the name-ordinal table holds an index into the address table, and the importable number is that index plus the directory's base. A forwarder is kept as its parsed target rather than as the string it points at, so a reader and a caller cannot disagree about which dot separates the DLL from the symbol.
+
+Two RVA conversions, deliberately not one: `to_file_offset` answers "where do I read this byte" and returns false for zero-fill, because handing back an offset into zero-fill sends a reader to a region that was never in the file. `resolve_rva` answers the loaded-image question and reports zero-fill as such. The relocation directory is reported as an RVA and a size rather than parsed -- nothing in the engine needs its contents, and a relocation reader is a larger piece of work than the question asked.
 
 ### ELF
 
-`ElfFile`, `ElfSymbol`, `ElfDynamic`, `ElfProgramHeader`, `ElfSectionHeader`, `ElfNote`, `ElfExceptionIndex`. The exception index is what the observer uses to map addresses onto symbol names.
+`elf.h` is the other half of the parser, and it answers a different question than `pe.h` does. `ElfImage` reads the headers and hands the engine a `DesiredMapping` -- the segments, the entry point, and a `StackRequest` for the auxiliary vector -- because an ELF is exec'd by the kernel here, so what the engine needs is what to map, not a structure to walk. `ProgramHeader`, `SectionHeader`, `Symbol`, `SymbolStatus`, and the `SymbolBind`/`SymbolType`/`SectionType`/`SegmentType` enums are the pieces; `LoadError` is the refusal vocabulary. A 64-bit little-endian x86-64 executable is the case handled natively; everything else is a refusal with a reason rather than a crash.
 
 ### Detection
 
-`Format{Unknown, Pe, Elf, MachO, Script, Raw}` with `sniff()` and `detect()`. `sniff()` decides from the first bytes alone; `detect()` additionally consults the filesystem. `Magic{Pe=0x5A4D, Elf=0x457F, MachO32=0xFEEDFACE, MachO64=0xFEEDFACF, MachOFat=0xCAFEBABE}`.
+`Format{Unknown, Elf, Apk, Zip, MachO, Pe}` with `format_name()`. Each format is identified by a signature at a fixed offset plus structural constraints a coincidence would have to satisfy as well, and the `Detection` struct carries the evidence that produced the verdict -- because a user who disagrees with the detection needs to see which bytes it was based on.
 
-`MachO` is recognized but not parsed. The gap is explicit in the enum rather than hidden.
+Two entry points, one analysis: `detect_file(path)` and `detect_bytes(ByteSpan)`. Neither fails; a path that cannot be read is `Format::Unknown` with the reason in the evidence. `Detection` also carries the ELF class/endianness/machine/type, a `bare_program_header` flag for Android OAT output, and the zip member list -- which lives there rather than on the engine's loaded image because the reader already walked the central directory to decide whether the file was a package, so an engine that wanted the names would otherwise re-read the file and could disagree with itself.
+
+`MachO` is recognized so the refusal can name the format instead of reporting a corrupt ELF. The gap is explicit in the enum rather than hidden.
 
 ---
 
 ## Engine
 
-`engine/engine.h`, `engine/engine.cpp`, `engine/pe_engine.h/.cpp`, `engine/exe_engine.h/.cpp`, `engine/apk_engine.h/.cpp`
+`engine/engine.h`, `engine/engine.cpp`, `engine/pe_engine.cpp`, `engine/exe_engine.cpp`, `engine/apk_engine.cpp`
 
-`FormatEngine` is the interface a format plugs into. Each engine owns detection-to-execution for one family.
+`Engine` is the interface a format plugs into: `kind()`, `name()`, `preflight()`, `load()`, `plan()`. One header, four implementations, no per-engine header -- the interface is the only thing a caller needs, and a derived class is reached through `engine_for()` rather than by name.
 
-- `pe_engine` drives PE runs
-- `exe_engine` handles the `.exe` container conventions
-- `apk_engine` handles APK packaging
+`EngineKind` has three members: `Elf` (a Linux executable or shared object, exec'd by the kernel), `Pe` (a Windows image, executed by occ's own runtime), `Apk` (an Android package). `engine_for()` routes a `Detection` to one; `engines()` lists them. A format this build recognizes but has no engine for is refused by name rather than exec'd, because a run whose isolation nobody designed is not a run worth having.
 
-`engine.cpp` holds the dispatch: given a path, pick the engine, hand it the options, collect the result. The engines are interchangeable, which is what keeps the CLI from growing a branch per format.
+`engine.cpp` holds the dispatch. `LoadedImage` is what an engine learned, in the terms the runner uses, and it is a struct rather than three parameters so that a failure is reportable without changing the interface. `EngineRequest` is what an engine is asked to plan; `LaunchPlan` is what it answers -- the command line, the environment, the descriptors, the isolation -- which the runner executes without knowing which format produced it.
 
 ---
 
@@ -137,17 +143,17 @@ This is what lets the same parser serve three different callers with different r
 
 The top of the stack for actually executing something.
 
-`pe_runner.cpp` holds `run_pe_process` and `run_pe_32`. `run_pe_process` is the 64-bit entry: it does the `sigaltstack`, installs the five signal handlers, arms memwatch and vm_trace, sets up GS base through `SYS_arch_prctl`, and uses `sigsetjmp` as the convergence point.
+`run.cpp` is the front half: `detect_file` the path, `engine_for` the format, `preflight`, `load`, `plan`, and then execute the plan. It owns the environment a target gets -- a caller who did not supply one gets three variables (`PATH`, `TERM=dumb`, `OCC_SANDBOX=1`) rather than the whole host environment, because `LD_PRELOAD` in the host environment changes what the binary does. The caller's named engine is an assertion the run checks rather than a second routing table: a caller who asked for one engine and got a detection that chose another is told the two disagree.
 
-`run_pe_32` is the 32-bit counterpart and runs the `i386` interpreter. The container is deliberately absent there, because the interpreter is itself the isolation.
+`pe_runner.cpp` is the back half and holds three entries. `run_pe_runner` is what occ exec's itself with under `__pe-runner`; `dbg_pe_runner` is the debug driver; `run_pe_32` runs the `i386` interpreter. The container is deliberately absent from the 32-bit path, because the interpreter is itself the isolation.
 
-`run.cpp` decides which of the two to call based on the machine type from the parser.
+`runtime::run_pe_process` -- in `runtime/pe_process.cpp`, not here -- is where a 64-bit guest actually starts: it does the `sigaltstack`, installs the five fault handlers (`SIGSEGV`, `SIGILL`, `SIGFPE`, `SIGBUS`, `SIGTRAP`) with `SA_SIGINFO | SA_ONSTACK`, arms memwatch and vm_trace, saves the host GS base through `SYS_arch_prctl`, and uses `sigsetjmp` as the convergence point the guest's exit leg jumps back to.
 
 ---
 
 ## Runtime
 
-See [RUNTIME.md](RUNTIME.md). In brief, it owns the guest environment: address space ledger, mapper, loader, TLS, TEB/PEB, SEH, the Windows ABI bridge, the guest heap and stdio, the export registry, API set resolution, synthetic guest module images, guest threads, write watching, VM dispatch tracing, image dump and minidump, IAT reconstruction, the 32-bit interpreter, containment, kernel objects, the guest debugger, the API hook, and 69 API simulation files covering 2733 registered exports.
+See [RUNTIME.md](RUNTIME.md). In brief, it owns the guest environment: address space ledger, mapper, loader, TLS, TEB/PEB, SEH, the Windows ABI bridge, the guest heap and stdio, the export registry, API set resolution, synthetic guest module images, guest threads, write watching, VM dispatch tracing, image dump and minidump, IAT reconstruction, the 32-bit interpreter, containment, kernel objects, the guest debugger, the API hook, and 70 API simulation files covering 6351 registered exports.
 
 ---
 
@@ -161,7 +167,7 @@ The kernel ABI layer.
 
 `capability.h` is a static capability table: what this host kernel can do. Probing happens once at startup, and everything downstream asks the table rather than probing again. This is what makes `doctor` able to answer "what can this host do" without running anything.
 
-`syscall.cpp` issues the calls. `errno.h` translates Linux errno to Windows error codes in one place, because the mapping is not symmetric and getting it wrong per call site is how inconsistency creeps in.
+`syscall.cpp` issues the calls. `errno.h` is where the errno numbers live, written out as constants rather than included from `<errno.h>`, because that header declares the thread-local errno variable and the syscall layer must not drag it in. `kEparse` is deliberately not an errno: it is a failure code distinct from every kernel value, so a caller can tell "the kernel said no" from "the input was malformed before the call". `util::strerror` reproduces the kernel's own descriptions rather than depending on the C library's locale files or its spelling of the message.
 
 ---
 
@@ -173,20 +179,40 @@ Two independent mechanisms.
 
 ### seccomp
 
-`build_filter` takes an `AllowedSyscallList`, an `AllowedOpenFlagsList`, and a `SeccompPolicy` bitfield, and compiles them into one `sock_filter` program through the SBF macros in `seccomp.h`.
+`seccomp.h` emits the filter bytecode itself rather than delegating to libseccomp, because the kernel only ever executes bytecode: a library adds a policy compiler and a syscall-name table pinned to the library release rather than to the kernel the filter runs on, and both are things this project would then have to trust.
+
+The shape of a generated program:
 
 ```
-kActionAllow  = 0x7FFF0000
-kActionErrno  = 0x00050005
-kActionTrace  = 0x7FF00000
-kActionKill   = 0x00000000
+load arch
+if arch != AUDIT_ARCH_X86_64 -> reject every call
+load nr
+if nr > max_nr -> reject
+jump to the block for nr, else fall through
+each block returns its action, or tests argument conditions first
+fallthrough -> the policy's fallback action
 ```
 
-The compiled program is written in one `write()` to the filter fd, so no partially-installed filter can be observed. The kill action is only allowed when `policy.allow_kill_process` is set.
+`SeccompPolicy` is a fallback (`SeccompDefault::Allow | Errno | Trap | KillProcess`, defaulting to `Errno` with `ENOSYS`), a `max_nr` above which nothing is dispatched, and a list of `SeccompRule`s -- one per syscall number, each with an action, an errno payload for the `Errno` action, and zero or more `SeccompArgTest`s. The comparisons are the four the classic BPF instruction set actually has (`Equal`, `Greater`, `GreaterOrEqual`, `Masked`), with the other three expressed by exchanging a comparison's jump targets. An earlier version of this header reached for `BPF_JNE`, `BPF_JLT` and `BPF_JLE`, which are eBPF opcodes: the kernel rejects the whole filter at install time, so a policy using one protected nothing.
+
+The `nr > max_nr` test is not an optimisation. On x86-64 the kernel sets bit 30 of the syscall number for x32 callers, so a number seen at the seccomp boundary has to be rejected on the full value; a filter that dispatched on the low bits would let an x32 caller reach the native entry point under a different number.
+
+`build_seccomp` compiles and never installs; the installer sets `PR_SET_NO_NEW_PRIVS` itself, before the filter, because the kernel refuses an unprivileged install without it and a bit the caller had to remember was a bit that was forgotten.
+
+`guest_default_policy()` is a refusal list rather than an allow list, and that choice is stated in the header: the runtime's own thunks reach the kernel on the target's behalf, so a target that needs a syscall the list forgot keeps running rather than stopping for a reason nobody can see from inside the container. The list takes away the calls a Windows target has no business making -- the mount family, the module family, kernel debugging and tracing, namespace changes, and the io_uring, keyring and cross-process memory interfaces. A caller that wants the stricter allow list sets `fallback = Errno` on its own policy and installs that instead.
 
 ### Container
 
-Runs the guest under a `chroot`-style confined process.
+`container.h` composes a container from kernel primitives, in an order that is not arbitrary:
+
+1. `clone3` with the namespace flags. The new process is created stopped behind a pipe so it cannot run one instruction before the rest of the setup has happened.
+2. Write the uid and gid maps. A user namespace starts with no mapping, so the process inside has no valid credentials until this completes.
+3. In the child: make the mount table private, so nothing that happens next can propagate back to the host.
+4. Assemble the new root. Overlayfs where a writable layer was asked for, a plain bind otherwise, then `pivot_root`.
+5. Attach to a cgroup, so the resource limits a caller asked for are in place before any real work starts.
+6. Install the seccomp filter last. It applies to the process that installs it, so everything above has to finish first.
+
+No hypervisor and no kernel module. `NamespaceSet` is which namespaces to create, and a partial set is a valid and sometimes useful thing -- sharing the network namespace is how a target gets real network access, and sharing the pid namespace is how a tracer outside the container still sees it by pid. Each step reports a failure where it happened, because a container that half-exists is worse than one that never started.
 
 The containment module (`runtime/containment.cpp`) is the path-level half: `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`, atomic in one syscall, with an `openat`/`readlinkat` fallback capped at 40 symlinks and an explicit `confinement_unsupported` marker when neither works.
 
@@ -202,40 +228,27 @@ The event stream. It records what a run did without the run needing to know it i
 
 ### Events
 
-`EventKind` enumerates 26 kinds:
+`EventKind` enumerates 17 kinds:
 
 ```
-Syscall, ApiCall, MemoryWrite, RegisterChange, PageFault, ExecEntry,
-ExecExit, ThreadCreate, ThreadExit, ModuleLoad, ModuleUnload, Breakpoint,
-Watchpoint, WatchpointMiss, SectionChange, ApiHook, Hostile, ApiGap,
-IatHook, MemoryProtectChange, Mutex, Snapshot, Trace, Coverage, Fatal,
-Internal
+SessionStart, SessionEnd, ProcessSpawn, ProcessExit, ImageLoaded, Mapping,
+Section, Import, FileOpened, SyscallBlocked, BreakpointHit, Signal,
+MemoryWrite, Exec, ProbeAttached, ProbeHit, Note
 ```
 
-Every event carries: `kind`, `t` (monotonic ns), `pid`, `tid`, `thread`, `address`, `arg0`/`arg1`/`arg2`, `a`/`b` (64-bit ints), `name` (32 chars), `text` (60 chars), `args`.
+`Section` is separate from `Mapping` on purpose: a section is a range of the file and a range of the address space, and the loader is what turns one into the other, so reporting a section as a mapping would claim a correspondence the file does not make. `ProbeAttached` is separate from `ProbeHit` for the same reason -- attaching is a fact about the run's setup and happens once, and a hit is a fact about the target and happens as often as the target calls the function. A run that placed nine of ten probes and did not say which one it missed is a run whose output has a silent hole in it.
 
-### The 128-byte record
+There is no event record struct. An `Event` *is* its already-encoded JSON body, built at the point the fact is observed, which keeps the encoder free of any state beyond the output sink and keeps a struct per event kind from being needed. `add()` is overloaded on the value type so a caller never quotes a string by hand; the `const char*` overload exists because a bare pointer would otherwise convert to `bool` and turn a name into a truth value.
 
-One event is exactly `kRecordBytes = 128`, made of `kHeaderBytes = 40` plus `kPayloadBytes = 88`.
+### Sinks and sessions
 
-```
-kNameBytes   = 32
-kTextBytes   = 60
-kArgsBytes   = 40
-kArgsPerEvent = 8
-```
+`Sink` is an fd, not a `FILE*`, because the stream has to survive the process replacement the run performs and a buffer would be duplicated or lost across it. A partial write is retried; anything else is a stop.
 
-This is a wire format, and the size is load-bearing: it makes the record cache-line-friendly, lets the ring buffer be a fixed block of memory rather than a growable structure, and means a reader can seek to event *n* by arithmetic instead of scanning.
+`SessionConfig` and `SessionResult` bracket a session. `DebugServer` owns the debugger-facing half, which is where `attach` lands.
 
-### Sessions and transport
+### Transport
 
-`ObserverSession` is the owner. Its magic is `kSessionMagic = 0x53454F42` ("SEO B"), its version is `kSessionVersion = 1`, and its stream magic is `kStreamMagic = 0x4F435354`.
-
-The transport is a Unix datagram socket at a fixed path, named after the session with the PID appended. Records are fixed-size `EventRecord`s; a write that would not fit in one datagram is truncated to a multiple of 128 bytes, so a partial record can never be read as a whole one.
-
-Reconnecting is what `attach` does: the CLI finds the socket, subscribes, and receives the stream. A long run can be inspected without babysitting it.
-
-Ring depth is `kRingDepth = 256`.
+`transport.h` holds `Connection` and `Listener`, and they are for the debugger protocol, not for the event stream. `Listener::open` takes a port as a number so that zero can be assigned by the kernel and read back -- that is how a caller learns which port it got when it asked for any free one. `Connection` owns the buffering that turns the byte stream back into packets and knows when the peer went away; a packet whose checksum failed does not count as complete, because there is nothing to handle until the debugger has been asked to send it again.
 
 ### Probes
 
@@ -247,15 +260,20 @@ Ring depth is `kRingDepth = 256`.
 
 ```cpp
 struct NtdllProbe {
-    const char* symbol;
+    std::string_view symbol;            // the Unix-side entry point
     ProbeCategory category;
-    const char* arg0; ... arg3;   // parameter names, NULL when fewer
+    std::string_view arg0; ... arg5;    // parameter names, empty when fewer
+    std::string_view note;              // why this call is worth a probe
 };
 ```
 
-`ProbeCategory` covers File, Memory, Registry, Process, Thread, Sync, Security, SystemInfo, Debug, Object, Network, Token, Section, Key, Misc.
+The symbol is the Unix-side ntdll entry point rather than the Windows export: the PE-side `NtCreateFile` is a thunk into `__wine_syscall_dispatcher`, and the dispatcher is not a body a uprobe can be placed on. Six argument slots because a uprobe can read six argument registers.
 
-The categories are used to group syscall events without the observer needing to know anything about the kernel. An unlisted ntdll symbol falls into `Misc` via `kUnknownCategory`, so nothing is silently dropped.
+`ProbeCategory` is eight values -- `File`, `Process`, `Memory`, `Registry`, `Sync`, `Module`, `Info`, `Other` -- and they are the ones a reader would sort events into, not the ones a kernel would. Two calls in the same category are reported together because a person asking about a program's file access wants both of them, even though the kernel implements one as a file lookup and the other as a handle close.
+
+The categories group syscall events without the observer needing to know anything about the kernel. A symbol outside the table has no entry at all rather than a defaulted one, so nothing is silently dropped and nothing is silently added.
+
+`occ doctor` reports the table's size next to whether this host can place any of it, which is what separates "no probes were placed" from "there were none to place".
 
 ---
 
@@ -374,7 +392,9 @@ Symbolic execution over the runtime's own execution.
 
 `inspect/inspect.h`, `inspect/inspect.cpp`, `inspect/analysis.h`, `inspect/analysis.cpp`, `inspect/disasm.h`, `inspect/disasm.cpp`
 
-The static report. `analysis.cpp` extracts headers, sections, imports, exports, TLS, exceptions, resources, and strings. `disasm.cpp` disassembles.
+The static report, one JSON document per image. `inspect.cpp` is the structural half: the headers, the data directories with presence flags, the sections with entropy and zero-tail counts, imports (per DLL, with the IAT and hint/name resolution), exports with forwarders, the TLS directory with its callbacks, the exception table with a flags histogram, the resource tree, and the debug directory. `strings` and `version` are options rather than defaults of the code -- both are on unless `--no-strings` says otherwise.
+
+`analysis.cpp` is the code half and is requested with `--analyze`: it walks the instruction stream to find functions, builds a CFG per function with a cap on instructions walked, collects cross-references, and emits a call graph. Every cap is reported next to the count it truncates, so a consumer knows an answer is bounded rather than complete.
 
 The point of `inspect` is that it never requires the file to be loadable. It reports what was parsed, alongside the diagnostics explaining what was not. That is the direct consumer of the parser's tolerance split.
 
@@ -386,28 +406,40 @@ The point of `inspect` is that it never requires the file to be loadable. It rep
 
 ### Identify
 
-`identify.cpp` scores candidate packers on shape. Four hard blockers cancel a candidate outright:
+`identify.cpp` answers "is this PE wrapped, and in what" from the file's own bytes. Six observations feed one weighted score per candidate:
 
-- `extra_section_penalty`: unusual section layout
-- `very_high_entropy`: data that looks encrypted
-- `bad_ep_section`: the entry point is outside any section
-- `tiny_code`: no room for the unpacker to have run
+| Observation | Weight | Why that number |
+|---|---|---|
+| Section name in the known table | 0.18 / 0.28 / 0.35 | Cheapest thing to fake; enough to notice, not to convict. Varies with how distinctive the name is. |
+| Entropy >= 7.0 bits/byte | 0.30 | Compiled x86 measures 4.5..6.5. 7.0 sits above the code band with margin. |
+| Virtual size >= 4x file bytes | 0.15 | A section that reserves more than it ships is reserving room for what the stub writes. |
+| `LoadLibrary*` and `GetProcAddress` both imported | 0.15 | The strongest of the cheap signals: a clean program has no reason to resolve everything by hand. |
+| Import count <= 3 | 0.10 | A packed image's import density is a fraction of a normal program's. |
+| Stub idiom at the entry | 0.10 each, capped at 0.20 | `pushad`, `pushf`, a leading `jmp rel32` (bare or straight after `pushad`), `push imm32; ret`, `call rel32; pop`. None occurs in a compiler-emitted prologue. |
 
-The UPX family is identified by a triple: the section name `UPX!`, `PackedVersion` in the overlay, and `InfoVersion` in the overlay, all required. That is why a "name-shape contradiction" is a strong signal: a section named `UPX!` without the version fields is either a stripped packer or a decoy, and the code says which.
+The UPX family is named by section name, and both spellings are in the table: `.upx0`/`.upx1`/`.upx2`, which is what UPX's writer emits, and `UPX0`/`UPX1`/`UPX2`, which survive from tools that strip the leading dot. Every other packer family is listed by the name it actually writes.
 
-Candidates are rank-ordered, not asserted.
+Consistency is scored in both directions. A section that claims a packer's name while measuring below 5.0 bits/byte contributes a negative weight, because the name and the bytes disagree; a zero-byte section (`.upx0`) is exempt, since it says nothing about its packer's entropy either way. `low_confidence` is set below 0.40 or on any contradictory candidate. The verdict bands are 0.60 (high) and 0.40 (medium); "unpacked (low-confidence signals only)" is a distinct string, not a soft "packed".
+
+What cannot be measured is withheld, not guessed: an unreadable section reports entropy 0 with a note, and an import directory that cannot be walked contributes no import evidence at all rather than being read as "imports nothing".
 
 ### SMC
 
-`smc.cpp` statically detects self-modifying code, needed because the unpacker writes into its own `.text`.
+`smc.cpp` classifies a write stream against the section layout: a write into an executable section is a write-to-exec finding, repeated writes into one section are the shape a decryption loop leaves, a write into a data section is recorded and not alarmed. `static_smc_hints` adds the offline form -- an RWX section is a reason to arm the watch, not a finding on its own.
 
 ### Pipeline
 
 `pipeline.cpp` orchestrates: identify, view, unpack, dump.
 
-### The gap
+### ESP law
 
-`esp_law.cpp` is not in the `occ_core` source list in `CMakeLists.txt`. It compiles nowhere in the normal build, which makes it dead code. Its own test is the only consumer. Treat the ESP-law unpacking as unfinished, not as a feature.
+`esp_law.cpp` is the offline unpacker, and it is the reason this module does not need a running guest to produce a decrypted image. It carries its own small x86-64 machine -- registers, flags, a flat 32 MiB space -- and decodes and executes the entry-point stream directly, watching for the regularity the OllyDbg "ESP law" names: the wrapper saves the register state, runs its decryption loop, restores the state, and transfers out, so the stack pointer returns to its entry-time value exactly when the wrapper's work is done. The OEP is the first control transfer taken at a balanced stack that lands on an address nothing has executed before.
+
+The decoder covers the subset a decryption loop uses -- moves, `lea`, the ALU group with register, memory and immediate forms, shifts, group 3, `inc`/`dec`, `jcc`/`jmp`/`call`/`ret`, `xchg`, `movzx`/`movsx`, `not`/`neg`, `pushad`/`popad`, `pushf`/`popf` -- and stops with the instruction's RVA and the reason when it meets anything else. A decoder that silently skipped an instruction would fabricate a successful unpack. Calls that leave the image are stubbed and recorded with a zero return, because resolving imports is the loader's job, not this loop's. Every write into the image is recorded as an `SMCWrite`, so the module feeds `analyze_smc` the same shape of evidence a runtime watch produces.
+
+`offline_unpack` composes the two offline analyses in the order an unpacker asks them: `identify` first, then the loop, gated on the verdict. The gate is a refusal to guess. An image identified as unpacked has no wrapper, and running the loop anyway would report a step cap as a finding rather than as the absence of one; so the loop runs only on a "packed" verdict, at either confidence. `offline_unpack_file` is the same over a path. Neither upgrades a low-confidence signal into a verdict, which is the rule `identify` itself follows.
+
+### The gap
 
 `packer` has no CLI command. `main.cpp` does not reference it. Its output is consumed by `inspect` and the tests.
 
@@ -417,11 +449,9 @@ Candidates are rank-ordered, not asserted.
 
 `dbi/dbi.h`, `dbi/dbi.cpp`
 
-Dynamic binary instrumentation. The pipeline is decode, split, rewrite, execute.
+Dynamic binary instrumentation. The pipeline is decode, split, rewrite, execute: a guest region is decoded, split at basic-block boundaries, rewritten with instrumentation calls, and executed from the rewritten buffer.
 
-`dbi.cpp` is the only file. `Coverage` is a fixed `uint8_t[32]`, not a `std::array`, deliberately.
-
-Coverage is a hash rather than a set: a basic block executed ten times contributes one bit, so coverage measures reach, not frequency.
+`dbi.cpp` is the only file. `Coverage` is `std::uint8_t map[1 << 16]` plus an edge counter and a hit counter, and the map is indexed by a hash of `(from, to)` rather than by a block id -- the same directional-edge state that makes AFL's coverage map useful. `edges` counts distinct edges and `hits` counts total crossings, so the type measures both reach and frequency and a consumer picks the one it means.
 
 Like `packer`, `dbi` has no CLI command and no `main.cpp` reference. It is a library.
 
@@ -453,7 +483,7 @@ Behavior reporting: what the sample did, summarized.
 
 `placer.cpp` places probes on host symbols.
 
-`doctor.cpp` is what `occ doctor` runs. It reports what this host can and cannot do, drawing on the `syscall` capability table and the container state. This is the honest answer to "what works here", and it is the reason the project does not need to pretend its API coverage is complete.
+`doctor.cpp` is what `occ doctor` runs. It reports what this host can and cannot do, drawing on the `syscall` capability table, the container state, and the observer's probe table -- the last one next to whether this host can place any of it, so that "no probes were placed" is never read as "there were none to place". This is the honest answer to "what works here", and it is the reason the project does not need to pretend its API coverage is complete.
 
 ---
 
@@ -477,7 +507,7 @@ Detects anti-analysis measures in a sample: debugger checks, timing checks, inte
 
 `fuzz/fuzz.h`, `fuzz/fuzz.cpp`
 
-Fuzz targets for the parsers. Built with `-fsanitize=fuzzer,address,undefined` when `OCC_ENABLE_FUZZ` is on, which also forces `OCC_STATIC_LINK=OFF`.
+Fuzz targets for the parsers. `OCC_ENABLE_FUZZ` compiles them with `-fsanitize=fuzzer-no-link,address,undefined` and links each harness with `-fsanitize=fuzzer,address,undefined` from `fuzz/CMakeLists.txt`; the split exists because libFuzzer's archive contributes a `main()` and the `occ` binary has one of its own. Turning the option on also forces `OCC_STATIC_LINK` off -- a sanitized fully static binary is not something the linkers produce -- and so does any build whose flags carry `-fsanitize`, whether or not this option is what put them there.
 
 ---
 
@@ -495,7 +525,7 @@ Logging, filesystem helpers, string helpers, spans. `span.h` is header-only.
 
 **Warnings are errors.** `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wcast-qual -Wdouble-promotion -Wformat=2 -Wundef -Wnull-dereference -Wimplicit-fallthrough` plus `-Werror`, controlled by `OCC_WERROR`. `-Wconversion` and `-Wsign-conversion` are on, which is why the relocation code computes `delta` unsigned and why the capacity checks exist.
 
-**Fixed sizes for wire structures.** Event records are 128 bytes, TEB is 8 KiB, PEB is 4 KiB, `MemoryBasicInformation` is 48 bytes, `DispatcherContext` is 0x50. Each has a `static_assert` where the compiler can see it. These are not preferences; they are the shapes the guest reads.
+**Fixed sizes for wire structures.** TEB is 8 KiB, PEB is 4 KiB, `MemoryBasicInformation` is 48 bytes, `DispatcherContext` is 0x50 with a `static_assert` on each field offset the SEH dispatcher reads. These are not preferences; they are the shapes the guest reads. The event stream is the exception that proves the rule: it has no fixed record at all, because the body is built as JSON where the fact is observed, and there is nothing to `static_assert`.
 
 **No third-party runtime dependencies.** The build needs a C++23 compiler and CMake. Nothing else.
 
@@ -507,7 +537,6 @@ Logging, filesystem helpers, string helpers, spans. `span.h` is header-only.
 
 Stated plainly, because a document that does not list them is marketing.
 
-- `esp_law.cpp` is not built. Dead code.
 - `packer`, `dbi`, and `emu` have no CLI entry points. They are libraries with tests.
 - MachO is detected but not parsed.
 - `modules.cpp`'s `kCrtForwarders[]` lists roughly 50 names with no corresponding registration.

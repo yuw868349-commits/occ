@@ -1,9 +1,12 @@
 #include "occ/doctor.h"
 
+#include "occ/observer/ntdll_probes.h"
+#include "occ/observer/uprobe.h"
 #include "occ/util/fs.h"
 #include "occ/util/string.h"
 #include "occ/syscall/syscall.h"
 
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -279,6 +282,27 @@ Check probe_procfs() {
     return ok("procfs", "mounted");
 }
 
+// The observer's probe table, and whether this host can place any of it.
+//
+// Two halves, because a report that gave only one of them would be read as
+// the other: "73 probes" on a host without tracefs is a table nothing can
+// be placed from, and "tracefs is available" says nothing about how deep
+// the observation would go. The pair is what lets "no probes were placed"
+// be told apart from "there were none to place" -- the first is this
+// host's answer and the second is a property of the build.
+Check probe_table() {
+    const std::size_t count = obs::ntdll_probe_count();
+    const obs::ProbeAvailability avail = obs::Uprobes::availability();
+
+    std::string detail = std::to_string(count) + " probes in the table";
+    if (avail.available) {
+        detail += "; uprobes available at " + avail.tracefs_root;
+        return ok("observer probes", std::move(detail));
+    }
+    detail += "; none of them can be placed here: " + avail.reason;
+    return warn("observer probes", std::move(detail));
+}
+
 } // namespace
 
 bool DoctorReport::has_failure() const noexcept {
@@ -294,7 +318,7 @@ int DoctorReport::exit_code() const noexcept { return has_failure() ? 1 : 0; }
 
 DoctorReport run_doctor() noexcept {
     DoctorReport report;
-    report.checks.reserve(16);
+    report.checks.reserve(14);
 
     report.checks.push_back(probe_identity());
     report.checks.push_back(probe_kernel());
@@ -309,6 +333,7 @@ DoctorReport run_doctor() noexcept {
     report.checks.push_back(probe_tracefs());
     report.checks.push_back(probe_binderfs());
     report.checks.push_back(probe_config());
+    report.checks.push_back(probe_table());
 
     return report;
 }

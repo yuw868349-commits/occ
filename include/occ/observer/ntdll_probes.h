@@ -117,9 +117,10 @@ struct NtdllProbe {
 [[nodiscard]] const NtdllProbe* ntdll_probe_for_symbol(
     std::string_view symbol) noexcept;
 
-// How many probes are in the table. Reported by `occ doctor` and by the
-// engine's degradation notes, so that "no probes were placed" can be
-// distinguished from "there were none to place".
+// How many probes are in the table. Reported by `occ doctor`, next to
+// whether this host can place any of them, so that "no probes were placed"
+// can be distinguished from "there were none to place" -- the first is a
+// fact about the host and the second is a fact about the build.
 [[nodiscard]] std::size_t ntdll_probe_count() noexcept;
 
 // The file names the Unix-side ntdll is found under, most specific first.
