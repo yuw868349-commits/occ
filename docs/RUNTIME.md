@@ -751,7 +751,7 @@ filesystem, heap, process, conio and utility -- are complete. The
 residuals: private is missing the 1177 names that are the C++ exception
 machinery, the demangler and the `_o_` detour spellings; multibyte is
 missing the 199 multi-byte string functions, whose code pages this
-single-byte runtime does not configure; math is missing the 168 names
+single-byte runtime does not configure; math is missing the 166 names
 that are the complex-arithmetic family and the vendor's internal float
 helpers; convert, string, stdio, runtime, locale and time are missing
 45, 23, 9, 8, 3 and 4 names. A guest calling one of the missing names

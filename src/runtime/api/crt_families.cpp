@@ -440,9 +440,6 @@ extern "C" __attribute__((ms_abi)) double crf_tan(double x) noexcept {
 extern "C" __attribute__((ms_abi)) float crf_tanf(float x) noexcept {
     return std::tan(x);
 }
-extern "C" __attribute__((ms_abi)) double crf_tanl(double x) noexcept {
-    return std::tan(x);
-}
 extern "C" __attribute__((ms_abi)) double crf_sin(double x) noexcept {
     return std::sin(x);
 }
@@ -1194,18 +1191,22 @@ extern "C" __attribute__((ms_abi)) std::int32_t crf__controlfp_s(
 // The invalid-parameter handlers, process-wide and per-thread. The setter
 // answers the previous one, which is what a caller that chains handlers
 // reads.
-void* g_invalid_parameter_handler = nullptr;
+// The handler storage is the modern domain's, which is where
+// `_invalid_parameter_noinfo` reads it from; the get and the set both go
+// through its setter so the state the pair keeps is one state.
+extern "C" __attribute__((ms_abi)) void* u32u__set_invalid_parameter_handler(
+    void* handler) noexcept;
 
 extern "C" __attribute__((ms_abi)) std::uint64_t crf__get_invalid_parameter_handler() noexcept {
-    return reinterpret_cast<std::uint64_t>(g_invalid_parameter_handler);
+    return reinterpret_cast<std::uint64_t>(
+        u32u__set_invalid_parameter_handler(nullptr));
 }
 
 extern "C" __attribute__((ms_abi)) std::uint64_t crf__set_invalid_parameter_handler(
     std::uint64_t handler) noexcept {
-    const std::uint64_t previous =
-        reinterpret_cast<std::uint64_t>(g_invalid_parameter_handler);
-    g_invalid_parameter_handler = reinterpret_cast<void*>(handler);
-    return previous;
+    return reinterpret_cast<std::uint64_t>(
+        u32u__set_invalid_parameter_handler(
+            reinterpret_cast<void*>(handler)));
 }
 
 thread_local void* t_invalid_parameter_handler = nullptr;
@@ -6590,27 +6591,6 @@ extern "C" __attribute__((ms_abi)) std::int32_t crf__memicmp(
     return 0;
 }
 
-// The character counts between two positions, which the classic runtime
-// exported for the multi-byte walks.
-extern "C" __attribute__((ms_abi)) std::uint64_t crf___strncnt(
-    const char* text, std::uint64_t count) noexcept {
-    if (text == nullptr) {
-        return 0;
-    }
-    const std::uint64_t length = std::strlen(text);
-    return length < count ? length : count;
-}
-
-extern "C" __attribute__((ms_abi)) std::uint64_t crf___wcsncnt(
-    const char16_t* text, std::uint64_t count) noexcept {
-    if (text == nullptr) {
-        return 0;
-    }
-    const std::uint64_t length =
-        std::char_traits<char16_t>::length(text);
-    return length < count ? length : count;
-}
-
 // The in-place rewrites, narrow and wide.
 extern "C" __attribute__((ms_abi)) char* crf__strrev(
     char* text) noexcept {
@@ -8659,9 +8639,10 @@ extern "C" __attribute__((ms_abi)) std::int32_t crf__wcsncoll(
 }
 
 // The locale-tagged narrow and wide rewrites and compares. The narrow
-// case rewrites they call are defined below, beside their secure forms.
-extern "C" __attribute__((ms_abi)) char* crf__strlwr(char* text) noexcept;
-extern "C" __attribute__((ms_abi)) char* crf__strupr(char* text) noexcept;
+// case rewrites they call are the classic domain's, which is the
+// registration the name answers through.
+extern "C" __attribute__((ms_abi)) char* cr__strlwr(char* text) noexcept;
+extern "C" __attribute__((ms_abi)) char* cr__strupr(char* text) noexcept;
 
 extern "C" __attribute__((ms_abi)) std::int32_t crf__stricmp_l(
     const char* a, const char* b, std::uint64_t locale) noexcept {
@@ -8692,13 +8673,13 @@ extern "C" __attribute__((ms_abi)) std::int32_t crf__strnicoll_l(
 extern "C" __attribute__((ms_abi)) char* crf__strlwr_l(
     char* text, std::uint64_t locale) noexcept {
     static_cast<void>(locale);
-    return crf__strlwr(text);
+    return cr__strlwr(text);
 }
 
 extern "C" __attribute__((ms_abi)) char* crf__strupr_l(
     char* text, std::uint64_t locale) noexcept {
     static_cast<void>(locale);
-    return crf__strupr(text);
+    return cr__strupr(text);
 }
 
 extern "C" __attribute__((ms_abi)) std::int32_t u32u_strlwr_s_impl(
@@ -8918,27 +8899,6 @@ extern "C" __attribute__((ms_abi)) char* crf__strupr_s(
 }
 
 // The narrow case rewrites, untagged.
-extern "C" __attribute__((ms_abi)) char* crf__strlwr(
-    char* text) noexcept {
-    if (text == nullptr) {
-        return nullptr;
-    }
-    for (char* p = text; *p != '\0'; ++p) {
-        *p = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
-    }
-    return text;
-}
-
-extern "C" __attribute__((ms_abi)) char* crf__strupr(
-    char* text) noexcept {
-    if (text == nullptr) {
-        return nullptr;
-    }
-    for (char* p = text; *p != '\0'; ++p) {
-        *p = static_cast<char>(std::toupper(static_cast<unsigned char>(*p)));
-    }
-    return text;
-}
 
 // The narrow case rewrites' locale-tagged internals, which the `_l`
 // spellings above reach; the implementations live beside the secure ones
@@ -9052,13 +9012,11 @@ void add_crt_families(ExportList& out) {
     e("__p__wpgmptr", reinterpret_cast<void*>(&crf___p__wpgmptr));
     e("__pwctype_func", reinterpret_cast<void*>(&crf___pwctype_func));
     e("__pxcptinfoptrs", reinterpret_cast<void*>(&crf___pxcptinfoptrs));
-    e("__strncnt", reinterpret_cast<void*>(&crf___strncnt));
     e("__threadhandle", reinterpret_cast<void*>(&crf___threadhandle));
     e("__threadid", reinterpret_cast<void*>(&crf___threadid));
     e("__timezone", reinterpret_cast<void*>(&crf___timezone));
     e("__toascii", reinterpret_cast<void*>(&crf___toascii));
     e("__tzname", reinterpret_cast<void*>(&crf___tzname));
-    e("__wcsncnt", reinterpret_cast<void*>(&crf___wcsncnt));
     e("_access", reinterpret_cast<void*>(&crf__access));
     e("_access_s", reinterpret_cast<void*>(&crf__access_s));
     e("_aligned_offset_free", reinterpret_cast<void*>(&crf__aligned_offset_free));
@@ -9339,7 +9297,6 @@ void add_crt_families(ExportList& out) {
     e("_stricmp_l", reinterpret_cast<void*>(&crf__stricmp_l));
     e("_stricoll", reinterpret_cast<void*>(&crf__stricoll));
     e("_stricoll_l", reinterpret_cast<void*>(&crf__stricoll_l));
-    e("_strlwr", reinterpret_cast<void*>(&crf__strlwr));
     e("_strlwr_l", reinterpret_cast<void*>(&crf__strlwr_l));
     e("_strlwr_s", reinterpret_cast<void*>(&crf__strlwr_s));
     e("_strlwr_s_l", reinterpret_cast<void*>(&crf__strlwr_s_l));
@@ -9353,7 +9310,6 @@ void add_crt_families(ExportList& out) {
     e("_strset", reinterpret_cast<void*>(&crf__strset));
     e("_strset_s", reinterpret_cast<void*>(&crf__strset_s));
     e("_strtime", reinterpret_cast<void*>(&crf__strtime));
-    e("_strupr", reinterpret_cast<void*>(&crf__strupr));
     e("_strupr_l", reinterpret_cast<void*>(&crf__strupr_l));
     e("_strupr_s", reinterpret_cast<void*>(&crf__strupr_s));
     e("_strupr_s_l", reinterpret_cast<void*>(&crf__strupr_s_l));
@@ -9734,6 +9690,8 @@ void add_crt_families(ExportList& out) {
     e("strxfrm", reinterpret_cast<void*>(&crf_strxfrm));
     e("tanhf", reinterpret_cast<void*>(&crf_tanhf));
     e("tanhl", reinterpret_cast<void*>(&crf_tanhl));
+    e("tan", reinterpret_cast<void*>(&crf_tan));
+    e("tanf", reinterpret_cast<void*>(&crf_tanf));
     e("tgamma", reinterpret_cast<void*>(&crf_tgamma));
     e("tgammaf", reinterpret_cast<void*>(&crf_tgammaf));
     e("tgammal", reinterpret_cast<void*>(&crf_tgammal));
