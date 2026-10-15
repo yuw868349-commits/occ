@@ -34,7 +34,7 @@ What is not finished is named below, and most of it is small.
 
 **Exception handling.** UNWIND_INFO parsing, cycle detection on chained entries, bounded stack walks, the C-specific handler with correct search and unwind phases, `RtlUnwindEx` with signal mask restoration.
 
-**The API surface.** 6353 registered exports across 57 module entries and 70 files. kernel32, the UCRT and classic C runtime across eleven MSVC versions, a large `Rtl*` subset, GDI, USER32, Winsock, crypt32, advapi32 including the full registry family, rpcrt4, dbghelp, and the rest.
+**The API surface.** 12181 registered exports across 77 module entries and 108 files. kernel32, the UCRT and classic C runtime across eleven MSVC versions, a large `Rtl*` subset, GDI, USER32, Winsock, crypt32, advapi32 including the full registry family, rpcrt4, dbghelp, and the rest.
 
 **Anti-detection.** Consistent answers across `NtQueryInformationProcess`, `CheckRemoteDebugerPresent`, and `IsWow64Process`. A single monotonic clock model so no two time APIs disagree. A curated fingerprint table across eight namespaces.
 

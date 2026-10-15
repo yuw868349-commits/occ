@@ -654,62 +654,104 @@ add_library(occ_core STATIC
     src/runtime/api/filemap.cpp
     src/runtime/api/threads_ext.cpp
     src/runtime/api/sysinfo_ext.cpp
-    src/runtime/api/proc_ext.cpp
-    src/runtime/api/dbg_ext.cpp
-    src/runtime/api/ldr_ext.cpp
-    src/runtime/api/antidebug2.cpp
-    src/runtime/api/shell_mem.cpp
-    src/runtime/api/ldr_ext2.cpp
-    src/runtime/api/strcase_ext.cpp
-    src/runtime/api/selfcheck_ext.cpp
-    src/runtime/api/ntdll_file2.cpp
-    src/runtime/api/kernel32_file3.cpp
-    src/runtime/api/advapi32_token2.cpp
-    src/runtime/api/shell_exec.cpp
-    src/runtime/api/imagehlp.cpp
-    src/runtime/api/wininet.cpp
-    src/runtime/api/urlmon.cpp
-    src/runtime/api/bcrypt.cpp
-    src/runtime/api/winmm.cpp
-    src/runtime/api/mscoree.cpp
-    src/runtime/api/ws2_32.cpp
-    src/runtime/api/iphlpapi.cpp
-    src/runtime/api/advapi32_reg.cpp
-    src/runtime/api/advapi32_sec.cpp
-    src/runtime/api/ntdll_rtl_str.cpp
-    src/runtime/api/ntdll_rtl_mem1.cpp
-    src/runtime/api/ntdll_rtl_mem2.cpp
-    src/runtime/api/ntdll_rtl_mem3.cpp
-    src/devirt/expr.cpp
-    src/devirt/ring.cpp
-    src/devirt/sat.cpp
-    src/devirt/bitblast.cpp
-    src/devirt/lift.cpp
-    src/devirt/adapt.cpp
-    src/devirt/goal.cpp
-    src/devirt/solve.cpp
-    src/devirt/cert.cpp
-    src/devirt/codegen.cpp
-    src/devirt/semlib.cpp
+
+    src/behave/behave.cpp
+    src/concolic/bitflow.cpp
+    src/concolic/engine.cpp
+    src/concolic/program.cpp
+    src/concolic/taint.cpp
+    src/dbi/dbi.cpp
     src/deobf/deobf.cpp
     src/deobf/flatten.cpp
     src/deobf/mba.cpp
     src/deobf/opaque.cpp
+    src/devirt/adapt.cpp
+    src/devirt/bitblast.cpp
+    src/devirt/cert.cpp
+    src/devirt/codegen.cpp
+    src/devirt/expr.cpp
+    src/devirt/goal.cpp
+    src/devirt/lift.cpp
+    src/devirt/ring.cpp
+    src/devirt/sat.cpp
+    src/devirt/semlib.cpp
+    src/devirt/solve.cpp
+    src/emu/emu.cpp
+    src/fuzz/fuzz.cpp
+    src/hostile/hostile.cpp
+    src/packer/esp_law.cpp
     src/packer/identify.cpp
     src/packer/pe_view.cpp
     src/packer/pipeline.cpp
     src/packer/smc.cpp
-    src/packer/esp_law.cpp
-    src/concolic/engine.cpp
-    src/concolic/program.cpp
-    src/concolic/taint.cpp
-    src/concolic/bitflow.cpp
-    src/dbi/dbi.cpp
-    src/emu/emu.cpp
-    src/hostile/hostile.cpp
-    src/behave/behave.cpp
-    src/fuzz/fuzz.cpp
     src/replay/replay.cpp
+    src/runtime/api/advapi32_reg.cpp
+    src/runtime/api/advapi32_sec.cpp
+    src/runtime/api/advapi32_token2.cpp
+    src/runtime/api/antidebug2.cpp
+    src/runtime/api/bcrypt.cpp
+    src/runtime/api/dbg_ext.cpp
+
+    # The surface this runtime did not answer, one file per module, from
+    # `tools/apiwork`. A generated file is checked in: it is read, and a
+    # reader is owed the same review of it as of anything else here.
+    src/runtime/api/generated/advapi32.cpp
+    src/runtime/api/generated/avifil32.cpp
+    src/runtime/api/generated/bcrypt.cpp
+    src/runtime/api/generated/comctl32.cpp
+    src/runtime/api/generated/comdlg32.cpp
+    src/runtime/api/generated/crypt32.cpp
+    src/runtime/api/generated/dbghelp.cpp
+    src/runtime/api/generated/dhcpcsvc.cpp
+    src/runtime/api/generated/dnsapi.cpp
+    src/runtime/api/generated/gdi32.cpp
+    src/runtime/api/generated/imm32.cpp
+    src/runtime/api/generated/iphlpapi.cpp
+    src/runtime/api/generated/kernel32.cpp
+    src/runtime/api/generated/mpr.cpp
+    src/runtime/api/generated/msacm32.cpp
+    src/runtime/api/generated/mswsock.cpp
+    src/runtime/api/generated/netapi32.cpp
+    src/runtime/api/generated/ntdll.cpp
+    src/runtime/api/generated/ole32.cpp
+    src/runtime/api/generated/oleaut32.cpp
+    src/runtime/api/generated/opengl32.cpp
+    src/runtime/api/generated/rpcrt4.cpp
+    src/runtime/api/generated/secur32.cpp
+    src/runtime/api/generated/setupapi.cpp
+    src/runtime/api/generated/shell32.cpp
+    src/runtime/api/generated/shlwapi.cpp
+    src/runtime/api/generated/user32.cpp
+    src/runtime/api/generated/userenv.cpp
+    src/runtime/api/generated/uxtheme.cpp
+    src/runtime/api/generated/winhttp.cpp
+    src/runtime/api/generated/wininet.cpp
+    src/runtime/api/generated/winmm.cpp
+    src/runtime/api/generated/winspool.cpp
+    src/runtime/api/generated/wintrust.cpp
+    src/runtime/api/generated/wldap32.cpp
+    src/runtime/api/generated/ws2_32.cpp
+    src/runtime/api/generated/wtsapi32.cpp
+    src/runtime/api/imagehlp.cpp
+    src/runtime/api/iphlpapi.cpp
+    src/runtime/api/kernel32_file3.cpp
+    src/runtime/api/ldr_ext.cpp
+    src/runtime/api/ldr_ext2.cpp
+    src/runtime/api/mscoree.cpp
+    src/runtime/api/ntdll_file2.cpp
+    src/runtime/api/ntdll_rtl_mem1.cpp
+    src/runtime/api/ntdll_rtl_mem2.cpp
+    src/runtime/api/ntdll_rtl_mem3.cpp
+    src/runtime/api/ntdll_rtl_str.cpp
+    src/runtime/api/proc_ext.cpp
+    src/runtime/api/selfcheck_ext.cpp
+    src/runtime/api/shell_exec.cpp
+    src/runtime/api/shell_mem.cpp
+    src/runtime/api/strcase_ext.cpp
+    src/runtime/api/urlmon.cpp
+    src/runtime/api/wininet.cpp
+    src/runtime/api/winmm.cpp
+    src/runtime/api/ws2_32.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

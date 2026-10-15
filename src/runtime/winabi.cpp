@@ -5869,6 +5869,7 @@ void add_kernel32(ExportModule& module) {
     add_kernel32_strcase_ext(module.host_exports);
     add_kernel32_selfcheck_ext(module.host_exports);
     add_kernel32_file3(module.host_exports);
+    add_generated_kernel32(module.host_exports);
 }
 
 void add_module_psapi(ExportModule& module) {
@@ -5881,6 +5882,7 @@ void add_module_psapi(ExportModule& module) {
 void add_module_secur32(ExportModule& module) {
     module.name = "SECUR32.dll";
     add_secur32(module.host_exports);
+    add_generated_secur32(module.host_exports);
 }
 
 void add_module_dbghelp(ExportModule& module) {
@@ -5889,6 +5891,7 @@ void add_module_dbghelp(ExportModule& module) {
     // The image-checksum pair, named for the module the calls originally
     // lived in: `CheckSumMappedFile` and `MapFileAndCheckSumA`.
     add_dbghelp_imagehlp(module.host_exports);
+    add_generated_dbghelp(module.host_exports);
 }
 
 void add_module_version(ExportModule& module) {
@@ -5934,6 +5937,7 @@ void add_user32(ExportModule& module) {
     add_user32_antidebug2(module.host_exports);
     add_user32_strcase_ext(module.host_exports);
     add_user32_selfcheck(module.host_exports);
+    add_generated_user32(module.host_exports);
 }
 
 void add_kernelbase(ExportModule& module) {
@@ -5960,6 +5964,7 @@ void add_shlwapi(ExportModule& module) {
     // in this file or contributed by a domain.
     add_path_shlwapi(module.host_exports);
     add_string_shlwapi(module.host_exports);
+    add_generated_shlwapi(module.host_exports);
 }
 
 // The module the runtime is presented under in the list above. It is a
@@ -6049,6 +6054,25 @@ void register_host_modules(ExportRegistry& registry) {
         {"MSVCRT20.dll", &add_module_msvcrt20},
         {"MSVCRT40.dll", &add_module_msvcrt40},
         {"MSVCIRT.dll", &add_module_msvcirt},
+        {"AVIFIL32.dll", &add_module_avifil32},
+        {"COMCTL32.dll", &add_module_comctl32},
+        {"COMDLG32.dll", &add_module_comdlg32},
+        {"DHCPCSVC.dll", &add_module_dhcpcsvc},
+        {"DNSAPI.dll", &add_module_dnsapi},
+        {"IMM32.dll", &add_module_imm32},
+        {"MPR.dll", &add_module_mpr},
+        {"MSACM32.dll", &add_module_msacm32},
+        {"MSWSOCK.dll", &add_module_mswsock},
+        {"NETAPI32.dll", &add_module_netapi32},
+        {"OLEAUT32.dll", &add_module_oleaut32},
+        {"OPENGL32.dll", &add_module_opengl32},
+        {"USERENV.dll", &add_module_userenv},
+        {"UXTHEME.dll", &add_module_uxtheme},
+        {"WINHTTP.dll", &add_module_winhttp},
+        {"WINSPOOL.DRV", &add_module_winspool},
+        {"WINTRUST.dll", &add_module_wintrust},
+        {"WLDAP32.dll", &add_module_wldap32},
+        {"WTSAPI32.dll", &add_module_wtsapi32},
     };
 
     auto& index = own_export_index();

@@ -34,11 +34,13 @@ void add_module_ntdll(ExportModule& module) {
     add_ntdll_shell_mem(module.host_exports);
     add_ntdll_ldr_ext2(module.host_exports);
     add_ntdll_file2(module.host_exports);
+    add_generated_ntdll(module.host_exports);
 }
 
 void add_module_gdi32(ExportModule& module) {
     module.name = "GDI32.dll";
     add_gdi32(module.host_exports);
+    add_generated_gdi32(module.host_exports);
 }
 
 void add_module_advapi32(ExportModule& module) {
@@ -49,16 +51,19 @@ void add_module_advapi32(ExportModule& module) {
     // The token manipulation: the group adjustment, the duplication and
     // the thread attachment, over the same token model.
     add_advapi32_token2(module.host_exports);
+    add_generated_advapi32(module.host_exports);
 }
 
 void add_module_rpcrt4(ExportModule& module) {
     module.name = "RPCRT4.dll";
     add_rpcrt4(module.host_exports);
+    add_generated_rpcrt4(module.host_exports);
 }
 
 void add_module_setupapi(ExportModule& module) {
     module.name = "SETUPAPI.dll";
     add_setupapi(module.host_exports);
+    add_generated_setupapi(module.host_exports);
 }
 
 void add_module_shell32(ExportModule& module) {
@@ -67,16 +72,19 @@ void add_module_shell32(ExportModule& module) {
     // The launcher: `ShellExecuteA` and `ShellExecuteW`, which start a
     // document or a program the way the shell would.
     add_shell32_exec(module.host_exports);
+    add_generated_shell32(module.host_exports);
 }
 
 void add_module_crypt32(ExportModule& module) {
     module.name = "CRYPT32.dll";
     add_crypt32(module.host_exports);
+    add_generated_crypt32(module.host_exports);
 }
 
 void add_module_bcrypt(ExportModule& module) {
     module.name = "BCRYPT.dll";
     add_bcrypt(module.host_exports);
+    add_generated_bcrypt(module.host_exports);
 }
 
 void add_module_bcryptprimitives(ExportModule& module) {
@@ -87,6 +95,7 @@ void add_module_bcryptprimitives(ExportModule& module) {
 void add_module_winmm(ExportModule& module) {
     module.name = "winmm.dll";
     add_winmm(module.host_exports);
+    add_generated_winmm(module.host_exports);
 }
 
 void add_module_mscoree(ExportModule& module) {
@@ -97,11 +106,13 @@ void add_module_mscoree(ExportModule& module) {
 void add_module_ws2_32(ExportModule& module) {
     module.name = "WS2_32.dll";
     add_ws2_32(module.host_exports);
+    add_generated_ws2_32(module.host_exports);
 }
 
 void add_module_wininet(ExportModule& module) {
     module.name = "WININET.dll";
     add_wininet(module.host_exports);
+    add_generated_wininet(module.host_exports);
 }
 
 void add_module_urlmon(ExportModule& module) {
@@ -112,11 +123,13 @@ void add_module_urlmon(ExportModule& module) {
 void add_module_iphlpapi(ExportModule& module) {
     module.name = "IPHLPAPI.dll";
     add_iphlpapi(module.host_exports);
+    add_generated_iphlpapi(module.host_exports);
 }
 
 void add_module_ole32(ExportModule& module) {
     module.name = "OLE32.dll";
     add_ole32(module.host_exports);
+    add_generated_ole32(module.host_exports);
 }
 
 void add_module_ucrtbase(ExportModule& module) {
@@ -492,6 +505,103 @@ void add_module_msvcrt40(ExportModule& module) {
 void add_module_msvcirt(ExportModule& module) {
     module.name = "MSVCIRT.dll";
     add_crt(module.host_exports, "msvcirt.dll");
+}
+
+
+// The modules whose whole surface is generated...
+void add_module_avifil32(ExportModule& module) {
+    module.name = "AVIFIL32.dll";
+    add_generated_avifil32(module.host_exports);
+}
+
+void add_module_comctl32(ExportModule& module) {
+    module.name = "COMCTL32.dll";
+    add_generated_comctl32(module.host_exports);
+}
+
+void add_module_comdlg32(ExportModule& module) {
+    module.name = "COMDLG32.dll";
+    add_generated_comdlg32(module.host_exports);
+}
+
+void add_module_dhcpcsvc(ExportModule& module) {
+    module.name = "DHCPCSVC.dll";
+    add_generated_dhcpcsvc(module.host_exports);
+}
+
+void add_module_dnsapi(ExportModule& module) {
+    module.name = "DNSAPI.dll";
+    add_generated_dnsapi(module.host_exports);
+}
+
+void add_module_imm32(ExportModule& module) {
+    module.name = "IMM32.dll";
+    add_generated_imm32(module.host_exports);
+}
+
+void add_module_mpr(ExportModule& module) {
+    module.name = "MPR.dll";
+    add_generated_mpr(module.host_exports);
+}
+
+void add_module_msacm32(ExportModule& module) {
+    module.name = "MSACM32.dll";
+    add_generated_msacm32(module.host_exports);
+}
+
+void add_module_mswsock(ExportModule& module) {
+    module.name = "MSWSOCK.dll";
+    add_generated_mswsock(module.host_exports);
+}
+
+void add_module_netapi32(ExportModule& module) {
+    module.name = "NETAPI32.dll";
+    add_generated_netapi32(module.host_exports);
+}
+
+void add_module_oleaut32(ExportModule& module) {
+    module.name = "OLEAUT32.dll";
+    add_generated_oleaut32(module.host_exports);
+}
+
+void add_module_opengl32(ExportModule& module) {
+    module.name = "OPENGL32.dll";
+    add_generated_opengl32(module.host_exports);
+}
+
+void add_module_userenv(ExportModule& module) {
+    module.name = "USERENV.dll";
+    add_generated_userenv(module.host_exports);
+}
+
+void add_module_uxtheme(ExportModule& module) {
+    module.name = "UXTHEME.dll";
+    add_generated_uxtheme(module.host_exports);
+}
+
+void add_module_winhttp(ExportModule& module) {
+    module.name = "WINHTTP.dll";
+    add_generated_winhttp(module.host_exports);
+}
+
+void add_module_winspool(ExportModule& module) {
+    module.name = "WINSPOOL.DRV";
+    add_generated_winspool(module.host_exports);
+}
+
+void add_module_wintrust(ExportModule& module) {
+    module.name = "WINTRUST.dll";
+    add_generated_wintrust(module.host_exports);
+}
+
+void add_module_wldap32(ExportModule& module) {
+    module.name = "WLDAP32.dll";
+    add_generated_wldap32(module.host_exports);
+}
+
+void add_module_wtsapi32(ExportModule& module) {
+    module.name = "WTSAPI32.dll";
+    add_generated_wtsapi32(module.host_exports);
 }
 
 }  // namespace occ::runtime::winabi

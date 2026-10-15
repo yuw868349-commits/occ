@@ -780,6 +780,115 @@ void add_module_ucrtbase(ExportModule& module);
 // heaps, the locale objects and the `__stdio_common_*` entry points.
 void add_ucrt_extra(ExportList& out);
 
+// ------------------------------------------------------- the reported version
+//
+// The version this runtime presents to a guest. It is stated once, here,
+// because more than one entry point answers with it: `GetVersionEx` fills a
+// record from it, `GetVersion` packs it into a word, and a verification call
+// compares against it. Three copies of the number are three answers that can
+// disagree, and a guest that compares two of them would find the
+// disagreement before it found anything this runtime does.
+constexpr std::uint32_t kReportedOsMajor = 10;
+constexpr std::uint32_t kReportedOsMinor = 0;
+constexpr std::uint32_t kReportedOsBuild = 19045;
+// VER_PLATFORM_WIN32_NT, the only platform identifier this runtime presents.
+constexpr std::uint32_t kReportedPlatformId = 2;
+
+
+// The generated surfaces. One entry point per name this runtime did not
+// answer, in a file of its own under `src/runtime/api/generated/`. Each
+// registers itself into the module it belongs to, exactly as a hand-written
+// domain does; the module builders below are the callers.
+void add_generated_advapi32(ExportList& out);
+void add_generated_avifil32(ExportList& out);
+void add_generated_bcrypt(ExportList& out);
+void add_generated_comctl32(ExportList& out);
+void add_generated_comdlg32(ExportList& out);
+void add_generated_crypt32(ExportList& out);
+void add_generated_dbghelp(ExportList& out);
+void add_generated_dhcpcsvc(ExportList& out);
+void add_generated_dnsapi(ExportList& out);
+void add_generated_gdi32(ExportList& out);
+void add_generated_imm32(ExportList& out);
+void add_generated_iphlpapi(ExportList& out);
+void add_generated_kernel32(ExportList& out);
+void add_generated_mpr(ExportList& out);
+void add_generated_msacm32(ExportList& out);
+void add_generated_mswsock(ExportList& out);
+void add_generated_netapi32(ExportList& out);
+void add_generated_ntdll(ExportList& out);
+void add_generated_ole32(ExportList& out);
+void add_generated_oleaut32(ExportList& out);
+void add_generated_opengl32(ExportList& out);
+void add_generated_rpcrt4(ExportList& out);
+void add_generated_secur32(ExportList& out);
+void add_generated_setupapi(ExportList& out);
+void add_generated_shell32(ExportList& out);
+void add_generated_shlwapi(ExportList& out);
+void add_generated_user32(ExportList& out);
+void add_generated_userenv(ExportList& out);
+void add_generated_uxtheme(ExportList& out);
+void add_generated_winhttp(ExportList& out);
+void add_generated_wininet(ExportList& out);
+void add_generated_winmm(ExportList& out);
+void add_generated_winspool(ExportList& out);
+void add_generated_wintrust(ExportList& out);
+void add_generated_wldap32(ExportList& out);
+void add_generated_ws2_32(ExportList& out);
+void add_generated_wtsapi32(ExportList& out);
+void add_module_avifil32(ExportModule& module);
+void add_module_comctl32(ExportModule& module);
+void add_module_comdlg32(ExportModule& module);
+void add_module_dhcpcsvc(ExportModule& module);
+void add_module_dnsapi(ExportModule& module);
+void add_module_imm32(ExportModule& module);
+void add_module_mpr(ExportModule& module);
+void add_module_msacm32(ExportModule& module);
+void add_module_mswsock(ExportModule& module);
+void add_module_netapi32(ExportModule& module);
+void add_module_oleaut32(ExportModule& module);
+void add_module_opengl32(ExportModule& module);
+void add_module_userenv(ExportModule& module);
+void add_module_uxtheme(ExportModule& module);
+void add_module_winhttp(ExportModule& module);
+void add_module_winspool(ExportModule& module);
+void add_module_wintrust(ExportModule& module);
+void add_module_wldap32(ExportModule& module);
+void add_module_wtsapi32(ExportModule& module);
+
+// ------------------------------------------------------- the reused entries
+//
+// A few of the domains under `src/runtime/api/generated/` answer a call by
+// reaching one this runtime already implements, rather than by re-deriving
+// it. `PathIsDirectoryEmpty` walks a directory, and the walk it must use is
+// the one `FindFirstFile` performs -- a second walk would be a second set of
+// rules about what an entry is.
+//
+// They are declared here rather than reached through the export registry
+// because the registry is built from these very domains: a lookup would
+// need the table it is still filling. Every one of them already had external
+// linkage; this is the declaration, not a change of linkage.
+
+extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetWindowsDirectoryA(
+    char* buffer, std::uint32_t count) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetWindowsDirectoryW(
+    char16_t* buffer, std::uint32_t count) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetSystemDirectoryA(
+    char* buffer, std::uint32_t count) noexcept;
+extern "C" __attribute__((ms_abi)) std::uint32_t k32p_GetSystemDirectoryW(
+    char16_t* buffer, std::uint32_t count) noexcept;
+
+extern "C" __attribute__((ms_abi)) void* k32f3_FindFirstFileA(
+    const char* pattern, void* data) noexcept;
+extern "C" __attribute__((ms_abi)) void* k32f3_FindFirstFileW(
+    const char16_t* pattern, void* data) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32f3_FindNextFileA(
+    void* handle, void* data) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32f2_FindNextFileW(
+    void* handle, void* data) noexcept;
+extern "C" __attribute__((ms_abi)) std::int32_t k32f2_FindClose(
+    void* handle) noexcept;
+
 // One of the `api-ms-win-crt-*` forwarder stubs, whose subset is decided
 // by the name the module already carries.
 void add_module_api_ms_win_crt(ExportModule& module);

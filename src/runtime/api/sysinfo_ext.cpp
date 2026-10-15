@@ -51,13 +51,15 @@ constexpr std::size_t kOviCsd = 20;
 constexpr std::size_t kOviBytes = 148;
 
 // `VER_PLATFORM_WIN32_NT`, the platform id of every modern Windows.
-constexpr std::uint32_t kPlatformWin32Nt = 2;
+constexpr std::uint32_t kPlatformWin32Nt = kReportedPlatformId;
 
 // The version this runtime presents: the same numbers the PEB carries, so
 // the two views of "what Windows is this" agree.
-constexpr std::uint32_t kOsMajor = 10;
-constexpr std::uint32_t kOsMinor = 0;
-constexpr std::uint32_t kOsBuild = 19045;
+// The numbers themselves live in `api.h`, because `GetVersion` and the
+// version-verification call answer with the same ones.
+constexpr std::uint32_t kOsMajor = kReportedOsMajor;
+constexpr std::uint32_t kOsMinor = kReportedOsMinor;
+constexpr std::uint32_t kOsBuild = kReportedOsBuild;
 
 // `GetSystemFirmwareTable`'s provider signature for the SMBIOS table set.
 constexpr std::uint32_t kFirmwareProviderSmbios = 0x52534D42u;  // 'RSMB'

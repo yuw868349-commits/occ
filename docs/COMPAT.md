@@ -2,7 +2,7 @@
 
 What this runtime answers, what it does not, and how the API surface is organized. All figures come from the source: `src/runtime/api/`, `src/runtime/winabi.cpp`, `src/runtime/apiset.cpp`, `src/runtime/exports.cpp`.
 
-Totals: **57 module entries**, **6353 registered exports**, **364 API set entries**, across **70 files** and roughly 95,000 lines.
+Totals: **77 module entries** (**76 registered**; one pair differs only in case), **12181 registered exports**, **364 API set entries**, across **205 source files** and roughly 288,000 lines. Of those exports, **5792** are the generated surface described below, and **6389** are hand-written.
 
 ---
 
@@ -11,6 +11,7 @@ Totals: **57 module entries**, **6353 registered exports**, **364 API set entrie
 - [How the surface is built](#how-the-surface-is-built)
 - [Module table](#module-table)
 - [Coverage by DLL](#coverage-by-dll)
+- [The generated surface](#the-generated-surface)
 - [API set resolution](#api-set-resolution)
 - [The forwarder gap](#the-forwarder-gap)
 - [Loading a library](#loading-a-library)
@@ -46,7 +47,7 @@ Forwarder detection: a target RVA inside the export directory range is a forward
 
 ## Module table
 
-`winabi.cpp`'s static `kModules[]`, 60 entries, consumed by `register_host_modules`:
+`winabi.cpp`'s static `kModules[]`, 77 entries, consumed by `register_host_modules`:
 
 | Group | Modules |
 |---|---|
@@ -59,8 +60,9 @@ Forwarder detection: a target RVA inside the export directory range is a forward
 | Network | `WS2_32.dll`, `WININET.dll`, `URLMON.dll`, `IPHLPAPI.dll` |
 | Shell and COM | `SHELL32.dll`, `OLE32.dll` |
 | System | `VERSION.dll`, `DBGHELP.dll`, `PSAPI.dll`, `PSAPI.DLL`, `RPCRT4.dll`, `SETUPAPI.dll`, `winmm.dll`, `MSCOREE.dll` |
+| Generated, whole surface | `AVIFIL32.dll`, `COMCTL32.dll`, `COMDLG32.dll`, `DHCPCSVC.dll`, `DNSAPI.dll`, `IMM32.dll`, `MPR.dll`, `MSACM32.dll`, `MSWSOCK.dll`, `NETAPI32.dll`, `OLEAUT32.dll`, `OPENGL32.dll`, `USERENV.dll`, `UXTHEME.dll`, `WINHTTP.dll`, `WINSPOOL.DRV`, `WINTRUST.dll`, `WLDAP32.dll`, `WTSAPI32.dll` |
 
-Module constructor locations in `winabi.cpp`: `add_kernel32` (5644), `add_module_psapi` (5808), `add_module_secur32` (5815), `add_module_dbghelp` (5820), `add_module_version` (5828), `add_module_vcruntime140` (5833), `add_module_vcruntime140_1` (5838), `add_module_msvcp140` (5843), `add_user32` (5848), `add_kernelbase` (5873), `add_shlwapi` (5886), `add_msvcrt` (5901). The rest are in `api/modules.cpp`.
+Module constructor locations in `winabi.cpp`: `add_kernel32` (5710), `add_module_psapi` (5875), `add_module_secur32` (5882), `add_module_dbghelp` (5888), `add_module_version` (5897), `add_module_vcruntime140` (5902), `add_module_msvcp140` (5912), `add_user32` (5917), `add_kernelbase` (5943), `add_shlwapi` (5956), `add_msvcrt` (5972). The rest are in `api/modules.cpp`.
 
 ## Coverage by DLL
 
@@ -148,6 +150,60 @@ Module constructor locations in `winabi.cpp`: `add_kernel32` (5644), `add_module
 | `ldr_ext2.cpp` | 20 | Loader lock, notifications, resource lookup, `LoadLibraryExA` |
 | `advapi32_token2.cpp` | 4 | `AdjustTokenGroups`, `DuplicateToken`, `DuplicateTokenEx`, `SetThreadToken` |
 | `advapi32.cpp` | 0 | Empty placeholder |
+
+## The generated surface
+
+`src/runtime/api/generated/` holds one C++ file per module: **37 files**, **89753 lines**, **5792 entry points**. They are the exports the mingw import libraries list and this runtime did not already answer, and every one of them has the signature the platform's own headers declare.
+
+The names come from `nm` over the import libraries, which are the real DLLs' export tables. The signatures come from the headers, preprocessed by `x86_64-w64-mingw32-gcc -E` and read by `tools/apiwork/extract_prototypes.py`. The preprocessor is not optional: the declarations are macro-decorated, and a text scan of the raw headers reads `WINAPI` as a return type -- a signature whose answer the caller then reads out of a register the callee never wrote.
+
+### Three kinds of entry point
+
+| Kind | Count | What it does |
+|---|---|---|
+| Implementation | 200 | does the thing |
+| Refusal | 5583 | `ERROR_CALL_NOT_IMPLEMENTED` through `SetLastError`, plus a comment naming the subsystem that would have to exist |
+| Refusal, no declared signature | 9 | the headers do not declare the name, so the thunk names no parameters at all |
+
+The signatureless case is safe rather than convenient, and the reason is the ABI: on the 64-bit Microsoft convention the caller allocates and releases the shadow space, so a callee that names no parameter reads neither it nor the registers the arguments arrived in. A guessed arity would not be safe, which is why the headers' silence is answered with no parameters rather than with a plausible-looking list.
+
+What none of the three does is answer success for work that did not happen. A guest handed a window handle for a window that was never created will use that handle four more times and free it; a guest told the call is unavailable takes the branch it already has for that answer. The first failure surfaces somewhere else entirely, in code with no reason to suspect what went wrong.
+
+### The refusals, by subsystem
+
+The reasons are grouped by what would have to exist, not by function. `refuse.py` holds the table and the generated comments quote it.
+
+| Subsystem | Families |
+|---|---|
+| the window manager | windows, menus, dialogs, messages, input, the desktop, the common controls, the common dialogs, themes, the IME |
+| the graphics device layer | device contexts, bitmaps, brushes, fonts, palettes, regions, and the OpenGL client library |
+| the device layer | the device tree, the print spooler, the audio and video device layers, serial ports, tape, volumes |
+| the system services | the service control manager, the event log and audit, the network redirector, DHCP, DNS, LDAP, the security packages, the terminal services |
+| the NT system call surface | `Nt*` and `Zw*` |
+| the security subsystem | tokens, descriptors, access checks, the LSA |
+| the COM and shell layers | interface calls by vtable, the shell namespace, the file-type database |
+| the protocol clients | WinINet, WinHTTP, RPC, LDAP, the trust providers |
+| the transactional file system | the `*Transacted` families and the kernel transaction manager |
+| the locale and NLS data | calendar, collation, formatting and the code-page tables |
+
+### What is implemented
+
+Two hundred names, and they are the ones whose behaviour is a property of a format or of arithmetic rather than of a capability this machine lacks.
+
+| Module | Implemented | What |
+|---|---|---|
+| `shlwapi` | 100 | the `Path*` grammar, the bounded `Str*` helpers, the shell's size and interval formatters, the narrow/wide conversions |
+| `kernel32` | 100 | the interlocked and bit-test family, the S-list depth query, the one-shot and barrier objects, the pointer encoder, the DOS time conversions, the profile files, `MulDiv`, the wide multiply, `GetVersion`, `GetSystemWindowsDirectory`, and the calls the API documents as having no effect |
+
+### The type table, and its last resort
+
+`wintypes.py` names every type the headers use, and the names matter in exactly one respect: which register an argument travels in. A `FLOAT`, a `DATE` and a `GLclampf` are not integers that happen to be small, and a runtime that passed one in a general-purpose register would have the callee read a bit pattern out of an XMM register that was never written.
+
+An unknown non-floating type of at most eight bytes travels in a general-purpose register whatever it is, so an unknown name maps to a 64-bit integer and the call is still correct. 700 distinct names reach that path; each is a handle, a status word or a pointer this table does not name, and each is checked by the rule that no floating-point name is among them.
+
+### The generator
+
+`tools/apiwork/` holds it, and the generated files are checked in. They are read, and a reader is owed the same review of them as of anything else here. The tool's own README states what it reads, what it writes and how to run it.
 
 ## API set resolution
 

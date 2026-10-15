@@ -26,7 +26,11 @@ The consequence of that last one is worth stating plainly, because it is the thi
 
 **PE parsing and mapping.** Its own parser for headers, sections, imports, exports, TLS, exceptions, resources, and delay imports, and its own loader that maps the image, applies the full relocation type set, rebuilds the import address table, and runs TLS initializers the way a Windows loader would, because guests notice when loading is done differently.
 
-**A Windows runtime on a Linux thread.** Guest TLS, TEB and PEB with the real x64 layouts, SEH dispatch and stack unwinding, a ntdll subset, API set resolution, and 6353 registered exports across 57 modules: kernel32, the UCRT and the classic C runtime across eleven MSVC versions, a large `Rtl*` surface, GDI, USER32, Winsock, crypt32, advapi32 including the whole registry family, rpcrt4, dbghelp, and the rest. Each one is a deliberate re-implementation with real semantics, not a stub that returns zero.
+**A Windows runtime on a Linux thread.** Guest TLS, TEB and PEB with the real x64 layouts, SEH dispatch and stack unwinding, a ntdll subset, API set resolution, and 12181 registered exports across 76 modules: kernel32, the UCRT and the classic C runtime across eleven MSVC versions, a large `Rtl*` surface, GDI, USER32, Winsock, crypt32, advapi32 including the whole registry family, rpcrt4, dbghelp, and the rest.
+
+Of those exports, 6389 are hand-written re-implementations with real semantics, and 5792 are the generated surface: one entry point per name the platform's import libraries list that this runtime does not answer, each with the signature the platform's own headers declare. 200 of the generated names are implemented -- the path grammar, the bounded string helpers, the interlocked family, the profile files, the formatters -- and the other 5592 refuse, through `ERROR_CALL_NOT_IMPLEMENTED` and a comment naming the subsystem that would have to exist.
+
+A refusal is not a stub returning zero for a call that worked. It is the answer Windows gives for an entry point whose subsystem is not present, and the distinction matters: a guest told that a window was created holds a handle it will use four more times, and the failure that follows lands in code with no reason to suspect what went wrong. A guest told the call is unavailable takes the branch it already has for that answer.
 
 **Guest threads.** Real threads, each with its own TEB and stack, with `SYS_arch_prctl` setting GS base so guest code can reach its TEB the way it was compiled to.
 

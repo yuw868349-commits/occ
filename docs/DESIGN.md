@@ -153,7 +153,7 @@ The top of the stack for actually executing something.
 
 ## Runtime
 
-See [RUNTIME.md](RUNTIME.md). In brief, it owns the guest environment: address space ledger, mapper, loader, TLS, TEB/PEB, SEH, the Windows ABI bridge, the guest heap and stdio, the export registry, API set resolution, synthetic guest module images, the module ledger and the library lifecycle, guest threads, write watching, VM dispatch tracing, image dump and minidump, IAT reconstruction, the 32-bit interpreter, containment, kernel objects, the guest debugger, the API hook, and 70 API simulation files covering 6353 registered exports.
+See [RUNTIME.md](RUNTIME.md). In brief, it owns the guest environment: address space ledger, mapper, loader, TLS, TEB/PEB, SEH, the Windows ABI bridge, the guest heap and stdio, the export registry, API set resolution, synthetic guest module images, the module ledger and the library lifecycle, guest threads, write watching, VM dispatch tracing, image dump and minidump, IAT reconstruction, the 32-bit interpreter, containment, kernel objects, the guest debugger, the API hook, and 108 API simulation files covering 12181 registered exports, of which 5792 are the generated surface described in [COMPAT.md](COMPAT.md).
 
 **Two shapes of guest, one runtime.** A program is *jumped to*: its entry
 point takes no arguments, never returns through the ordinary path, and its

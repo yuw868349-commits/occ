@@ -597,7 +597,7 @@ Handle base is `kHandleBase = 0x200000`, chosen above the file-handle range. `kI
 
 ## API simulation layer
 
-`runtime/api/` holds 70 files, about 95,000 lines. Total registered exports: 6353.
+`runtime/api/` holds 108 files, about 189,000 lines. Total registered exports: 12181, of which 5792 are generated and 6389 hand-written.
 
 ### Registration path
 
@@ -613,7 +613,7 @@ The same data is consumed in three places, so registering a name in one file mak
 
 ### Module table
 
-`winabi.cpp`'s static `kModules[]` has **60 entries**, consumed by `register_host_modules`:
+`winabi.cpp`'s static `kModules[]` has **77 entries**, consumed by `register_host_modules`:
 
 ```
 KERNEL32.dll        KERNELBASE.dll      msvcrt.dll          USER32.dll
